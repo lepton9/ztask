@@ -1,0 +1,13 @@
+.{
+    .name = .ztask,
+    .version = "0.0.0",
+    .fingerprint = 0x67a0b4a4055f624,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
