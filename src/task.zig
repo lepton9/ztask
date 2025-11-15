@@ -13,9 +13,15 @@ pub const Task = struct {
         return task;
     }
 
-    pub fn deinit(task: *Task, gpa: std.mem.Allocator) void {
-        gpa.free(task.name);
-        gpa.destroy(task);
+    pub fn deinit(self: *Task, gpa: std.mem.Allocator) void {
+        for (self.jobs) |job| {
+            gpa.free(job.name);
+            for (job.steps) |step| {
+                gpa.free(step.value);
+            }
+        }
+        gpa.free(self.name);
+        gpa.destroy(self);
     }
 };
 
@@ -33,6 +39,7 @@ pub const Job = struct {
 };
 
 pub const StepKind = enum { Command };
+
 pub const Step = struct {
     kind: StepKind,
     value: []const u8,
