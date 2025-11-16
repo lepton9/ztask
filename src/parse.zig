@@ -162,6 +162,47 @@ pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {
     return parseTaskBuffer(gpa, yaml_file);
 }
 
+test "parse_empty" {
+    try std.testing.expect(
+        parseTaskBuffer(std.testing.allocator, "") == ParseError.EmptyTaskFile,
+    );
+}
+
+test "missing_name" {
+    const source =
+        \\ on:
+        \\   watch: "src/main.zig"
+    ;
+    try std.testing.expect(
+        parseTaskBuffer(std.testing.allocator, source) == ParseError.UnnamedTask,
+    );
+}
+
+test "parse_task" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   watch: "src/main.zig"
+        \\
+        \\ jobs:
+        \\   build:
+        \\     steps:
+        \\       - command: "zig fmt --check ./*.zig src/*.zig"
+        \\       - command: "zig build-exe src/main.zig"
+        \\     run_on: local
+        \\   test:
+        \\     steps:
+        \\       - command: "./main_test"
+        \\     run_on: remote:runner1
+        \\     deps: [build]
+        \\   deploy:
+        \\     command: "./deploy.sh"
+        \\     run_on: remote:runner2
+        \\     deps: [test]
+    ;
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
 }
 
 // pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {}

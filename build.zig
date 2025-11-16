@@ -51,7 +51,11 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    const run_parse_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = parse_mod,
+    }));
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_parse_tests.step);
 }
