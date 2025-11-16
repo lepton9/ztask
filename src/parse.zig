@@ -6,14 +6,22 @@ const Task = task.Task;
 
 pub const max_size = 8192;
 
-fn parseToTask(gpa: std.mem.Allocator, values: []yaml.Yaml.Value) !*Task {
-    if (values.len == 0) return error.EmptyTaskFile;
-    const map = values[0].map;
+const ParseError = error{
+    InvalidFileFormat,
+    EmptyTaskFile,
+    UnnamedTask,
+    UnknownDependency,
+    DuplicateJobName,
+    InvalidStep,
+    InvalidStepKind,
+    InvalidFieldType,
+};
 
+fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     // Task name
     const name: []const u8 = blk: {
-        const nv = map.get("name") orelse return error.UnnamedTask;
-        break :blk nv.asScalar() orelse return error.InvalidFieldType;
+        const nv = map.get("name") orelse return ParseError.UnnamedTask;
+        break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
     };
 
     var trigger: ?task.Trigger = null;
@@ -21,9 +29,9 @@ fn parseToTask(gpa: std.mem.Allocator, values: []yaml.Yaml.Value) !*Task {
 
     // Trigger
     if (map.get("on")) |on_val| {
-        const on = on_val.asMap() orelse return error.InvalidFieldType;
+        const on = on_val.asMap() orelse return ParseError.InvalidFieldType;
         if (on.get("watch")) |watch| {
-            const path = watch.asScalar() orelse return error.InvalidFieldType;
+            const path = watch.asScalar() orelse return ParseError.InvalidFieldType;
             trigger = .{ .watch = .{ .path = try gpa.dupe(u8, path), .type = .file } };
         }
     }
@@ -50,17 +58,17 @@ fn parseJobs(gpa: std.mem.Allocator, map: yaml.Yaml.Map) ![]task.Job {
         jobs.deinit(gpa);
     }
     if (map.get("jobs")) |jobs_val| {
-        const jobs_map = jobs_val.asMap() orelse return error.InvalidFieldType;
+        const jobs_map = jobs_val.asMap() orelse return ParseError.InvalidFieldType;
         var it = jobs_map.iterator();
         while (it.next()) |entry| {
             // Parse job
             const job_name = entry.key_ptr.*;
             const job_map = entry.value_ptr.*.asMap() orelse
-                return error.InvalidFieldType;
+                return ParseError.InvalidFieldType;
 
             // Check if job already exists
             const job_result = try seen_jobs.getOrPut(job_name);
-            if (job_result.found_existing) return error.DuplicateJobName;
+            if (job_result.found_existing) return ParseError.DuplicateJobName;
 
             const job = try parseJob(gpa, job_name, job_map, seen_jobs);
 
@@ -82,10 +90,10 @@ fn parseJob(
     const step_values: []yaml.Yaml.Value = blk: {
         const steps_value = job.get("steps") orelse break :blk &.{};
         break :blk steps_value.asList() orelse
-            return error.InvalidFieldType;
+            return ParseError.InvalidFieldType;
     };
     const run_on: ?[]const u8 = if (job.get("run_on")) |on|
-        on.asScalar() orelse return error.InvalidFieldType
+        on.asScalar() orelse return ParseError.InvalidFieldType
     else
         null;
 
@@ -96,15 +104,15 @@ fn parseJob(
         steps.deinit(gpa);
     }
     for (step_values) |step| {
-        const s = step.asMap() orelse return error.InvalidStep;
+        const s = step.asMap() orelse return ParseError.InvalidStep;
         var step_it = s.iterator();
         while (step_it.next()) |step_e| {
             const kind = std.meta.stringToEnum(
                 task.StepKind,
                 step_e.key_ptr.*,
-            ) orelse return error.InvalidStepKind;
+            ) orelse return ParseError.InvalidStepKind;
             const step_value = step_e.value_ptr.*.asScalar() orelse
-                return error.InvalidFieldType;
+                return ParseError.InvalidFieldType;
             try steps.append(gpa, .{
                 .kind = kind,
                 .value = try gpa.dupe(u8, step_value),
@@ -115,16 +123,16 @@ fn parseJob(
     // Parse job dependencies
     const deps: ?[]*const task.Job = blk: {
         const deps_values = if (job.get("deps")) |deps|
-            deps.asList() orelse return error.InvalidFieldType
+            deps.asList() orelse return ParseError.InvalidFieldType
         else
             break :blk null;
         var deps = try std.ArrayList(*const task.Job).initCapacity(gpa, 5);
         errdefer deps.deinit(gpa);
         for (deps_values) |val| {
             const job_dep = val.asScalar() orelse
-                return error.InvalidFieldType;
+                return ParseError.InvalidFieldType;
             const dep = seen_jobs.get(job_dep) orelse
-                return error.UnknownDependency;
+                return ParseError.UnknownDependency;
             try deps.append(gpa, dep);
         }
         break :blk try deps.toOwnedSlice(gpa);
@@ -138,15 +146,22 @@ fn parseJob(
     };
 }
 
+fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
+    var yaml_parser: yaml.Yaml = .{ .source = buf };
+    defer yaml_parser.deinit(gpa);
+    yaml_parser.load(gpa) catch return ParseError.InvalidFileFormat;
+    const values = yaml_parser.docs.items;
+    if (values.len == 0) return ParseError.EmptyTaskFile;
+    const map = values[0].map;
+    return parseTask(gpa, map);
+}
+
 pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {
     const yaml_file = try std.fs.cwd().readFileAlloc(gpa, path, max_size);
     defer gpa.free(yaml_file);
+    return parseTaskBuffer(gpa, yaml_file);
+}
 
-    var yaml_parser: yaml.Yaml = .{ .source = yaml_file };
-    yaml_parser.load(gpa) catch return error.InvalidTaskFile;
-    defer yaml_parser.deinit(gpa);
-    const t: *Task = try parseToTask(gpa, yaml_parser.docs.items);
-    return t;
 }
 
 // pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {}

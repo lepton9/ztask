@@ -17,6 +17,8 @@ pub const Task = struct {
         for (self.jobs) |job| {
             job.deinit(gpa);
         }
+        if (self.trigger) |trigger| trigger.deinit(gpa);
+        gpa.free(self.jobs);
         gpa.free(self.name);
         gpa.destroy(self);
     }
@@ -44,6 +46,9 @@ pub const Job = struct {
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
         if (self.run_on) |on| gpa.free(on);
+        if (self.deps) |deps| gpa.free(deps);
+        for (self.steps) |step| step.deinit(gpa);
+        gpa.free(self.steps);
     }
 };
 

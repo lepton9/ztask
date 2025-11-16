@@ -5,5 +5,6 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    _ = try parse.parseTaskFile(allocator, "test.yml");
+    const task = try parse.parseTaskFile(allocator, "test.yml");
+    defer task.deinit(allocator);
 }
