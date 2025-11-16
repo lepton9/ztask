@@ -29,8 +29,21 @@ fn parseToTask(gpa: std.mem.Allocator, values: []yaml.Yaml.Value) !*Task {
     }
 
     // Parse all jobs
+    const jobs = try parseJobs(gpa, map);
+    errdefer {
+        for (jobs) |job| job.deinit(gpa);
+        gpa.free(jobs);
+    }
+
+    const t = try Task.init(gpa, name);
+    t.trigger = trigger;
+    t.jobs = jobs;
+    return t;
+}
+
+fn parseJobs(gpa: std.mem.Allocator, map: yaml.Yaml.Map) ![]task.Job {
     var jobs = try std.ArrayList(task.Job).initCapacity(gpa, 5);
-    var seen_jobs = std.StringArrayHashMap(usize).init(gpa);
+    var seen_jobs = std.StringArrayHashMap(*const task.Job).init(gpa);
     defer seen_jobs.deinit();
     errdefer {
         for (jobs.items) |job| job.deinit(gpa);
@@ -42,77 +55,87 @@ fn parseToTask(gpa: std.mem.Allocator, values: []yaml.Yaml.Value) !*Task {
         while (it.next()) |entry| {
             // Parse job
             const job_name = entry.key_ptr.*;
-            const job = entry.value_ptr.*.asMap() orelse
+            const job_map = entry.value_ptr.*.asMap() orelse
                 return error.InvalidFieldType;
-            const step_values: []yaml.Yaml.Value = blk: {
-                const steps_value = job.get("steps") orelse break :blk &.{};
-                break :blk steps_value.asList() orelse
-                    return error.InvalidFieldType;
-            };
-            const run_on: ?[]const u8 = if (job.get("run_on")) |on|
-                on.asScalar() orelse return error.InvalidFieldType
-            else
-                null;
 
-            // Parse job steps
-            var steps = try std.ArrayList(task.Step).initCapacity(gpa, 5);
-            errdefer {
-                for (steps.items) |step| step.deinit(gpa);
-                steps.deinit(gpa);
-            }
-            for (step_values) |step| {
-                const s = step.asMap() orelse return error.InvalidStep;
-                var step_it = s.iterator();
-                while (step_it.next()) |step_e| {
-                    const kind = std.meta.stringToEnum(
-                        task.StepKind,
-                        step_e.key_ptr.*,
-                    ) orelse return error.InvalidStepKind;
-                    const step_value = step_e.value_ptr.*.asScalar() orelse
-                        return error.InvalidFieldType;
-                    try steps.append(gpa, .{
-                        .kind = kind,
-                        .value = try gpa.dupe(u8, step_value),
-                    });
-                }
-            }
-
-            // Parse job dependencies
-            const deps: ?[]*const task.Job = blk: {
-                const deps_values = if (job.get("deps")) |deps|
-                    deps.asList() orelse return error.InvalidFieldType
-                else
-                    break :blk null;
-                var deps = try std.ArrayList(*const task.Job).initCapacity(gpa, 5);
-                errdefer deps.deinit(gpa);
-                for (deps_values) |val| {
-                    const job_dep = val.asScalar() orelse
-                        return error.InvalidFieldType;
-                    const ind = seen_jobs.get(job_dep) orelse
-                        return error.UnknownDependency;
-                    try deps.append(gpa, &jobs.items[ind]);
-                }
-                break :blk try deps.toOwnedSlice(gpa);
-            };
-            errdefer if (deps) |d| gpa.free(d);
-
-            // Add new job
+            // Check if job already exists
             const job_result = try seen_jobs.getOrPut(job_name);
             if (job_result.found_existing) return error.DuplicateJobName;
-            try jobs.append(gpa, .{
-                .name = try gpa.dupe(u8, job_name),
-                .steps = try steps.toOwnedSlice(gpa),
-                .run_on = if (run_on) |on| try gpa.dupe(u8, on) else null,
-                .deps = deps,
+
+            const job = try parseJob(gpa, job_name, job_map, seen_jobs);
+
+            // Add new job
+            try jobs.append(gpa, job);
+            job_result.key_ptr.* = job.name;
+            job_result.value_ptr.* = &job;
+        }
+    }
+    return try jobs.toOwnedSlice(gpa);
+}
+
+fn parseJob(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    job: yaml.Yaml.Map,
+    seen_jobs: std.StringArrayHashMap(*const task.Job),
+) !task.Job {
+    const step_values: []yaml.Yaml.Value = blk: {
+        const steps_value = job.get("steps") orelse break :blk &.{};
+        break :blk steps_value.asList() orelse
+            return error.InvalidFieldType;
+    };
+    const run_on: ?[]const u8 = if (job.get("run_on")) |on|
+        on.asScalar() orelse return error.InvalidFieldType
+    else
+        null;
+
+    // Parse job steps
+    var steps = try std.ArrayList(task.Step).initCapacity(gpa, 5);
+    errdefer {
+        for (steps.items) |step| step.deinit(gpa);
+        steps.deinit(gpa);
+    }
+    for (step_values) |step| {
+        const s = step.asMap() orelse return error.InvalidStep;
+        var step_it = s.iterator();
+        while (step_it.next()) |step_e| {
+            const kind = std.meta.stringToEnum(
+                task.StepKind,
+                step_e.key_ptr.*,
+            ) orelse return error.InvalidStepKind;
+            const step_value = step_e.value_ptr.*.asScalar() orelse
+                return error.InvalidFieldType;
+            try steps.append(gpa, .{
+                .kind = kind,
+                .value = try gpa.dupe(u8, step_value),
             });
-            job_result.value_ptr.* = jobs.items.len - 1;
         }
     }
 
-    const t = try Task.init(gpa, name);
-    t.trigger = trigger;
-    t.jobs = try jobs.toOwnedSlice(gpa);
-    return t;
+    // Parse job dependencies
+    const deps: ?[]*const task.Job = blk: {
+        const deps_values = if (job.get("deps")) |deps|
+            deps.asList() orelse return error.InvalidFieldType
+        else
+            break :blk null;
+        var deps = try std.ArrayList(*const task.Job).initCapacity(gpa, 5);
+        errdefer deps.deinit(gpa);
+        for (deps_values) |val| {
+            const job_dep = val.asScalar() orelse
+                return error.InvalidFieldType;
+            const dep = seen_jobs.get(job_dep) orelse
+                return error.UnknownDependency;
+            try deps.append(gpa, dep);
+        }
+        break :blk try deps.toOwnedSlice(gpa);
+    };
+    errdefer if (deps) |d| gpa.free(d);
+    return .{
+        .name = try gpa.dupe(u8, name),
+        .steps = try steps.toOwnedSlice(gpa),
+        .run_on = if (run_on) |on| try gpa.dupe(u8, on) else null,
+        .deps = deps,
+    };
 }
 
 pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {

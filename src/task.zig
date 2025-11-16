@@ -15,32 +15,45 @@ pub const Task = struct {
 
     pub fn deinit(self: *Task, gpa: std.mem.Allocator) void {
         for (self.jobs) |job| {
-            gpa.free(job.name);
-            for (job.steps) |step| {
-                gpa.free(step.value);
-            }
+            job.deinit(gpa);
         }
         gpa.free(self.name);
         gpa.destroy(self);
     }
 };
 
-pub const Trigger = union {
+pub const Trigger = union(enum) {
     watch: struct {
-        type: enum { Dir, File },
+        type: enum { dir, file },
         path: []const u8,
     },
+
+    pub fn deinit(self: Trigger, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .watch => |w| gpa.free(w.path),
+        }
+    }
 };
 
 pub const Job = struct {
     name: []const u8,
     steps: []Step = undefined,
-    deps: ?[]*const Job = null,
+    deps: ?[]*const Job = null, // Job not own the pointers
+    run_on: ?[]const u8, // TODO: better field type
+
+    pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        if (self.run_on) |on| gpa.free(on);
+    }
 };
 
-pub const StepKind = enum { Command };
+pub const StepKind = enum { command };
 
 pub const Step = struct {
     kind: StepKind,
     value: []const u8,
+
+    pub fn deinit(self: Step, gpa: std.mem.Allocator) void {
+        gpa.free(self.value);
+    }
 };
