@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Task = struct {
     name: []const u8,
+    file_path: ?[]const u8 = null,
     trigger: ?Trigger = null,
     jobs: []Job = undefined,
 
@@ -17,6 +18,7 @@ pub const Task = struct {
         for (self.jobs) |job| {
             job.deinit(gpa);
         }
+        if (self.file_path) |path| gpa.free(path);
         if (self.trigger) |trigger| trigger.deinit(gpa);
         gpa.free(self.jobs);
         gpa.free(self.name);

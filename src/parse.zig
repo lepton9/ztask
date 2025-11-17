@@ -160,13 +160,45 @@ fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
     return parseTask(gpa, map);
 }
 
+/// Parse singular task file
 pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {
     const yaml_file = try std.fs.cwd().readFileAlloc(gpa, path, max_size);
     defer gpa.free(yaml_file);
-    return parseTaskBuffer(gpa, yaml_file);
+    const t = try parseTaskBuffer(gpa, yaml_file);
+    t.file_path = try gpa.dupe(u8, path);
+    return t;
 }
 
-// pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {}
+/// Parse all task files from a directory to a slice
+pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {
+    const cwd = std.fs.cwd();
+    var dir = cwd.openDir(dirPath, .{ .iterate = true }) catch
+        return error.ErrorOpenDir;
+    defer dir.close();
+
+    var tasks = try std.ArrayList(*Task).initCapacity(gpa, 5);
+    errdefer {
+        for (tasks.items) |t| t.deinit(gpa);
+        tasks.deinit(gpa);
+    }
+
+    // Find all task files
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| switch (entry.kind) {
+        .file => {
+            if (std.mem.endsWith(u8, entry.name, ".yaml") or
+                std.mem.endsWith(u8, entry.name, ".yml"))
+            {
+                const path = try std.fs.path.join(gpa, &.{ dirPath, entry.name });
+                defer gpa.free(path);
+                try tasks.append(gpa, try parseTaskFile(gpa, path));
+            }
+        },
+        .directory => {},
+        else => continue,
+    };
+    return try tasks.toOwnedSlice(gpa);
+}
 
 test "parse_empty" {
     try std.testing.expect(
