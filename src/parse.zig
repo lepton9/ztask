@@ -38,10 +38,11 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     }
 
     // Parse all jobs
-    const jobs = try parseJobs(gpa, map);
+    var jobs = try parseJobs(gpa, map);
     errdefer {
-        for (jobs) |job| job.deinit(gpa);
-        gpa.free(jobs);
+        var it = jobs.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
+        jobs.deinit();
     }
 
     const t = try Task.init(gpa, name);
@@ -50,13 +51,15 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     return t;
 }
 
-fn parseJobs(gpa: std.mem.Allocator, map: yaml.Yaml.Map) ![]task.Job {
-    var jobs = try std.ArrayList(task.Job).initCapacity(gpa, 5);
-    var seen_jobs = std.StringArrayHashMap(*const task.Job).init(gpa);
-    defer seen_jobs.deinit();
+fn parseJobs(
+    gpa: std.mem.Allocator,
+    map: yaml.Yaml.Map,
+) !std.StringArrayHashMap(task.Job) {
+    var jobs = std.StringArrayHashMap(task.Job).init(gpa);
     errdefer {
-        for (jobs.items) |job| job.deinit(gpa);
-        jobs.deinit(gpa);
+        var it = jobs.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
+        jobs.deinit();
     }
     if (map.get("jobs")) |jobs_val| {
         const jobs_map = jobs_val.asMap() orelse return ParseError.InvalidFieldType;
@@ -68,25 +71,21 @@ fn parseJobs(gpa: std.mem.Allocator, map: yaml.Yaml.Map) ![]task.Job {
                 return ParseError.InvalidFieldType;
 
             // Check if job already exists
-            const job_result = try seen_jobs.getOrPut(job_name);
-            if (job_result.found_existing) return ParseError.DuplicateJobName;
-
-            const job = try parseJob(gpa, job_name, job_map, seen_jobs);
+            if (jobs.get(job_name)) |_| return ParseError.DuplicateJobName;
 
             // Add new job
-            try jobs.append(gpa, job);
-            job_result.key_ptr.* = job.name;
-            job_result.value_ptr.* = &job;
+            const job = try parseJob(gpa, job_name, job_map, jobs);
+            try jobs.put(job.name, job);
         }
     }
-    return try jobs.toOwnedSlice(gpa);
+    return jobs;
 }
 
 fn parseJob(
     gpa: std.mem.Allocator,
     name: []const u8,
     job: yaml.Yaml.Map,
-    seen_jobs: std.StringArrayHashMap(*const task.Job),
+    seen_jobs: std.StringArrayHashMap(task.Job),
 ) !task.Job {
     const step_values: []yaml.Yaml.Value = blk: {
         const steps_value = job.get("steps") orelse break :blk &.{};
@@ -122,19 +121,19 @@ fn parseJob(
     }
 
     // Parse job dependencies
-    const deps: ?[]*const task.Job = blk: {
+    const deps: ?[]const []const u8 = blk: {
         const deps_values = if (job.get("deps")) |deps|
             deps.asList() orelse return ParseError.InvalidFieldType
         else
             break :blk null;
-        var deps = try std.ArrayList(*const task.Job).initCapacity(gpa, 5);
+        var deps = try std.ArrayList([]const u8).initCapacity(gpa, 5);
         errdefer deps.deinit(gpa);
         for (deps_values) |val| {
             const job_dep = val.asScalar() orelse
                 return ParseError.InvalidFieldType;
             const dep = seen_jobs.get(job_dep) orelse
                 return ParseError.UnknownDependency;
-            try deps.append(gpa, dep);
+            try deps.append(gpa, dep.name);
         }
         break :blk try deps.toOwnedSlice(gpa);
     };
@@ -161,7 +160,7 @@ fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
 }
 
 /// Parse singular task file
-pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {
+pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     const yaml_file = try std.fs.cwd().readFileAlloc(gpa, path, max_size);
     defer gpa.free(yaml_file);
     const t = try parseTaskBuffer(gpa, yaml_file);
@@ -191,7 +190,7 @@ pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {
             {
                 const path = try std.fs.path.join(gpa, &.{ dirPath, entry.name });
                 defer gpa.free(path);
-                try tasks.append(gpa, try parseTaskFile(gpa, path));
+                try tasks.append(gpa, try loadTask(gpa, path));
             }
         },
         .directory => {},
@@ -262,11 +261,12 @@ test "parse_task" {
         \\     deps: [build, test]
     ;
     const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
     try std.testing.expect(std.mem.eql(u8, t.name, "test"));
     try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src/main.zig"));
-    try std.testing.expect(t.jobs[0].steps.len == 2);
-    try std.testing.expect(t.jobs[0].steps[0].kind == task.StepKind.command);
-    try std.testing.expect(t.jobs.len == 3);
-    try std.testing.expect(t.jobs[2].deps.?.len == 2);
-    defer t.deinit(gpa);
+    try std.testing.expect(t.jobs.count() == 3);
+    const build_job = t.jobs.get("build").?;
+    try std.testing.expect(build_job.steps.len == 2);
+    try std.testing.expect(build_job.steps[0].kind == task.StepKind.command);
+    try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
 }

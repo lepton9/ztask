@@ -4,7 +4,7 @@ pub const Task = struct {
     name: []const u8,
     file_path: ?[]const u8 = null,
     trigger: ?Trigger = null,
-    jobs: []Job = undefined,
+    jobs: std.StringArrayHashMap(Job) = undefined,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8) !*Task {
         const task = try gpa.create(Task);
@@ -15,14 +15,18 @@ pub const Task = struct {
     }
 
     pub fn deinit(self: *Task, gpa: std.mem.Allocator) void {
-        for (self.jobs) |job| {
-            job.deinit(gpa);
-        }
+        var it = self.jobs.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
+        self.jobs.deinit();
+
         if (self.file_path) |path| gpa.free(path);
         if (self.trigger) |trigger| trigger.deinit(gpa);
-        gpa.free(self.jobs);
         gpa.free(self.name);
         gpa.destroy(self);
+    }
+
+    pub fn findJob(self: *Task, job_name: []const u8) ?*Job {
+        return self.jobs.getPtr(job_name);
     }
 };
 
@@ -42,7 +46,7 @@ pub const Trigger = union(enum) {
 pub const Job = struct {
     name: []const u8,
     steps: []Step = undefined,
-    deps: ?[]*const Job = null, // Job not own the pointers
+    deps: ?[]const []const u8 = null, // Only the slice is allocated
     run_on: ?[]const u8, // TODO: better field type
 
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
