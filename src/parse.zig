@@ -92,10 +92,13 @@ fn parseJob(
         break :blk steps_value.asList() orelse
             return ParseError.InvalidFieldType;
     };
-    const run_on: ?[]const u8 = if (job.get("run_on")) |on|
-        on.asScalar() orelse return ParseError.InvalidFieldType
-    else
-        null;
+    const run_on = blk: {
+        const run_field: ?[]const u8 = if (job.get("run_on")) |on|
+            on.asScalar() orelse return ParseError.InvalidFieldType
+        else
+            null;
+        break :blk if (run_field) |on| try task.RunLocation.parse(on) else .local;
+    };
 
     // Parse job steps
     var steps = try std.ArrayList(task.Step).initCapacity(gpa, 5);
@@ -141,7 +144,10 @@ fn parseJob(
     return .{
         .name = try gpa.dupe(u8, name),
         .steps = try steps.toOwnedSlice(gpa),
-        .run_on = if (run_on) |on| try gpa.dupe(u8, on) else null,
+        .run_on = switch (run_on) {
+            .local => .local,
+            .remote => |r| .{ .remote = try gpa.dupe(u8, r) },
+        },
         .deps = deps,
     };
 }
@@ -268,5 +274,9 @@ test "parse_task" {
     const build_job = t.jobs.get("build").?;
     try std.testing.expect(build_job.steps.len == 2);
     try std.testing.expect(build_job.steps[0].kind == task.StepKind.command);
+    try std.testing.expect(build_job.run_on == .local);
+    const test_job = t.jobs.get("test").?;
+    try std.testing.expect(test_job.run_on == .remote);
+    try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote, "runner1"));
     try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
 }

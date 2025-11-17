@@ -43,15 +43,34 @@ pub const Trigger = union(enum) {
     }
 };
 
+pub const RunLocation = union(enum) {
+    local,
+    remote: []const u8,
+
+    pub fn parse(l: []const u8) !RunLocation {
+        if (std.mem.eql(u8, l, "local")) return .local;
+        const colon_idx = std.mem.indexOfScalar(u8, l, ':') orelse
+            return error.InvalidRemoteRunner;
+        if (colon_idx == l.len) return error.InvalidRunnerName;
+        if (std.mem.eql(u8, l[0..colon_idx], "remote")) {
+            return .{ .remote = l[colon_idx + 1 ..] };
+        }
+        return error.InvalidRemoteRunner;
+    }
+};
+
 pub const Job = struct {
     name: []const u8,
     steps: []Step = undefined,
     deps: ?[]const []const u8 = null, // Only the slice is allocated
-    run_on: ?[]const u8, // TODO: better field type
+    run_on: RunLocation = .local,
 
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
-        if (self.run_on) |on| gpa.free(on);
+        switch (self.run_on) {
+            .remote => |r| gpa.free(r),
+            else => {},
+        }
         if (self.deps) |deps| gpa.free(deps);
         for (self.steps) |step| step.deinit(gpa);
         gpa.free(self.steps);
