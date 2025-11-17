@@ -12,6 +12,7 @@ const ParseError = error{
     UnnamedTask,
     UnknownDependency,
     DuplicateJobName,
+    DuplicateKey,
     InvalidStep,
     InvalidStepKind,
     InvalidFieldType,
@@ -149,7 +150,10 @@ fn parseJob(
 fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
     var yaml_parser: yaml.Yaml = .{ .source = buf };
     defer yaml_parser.deinit(gpa);
-    yaml_parser.load(gpa) catch return ParseError.InvalidFileFormat;
+    yaml_parser.load(gpa) catch |err| return switch (err) {
+        error.DuplicateMapKey => ParseError.DuplicateKey,
+        else => return ParseError.InvalidFileFormat,
+    };
     const values = yaml_parser.docs.items;
     if (values.len == 0) return ParseError.EmptyTaskFile;
     const map = values[0].map;
@@ -161,6 +165,8 @@ pub fn parseTaskFile(gpa: std.mem.Allocator, path: []const u8) !*Task {
     defer gpa.free(yaml_file);
     return parseTaskBuffer(gpa, yaml_file);
 }
+
+// pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {}
 
 test "parse_empty" {
     try std.testing.expect(
@@ -178,6 +184,30 @@ test "missing_name" {
     );
 }
 
+test "duplicate_job" {
+    const source =
+        \\ name: test
+        \\ jobs:
+        \\   jobname:
+        \\     steps: []
+        \\   jobname:
+        \\     steps: []
+    ;
+    const t = parseTaskBuffer(std.testing.allocator, source);
+    try std.testing.expect(t == ParseError.DuplicateKey);
+}
+
+test "unknown_dep" {
+    const source =
+        \\ name: test
+        \\ jobs:
+        \\   job:
+        \\     deps: [dependency]
+    ;
+    const t = parseTaskBuffer(std.testing.allocator, source);
+    try std.testing.expect(t == ParseError.UnknownDependency);
+}
+
 test "parse_task" {
     const gpa = std.testing.allocator;
     const source =
@@ -193,16 +223,18 @@ test "parse_task" {
         \\     run_on: local
         \\   test:
         \\     steps:
-        \\       - command: "./main_test"
+        \\       - command: "./test"
         \\     run_on: remote:runner1
         \\     deps: [build]
-        \\   deploy:
-        \\     command: "./deploy.sh"
-        \\     run_on: remote:runner2
-        \\     deps: [test]
+        \\   depend:
+        \\     deps: [build, test]
     ;
     const t = try parseTaskBuffer(gpa, source);
+    try std.testing.expect(std.mem.eql(u8, t.name, "test"));
+    try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src/main.zig"));
+    try std.testing.expect(t.jobs[0].steps.len == 2);
+    try std.testing.expect(t.jobs[0].steps[0].kind == task.StepKind.command);
+    try std.testing.expect(t.jobs.len == 3);
+    try std.testing.expect(t.jobs[2].deps.?.len == 2);
     defer t.deinit(gpa);
 }
-
-// pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {}
