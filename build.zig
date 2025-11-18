@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "parse", .module = parse_mod },
             .{ .name = "task", .module = task_mod },
         },
     });

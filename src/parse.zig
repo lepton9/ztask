@@ -4,9 +4,9 @@ const yaml = @import("yaml");
 
 const Task = task.Task;
 
-pub const max_size = 8192;
+const max_size = 8192;
 
-const ParseError = error{
+pub const ParseError = error{
     InvalidFileFormat,
     EmptyTaskFile,
     UnnamedTask,
@@ -174,35 +174,9 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     return t;
 }
 
-/// Parse all task files from a directory to a slice
-pub fn loadTasksFromDir(gpa: std.mem.Allocator, dirPath: []const u8) ![]*Task {
-    const cwd = std.fs.cwd();
-    var dir = cwd.openDir(dirPath, .{ .iterate = true }) catch
-        return error.ErrorOpenDir;
-    defer dir.close();
-
-    var tasks = try std.ArrayList(*Task).initCapacity(gpa, 5);
-    errdefer {
-        for (tasks.items) |t| t.deinit(gpa);
-        tasks.deinit(gpa);
-    }
-
-    // Find all task files
-    var it = dir.iterate();
-    while (it.next() catch null) |entry| switch (entry.kind) {
-        .file => {
-            if (std.mem.endsWith(u8, entry.name, ".yaml") or
-                std.mem.endsWith(u8, entry.name, ".yml"))
-            {
-                const path = try std.fs.path.join(gpa, &.{ dirPath, entry.name });
-                defer gpa.free(path);
-                try tasks.append(gpa, try loadTask(gpa, path));
-            }
-        },
-        .directory => {},
-        else => continue,
-    };
-    return try tasks.toOwnedSlice(gpa);
+pub fn isTaskFile(file: []const u8) bool {
+    return std.mem.endsWith(u8, file, ".yaml") or
+        std.mem.endsWith(u8, file, ".yml");
 }
 
 test "parse_empty" {

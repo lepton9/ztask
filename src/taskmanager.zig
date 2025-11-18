@@ -1,4 +1,5 @@
 const std = @import("std");
+const parse = @import("parse");
 const task = @import("task");
 const Task = task.Task;
 
@@ -7,6 +8,7 @@ pub const TaskManager = struct {
     gpa: std.mem.Allocator,
     /// Task yaml files
     task_files: std.ArrayList([]const u8),
+    // loaded_tasks: std.StringArrayHashMap(*Task),
 
     pub fn init(gpa: std.mem.Allocator) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -25,6 +27,8 @@ pub const TaskManager = struct {
         self.gpa.destroy(self);
     }
 
+    /// Find all task files from a given directory
+    /// Recurse all sub directories if the `recursive` flag is `true`
     pub fn findTaskFiles(
         self: *TaskManager,
         dir_path: []const u8,
@@ -38,9 +42,7 @@ pub const TaskManager = struct {
         var it = dir.iterate();
         while (it.next() catch null) |entry| switch (entry.kind) {
             .file => {
-                if (std.mem.endsWith(u8, entry.name, ".yaml") or
-                    std.mem.endsWith(u8, entry.name, ".yml"))
-                {
+                if (parse.isTaskFile(entry.name)) {
                     const path = try std.fs.path.join(
                         self.gpa,
                         &.{ dir_path, entry.name },
@@ -59,5 +61,15 @@ pub const TaskManager = struct {
             },
             else => continue,
         };
+    }
+
+    /// Find one task file from given path
+    pub fn findTaskFile(self: *TaskManager, path: []const u8) !void {
+        const cwd = std.fs.cwd();
+        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
+        defer file.close();
+        if (parse.isTaskFile(path)) {
+            try self.task_files.append(self.gpa, try self.gpa.dupe(u8, path));
+        }
     }
 };
