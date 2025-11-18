@@ -24,6 +24,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // TaskManager
+    const manager_mod = b.createModule(.{
+        .root_source_file = b.path("src/taskmanager.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "task", .module = task_mod },
+        },
+    });
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "ztask",
@@ -33,6 +43,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "parse", .module = parse_mod },
+                .{ .name = "taskmanager", .module = manager_mod },
             },
         }),
     });
