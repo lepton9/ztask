@@ -9,6 +9,8 @@ const ErrorDAG = error{
     CycleDetected,
 };
 
+pub const JobNode = Node(Job);
+
 /// Scheduler for executing one task
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
@@ -57,7 +59,7 @@ pub const Scheduler = struct {
         // Initialize the job node array and the hashmap
         while (it.next()) |entry| : (idx += 1) {
             self.nodes[idx] = .{
-                .job = entry.value_ptr,
+                .ptr = entry.value_ptr,
                 .status = .pending,
                 .dependents = try std.ArrayList(*JobNode).initCapacity(self.gpa, 3),
                 .remaining_deps = 0,
@@ -83,6 +85,7 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Validate if the scheduler graph is a DAG
     fn validateDAG(self: *Scheduler) !void {
         const adjacents = struct {
             fn f(job: JobNode) []*JobNode {
@@ -146,7 +149,7 @@ fn indexOfNode(comptime T: type, nodes: []T, ptr: *T) usize {
     return @divExact(@intFromPtr(ptr) - @intFromPtr(nodes.ptr), @sizeOf(T));
 }
 
-pub const JobStatus = enum {
+pub const Status = enum {
     pending,
     ready,
     running,
@@ -154,16 +157,18 @@ pub const JobStatus = enum {
     failed,
 };
 
-pub const JobNode = struct {
-    job: *Job,
-    status: JobStatus = .pending,
-    /// Jobs that depend on this job
-    dependents: std.ArrayList(*JobNode),
-    /// Number of dependencies not yet finished
-    remaining_deps: usize,
-    scheduler: *Scheduler,
+fn Node(comptime T: type) type {
+    return struct {
+        ptr: *T,
+        status: Status = .pending,
+        /// Nodes that depend on this node
+        dependents: std.ArrayList(*@This()),
+        /// Number of dependencies not yet finished
+        remaining_deps: usize,
+        scheduler: *Scheduler,
 
-    pub fn deinit(self: *JobNode, gpa: std.mem.Allocator) void {
-        self.dependents.deinit(gpa);
-    }
-};
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            self.dependents.deinit(gpa);
+        }
+    };
+}
