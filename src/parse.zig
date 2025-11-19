@@ -74,7 +74,7 @@ fn parseJobs(
             if (jobs.get(job_name)) |_| return ParseError.DuplicateJobName;
 
             // Add new job
-            const job = try parseJob(gpa, job_name, job_map, jobs);
+            const job = try parseJob(gpa, job_name, job_map);
             try jobs.put(job.name, job);
         }
     }
@@ -84,16 +84,15 @@ fn parseJobs(
 fn parseJob(
     gpa: std.mem.Allocator,
     name: []const u8,
-    job: yaml.Yaml.Map,
-    seen_jobs: std.StringArrayHashMap(task.Job),
+    map: yaml.Yaml.Map,
 ) !task.Job {
     const step_values: []yaml.Yaml.Value = blk: {
-        const steps_value = job.get("steps") orelse break :blk &.{};
+        const steps_value = map.get("steps") orelse break :blk &.{};
         break :blk steps_value.asList() orelse
             return ParseError.InvalidFieldType;
     };
     const run_on = blk: {
-        const run_field: ?[]const u8 = if (job.get("run_on")) |on|
+        const run_field: ?[]const u8 = if (map.get("run_on")) |on|
             on.asScalar() orelse return ParseError.InvalidFieldType
         else
             null;
@@ -125,7 +124,7 @@ fn parseJob(
 
     // Parse job dependencies
     const deps: ?[]const []const u8 = blk: {
-        const deps_values = if (job.get("deps")) |deps|
+        const deps_values = if (map.get("deps")) |deps|
             deps.asList() orelse return ParseError.InvalidFieldType
         else
             break :blk null;
@@ -134,13 +133,14 @@ fn parseJob(
         for (deps_values) |val| {
             const job_dep = val.asScalar() orelse
                 return ParseError.InvalidFieldType;
-            const dep = seen_jobs.get(job_dep) orelse
-                return ParseError.UnknownDependency;
-            try deps.append(gpa, dep.name);
+            try deps.append(gpa, try gpa.dupe(u8, job_dep));
         }
         break :blk try deps.toOwnedSlice(gpa);
     };
-    errdefer if (deps) |d| gpa.free(d);
+    errdefer if (deps) |d| {
+        for (d) |dep| gpa.free(dep);
+        gpa.free(d);
+    };
     return .{
         .name = try gpa.dupe(u8, name),
         .steps = try steps.toOwnedSlice(gpa),
@@ -206,17 +206,6 @@ test "duplicate_job" {
     ;
     const t = parseTaskBuffer(std.testing.allocator, source);
     try std.testing.expect(t == ParseError.DuplicateKey);
-}
-
-test "unknown_dep" {
-    const source =
-        \\ name: test
-        \\ jobs:
-        \\   job:
-        \\     deps: [dependency]
-    ;
-    const t = parseTaskBuffer(std.testing.allocator, source);
-    try std.testing.expect(t == ParseError.UnknownDependency);
 }
 
 test "parse_task" {
