@@ -62,7 +62,7 @@ pub const RunLocation = union(enum) {
 pub const Job = struct {
     name: []const u8,
     steps: []Step = undefined,
-    deps: ?[]const []const u8 = null, // Only the slice is allocated
+    deps: ?[]const []const u8 = null,
     run_on: RunLocation = .local,
 
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
@@ -71,7 +71,10 @@ pub const Job = struct {
             .remote => |r| gpa.free(r),
             else => {},
         }
-        if (self.deps) |deps| gpa.free(deps);
+        if (self.deps) |deps| {
+            for (deps) |dep| gpa.free(dep);
+            gpa.free(deps);
+        }
         for (self.steps) |step| step.deinit(gpa);
         gpa.free(self.steps);
     }

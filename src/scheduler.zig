@@ -62,6 +62,7 @@ pub const Scheduler = struct {
                 .ptr = entry.value_ptr,
                 .status = .pending,
                 .dependents = try std.ArrayList(*JobNode).initCapacity(self.gpa, 3),
+                .dependencies = 0,
                 .remaining_deps = 0,
                 .scheduler = self,
             };
@@ -80,6 +81,7 @@ pub const Scheduler = struct {
                 const dep_node = jobs.get(dep_name) orelse
                     return error.UnknownDependency;
                 try dep_node.dependents.append(self.gpa, node);
+                node.dependencies += 1;
                 node.remaining_deps += 1;
             };
         }
@@ -87,14 +89,35 @@ pub const Scheduler = struct {
 
     /// Validate if the scheduler graph is a DAG
     fn validateDAG(self: *Scheduler) !void {
-        const adjacents = struct {
-            fn f(job: JobNode) []*JobNode {
-                return job.dependents.items;
-            }
-        }.f;
-        if (try detectCycle(JobNode, self.gpa, self.nodes, adjacents)) {
+        if (try detectCycle(
+            JobNode,
+            self.gpa,
+            self.nodes,
+            JobNode.getDependents,
+        )) {
             return ErrorDAG.CycleDetected;
         }
+    }
+
+    pub fn start(self: *Scheduler) !void {
+        if (self.running) return error.SchedulerRunning;
+        for (self.nodes) |*node| node.reset();
+        self.running = true;
+        self.enqueueReadyJobs();
+    }
+
+    fn enqueueReadyJobs(self: *Scheduler) void {
+        for (self.nodes) |*node| {
+            if (node.remaining_deps == 0 and node.status == .pending) {
+                node.status = .ready;
+                self.queue.appendAssumeCapacity(node);
+            }
+        }
+        if (self.queue.items.len == 0) @panic("Queue should have at least one node");
+    }
+
+    pub fn tryScheduleJobs(_: *Scheduler) void {
+        @panic("TODO");
     }
 };
 
@@ -163,12 +186,19 @@ fn Node(comptime T: type) type {
         status: Status = .pending,
         /// Nodes that depend on this node
         dependents: std.ArrayList(*@This()),
+        /// Total number of dependencies
+        dependencies: usize = 0,
         /// Number of dependencies not yet finished
         remaining_deps: usize = 0,
         scheduler: *Scheduler = undefined,
 
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             self.dependents.deinit(gpa);
+        }
+
+        fn reset(self: *@This()) void {
+            self.status = .pending;
+            self.remaining_deps = self.dependencies;
         }
 
         fn getDependents(self: @This()) []*@This() {
@@ -240,6 +270,13 @@ test "cycle_detected" {
         .ptr = &ar[i],
         .dependents = try std.ArrayList(*NodeT).initCapacity(gpa, 2),
     };
+
+    // Self dependent
+    nodes[2].dependents.appendAssumeCapacity(&nodes[2]);
+    try std.testing.expect(
+        try detectCycle(NodeT, gpa, nodes, NodeT.getDependents) == true,
+    );
+    _ = nodes[2].dependents.pop();
 
     // Nodes depend on each other
     nodes[0].dependents.appendAssumeCapacity(&nodes[1]);

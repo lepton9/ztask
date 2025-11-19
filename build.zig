@@ -24,12 +24,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Scheduler
+    const scheduler_mod = b.createModule(.{
+        .root_source_file = b.path("src/scheduler.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "task", .module = task_mod },
+        },
+    });
+
     // TaskManager
     const manager_mod = b.createModule(.{
         .root_source_file = b.path("src/taskmanager.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "scheduler", .module = scheduler_mod },
             .{ .name = "parse", .module = parse_mod },
             .{ .name = "task", .module = task_mod },
         },
@@ -66,8 +77,12 @@ pub fn build(b: *std.Build) void {
     const run_parse_tests = b.addRunArtifact(b.addTest(.{
         .root_module = parse_mod,
     }));
+    const run_scheduler_tests = b.addRunArtifact(b.addTest(.{
+        .root_module = scheduler_mod,
+    }));
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_parse_tests.step);
+    test_step.dependOn(&run_scheduler_tests.step);
 }
