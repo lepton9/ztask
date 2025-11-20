@@ -22,6 +22,10 @@ pub const LocalRunner = struct {
         job: *JobNode,
         results: *scheduler.ResultQueue,
     ) void {
-        results.push(.{ .node = job, .runner = self, .success = true });
+        results.push(.{
+            .node = job,
+            .runner = self,
+            .result = .{ .exit_code = 0, .duration_ms = 0 },
+        });
     }
 };

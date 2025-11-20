@@ -1,7 +1,9 @@
 const std = @import("std");
 const task_zig = @import("task");
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
-const LocalRunner = @import("runner/localrunner.zig").LocalRunner;
+const localrunner = @import("runner/localrunner.zig");
+const LocalRunner = localrunner.LocalRunner;
+const ExecResult = localrunner.ExecResult;
 const Job = task_zig.Job;
 const Task = task_zig.Task;
 
@@ -72,7 +74,6 @@ pub const Scheduler = struct {
                 .dependents = try std.ArrayList(*JobNode).initCapacity(self.gpa, 3),
                 .dependencies = 0,
                 .remaining_deps = 0,
-                .scheduler = self,
             };
             jobs.putAssumeCapacity(entry.key_ptr.*, &self.nodes[idx]);
         }
@@ -154,13 +155,13 @@ pub const Scheduler = struct {
     pub fn handleResults(self: *Scheduler) void {
         while (self.result_queue.pop()) |res| {
             self.pool.release(res.runner);
-            self.onJobCompleted(res.node);
+            self.onJobCompleted(res.node, res.result);
         }
     }
 
     /// Handle a completed job
-    pub fn onJobCompleted(self: *Scheduler, node: *JobNode) void {
-        node.status = .success;
+    pub fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
+        node.status = if (result.exit_code == 0) .success else .failed;
         for (node.dependents.items) |dep| {
             dep.remaining_deps -= 1;
             if (dep.remaining_deps == 0 and dep.status == .pending) {
@@ -187,7 +188,7 @@ pub const Scheduler = struct {
 pub const Result = struct {
     node: *JobNode,
     runner: *LocalRunner,
-    success: bool,
+    result: ExecResult,
 };
 
 pub const ResultQueue = struct {
@@ -238,7 +239,6 @@ fn Node(comptime T: type) type {
         dependencies: usize = 0,
         /// Number of dependencies not yet finished
         remaining_deps: usize = 0,
-        scheduler: *Scheduler = undefined,
 
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             self.dependents.deinit(gpa);
