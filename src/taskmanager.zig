@@ -1,13 +1,19 @@
 const std = @import("std");
+pub const scheduler = @import("core/scheduler.zig");
 const parse = @import("parse");
 const task = @import("task");
 const Task = task.Task;
+
+test {
+    _ = scheduler;
+}
 
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
     /// Task yaml files
     task_files: std.ArrayList([]const u8),
+
     // loaded_tasks: std.StringArrayHashMap(*Task),
 
     pub fn init(gpa: std.mem.Allocator) !*TaskManager {
