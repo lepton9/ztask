@@ -20,20 +20,24 @@ pub const Scheduler = struct {
     nodes: []JobNode = undefined,
     /// Ready queue of jobs that can run
     queue: std.ArrayList(*JobNode),
+    /// Queue for completed jobs
+    result_queue: *ResultQueue,
     running: bool,
     pool: *RunnerPool,
 
     pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
+        const node_n = task.jobs.count();
         scheduler.* = .{
             .gpa = gpa,
             .task = task,
             .pool = pool,
             .queue = try std.ArrayList(*JobNode).initCapacity(
                 gpa,
-                task.jobs.count(),
+                node_n,
             ),
+            .result_queue = try ResultQueue.init(gpa, node_n),
             .running = false,
         };
         try scheduler.buildDAG();
@@ -128,9 +132,7 @@ pub const Scheduler = struct {
     fn runNextJob(self: *Scheduler, runner: *LocalRunner) void {
         if (self.queue.items.len == 0) return;
         const node = self.queue.orderedRemove(0);
-        // TODO: run job
-        self.pool.release(runner);
-        self.onJobCompleted(node);
+        runner.runJob(node, self.result_queue);
     }
 
     /// Request executor from the pool
@@ -148,7 +150,15 @@ pub const Scheduler = struct {
         _ = self.requestRunner();
     }
 
-    /// Callback to notify scheduler the job completed
+    /// Handle the completed job results
+    pub fn handleResults(self: *Scheduler) void {
+        while (self.result_queue.pop()) |res| {
+            self.pool.release(res.runner);
+            self.onJobCompleted(res.node);
+        }
+    }
+
+    /// Handle a completed job
     pub fn onJobCompleted(self: *Scheduler, node: *JobNode) void {
         node.status = .success;
         for (node.dependents.items) |dep| {
@@ -173,6 +183,77 @@ pub const Scheduler = struct {
         return true;
     }
 };
+
+pub const Result = struct {
+    node: *JobNode,
+    runner: *LocalRunner,
+    success: bool,
+};
+
+pub const ResultQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    queue: std.ArrayList(Result),
+
+    fn init(gpa: std.mem.Allocator, n: usize) !*ResultQueue {
+        const queue = try gpa.create(ResultQueue);
+        queue.* = .{
+            .queue = try std.ArrayList(Result).initCapacity(gpa, n),
+        };
+        return queue;
+    }
+
+    pub fn push(self: *ResultQueue, msg: Result) void {
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.queue.appendAssumeCapacity(msg);
+        }
+        self.cond.signal();
+    }
+
+    pub fn pop(self: *ResultQueue) ?Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.queue.items.len == 0) return null;
+        return self.queue.orderedRemove(0);
+    }
+};
+
+pub const Status = enum {
+    pending,
+    ready,
+    running,
+    success,
+    failed,
+};
+
+fn Node(comptime T: type) type {
+    return struct {
+        ptr: *T,
+        status: Status = .pending,
+        /// Nodes that depend on this node
+        dependents: std.ArrayList(*@This()),
+        /// Total number of dependencies
+        dependencies: usize = 0,
+        /// Number of dependencies not yet finished
+        remaining_deps: usize = 0,
+        scheduler: *Scheduler = undefined,
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            self.dependents.deinit(gpa);
+        }
+
+        fn reset(self: *@This()) void {
+            self.status = .pending;
+            self.remaining_deps = self.dependencies;
+        }
+
+        fn getDependents(self: @This()) []*@This() {
+            return self.dependents.items;
+        }
+    };
+}
 
 fn dfsUtil(
     comptime T: type,
@@ -223,41 +304,6 @@ fn detectCycle(
 /// Assumes that the node is in the slice
 fn indexOfNode(comptime T: type, nodes: []T, ptr: *T) usize {
     return @divExact(@intFromPtr(ptr) - @intFromPtr(nodes.ptr), @sizeOf(T));
-}
-
-pub const Status = enum {
-    pending,
-    ready,
-    running,
-    success,
-    failed,
-};
-
-fn Node(comptime T: type) type {
-    return struct {
-        ptr: *T,
-        status: Status = .pending,
-        /// Nodes that depend on this node
-        dependents: std.ArrayList(*@This()),
-        /// Total number of dependencies
-        dependencies: usize = 0,
-        /// Number of dependencies not yet finished
-        remaining_deps: usize = 0,
-        scheduler: *Scheduler = undefined,
-
-        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-            self.dependents.deinit(gpa);
-        }
-
-        fn reset(self: *@This()) void {
-            self.status = .pending;
-            self.remaining_deps = self.dependencies;
-        }
-
-        fn getDependents(self: @This()) []*@This() {
-            return self.dependents.items;
-        }
-    };
 }
 
 test "index_of_node" {

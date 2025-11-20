@@ -16,4 +16,12 @@ pub const LocalRunner = struct {
     mutex: std.Thread.Mutex = std.Thread.Mutex{},
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
+
+    pub fn runJob(
+        self: *LocalRunner,
+        job: *JobNode,
+        results: *scheduler.ResultQueue,
+    ) void {
+        results.push(.{ .node = job, .runner = self, .success = true });
+    }
 };
