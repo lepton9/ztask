@@ -3,6 +3,7 @@ pub const scheduler = @import("core/scheduler.zig");
 const parse = @import("parse");
 const task = @import("task");
 const Task = task.Task;
+const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
 
 test {
     _ = scheduler;
@@ -13,6 +14,7 @@ pub const TaskManager = struct {
     gpa: std.mem.Allocator,
     /// Task yaml files
     task_files: std.ArrayList([]const u8),
+    pool: *RunnerPool,
 
     // loaded_tasks: std.StringArrayHashMap(*Task),
 

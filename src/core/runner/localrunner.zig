@@ -1,4 +1,9 @@
 const std = @import("std");
+const scheduler = @import("../scheduler.zig");
+const runnerpool = @import("runnerpool.zig");
+const Scheduler = scheduler.Scheduler;
+const JobNode = scheduler.JobNode;
+const RunnerPool = runnerpool.RunnerPool;
 
 // TODO: stdin and stderr logs
 pub const ExecResult = struct {
@@ -7,7 +12,7 @@ pub const ExecResult = struct {
 };
 
 /// Runner for one job
-pub const LocalExecutor = struct {
+pub const LocalRunner = struct {
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 };
