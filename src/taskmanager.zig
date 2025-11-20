@@ -5,6 +5,8 @@ const task = @import("task");
 const Task = task.Task;
 const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
 
+const BASE_RUNNERS_N = 10;
+
 test {
     _ = scheduler;
 }
@@ -22,6 +24,7 @@ pub const TaskManager = struct {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
+            .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
             .task_files = try std.ArrayList([]const u8).initCapacity(gpa, 5),
         };
         return self;

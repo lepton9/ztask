@@ -13,6 +13,7 @@ pub const ExecResult = struct {
 
 /// Runner for one job
 pub const LocalRunner = struct {
+    mutex: std.Thread.Mutex = std.Thread.Mutex{},
     in_use: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 };

@@ -1,5 +1,7 @@
 const std = @import("std");
 const task_zig = @import("task");
+const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
+const LocalRunner = @import("runner/localrunner.zig").LocalRunner;
 const Job = task_zig.Job;
 const Task = task_zig.Task;
 
@@ -19,13 +21,15 @@ pub const Scheduler = struct {
     /// Ready queue of jobs that can run
     queue: std.ArrayList(*JobNode),
     running: bool,
+    pool: *RunnerPool,
 
-    pub fn init(gpa: std.mem.Allocator, task: *Task) !*Scheduler {
+    pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         scheduler.* = .{
             .gpa = gpa,
             .task = task,
+            .pool = pool,
             .queue = try std.ArrayList(*JobNode).initCapacity(
                 gpa,
                 task.jobs.count(),
@@ -99,14 +103,11 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Begin running the task
     pub fn start(self: *Scheduler) !void {
         if (self.running) return error.SchedulerRunning;
         for (self.nodes) |*node| node.reset();
         self.running = true;
-        self.enqueueReadyJobs();
-    }
-
-    fn enqueueReadyJobs(self: *Scheduler) void {
         for (self.nodes) |*node| {
             if (node.remaining_deps == 0 and node.status == .pending) {
                 node.status = .ready;
@@ -116,8 +117,60 @@ pub const Scheduler = struct {
         if (self.queue.items.len == 0) @panic("Queue should have at least one node");
     }
 
-    pub fn tryScheduleJobs(_: *Scheduler) void {
-        @panic("TODO");
+    /// Try to put more jobs to queue
+    pub fn tryScheduleJobs(self: *Scheduler) void {
+        for (0..self.queue.items.len) |_| {
+            if (!self.requestRunner()) return;
+        }
+    }
+
+    /// Run the next job from queue with the provided runner
+    fn runNextJob(self: *Scheduler, runner: *LocalRunner) void {
+        if (self.queue.items.len == 0) return;
+        const node = self.queue.orderedRemove(0);
+        // TODO: run job
+        self.pool.release(runner);
+        self.onJobCompleted(node);
+    }
+
+    /// Request executor from the pool
+    pub fn requestRunner(self: *Scheduler) bool {
+        if (self.pool.tryAcquire()) |runner| {
+            self.runNextJob(runner);
+            return true;
+        }
+        self.pool.waitForRunner(self);
+        return false;
+    }
+
+    /// Callback to receive an executor
+    pub fn onRunnerAvailable(self: *Scheduler) void {
+        _ = self.requestRunner();
+    }
+
+    /// Callback to notify scheduler the job completed
+    pub fn onJobCompleted(self: *Scheduler, node: *JobNode) void {
+        node.status = .success;
+        for (node.dependents.items) |dep| {
+            dep.remaining_deps -= 1;
+            if (dep.remaining_deps == 0 and dep.status == .pending) {
+                dep.status = .ready;
+                self.queue.appendAssumeCapacity(dep);
+            }
+        }
+        self.tryScheduleJobs();
+        if (self.allJobsCompleted()) {
+            self.running = false;
+        }
+    }
+
+    /// Check if task is being executed
+    fn allJobsCompleted(self: *Scheduler) bool {
+        for (self.nodes) |node| switch (node.status) {
+            .pending, .running, .ready => return false,
+            else => continue,
+        };
+        return true;
     }
 };
 

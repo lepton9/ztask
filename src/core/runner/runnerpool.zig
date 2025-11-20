@@ -4,7 +4,6 @@ const Scheduler = @import("../scheduler.zig").Scheduler;
 
 pub const RunnerPool = struct {
     gpa: std.mem.Allocator,
-    mutex: std.Thread.Mutex,
     runners: []LocalRunner,
     waiters: std.ArrayList(*Scheduler),
 
@@ -12,7 +11,6 @@ pub const RunnerPool = struct {
         const pool = try gpa.create(RunnerPool);
         pool.* = .{
             .gpa = gpa,
-            .mutex = std.Thread.Mutex{},
             .runners = try gpa.alloc(LocalRunner, n),
             .waiters = try std.ArrayList(*Scheduler).initCapacity(gpa, 3),
         };
@@ -25,5 +23,28 @@ pub const RunnerPool = struct {
         self.gpa.free(self.runners);
         self.waiters.deinit(self.gpa);
         self.gpa.destroy(self);
+    }
+
+    pub fn tryAcquire(self: *RunnerPool) ?*LocalRunner {
+        for (self.runners) |*runner| {
+            if (!runner.in_use.swap(true, .seq_cst)) return runner;
+        }
+        return null;
+    }
+
+    pub fn release(self: *RunnerPool, runner: *LocalRunner) void {
+        _ = runner.in_use.swap(false, .seq_cst);
+        self.notifyWaiters();
+    }
+
+    fn notifyWaiters(self: *RunnerPool) void {
+        for (self.waiters.items) |waiter| {
+            waiter.onRunnerAvailable();
+        }
+        self.waiters.clearRetainingCapacity();
+    }
+
+    pub fn waitForRunner(self: *RunnerPool, scheduler: *Scheduler) void {
+        self.waiters.append(self.gpa, scheduler) catch {};
     }
 };
