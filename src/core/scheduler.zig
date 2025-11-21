@@ -20,13 +20,13 @@ pub const JobNode = Node(Job);
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
     task: *Task,
+    pool: *RunnerPool,
     nodes: []JobNode = undefined,
     /// Ready queue of jobs that can run
     queue: std.ArrayList(*JobNode),
     /// Queue for completed jobs
     result_queue: *ResultQueue,
-    running: bool,
-    pool: *RunnerPool,
+    status: enum { running, waiting, inactive },
 
     pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
@@ -36,12 +36,13 @@ pub const Scheduler = struct {
             .gpa = gpa,
             .task = task,
             .pool = pool,
+            .nodes = try scheduler.gpa.alloc(JobNode, node_n),
             .queue = try std.ArrayList(*JobNode).initCapacity(
                 gpa,
                 node_n,
             ),
             .result_queue = try ResultQueue.init(gpa, node_n),
-            .running = false,
+            .status = .inactive,
         };
         try scheduler.buildDAG();
         try scheduler.validateDAG();
@@ -49,7 +50,7 @@ pub const Scheduler = struct {
     }
 
     pub fn deinit(self: *Scheduler) void {
-        if (self.running) return;
+        if (self.status == .running) return;
         for (self.nodes) |*node| node.deinit(self.gpa);
         self.queue.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -58,7 +59,6 @@ pub const Scheduler = struct {
     /// Build directed acyclic graph from the job nodes
     fn buildDAG(self: *Scheduler) (error{OutOfMemory} || ErrorDAG)!void {
         const count = self.task.jobs.count();
-        self.nodes = try self.gpa.alloc(JobNode, count);
 
         // Hashmap of the jobs
         var jobs = std.StringHashMap(*JobNode).init(self.gpa);
@@ -106,9 +106,9 @@ pub const Scheduler = struct {
 
     /// Begin running the task
     pub fn start(self: *Scheduler) !void {
-        if (self.running) return error.SchedulerRunning;
+        if (self.status == .running) return error.SchedulerRunning;
         for (self.nodes) |*node| node.reset();
-        self.running = true;
+        self.status = .running;
         // Find nodes without dependencies
         for (self.nodes) |*node| {
             if (node.readyToRun()) {
@@ -171,7 +171,7 @@ pub const Scheduler = struct {
         }
         self.tryScheduleJobs();
         if (self.allJobsCompleted()) {
-            self.running = false;
+            self.status = .inactive;
         }
     }
 

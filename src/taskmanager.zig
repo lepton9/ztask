@@ -53,21 +53,30 @@ pub const TaskManager = struct {
         _ = self.running.swap(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
             self.updateSchedulers();
+            // TODO: temporary
+            if (self.schedulers.count() == 0)
+                _ = self.running.swap(false, .seq_cst);
         }
     }
 
     /// Advance the schedulers
     fn updateSchedulers(self: *TaskManager) void {
-        var it = self.schedulers.iterator();
-        while (it.next()) |e| {
-            const s = e.value_ptr.*;
-            if (s.running) {
-                s.handleResults();
+        var it = self.schedulers.valueIterator();
+        while (it.next()) |s| switch (s.*.status) {
+            .running => {
+                s.*.handleResults();
                 continue;
-            }
-            // TODO: keep loaded if task has a watcher
-            self.unloadTask(s.task);
-        }
+            },
+            .inactive => {
+                // TODO: keep loaded if task has a watcher
+                std.debug.print("Task done: '{s}', Remaining: {d}\n", .{
+                    s.*.task.file_path.?,
+                    self.loaded_tasks.count() - 1,
+                });
+                self.unloadTask(s.*.task);
+            },
+            .waiting => {},
+        };
     }
 
     /// Unload a task and its scheduler from memory
@@ -92,7 +101,7 @@ pub const TaskManager = struct {
         s.tryScheduleJobs();
     }
 
-    pub fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
+    fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
         return self.loaded_tasks.get(task_file) orelse
             blk: {
                 const t = try parse.loadTask(self.gpa, task_file);

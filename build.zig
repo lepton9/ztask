@@ -59,20 +59,17 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
 
     // Testing
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-    const run_parse_tests = b.addRunArtifact(b.addTest(.{
-        .root_module = parse_mod,
-    }));
-    const run_manager_tests = b.addRunArtifact(b.addTest(.{
-        .root_module = manager_mod,
-    }));
+    const test_modules = [_]*std.Build.Module{
+        exe.root_module,
+        parse_mod,
+        manager_mod,
+    };
 
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_parse_tests.step);
-    test_step.dependOn(&run_manager_tests.step);
-    // test_step.dependOn(&run_scheduler_tests.step);
+    for (test_modules) |mod| {
+        const run_tests = b.addRunArtifact(b.addTest(.{
+            .root_module = mod,
+        }));
+        test_step.dependOn(&run_tests.step);
+    }
 }
