@@ -12,6 +12,7 @@ pub const Status = enum {
     running,
     success,
     failed,
+    skipped,
 };
 
 pub fn Node(comptime T: type) type {

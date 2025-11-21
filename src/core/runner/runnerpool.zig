@@ -33,17 +33,12 @@ pub const RunnerPool = struct {
 
     /// Get a runner if one is available
     pub fn tryAcquire(self: *RunnerPool) ?*LocalRunner {
-        if (self.free_idx.pop()) |i| {
-            var runner = &self.runners[i];
-            _ = runner.in_use.swap(true, .seq_cst);
-            return runner;
-        }
+        if (self.free_idx.pop()) |i| return &self.runners[i];
         return null;
     }
 
     /// Release the runner back to the pool
     pub fn release(self: *RunnerPool, runner: *LocalRunner) void {
-        _ = runner.in_use.swap(false, .seq_cst);
         const idx: usize = @divExact(
             @intFromPtr(runner) - @intFromPtr(self.runners.ptr),
             @sizeOf(LocalRunner),

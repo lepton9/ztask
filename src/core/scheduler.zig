@@ -24,6 +24,8 @@ pub const Scheduler = struct {
     nodes: []JobNode = undefined,
     /// Ready queue of jobs that can run
     queue: std.ArrayList(*JobNode),
+    /// Runners currently running jobs
+    active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
     result_queue: *ResultQueue,
     status: enum { running, waiting, inactive },
@@ -37,13 +39,12 @@ pub const Scheduler = struct {
             .task = task,
             .pool = pool,
             .nodes = try scheduler.gpa.alloc(JobNode, node_n),
-            .queue = try std.ArrayList(*JobNode).initCapacity(
-                gpa,
-                node_n,
-            ),
+            .active_runners = .{},
+            .queue = try .initCapacity(gpa, node_n),
             .result_queue = try ResultQueue.init(gpa, node_n),
             .status = .inactive,
         };
+        try scheduler.active_runners.ensureTotalCapacity(gpa, @intCast(node_n));
         try scheduler.buildDAG();
         try scheduler.validateDAG();
         return scheduler;
@@ -131,6 +132,7 @@ pub const Scheduler = struct {
     fn runNextJob(self: *Scheduler, runner: *LocalRunner) void {
         if (self.queue.items.len == 0) return;
         const node = self.queue.orderedRemove(0);
+        self.active_runners.putAssumeCapacity(node, runner);
         runner.runJob(node, self.result_queue);
     }
 
@@ -149,11 +151,47 @@ pub const Scheduler = struct {
         _ = self.requestRunner();
     }
 
+    /// Force stop if scheduler is running and skip remaining jobs
+    pub fn forceStop(self: *Scheduler) void {
+        self.status = .inactive;
+        self.handleResults();
+        self.queue.clearRetainingCapacity();
+
+        // Force stop running runners
+        var it = self.active_runners.iterator();
+        while (it.next()) |e| {
+            const runner = e.value_ptr.*;
+            const node = e.key_ptr.*;
+            runner.forceStop();
+            self.pool.release(runner);
+            // Skip job and the dependents
+            node.status = .skipped;
+            for (node.getDependents()) |dep| {
+                dep.status = .skipped;
+            }
+        }
+        self.active_runners.clearRetainingCapacity();
+
+        // Skip rest of the jobs
+        for (self.nodes) |*node| switch (node.status) {
+            .pending, .ready => node.status = .skipped,
+            else => {},
+        };
+    }
+
+    /// Handle completed jobs and schedule more
+    pub fn update(self: *Scheduler) void {
+        self.handleResults();
+    }
+
     /// Handle the completed job results
-    pub fn handleResults(self: *Scheduler) void {
+    fn handleResults(self: *Scheduler) void {
         while (self.result_queue.pop()) |res| {
-            res.runner.joinThread();
-            self.pool.release(res.runner);
+            const kv = self.active_runners.fetchRemove(res.node) orelse
+                @panic("Active runners should have the runner entry");
+            const runner = kv.value;
+            runner.joinThread();
+            self.pool.release(runner);
             self.onJobCompleted(res.node, res.result);
         }
     }
@@ -169,9 +207,11 @@ pub const Scheduler = struct {
                 self.queue.appendAssumeCapacity(dep);
             }
         }
-        self.tryScheduleJobs();
-        if (self.allJobsCompleted()) {
-            self.status = .inactive;
+        if (self.status == .running) {
+            self.tryScheduleJobs();
+            if (self.allJobsCompleted()) {
+                self.status = .inactive;
+            }
         }
     }
 
@@ -183,11 +223,22 @@ pub const Scheduler = struct {
         };
         return true;
     }
+
+    fn taskStatus(self: *Scheduler) dag.Status {
+        var status = .success;
+        for (self.nodes) |node| switch (node.status) {
+            .pending => status = .pending,
+            .running => return .running,
+            .failed => return .failed,
+            .skipped => return .skipped,
+            else => {},
+        };
+        return status;
+    }
 };
 
 pub const Result = struct {
     node: *JobNode,
-    runner: *LocalRunner,
     result: ExecResult,
 };
 

@@ -62,7 +62,17 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
         _ = self.running.swap(false, .seq_cst);
         if (self.thread) |t| t.join();
+        self.stopSchedulers();
         self.thread = null;
+    }
+
+    fn stopSchedulers(self: *TaskManager) void {
+        var it = self.schedulers.valueIterator();
+        while (it.next()) |s| switch (s.*.status) {
+            .running => s.*.forceStop(),
+            .inactive => {},
+            .waiting => s.*.status = .inactive,
+        };
     }
 
     /// Main run loop
