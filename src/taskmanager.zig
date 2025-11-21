@@ -4,6 +4,7 @@ const parse = @import("parse");
 const task = @import("task");
 const Task = task.Task;
 const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
+const Scheduler = scheduler.Scheduler;
 
 const BASE_RUNNERS_N = 10;
 
@@ -14,11 +15,13 @@ test {
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
+    running: std.atomic.Value(bool) = .init(false),
     /// Task yaml files
     task_files: std.ArrayList([]const u8),
     pool: *RunnerPool,
 
-    // loaded_tasks: std.StringArrayHashMap(*Task),
+    schedulers: std.AutoHashMap(*Task, *Scheduler),
+    loaded_tasks: std.StringArrayHashMap(*Task),
 
     pub fn init(gpa: std.mem.Allocator) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -26,6 +29,8 @@ pub const TaskManager = struct {
             .gpa = gpa,
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
             .task_files = try std.ArrayList([]const u8).initCapacity(gpa, 5),
+            .schedulers = std.AutoHashMap(*Task, *Scheduler).init(self.gpa),
+            .loaded_tasks = std.StringArrayHashMap(*Task).init(self.gpa),
         };
         return self;
     }
@@ -34,8 +39,66 @@ pub const TaskManager = struct {
         for (self.task_files.items) |path| {
             self.gpa.free(path);
         }
+        for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
+        self.loaded_tasks.deinit();
+        var it = self.schedulers.valueIterator();
+        while (it.next()) |s| s.*.deinit();
+        self.schedulers.deinit();
         self.task_files.deinit(self.gpa);
         self.gpa.destroy(self);
+    }
+
+    /// Task manager main loop
+    pub fn run(self: *TaskManager) void {
+        _ = self.running.swap(true, .seq_cst);
+        while (self.running.load(.seq_cst)) {
+            self.updateSchedulers();
+        }
+    }
+
+    /// Advance the schedulers
+    fn updateSchedulers(self: *TaskManager) void {
+        var it = self.schedulers.iterator();
+        while (it.next()) |e| {
+            const s = e.value_ptr.*;
+            if (s.running) {
+                s.handleResults();
+                continue;
+            }
+            // TODO: keep loaded if task has a watcher
+            self.unloadTask(s.task);
+        }
+    }
+
+    /// Unload a task and its scheduler from memory
+    fn unloadTask(self: *TaskManager, t: *Task) void {
+        if (self.schedulers.fetchRemove(t)) |kv| {
+            _ = self.loaded_tasks.orderedRemove(t.file_path.?);
+            kv.value.deinit(); // Free scheduler
+            kv.key.deinit(self.gpa); // Free task
+        }
+    }
+
+    /// Parse task file and initialize a scheduler to run the task
+    pub fn beginTask(self: *TaskManager, task_file: []const u8) !void {
+        const t = try self.loadTask(task_file);
+        const s = blk: {
+            if (self.schedulers.get(t)) |s| break :blk s;
+            const s = try Scheduler.init(self.gpa, t, self.pool);
+            try self.schedulers.put(t, s);
+            break :blk s;
+        };
+        try s.start();
+        s.tryScheduleJobs();
+    }
+
+    pub fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
+        return self.loaded_tasks.get(task_file) orelse
+            blk: {
+                const t = try parse.loadTask(self.gpa, task_file);
+                try self.loaded_tasks.put(task_file, t);
+                break :blk t;
+            };
     }
 
     /// Find all task files from a given directory
