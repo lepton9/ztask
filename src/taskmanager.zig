@@ -1,8 +1,8 @@
 const std = @import("std");
 pub const scheduler = @import("core/scheduler.zig");
 const parse = @import("parse");
-const task = @import("task");
-const Task = task.Task;
+const task_zig = @import("task");
+const Task = task_zig.Task;
 const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 
@@ -15,6 +15,8 @@ test {
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     /// Task yaml files
     task_files: std.ArrayList([]const u8),
@@ -48,32 +50,49 @@ pub const TaskManager = struct {
         self.gpa.destroy(self);
     }
 
-    /// Task manager main loop
-    pub fn run(self: *TaskManager) void {
+    /// Start task manager thread
+    pub fn start(self: *TaskManager) !void {
         _ = self.running.swap(true, .seq_cst);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// Stop the task manager thread
+    pub fn stop(self: *TaskManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.running.swap(false, .seq_cst);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+    }
+
+    /// Main run loop
+    fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
-            self.updateSchedulers();
+            self.updateSchedulers() catch {};
             // TODO: temporary
             if (self.schedulers.count() == 0)
-                _ = self.running.swap(false, .seq_cst);
+                self.stop();
         }
     }
 
     /// Advance the schedulers
-    fn updateSchedulers(self: *TaskManager) void {
+    fn updateSchedulers(self: *TaskManager) !void {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
             .running => {
-                s.*.handleResults();
+                s.*.update();
                 continue;
             },
             .inactive => {
-                // TODO: keep loaded if task has a watcher
-                std.debug.print("Task done: '{s}', Remaining: {d}\n", .{
-                    s.*.task.file_path.?,
-                    self.loaded_tasks.count() - 1,
-                });
+                std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path.?});
+                if (s.*.task.trigger) |_| {
+                    s.*.status = .waiting;
+                    continue;
+                }
                 self.unloadTask(s.*.task);
+                std.debug.print("Remaining: {d}\n", .{
+                    self.loaded_tasks.count(),
+                });
             },
             .waiting => {},
         };
@@ -90,24 +109,24 @@ pub const TaskManager = struct {
 
     /// Parse task file and initialize a scheduler to run the task
     pub fn beginTask(self: *TaskManager, task_file: []const u8) !void {
-        const t = try self.loadTask(task_file);
-        const s = blk: {
-            if (self.schedulers.get(t)) |s| break :blk s;
-            const s = try Scheduler.init(self.gpa, t, self.pool);
-            try self.schedulers.put(t, s);
+        const task = try self.loadTask(task_file);
+        const task_scheduler = blk: {
+            if (self.schedulers.get(task)) |s| break :blk s;
+            const s = try Scheduler.init(self.gpa, task, self.pool);
+            try self.schedulers.put(task, s);
             break :blk s;
         };
-        try s.start();
-        s.tryScheduleJobs();
+        try task_scheduler.start();
+        task_scheduler.tryScheduleJobs();
     }
 
+    /// Parse task file and load the task to memory
     fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
-        return self.loaded_tasks.get(task_file) orelse
-            blk: {
-                const t = try parse.loadTask(self.gpa, task_file);
-                try self.loaded_tasks.put(task_file, t);
-                break :blk t;
-            };
+        return self.loaded_tasks.get(task_file) orelse blk: {
+            const task = try parse.loadTask(self.gpa, task_file);
+            try self.loaded_tasks.put(task_file, task);
+            break :blk task;
+        };
     }
 
     /// Find all task files from a given directory
