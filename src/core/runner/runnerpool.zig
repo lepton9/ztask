@@ -49,15 +49,14 @@ pub const RunnerPool = struct {
             @sizeOf(LocalRunner),
         );
         self.free_idx.appendAssumeCapacity(idx);
-        self.notifyWaiters();
+        self.notifyNextWaiter();
     }
 
-    /// Notify the waiting schedulers that a runner is available
-    fn notifyWaiters(self: *RunnerPool) void {
-        for (self.waiters.items) |waiter| {
+    /// Notify a waiting scheduler that a runner is available
+    fn notifyNextWaiter(self: *RunnerPool) void {
+        if (self.waiters.pop()) |waiter| {
             waiter.onRunnerAvailable();
         }
-        self.waiters.clearRetainingCapacity();
     }
 
     /// Put scheduler to a waiting queue
