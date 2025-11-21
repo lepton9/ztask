@@ -109,14 +109,15 @@ pub const Scheduler = struct {
         if (self.running) return error.SchedulerRunning;
         for (self.nodes) |*node| node.reset();
         self.running = true;
-        // Find a node without dependencies
+        // Find nodes without dependencies
         for (self.nodes) |*node| {
             if (node.readyToRun()) {
                 node.status = .ready;
                 self.queue.appendAssumeCapacity(node);
             }
         }
-        if (self.queue.items.len == 0) @panic("Queue should have at least one node");
+        // Queue should have at least one node
+        std.debug.assert(self.queue.items.len > 0);
     }
 
     /// Try to put more jobs to queue
@@ -159,9 +160,10 @@ pub const Scheduler = struct {
 
     /// Handle a completed job
     pub fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
+        // TODO: log the job run
         node.status = if (result.exit_code == 0) .success else .failed;
-        for (node.dependents.items) |dep| {
-            dep.remaining_deps -= 1;
+        for (node.getDependents()) |dep| {
+            dep.dependencyDone();
             if (dep.readyToRun()) {
                 dep.status = .ready;
                 self.queue.appendAssumeCapacity(dep);
