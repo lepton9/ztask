@@ -22,10 +22,40 @@ pub const LocalRunner = struct {
         job: *JobNode,
         results: *scheduler.ResultQueue,
     ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.thread = std.Thread.spawn(.{}, runFn, .{
+            self,
+            job,
+            results,
+        }) catch {
+            return results.push(.{
+                .node = job,
+                .runner = self,
+                .result = .{ .exit_code = 1, .duration_ms = 0 },
+            });
+        };
+    }
+
+    fn runFn(
+        self: *LocalRunner,
+        job: *JobNode,
+        results: *scheduler.ResultQueue,
+    ) void {
+        std.debug.print("- Start {s}\n", .{job.ptr.name});
+        for (job.ptr.steps) |step| {
+            std.debug.print("{s}: step: {s}\n", .{ job.ptr.name, step.value });
+            std.Thread.sleep(1 * 1_000_000_000);
+        }
         results.push(.{
             .node = job,
             .runner = self,
             .result = .{ .exit_code = 0, .duration_ms = 0 },
         });
+    }
+
+    pub fn joinThread(self: *LocalRunner) void {
+        if (self.thread) |t| t.join();
+        self.thread = null;
     }
 };

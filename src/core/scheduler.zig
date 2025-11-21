@@ -109,8 +109,9 @@ pub const Scheduler = struct {
         if (self.running) return error.SchedulerRunning;
         for (self.nodes) |*node| node.reset();
         self.running = true;
+        // Find a node without dependencies
         for (self.nodes) |*node| {
-            if (node.remaining_deps == 0 and node.status == .pending) {
+            if (node.readyToRun()) {
                 node.status = .ready;
                 self.queue.appendAssumeCapacity(node);
             }
@@ -150,6 +151,7 @@ pub const Scheduler = struct {
     /// Handle the completed job results
     pub fn handleResults(self: *Scheduler) void {
         while (self.result_queue.pop()) |res| {
+            res.runner.joinThread();
             self.pool.release(res.runner);
             self.onJobCompleted(res.node, res.result);
         }
@@ -160,7 +162,7 @@ pub const Scheduler = struct {
         node.status = if (result.exit_code == 0) .success else .failed;
         for (node.dependents.items) |dep| {
             dep.remaining_deps -= 1;
-            if (dep.remaining_deps == 0 and dep.status == .pending) {
+            if (dep.readyToRun()) {
                 dep.status = .ready;
                 self.queue.appendAssumeCapacity(dep);
             }

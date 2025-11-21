@@ -34,6 +34,10 @@ pub fn Node(comptime T: type) type {
             self.remaining_deps = self.dependencies;
         }
 
+        pub fn readyToRun(self: *const @This()) bool {
+            return self.remaining_deps == 0 and self.status == .pending;
+        }
+
         fn getDependents(self: @This()) []*@This() {
             return self.dependents.items;
         }
