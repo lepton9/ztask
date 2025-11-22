@@ -28,7 +28,7 @@ pub const LocalRunner = struct {
             job,
             results,
         }) catch {
-            return results.push(.{
+            return results.pushAssumeCapacity(.{
                 .node = job,
                 .result = .{ .exit_code = 1, .duration_ns = 0 },
             });
@@ -47,7 +47,7 @@ pub const LocalRunner = struct {
             std.debug.print("{s}: step: {s}\n", .{ job.ptr.name, step.value });
             std.Thread.sleep(1 * 1_000_000_000);
         }
-        results.push(.{
+        results.pushAssumeCapacity(.{
             .node = job,
             .result = .{ .exit_code = 0, .duration_ns = timer.read() },
         });

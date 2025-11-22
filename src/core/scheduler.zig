@@ -1,6 +1,7 @@
 const std = @import("std");
 const task_zig = @import("task");
 const dag = @import("dag.zig");
+const queue_zig = @import("../queue.zig");
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const localrunner = @import("runner/localrunner.zig");
 const LocalRunner = localrunner.LocalRunner;
@@ -15,6 +16,13 @@ test {
 }
 
 pub const JobNode = Node(Job);
+
+pub const Result = struct {
+    node: *JobNode,
+    result: ExecResult,
+};
+
+pub const ResultQueue = queue_zig.Queue(Result);
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
@@ -54,6 +62,7 @@ pub const Scheduler = struct {
         if (self.status == .running) return;
         for (self.nodes) |*node| node.deinit(self.gpa);
         self.queue.deinit(self.gpa);
+        self.result_queue.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -234,40 +243,5 @@ pub const Scheduler = struct {
             else => {},
         };
         return status;
-    }
-};
-
-pub const Result = struct {
-    node: *JobNode,
-    result: ExecResult,
-};
-
-pub const ResultQueue = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-    queue: std.ArrayList(Result),
-
-    fn init(gpa: std.mem.Allocator, n: usize) !*ResultQueue {
-        const queue = try gpa.create(ResultQueue);
-        queue.* = .{
-            .queue = try std.ArrayList(Result).initCapacity(gpa, n),
-        };
-        return queue;
-    }
-
-    pub fn push(self: *ResultQueue, msg: Result) void {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            self.queue.appendAssumeCapacity(msg);
-        }
-        self.cond.signal();
-    }
-
-    pub fn pop(self: *ResultQueue) ?Result {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.queue.items.len == 0) return null;
-        return self.queue.orderedRemove(0);
     }
 };
