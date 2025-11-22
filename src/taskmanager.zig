@@ -1,10 +1,12 @@
 const std = @import("std");
 pub const scheduler = @import("core/scheduler.zig");
 const parse = @import("parse");
+const watcher_zig = @import("watcher.zig");
 const task_zig = @import("task");
 const Task = task_zig.Task;
 const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
+const Watcher = watcher_zig.Watcher;
 
 const BASE_RUNNERS_N = 10;
 
@@ -19,20 +21,27 @@ pub const TaskManager = struct {
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     /// Task yaml files
-    task_files: std.ArrayList([]const u8),
+    task_files: std.ArrayListUnmanaged([]const u8),
     pool: *RunnerPool,
 
+    /// Active schedulers
     schedulers: std.AutoHashMap(*Task, *Scheduler),
     loaded_tasks: std.StringArrayHashMap(*Task),
+
+    watcher: *Watcher,
+    /// Maps paths to active schedulers
+    watch_map: std.StringHashMap(std.ArrayListUnmanaged(*Scheduler)),
 
     pub fn init(gpa: std.mem.Allocator) !*TaskManager {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
-            .task_files = try std.ArrayList([]const u8).initCapacity(gpa, 5),
-            .schedulers = std.AutoHashMap(*Task, *Scheduler).init(self.gpa),
-            .loaded_tasks = std.StringArrayHashMap(*Task).init(self.gpa),
+            .task_files = try .initCapacity(gpa, 5),
+            .schedulers = .init(self.gpa),
+            .loaded_tasks = .init(self.gpa),
+            .watcher = try Watcher.init(gpa),
+            .watch_map = .init(self.gpa),
         };
         return self;
     }
@@ -47,6 +56,8 @@ pub const TaskManager = struct {
         while (it.next()) |s| s.*.deinit();
         self.schedulers.deinit();
         self.task_files.deinit(self.gpa);
+        self.watcher.deinit();
+        self.watch_map.deinit();
         self.gpa.destroy(self);
     }
 
@@ -58,51 +69,104 @@ pub const TaskManager = struct {
 
     /// Stop the task manager thread
     pub fn stop(self: *TaskManager) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         _ = self.running.swap(false, .seq_cst);
         if (self.thread) |t| t.join();
         self.stopSchedulers();
         self.thread = null;
     }
 
+    /// End all running schedulers
     fn stopSchedulers(self: *TaskManager) void {
         var it = self.schedulers.valueIterator();
-        while (it.next()) |s| switch (s.*.status) {
-            .running => s.*.forceStop(),
+        while (it.next()) |s| {
+            // TODO: free the scheduler?
+            self.stopScheduler(s.*);
+        }
+    }
+
+    /// Set scheduler to inactive
+    pub fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (s.*.status) {
+            .running => {
+                s.*.forceStop();
+                self.removeFromWatchList(s);
+            },
+            .waiting, .completed => {
+                s.*.status = .inactive;
+                self.removeFromWatchList(s);
+            },
             .inactive => {},
-            .waiting => s.*.status = .inactive,
+        }
+    }
+
+    /// Remove scheduler from watch list if the task trigger is being watched
+    fn removeFromWatchList(self: *TaskManager, s: *Scheduler) void {
+        const path = blk: {
+            if (s.task.trigger) |t| switch (t) {
+                .watch => |w| break :blk w.path,
+            };
+            return;
         };
+        if (self.watch_map.getEntry(path)) |e| {
+            var list = e.value_ptr.*;
+            for (0..list.items.len) |i| {
+                if (@intFromPtr(list.items[i]) == @intFromPtr(s)) {
+                    _ = list.orderedRemove(i);
+                    break;
+                }
+            }
+            // No more schedulers that have the same watch path
+            if (list.items.len == 0) {
+                _ = self.watch_map.remove(path);
+                list.deinit(self.gpa);
+                self.watcher.removeWatch(path);
+            }
+        }
     }
 
     /// Main run loop
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
+            self.checkWatcher() catch unreachable;
             self.updateSchedulers() catch {};
-            // TODO: temporary
-            if (self.schedulers.count() == 0)
-                self.stop();
         }
+    }
+
+    /// Handle watcher events and trigger corresponding schedulers
+    fn checkWatcher(self: *TaskManager) !void {
+        while (self.watcher.getEvent()) |e| if (self.watch_map.get(e.path)) |l| {
+            for (l.items) |s| if (s.status == .waiting) {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                try s.trigger();
+            };
+        };
     }
 
     /// Advance the schedulers
     fn updateSchedulers(self: *TaskManager) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
             .running => {
                 s.*.update();
                 continue;
             },
-            .inactive => {
+            .completed => {
                 std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path.?});
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
-                    continue;
-                }
-                self.unloadTask(s.*.task);
+                } else s.*.status = .inactive;
+            },
+            .inactive => {
+                std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path.?});
                 std.debug.print("Remaining: {d}\n", .{
-                    self.loaded_tasks.count(),
+                    self.loaded_tasks.count() - 1,
                 });
+                self.unloadTask(s.*.task);
             },
             .waiting => {},
         };
@@ -119,6 +183,8 @@ pub const TaskManager = struct {
 
     /// Parse task file and initialize a scheduler to run the task
     pub fn beginTask(self: *TaskManager, task_file: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const task = try self.loadTask(task_file);
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| break :blk s;
@@ -126,8 +192,20 @@ pub const TaskManager = struct {
             try self.schedulers.put(task, s);
             break :blk s;
         };
-        try task_scheduler.start();
-        task_scheduler.tryScheduleJobs();
+        // Add trigger
+        if (task.trigger) |t| {
+            task_scheduler.status = .waiting;
+            switch (t) {
+                .watch => |watch| {
+                    const res = try self.watch_map.getOrPut(watch.path);
+                    if (!res.found_existing) {
+                        res.value_ptr.* = try .initCapacity(self.gpa, 1);
+                        res.value_ptr.*.appendAssumeCapacity(task_scheduler);
+                    } else try res.value_ptr.*.append(self.gpa, task_scheduler);
+                    try self.watcher.addWatch(watch.path);
+                },
+            }
+        } else try task_scheduler.trigger();
     }
 
     /// Parse task file and load the task to memory

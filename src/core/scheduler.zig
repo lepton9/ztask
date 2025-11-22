@@ -36,7 +36,7 @@ pub const Scheduler = struct {
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
     result_queue: *ResultQueue,
-    status: enum { running, waiting, inactive },
+    status: enum { running, completed, waiting, inactive },
 
     pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
@@ -112,6 +112,12 @@ pub const Scheduler = struct {
         if (try dag.detectCycle(Job, self.gpa, self.nodes)) {
             return ErrorDAG.CycleDetected;
         }
+    }
+
+    /// Trigger the scheduler and start executing the jobs
+    pub fn trigger(self: *Scheduler) !void {
+        try self.start();
+        self.tryScheduleJobs();
     }
 
     /// Begin running the task
@@ -219,7 +225,7 @@ pub const Scheduler = struct {
         if (self.status == .running) {
             self.tryScheduleJobs();
             if (self.allJobsCompleted()) {
-                self.status = .inactive;
+                self.status = .completed;
             }
         }
     }
