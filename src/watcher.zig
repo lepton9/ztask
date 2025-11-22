@@ -3,9 +3,10 @@ const queue_zig = @import("queue.zig");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
+const EventType = enum { modified, created, deleted };
 pub const WatchEvent = struct {
     path: []const u8,
-    kind: enum { modified, created, deleted },
+    kind: EventType,
 };
 const EventQueue = queue_zig.Queue(WatchEvent);
 
@@ -14,7 +15,7 @@ pub const Watcher = struct {
     mutex: std.Thread.Mutex = .{},
     thread: std.Thread = undefined,
     queue: *EventQueue,
-    running: bool = false,
+    running: std.atomic.Value(bool) = .init(false),
     fd: i32,
     wd_map: std.AutoHashMap(i32, []const u8),
 
@@ -44,9 +45,9 @@ pub const Watcher = struct {
     }
 
     pub fn stop(self: *Watcher) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.running = false;
+        if (!self.running.load(.seq_cst)) return;
+        _ = self.running.swap(false, .seq_cst);
+        self.thread.join();
     }
 
     /// Add a file path to watch list
@@ -82,7 +83,7 @@ pub const Watcher = struct {
         var buf: [4096]u8 = undefined;
         const event_size = @sizeOf(std.os.linux.inotify_event);
 
-        while (self.running) {
+        while (self.running.load(.seq_cst)) {
             const n = std.posix.read(self.fd, &buf) catch {
                 std.Thread.sleep(5 * std.time.ns_per_ms);
                 continue;

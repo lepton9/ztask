@@ -64,6 +64,7 @@ pub const TaskManager = struct {
     /// Start task manager thread
     pub fn start(self: *TaskManager) !void {
         _ = self.running.swap(true, .seq_cst);
+        try self.watcher.start();
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -71,8 +72,9 @@ pub const TaskManager = struct {
     pub fn stop(self: *TaskManager) void {
         _ = self.running.swap(false, .seq_cst);
         if (self.thread) |t| t.join();
-        self.stopSchedulers();
         self.thread = null;
+        self.stopSchedulers();
+        self.watcher.stop();
     }
 
     /// End all running schedulers

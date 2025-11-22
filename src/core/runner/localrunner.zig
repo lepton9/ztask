@@ -12,7 +12,7 @@ pub const ExecResult = struct {
 /// Runner for one job
 pub const LocalRunner = struct {
     mutex: std.Thread.Mutex = std.Thread.Mutex{},
-    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
     pub fn runJob(
@@ -55,8 +55,6 @@ pub const LocalRunner = struct {
     }
 
     pub fn joinThread(self: *LocalRunner) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         if (self.thread) |t| t.join();
         self.thread = null;
     }
