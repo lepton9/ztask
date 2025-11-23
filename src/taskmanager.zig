@@ -1,7 +1,7 @@
 const std = @import("std");
 pub const scheduler = @import("core/scheduler.zig");
 const parse = @import("parse");
-const watcher_zig = @import("watcher.zig");
+const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("task");
 const Task = task_zig.Task;
 const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
@@ -123,7 +123,7 @@ pub const TaskManager = struct {
             if (list.items.len == 0) {
                 _ = self.watch_map.remove(path);
                 list.deinit(self.gpa);
-                self.watcher.removeWatch(path);
+                self.watcher.file_watcher.removeWatch(path);
             }
         }
     }
@@ -204,7 +204,7 @@ pub const TaskManager = struct {
                         res.value_ptr.* = try .initCapacity(self.gpa, 1);
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
                     } else try res.value_ptr.*.append(self.gpa, task_scheduler);
-                    try self.watcher.addWatch(watch.path);
+                    try self.watcher.file_watcher.addWatch(watch.path);
                 },
             }
         } else try task_scheduler.trigger();
