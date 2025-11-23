@@ -9,6 +9,7 @@ const EventType = watcher.EventType;
 pub const FileWatcherLinux = struct {
     fd: i32,
     wd_map: std.AutoHashMap(i32, []const u8),
+    buffer: [65536]u8 = undefined,
 
     pub fn filewatcher(gpa: std.mem.Allocator) !FileWatcher {
         return .{
@@ -66,8 +67,8 @@ pub const FileWatcherLinux = struct {
         out: *EventQueue,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        var buf: [4096]u8 = undefined;
         const event_size = @sizeOf(std.os.linux.inotify_event);
+        var buf = self.buffer;
 
         const n = try std.posix.read(self.fd, &buf);
 
@@ -83,16 +84,16 @@ pub const FileWatcherLinux = struct {
             else
                 .deleted;
 
-            out.push(gpa, .{
+            try out.push(gpa, .{ .fileEvent = .{
                 .path = path,
                 .kind = kind,
-            }) catch {};
+            } });
 
             if (ev.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF |
                 linux.IN.IGNORED) != 0)
             {
                 _ = self.wd_map.remove(ev.wd);
-                addWatch(self, path) catch {};
+                try addWatch(self, path);
             }
 
             offset += event_size + ev.len;

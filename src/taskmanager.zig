@@ -123,7 +123,7 @@ pub const TaskManager = struct {
             if (list.items.len == 0) {
                 _ = self.watch_map.remove(path);
                 list.deinit(self.gpa);
-                self.watcher.file_watcher.removeWatch(path);
+                self.watcher.removeFileWatch(path);
             }
         }
     }
@@ -138,12 +138,14 @@ pub const TaskManager = struct {
 
     /// Handle watcher events and trigger corresponding schedulers
     fn checkWatcher(self: *TaskManager) !void {
-        while (self.watcher.getEvent()) |e| if (self.watch_map.get(e.path)) |l| {
-            for (l.items) |s| if (s.status == .waiting) {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                try s.trigger();
-            };
+        while (self.watcher.getEvent()) |event| switch (event) {
+            .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
+                for (l.items) |s| if (s.status == .waiting) {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    try s.trigger();
+                };
+            },
         };
     }
 
@@ -204,7 +206,7 @@ pub const TaskManager = struct {
                         res.value_ptr.* = try .initCapacity(self.gpa, 1);
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
                     } else try res.value_ptr.*.append(self.gpa, task_scheduler);
-                    try self.watcher.file_watcher.addWatch(watch.path);
+                    try self.watcher.addFileWatch(watch.path);
                 },
             }
         } else try task_scheduler.trigger();
