@@ -1,5 +1,5 @@
 const std = @import("std");
-const scheduler = @import("../scheduler.zig");
+const scheduler = @import("../scheduler/scheduler.zig");
 const Scheduler = scheduler.Scheduler;
 const JobNode = scheduler.JobNode;
 

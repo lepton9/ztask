@@ -1,6 +1,6 @@
 const std = @import("std");
 const LocalRunner = @import("localrunner.zig").LocalRunner;
-const Scheduler = @import("../scheduler.zig").Scheduler;
+const Scheduler = @import("../scheduler/scheduler.zig").Scheduler;
 
 pub const RunnerPool = struct {
     gpa: std.mem.Allocator,

@@ -1,10 +1,10 @@
 const std = @import("std");
-pub const scheduler = @import("core/scheduler.zig");
+pub const scheduler = @import("scheduler/scheduler.zig");
 const parse = @import("parse");
 const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("task");
 const Task = task_zig.Task;
-const RunnerPool = @import("core/runner/runnerpool.zig").RunnerPool;
+const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 const Watcher = watcher_zig.Watcher;
 
