@@ -50,10 +50,10 @@ pub const TaskManager = struct {
         for (self.task_files.items) |path| {
             self.gpa.free(path);
         }
-        for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
-        self.loaded_tasks.deinit();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
+        for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
+        self.loaded_tasks.deinit();
         self.schedulers.deinit();
         self.task_files.deinit(self.gpa);
         self.watcher.deinit();
@@ -108,6 +108,7 @@ pub const TaskManager = struct {
         const path = blk: {
             if (s.task.trigger) |t| switch (t) {
                 .watch => |w| break :blk w.path,
+                else => {},
             };
             return;
         };
@@ -146,6 +147,7 @@ pub const TaskManager = struct {
                     try s.trigger();
                 };
             },
+            else => {},
         };
     }
 
@@ -215,6 +217,7 @@ pub const TaskManager = struct {
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
                     } else try res.value_ptr.*.append(self.gpa, task_scheduler);
                 },
+                else => {},
             }
         } else try task_scheduler.trigger();
     }

@@ -36,10 +36,19 @@ pub const Trigger = union(enum) {
         type: enum { dir, file },
         path: []const u8,
     },
+    interval: struct {
+        hours: u32,
+        minutes: u32,
+        seconds: u32,
+        milliseconds: u32,
+    },
+    time: []const u8,
 
     pub fn deinit(self: Trigger, gpa: std.mem.Allocator) void {
         switch (self) {
             .watch => |w| gpa.free(w.path),
+            .time => |t| gpa.free(t),
+            else => {},
         }
     }
 };

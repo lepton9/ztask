@@ -1,6 +1,7 @@
 const std = @import("std");
 const queue_zig = @import("../queue.zig");
 const builtin = @import("builtin");
+const task = @import("task");
 
 pub const EventType = enum { modified, created, deleted };
 pub const WatchEvent = union(enum) {
@@ -8,6 +9,8 @@ pub const WatchEvent = union(enum) {
         path: []const u8,
         kind: EventType,
     },
+    interval: @TypeOf(task.Trigger.interval),
+    time: @TypeOf(task.Trigger.time),
 };
 
 pub const EventQueue = queue_zig.Queue(WatchEvent);
