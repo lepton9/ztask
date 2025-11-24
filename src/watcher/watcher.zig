@@ -16,24 +16,25 @@ pub const EventQueue = queue_zig.Queue(WatchEvent);
 pub const Watcher = struct {
     gpa: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
     thread: std.Thread = undefined,
     running: std.atomic.Value(bool) = .init(false),
     queue: *EventQueue,
-    file_watcher: *FileWatcher,
+    file_watcher: ?*FileWatcher,
 
     pub fn init(gpa: std.mem.Allocator) !*Watcher {
         const watcher = try gpa.create(Watcher);
         watcher.* = .{
             .gpa = gpa,
             .queue = try EventQueue.init(gpa, 5),
-            .file_watcher = try FileWatcher.init(gpa),
+            .file_watcher = FileWatcher.init(gpa) catch null,
         };
         return watcher;
     }
 
     pub fn deinit(self: *Watcher) void {
         self.queue.deinit(self.gpa);
-        self.file_watcher.deinit(self.gpa);
+        if (self.file_watcher) |fw| fw.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -46,6 +47,7 @@ pub const Watcher = struct {
     /// Stop event watcher thread from running
     pub fn stop(self: *Watcher) void {
         if (!self.running.load(.seq_cst)) return;
+        self.cond.broadcast(); // Wake up if waiting
         _ = self.running.swap(false, .seq_cst);
         self.thread.join();
     }
@@ -53,8 +55,24 @@ pub const Watcher = struct {
     /// Run watcher and poll for events
     fn runWatcher(self: *Watcher) void {
         while (self.running.load(.seq_cst)) {
-            self.file_watcher.pollEvents(self.gpa, self.queue) catch {};
+            // Wait for work
+            while (self.running.load(.seq_cst) and !self.hasWork()) {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                self.cond.wait(&self.mutex);
+            }
+            if (!self.running.load(.seq_cst)) break;
+
+            // Poll watchers for events
+            if (self.file_watcher) |fw|
+                fw.pollEvents(self.gpa, self.queue) catch {};
         }
+    }
+
+    /// Determine if the watcher has anything to watch
+    fn hasWork(self: *Watcher) bool {
+        const fw_work = if (self.file_watcher) |fw| fw.watchCount() > 0 else false;
+        return fw_work;
     }
 
     /// Pop an event from the event queue if there is one
@@ -66,14 +84,19 @@ pub const Watcher = struct {
     pub fn addFileWatch(self: *Watcher, path: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.file_watcher.addWatch(path);
+        if (self.file_watcher) |fw| {
+            try fw.addWatch(path);
+            self.cond.signal();
+        } else return error.UnsupportedPlatform;
     }
 
     /// Remove a file path from the `FileWatcher`
     pub fn removeFileWatch(self: *Watcher, path: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.file_watcher.removeWatch(path);
+        if (self.file_watcher) |fw| {
+            fw.removeWatch(path);
+        }
     }
 };
 
@@ -83,6 +106,7 @@ pub const FileWatcher = struct {
         deinit: *const fn (opq: *anyopaque, gpa: std.mem.Allocator) void,
         addWatch: *const fn (opq: *anyopaque, path: []const u8) anyerror!void,
         removeWatch: *const fn (opq: *anyopaque, path: []const u8) void,
+        watchCount: *const fn (opq: *anyopaque) u32,
         pollEvents: *const fn (
             opq: *anyopaque,
             gpa: std.mem.Allocator,
@@ -109,6 +133,11 @@ pub const FileWatcher = struct {
     /// Remove a file from the watch list
     fn removeWatch(self: *FileWatcher, path: []const u8) void {
         return self.vtable.removeWatch(self.ptr, path);
+    }
+
+    /// Get the amount of paths to watch
+    fn watchCount(self: *FileWatcher) u32 {
+        return self.vtable.watchCount(self.ptr);
     }
 
     /// Check if any files in the watch list have changed

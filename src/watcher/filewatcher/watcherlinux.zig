@@ -18,6 +18,7 @@ pub const FileWatcherLinux = struct {
                 .deinit = deinit,
                 .addWatch = addWatch,
                 .removeWatch = removeWatch,
+                .watchCount = watchCount,
                 .pollEvents = pollEvents,
             },
         };
@@ -59,6 +60,12 @@ pub const FileWatcherLinux = struct {
             _ = self.wd_map.remove(e.key_ptr.*);
             return;
         };
+    }
+
+    /// Get the amount of paths to watch
+    fn watchCount(opq: *anyopaque) u32 {
+        const self: *@This() = @ptrCast(@alignCast(opq));
+        return self.wd_map.count();
     }
 
     fn pollEvents(
