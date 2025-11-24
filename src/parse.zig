@@ -25,6 +25,11 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
         break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
     };
 
+    const id_maybe: ?[]const u8 = blk: {
+        const nv = map.get("id") orelse break :blk null;
+        break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
+    };
+
     var trigger: ?task.Trigger = null;
     errdefer if (trigger) |t| t.deinit(gpa);
 
@@ -46,6 +51,7 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     }
 
     const t = try Task.init(gpa, name);
+    if (id_maybe) |id| t.id = task.Id.fromStr(id);
     t.trigger = trigger;
     t.jobs = jobs;
     return t;
@@ -171,6 +177,7 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     defer gpa.free(yaml_file);
     const t = try parseTaskBuffer(gpa, yaml_file);
     t.file_path = try gpa.dupe(u8, path);
+    if (t.id.value == 0) t.id = task.Id.fromStr(t.file_path.?);
     return t;
 }
 
@@ -208,10 +215,19 @@ test "duplicate_job" {
     try std.testing.expect(t == ParseError.DuplicateKey);
 }
 
+test "empty_id" {
+    const gpa = std.testing.allocator;
+    const source = "name: test";
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.id.value == 0);
+}
+
 test "parse_task" {
     const gpa = std.testing.allocator;
     const source =
         \\ name: test
+        \\ id: 123
         \\ on:
         \\   watch: "src/main.zig"
         \\
@@ -231,6 +247,7 @@ test "parse_task" {
     ;
     const t = try parseTaskBuffer(gpa, source);
     defer t.deinit(gpa);
+    try std.testing.expect(t.id.value == task.Id.fromStr("123").value);
     try std.testing.expect(std.mem.eql(u8, t.name, "test"));
     try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src/main.zig"));
     try std.testing.expect(t.jobs.count() == 3);

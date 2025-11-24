@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Task = struct {
+    id: Id = .{},
     name: []const u8,
     file_path: ?[]const u8 = null,
     trigger: ?Trigger = null,
@@ -88,5 +89,21 @@ pub const Step = struct {
 
     pub fn deinit(self: Step, gpa: std.mem.Allocator) void {
         gpa.free(self.value);
+    }
+};
+
+pub const Id = struct {
+    value: u64 = 0,
+
+    pub fn fromStr(str: []const u8) Id {
+        return .{ .value = std.hash.XxHash64.hash(0, str) };
+    }
+
+    pub fn fromUUID(bytes: [16]u8) Id {
+        return .{ .value = std.hash.XxHash64.hash(0, bytes) };
+    }
+
+    pub fn fmt(self: Id, buf: []u8) ![]u8 {
+        return std.fmt.bufPrint(buf, "{x}", .{self.value});
     }
 };
