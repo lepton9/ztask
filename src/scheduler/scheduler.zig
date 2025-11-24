@@ -13,6 +13,7 @@ const ErrorDAG = dag.ErrorDAG;
 
 test {
     _ = dag;
+    _ = queue_zig;
 }
 
 pub const JobNode = Node(Job);
