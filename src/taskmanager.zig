@@ -73,8 +73,8 @@ pub const TaskManager = struct {
         _ = self.running.swap(false, .seq_cst);
         if (self.thread) |t| t.join();
         self.thread = null;
-        self.stopSchedulers();
         self.watcher.stop();
+        self.stopSchedulers();
     }
 
     /// End all running schedulers

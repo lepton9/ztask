@@ -47,8 +47,8 @@ pub const Watcher = struct {
     /// Stop event watcher thread from running
     pub fn stop(self: *Watcher) void {
         if (!self.running.load(.seq_cst)) return;
-        self.cond.broadcast(); // Wake up if waiting
         _ = self.running.swap(false, .seq_cst);
+        self.cond.broadcast(); // Wake up if waiting
         self.thread.join();
     }
 
@@ -56,7 +56,7 @@ pub const Watcher = struct {
     fn runWatcher(self: *Watcher) void {
         while (self.running.load(.seq_cst)) {
             // Wait for work
-            while (self.running.load(.seq_cst) and !self.hasWork()) {
+            if (self.running.load(.seq_cst) and !self.hasWork()) {
                 self.mutex.lock();
                 defer self.mutex.unlock();
                 self.cond.wait(&self.mutex);
