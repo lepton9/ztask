@@ -186,7 +186,10 @@ pub const TaskManager = struct {
     }
 
     /// Parse task file and initialize a scheduler to run the task
-    pub fn beginTask(self: *TaskManager, task_file: []const u8) !void {
+    pub fn beginTask(
+        self: *TaskManager,
+        task_file: []const u8,
+    ) (error{WatcherAddUnsupported} || anyerror)!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const task = try self.loadTask(task_file);
@@ -201,12 +204,16 @@ pub const TaskManager = struct {
             task_scheduler.status = .waiting;
             switch (t) {
                 .watch => |watch| {
+                    self.watcher.addFileWatch(watch.path) catch |err|
+                        return switch (err) {
+                            error.UnsupportedPlatform => error.WatcherAddUnsupported,
+                            else => err,
+                        };
                     const res = try self.watch_map.getOrPut(watch.path);
                     if (!res.found_existing) {
                         res.value_ptr.* = try .initCapacity(self.gpa, 1);
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
                     } else try res.value_ptr.*.append(self.gpa, task_scheduler);
-                    try self.watcher.addFileWatch(watch.path);
                 },
             }
         } else try task_scheduler.trigger();

@@ -116,6 +116,7 @@ pub const FileWatcher = struct {
 
     fn init(gpa: std.mem.Allocator) !*FileWatcher {
         const w = try gpa.create(FileWatcher);
+        errdefer gpa.destroy(w);
         w.* = try loadWatcherBackend(gpa);
         return w;
     }
