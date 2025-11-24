@@ -55,6 +55,7 @@ pub const TaskManager = struct {
         for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
         self.loaded_tasks.deinit();
         self.schedulers.deinit();
+        self.pool.deinit();
         self.task_files.deinit(self.gpa);
         self.watcher.deinit();
         self.watch_map.deinit();
@@ -277,3 +278,38 @@ pub const TaskManager = struct {
         }
     }
 };
+
+test "manager_simple" {
+    const gpa = std.testing.allocator;
+    const task1_file =
+        \\ name: task1
+        \\ id: 1
+    ;
+    const task2_file =
+        \\ name: task2
+        \\ id: 2
+    ;
+    var task1_buf: [64]u8 = undefined;
+    var task2_buf: [64]u8 = undefined;
+    const task_manager = try TaskManager.init(gpa);
+    defer task_manager.deinit();
+    const task1 = try parse.parseTaskBuffer(gpa, task1_file);
+    const task2 = try parse.parseTaskBuffer(gpa, task2_file);
+    try task_manager.loaded_tasks.put(try task1.id.fmt(&task1_buf), task1);
+    try task_manager.loaded_tasks.put(try task2.id.fmt(&task2_buf), task2);
+
+    try std.testing.expect(task_manager.schedulers.count() == 0);
+
+    // Start tasks
+    for (task_manager.loaded_tasks.keys()) |key| {
+        _ = try task_manager.beginTask(key);
+    }
+    try std.testing.expect(task_manager.schedulers.count() == 2);
+
+    try std.testing.expect(
+        task_manager.schedulers.getEntry(task1).?.value_ptr.*.status == .completed,
+    );
+    try std.testing.expect(
+        task_manager.schedulers.getEntry(task2).?.value_ptr.*.status == .completed,
+    );
+}

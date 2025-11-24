@@ -62,7 +62,9 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         if (self.status == .running) return;
         for (self.nodes) |*node| node.deinit(self.gpa);
+        self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);
+        self.active_runners.deinit(self.gpa);
         self.result_queue.deinit(self.gpa);
         self.gpa.destroy(self);
     }
@@ -124,6 +126,13 @@ pub const Scheduler = struct {
     /// Begin running the task
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
+
+        // Task has no jobs
+        if (self.nodes.len == 0) {
+            self.status = .completed;
+            return;
+        }
+
         for (self.nodes) |*node| node.reset();
         self.status = .running;
         // Find nodes without dependencies
