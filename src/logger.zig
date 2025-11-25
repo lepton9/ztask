@@ -75,6 +75,43 @@ pub const RunLogger = struct {
         defer self.gpa.free(json);
         try writeFile(file_path, json);
     }
+
+    pub fn startJob(self: *RunLogger, meta: *JobRunMetadata) !void {
+        const cwd = std.fs.cwd();
+        const dir = try std.fs.path.join(
+            self.gpa,
+            &.{ self.run_path, "jobs", meta.job_name },
+        );
+        defer self.gpa.free(dir);
+        try cwd.makePath(dir);
+        const stdout_log = try std.fs.path.join(self.gpa, &.{ dir, "stdout.log" });
+        defer self.gpa.free(stdout_log);
+        var file = try cwd.createFile(stdout_log, .{ .truncate = false });
+        defer file.close();
+
+        meta.start_time = std.time.timestamp();
+        meta.status = .running;
+
+        try self.logJobMetadata(meta);
+    }
+
+    pub fn finishJob(self: *RunLogger, meta: *JobRunMetadata) !void {
+        meta.end_time = std.time.timestamp();
+        try self.logJobMetadata(meta);
+    }
+
+    pub fn appendJobLog(self: *RunLogger, meta: *JobRunMetadata, content: []const u8) !void {
+        const file_path = try std.fs.path.join(
+            self.gpa,
+            &.{ self.run_path, "jobs", meta.job_name, "stdout.log" },
+        );
+        defer self.gpa.free(file_path);
+        var file = try std.fs.cwd().openFile(file_path, .{ .mode = .write_only });
+        defer file.close();
+        try file.seekFromEnd(0);
+
+        try file.writeAll(content);
+    }
 };
 
 fn toJson(gpa: std.mem.Allocator, value: anytype) ![]u8 {
