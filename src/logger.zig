@@ -25,7 +25,6 @@ pub const JobRunMetadata = struct {
 
 pub const RunLogger = struct {
     gpa: std.mem.Allocator,
-    meta: TaskRunMetadata,
     base_path: []const u8,
     task_path: []const u8,
     run_path: []const u8,
@@ -34,21 +33,12 @@ pub const RunLogger = struct {
         gpa: std.mem.Allocator,
         task_id: []const u8,
         run_id: []const u8,
-        job_count: usize,
     ) !RunLogger {
-        const cwd = std.fs.cwd();
         var logger: RunLogger = undefined;
         logger.gpa = gpa;
         logger.base_path = logs_root;
         logger.task_path = try std.fs.path.join(gpa, &.{ logs_root, task_id, "runs" });
         logger.run_path = try std.fs.path.join(gpa, &.{ logger.task_path, run_id });
-        try cwd.makePath(logger.run_path);
-        logger.meta = .{
-            .task_id = task_id,
-            .run_id = run_id,
-            .start_time = std.time.timestamp(),
-            .jobs_total = job_count,
-        };
         return logger;
     }
 
@@ -57,10 +47,10 @@ pub const RunLogger = struct {
         self.gpa.free(self.run_path);
     }
 
-    pub fn logTaskMetadata(self: *RunLogger) !void {
+    pub fn logTaskMetadata(self: *RunLogger, meta: *TaskRunMetadata) !void {
         const file_path = try std.fs.path.join(self.gpa, &.{ self.run_path, "meta.json" });
         defer self.gpa.free(file_path);
-        const json = try toJson(self.gpa, self.meta);
+        const json = try toJson(self.gpa, meta.*);
         defer self.gpa.free(json);
         try writeFile(file_path, json);
     }
@@ -74,6 +64,17 @@ pub const RunLogger = struct {
         const json = try toJson(self.gpa, meta.*);
         defer self.gpa.free(json);
         try writeFile(file_path, json);
+    }
+
+    pub fn startTask(self: *RunLogger, meta: *TaskRunMetadata) !void {
+        try std.fs.cwd().makePath(self.run_path);
+        meta.start_time = std.time.timestamp();
+        try self.logTaskMetadata(meta);
+    }
+
+    pub fn endTask(self: *RunLogger, meta: *TaskRunMetadata) !void {
+        meta.end_time = std.time.timestamp();
+        try self.logTaskMetadata(meta);
     }
 
     pub fn startJob(self: *RunLogger, meta: *JobRunMetadata) !void {
@@ -95,7 +96,7 @@ pub const RunLogger = struct {
         try self.logJobMetadata(meta);
     }
 
-    pub fn finishJob(self: *RunLogger, meta: *JobRunMetadata) !void {
+    pub fn endJob(self: *RunLogger, meta: *JobRunMetadata) !void {
         meta.end_time = std.time.timestamp();
         try self.logJobMetadata(meta);
     }
