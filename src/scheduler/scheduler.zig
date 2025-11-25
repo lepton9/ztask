@@ -1,6 +1,7 @@
 const std = @import("std");
 const task_zig = @import("task");
 const dag = @import("dag.zig");
+const log = @import("../logger.zig");
 const queue_zig = @import("../queue.zig");
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const localrunner = @import("../runner/localrunner.zig");
@@ -39,10 +40,19 @@ pub const Scheduler = struct {
     result_queue: *ResultQueue,
     status: enum { running, completed, waiting, inactive },
 
+    logger: log.RunLogger,
+    task_meta: log.TaskRunMetadata,
+
     pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
+        var buf: [64]u8 = undefined;
+        const task_meta: log.TaskRunMetadata = .{
+            .task_id = try gpa.dupe(u8, try task.id.fmt(&buf)),
+            .start_time = std.time.timestamp(),
+            .jobs_total = node_n,
+        };
         scheduler.* = .{
             .gpa = gpa,
             .task = task,
@@ -52,6 +62,8 @@ pub const Scheduler = struct {
             .queue = try .initCapacity(gpa, node_n),
             .result_queue = try ResultQueue.init(gpa, node_n),
             .status = .inactive,
+            .logger = try .init(gpa, task_meta.task_id),
+            .task_meta = task_meta,
         };
         try scheduler.active_runners.ensureTotalCapacity(gpa, @intCast(node_n));
         try scheduler.buildDAG();
@@ -66,6 +78,8 @@ pub const Scheduler = struct {
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.result_queue.deinit(self.gpa);
+        self.logger.deinit();
+        self.task_meta.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -127,9 +141,12 @@ pub const Scheduler = struct {
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
 
+        // TODO: handle run id
+        try self.logger.startTask(&self.task_meta, try self.gpa.dupe(u8, "1"));
+
         // Task has no jobs
         if (self.nodes.len == 0) {
-            self.status = .completed;
+            self.completeTask();
             return;
         }
 
@@ -234,9 +251,7 @@ pub const Scheduler = struct {
         }
         if (self.status == .running) {
             self.tryScheduleJobs();
-            if (self.allJobsCompleted()) {
-                self.status = .completed;
-            }
+            if (self.allJobsCompleted()) self.completeTask();
         }
     }
 
@@ -247,6 +262,12 @@ pub const Scheduler = struct {
             else => continue,
         };
         return true;
+    }
+
+    /// Mark task as completed and log the final metadata
+    fn completeTask(self: *Scheduler) void {
+        self.logger.endTask(&self.task_meta) catch {};
+        self.status = .completed;
     }
 
     fn taskStatus(self: *Scheduler) dag.Status {
