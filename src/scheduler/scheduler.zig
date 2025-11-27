@@ -99,7 +99,7 @@ pub const Scheduler = struct {
         self.active_runners.deinit(self.gpa);
         self.result_queue.deinit(self.gpa);
         self.log_queue.deinit(self.gpa);
-        self.logger.deinit();
+        self.logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);
         self.job_metas.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -164,7 +164,11 @@ pub const Scheduler = struct {
         if (self.status == .running) return error.SchedulerRunning;
 
         // TODO: handle run id
-        try self.logger.startTask(&self.task_meta, try self.gpa.dupe(u8, "1"));
+        try self.logger.startTask(
+            self.gpa,
+            &self.task_meta,
+            try self.gpa.dupe(u8, "1"),
+        );
 
         // Task has no jobs
         if (self.nodes.len == 0) {
@@ -197,7 +201,10 @@ pub const Scheduler = struct {
         if (self.queue.items.len == 0) return;
         const node = self.queue.orderedRemove(0);
         self.active_runners.putAssumeCapacity(node, runner);
-        self.logger.startJob(self.job_metas.getPtr(node) orelse unreachable) catch {};
+        self.logger.startJob(
+            self.gpa,
+            self.job_metas.getPtr(node) orelse unreachable,
+        ) catch {};
         runner.runJob(node, self.result_queue, self.log_queue);
     }
 
@@ -238,7 +245,7 @@ pub const Scheduler = struct {
             var job_meta = self.job_metas.getPtr(node) orelse unreachable;
             job_meta.status = .interrupted;
             job_meta.end_time = std.time.timestamp();
-            self.logger.logJobMetadata(job_meta) catch {};
+            self.logger.logJobMetadata(self.gpa, job_meta) catch {};
         }
         self.active_runners.clearRetainingCapacity();
 
@@ -251,7 +258,7 @@ pub const Scheduler = struct {
         // Log task metadata
         self.task_meta.status = .interrupted;
         self.task_meta.jobs_completed = self.completedJobs();
-        self.logger.endTask(&self.task_meta) catch {};
+        self.logger.endTask(self.gpa, &self.task_meta) catch {};
     }
 
     /// Update the scheduler and handle pending events
@@ -278,18 +285,18 @@ pub const Scheduler = struct {
             .job_started => |e| {
                 var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
                 job_meta.start_time = e.timestamp;
-                self.logger.logJobMetadata(job_meta) catch {};
+                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
             },
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
-                self.logger.appendJobLog(job_meta, e.data) catch {};
+                self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
                 var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
                 job_meta.end_time = e.timestamp;
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;
-                self.logger.logJobMetadata(job_meta) catch {};
+                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
             },
         };
     }
@@ -324,7 +331,7 @@ pub const Scheduler = struct {
     fn completeTask(self: *Scheduler) void {
         self.task_meta.status = self.taskStatus();
         self.task_meta.jobs_completed = self.completedJobs();
-        self.logger.endTask(&self.task_meta) catch {};
+        self.logger.endTask(self.gpa, &self.task_meta) catch {};
         self.status = .completed;
     }
 
