@@ -125,19 +125,7 @@ pub const DataStore = struct {
     ) !?TaskRunMetadata {
         const task_path = try self.taskRunMetaPath(gpa, task_id, run_id);
         defer gpa.free(task_path);
-        const file = std.fs.cwd().openFile(task_path, .{}) catch return null;
-        defer file.close();
-        var reader = file.reader(&.{});
-        var buffer: [512]u8 = undefined;
-        const read = try reader.interface.readSliceShort(&buffer);
-        const json = std.json.parseFromSlice(
-            TaskRunMetadata,
-            gpa,
-            buffer[0..read],
-            .{},
-        ) catch return error.InvalidMetaDataFile;
-        defer json.deinit();
-        return json.value;
+        return parseMetaFile(TaskRunMetadata, gpa, task_path);
     }
 
     /// Load and parse a task run metadata file
@@ -150,19 +138,23 @@ pub const DataStore = struct {
     ) !?JobRunMetadata {
         const job_path = try self.jobRunMetaPath(gpa, task_id, run_id, job_name);
         defer gpa.free(job_path);
-        const file = std.fs.cwd().openFile(job_path, .{}) catch return null;
-        defer file.close();
-        var reader = file.reader(&.{});
-        var buffer: [512]u8 = undefined;
-        const read = try reader.interface.readSliceShort(&buffer);
-        std.debug.print("{s}\n", .{buffer[0..read]});
-        const json = std.json.parseFromSlice(
-            JobRunMetadata,
-            gpa,
-            buffer[0..read],
-            .{},
-        ) catch return error.InvalidMetaDataFile;
-        defer json.deinit();
-        return json.value;
+        return parseMetaFile(JobRunMetadata, gpa, job_path);
     }
 };
+
+/// Parse a file from JSON to type `T`
+fn parseMetaFile(
+    comptime T: type,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+) !?T {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    var reader = file.reader(&.{});
+    var buffer: [512]u8 = undefined;
+    const read = try reader.interface.readSliceShort(&buffer);
+    const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{}) catch
+        return error.InvalidMetaDataFile;
+    defer json.deinit();
+    return json.value;
+}
