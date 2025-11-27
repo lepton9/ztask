@@ -1,30 +1,8 @@
 const std = @import("std");
+const data = @import("data.zig");
 
-pub const TaskRunStatus = enum { running, success, failed, interrupted };
-pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
-
-pub const TaskRunMetadata = struct {
-    task_id: []const u8,
-    run_id: ?[]const u8 = null,
-    start_time: i64,
-    end_time: ?i64 = null,
-    status: TaskRunStatus = .running,
-    jobs_total: usize,
-    jobs_completed: usize = 0,
-
-    pub fn deinit(self: *TaskRunMetadata, gpa: std.mem.Allocator) void {
-        gpa.free(self.task_id);
-        if (self.run_id) |id| gpa.free(id);
-    }
-};
-
-pub const JobRunMetadata = struct {
-    job_name: []const u8,
-    start_time: i64,
-    end_time: ?i64 = null,
-    exit_code: ?i32 = null,
-    status: JobRunStatus = .pending,
-};
+const TaskRunMetadata = data.TaskRunMetadata;
+const JobRunMetadata = data.JobRunMetadata;
 
 /// Logger for task and job execution logs and metadata
 pub const RunLogger = struct {

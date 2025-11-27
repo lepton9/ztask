@@ -52,8 +52,8 @@ pub const Scheduler = struct {
     log_queue: *LogQueue,
 
     logger: log.RunLogger,
-    task_meta: log.TaskRunMetadata,
-    job_metas: std.AutoHashMapUnmanaged(*JobNode, log.JobRunMetadata),
+    task_meta: data.TaskRunMetadata,
+    job_metas: std.AutoHashMapUnmanaged(*JobNode, data.JobRunMetadata),
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -65,7 +65,7 @@ pub const Scheduler = struct {
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
         var buf: [64]u8 = undefined;
-        const task_meta: log.TaskRunMetadata = .{
+        const task_meta: data.TaskRunMetadata = .{
             .task_id = try gpa.dupe(u8, try task.id.fmt(&buf)),
             .start_time = std.time.timestamp(),
             .jobs_total = node_n,
@@ -173,13 +173,11 @@ pub const Scheduler = struct {
     /// Begin running the task
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
-        const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
+        const run_id = try std.fmt.allocPrint(self.gpa, "{d}", .{
+            try self.datastore.nextRunId(self.gpa, self.task_meta.task_id),
+        });
 
-        try self.logger.startTask(
-            self.gpa,
-            &self.task_meta,
-            try std.fmt.allocPrint(self.gpa, "{d}", .{run_id}),
-        );
+        try self.logger.startTask(self.gpa, &self.task_meta, run_id);
 
         // Task has no jobs
         if (self.nodes.len == 0) {
@@ -356,8 +354,8 @@ pub const Scheduler = struct {
     }
 
     /// Get status of the task
-    fn taskStatus(self: *Scheduler) log.TaskRunStatus {
-        var status: log.TaskRunStatus = .success;
+    fn taskStatus(self: *Scheduler) data.TaskRunStatus {
+        var status: data.TaskRunStatus = .success;
         for (self.nodes) |node| switch (node.status) {
             .failed => return .failed,
             .skipped => return .interrupted,
