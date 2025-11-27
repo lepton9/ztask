@@ -23,16 +23,16 @@ pub const TaskManager = struct {
     running: std.atomic.Value(bool) = .init(false),
     datastore: data.DataStore,
     /// Task yaml files
-    task_files: std.ArrayListUnmanaged([]const u8),
+    task_files: std.ArrayList([]const u8),
     pool: *RunnerPool,
 
     /// Active schedulers
-    schedulers: std.AutoHashMap(*Task, *Scheduler),
-    loaded_tasks: std.StringArrayHashMap(*Task),
+    schedulers: std.AutoHashMapUnmanaged(*Task, *Scheduler),
+    loaded_tasks: std.StringArrayHashMapUnmanaged(*Task),
 
     watcher: *Watcher,
     /// Maps paths to active schedulers
-    watch_map: std.StringHashMap(std.ArrayListUnmanaged(*Scheduler)),
+    watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
     pub fn init(gpa: std.mem.Allocator) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -41,10 +41,10 @@ pub const TaskManager = struct {
             .datastore = .init(data.root_dir),
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
             .task_files = try .initCapacity(gpa, 5),
-            .schedulers = .init(self.gpa),
-            .loaded_tasks = .init(self.gpa),
+            .schedulers = .{},
+            .loaded_tasks = .{},
+            .watch_map = .{},
             .watcher = try Watcher.init(gpa),
-            .watch_map = .init(self.gpa),
         };
         return self;
     }
@@ -56,12 +56,12 @@ pub const TaskManager = struct {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
-        self.loaded_tasks.deinit();
-        self.schedulers.deinit();
+        self.loaded_tasks.deinit(self.gpa);
+        self.schedulers.deinit(self.gpa);
         self.pool.deinit();
         self.task_files.deinit(self.gpa);
         self.watcher.deinit();
-        self.watch_map.deinit();
+        self.watch_map.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -202,7 +202,7 @@ pub const TaskManager = struct {
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| break :blk s;
             const s = try Scheduler.init(self.gpa, task, self.pool, &self.datastore);
-            try self.schedulers.put(task, s);
+            try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };
         // Add trigger
@@ -215,7 +215,7 @@ pub const TaskManager = struct {
                             error.UnsupportedPlatform => error.WatcherAddUnsupported,
                             else => err,
                         };
-                    const res = try self.watch_map.getOrPut(watch.path);
+                    const res = try self.watch_map.getOrPut(self.gpa, watch.path);
                     if (!res.found_existing) {
                         res.value_ptr.* = try .initCapacity(self.gpa, 1);
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
@@ -230,7 +230,7 @@ pub const TaskManager = struct {
     fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
         return self.loaded_tasks.get(task_file) orelse blk: {
             const task = try parse.loadTask(self.gpa, task_file);
-            try self.loaded_tasks.put(task_file, task);
+            try self.loaded_tasks.put(self.gpa, task_file, task);
             break :blk task;
         };
     }
@@ -298,8 +298,8 @@ test "manager_simple" {
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    try task_manager.loaded_tasks.put(try task1.id.fmt(&task1_buf), task1);
-    try task_manager.loaded_tasks.put(try task2.id.fmt(&task2_buf), task2);
+    try task_manager.loaded_tasks.put(gpa, try task1.id.fmt(&task1_buf), task1);
+    try task_manager.loaded_tasks.put(gpa, try task2.id.fmt(&task2_buf), task2);
 
     try std.testing.expect(task_manager.schedulers.count() == 0);
 
