@@ -197,7 +197,8 @@ pub const Scheduler = struct {
         if (self.queue.items.len == 0) return;
         const node = self.queue.orderedRemove(0);
         self.active_runners.putAssumeCapacity(node, runner);
-        runner.runJob(node, self.result_queue);
+        self.logger.startJob(self.job_metas.getPtr(node) orelse unreachable) catch {};
+        runner.runJob(node, self.result_queue, self.log_queue);
     }
 
     /// Request executor from the pool
@@ -233,6 +234,11 @@ pub const Scheduler = struct {
             for (node.getDependents()) |dep| {
                 dep.status = .skipped;
             }
+            // Log job metadata
+            var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+            job_meta.status = .interrupted;
+            job_meta.end_time = std.time.timestamp();
+            self.logger.logJobMetadata(job_meta) catch {};
         }
         self.active_runners.clearRetainingCapacity();
 
@@ -241,9 +247,14 @@ pub const Scheduler = struct {
             .pending, .ready => node.status = .skipped,
             else => {},
         };
+
+        // Log task metadata
+        self.task_meta.status = .interrupted;
+        self.task_meta.jobs_completed = self.completedJobs();
+        self.logger.endTask(&self.task_meta) catch {};
     }
 
-    /// Handle completed jobs and schedule more
+    /// Update the scheduler and handle pending events
     pub fn update(self: *Scheduler) void {
         self.handleResults();
         self.handleLogs();
@@ -261,12 +272,30 @@ pub const Scheduler = struct {
         }
     }
 
+    /// Handle the job log events in the queue
     fn handleLogs(self: *Scheduler) void {
-        while (self.log_queue.pop()) |_| {}
+        while (self.log_queue.pop()) |event| switch (event) {
+            .job_started => |e| {
+                var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                job_meta.start_time = e.timestamp;
+                self.logger.logJobMetadata(job_meta) catch {};
+            },
+            .job_output => |e| {
+                const job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                self.logger.appendJobLog(job_meta, e.data) catch {};
+            },
+            .job_finished => |e| {
+                var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                job_meta.end_time = e.timestamp;
+                job_meta.exit_code = e.exit_code;
+                job_meta.status = if (e.exit_code == 0) .success else .failed;
+                self.logger.logJobMetadata(job_meta) catch {};
+            },
+        };
     }
 
     /// Handle a completed job
-    pub fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
+    fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
         // TODO: log the job run
         node.status = if (result.exit_code == 0) .success else .failed;
         for (node.getDependents()) |dep| {
@@ -293,18 +322,29 @@ pub const Scheduler = struct {
 
     /// Mark task as completed and log the final metadata
     fn completeTask(self: *Scheduler) void {
+        self.task_meta.status = self.taskStatus();
+        self.task_meta.jobs_completed = self.completedJobs();
         self.logger.endTask(&self.task_meta) catch {};
         self.status = .completed;
     }
 
-    fn taskStatus(self: *Scheduler) dag.Status {
-        var status = .success;
+    /// Get total number of completed jobs
+    fn completedJobs(self: *Scheduler) usize {
+        var completed: usize = 0;
+        for (self.nodes) |node| {
+            if (node.status == .success) completed += 1;
+        }
+        return completed;
+    }
+
+    /// Get status of the task
+    fn taskStatus(self: *Scheduler) log.TaskRunStatus {
+        var status: log.TaskRunStatus = .success;
         for (self.nodes) |node| switch (node.status) {
-            .pending => status = .pending,
-            .running => return .running,
             .failed => return .failed,
-            .skipped => return .skipped,
-            else => {},
+            .skipped => return .interrupted,
+            .success => {},
+            else => status = .running,
         };
         return status;
     }

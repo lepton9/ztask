@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
-pub const JonRunStatus = enum { pending, running, success, failed };
+pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
 
 const logs_root: []const u8 = "./logs";
 
@@ -25,7 +25,7 @@ pub const JobRunMetadata = struct {
     start_time: i64,
     end_time: ?i64 = null,
     exit_code: ?i32 = null,
-    status: JonRunStatus = .pending,
+    status: JobRunStatus = .pending,
 };
 
 /// Logger for task and job execution logs and metadata
@@ -76,12 +76,15 @@ pub const RunLogger = struct {
         if (self.run_path) |run| self.gpa.free(run);
         self.run_path = try std.fs.path.join(self.gpa, &.{ self.task_path, run_id });
         try std.fs.cwd().makePath(self.run_path.?);
+
+        // Reset task metadata
         meta.start_time = std.time.timestamp();
         meta.end_time = null;
         meta.status = .running;
         meta.jobs_completed = 0;
         if (meta.run_id) |id| self.gpa.free(id);
         meta.run_id = run_id;
+
         try self.logTaskMetadata(meta);
     }
 
@@ -107,15 +110,12 @@ pub const RunLogger = struct {
         var file = try cwd.createFile(stdout_log, .{ .truncate = false });
         defer file.close();
 
-        meta.start_time = std.time.timestamp();
+        // Reset job metadata
         meta.status = .running;
+        meta.start_time = std.time.timestamp();
+        meta.end_time = null;
+        meta.exit_code = null;
 
-        try self.logJobMetadata(meta);
-    }
-
-    /// Record the final state of the job in a metadata file
-    pub fn endJob(self: *RunLogger, meta: *JobRunMetadata) !void {
-        meta.end_time = std.time.timestamp();
         try self.logJobMetadata(meta);
     }
 
