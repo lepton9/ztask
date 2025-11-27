@@ -11,12 +11,12 @@ pub const DataStore = struct {
     }
 
     /// Get and allocate the tasks directory path
-    pub fn getTasksDir(self: *DataStore, gpa: std.mem.Allocator) ![]u8 {
+    pub fn tasksPath(self: *DataStore, gpa: std.mem.Allocator) ![]u8 {
         return std.fs.path.join(gpa, &.{ self.root, "tasks" });
     }
 
     /// Get and allocate the directory path for a task
-    pub fn getTaskDir(
+    pub fn taskPath(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
@@ -31,7 +31,7 @@ pub const DataStore = struct {
         task_id: []const u8,
     ) !u64 {
         const cwd = std.fs.cwd();
-        const task_dir = try self.getTaskDir(gpa, task_id);
+        const task_dir = try self.taskPath(gpa, task_id);
         defer gpa.free(task_dir);
         cwd.makePath(task_dir) catch {};
         const counter_file_path = try std.fs.path.join(gpa, &.{

@@ -3,8 +3,6 @@ const std = @import("std");
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
 pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
 
-const logs_root: []const u8 = "./logs";
-
 pub const TaskRunMetadata = struct {
     task_id: []const u8,
     run_id: ?[]const u8 = null,
@@ -30,14 +28,16 @@ pub const JobRunMetadata = struct {
 
 /// Logger for task and job execution logs and metadata
 pub const RunLogger = struct {
-    base_path: []const u8,
     task_path: []const u8,
     run_path: ?[]const u8 = null,
 
-    pub fn init(gpa: std.mem.Allocator, task_id: []const u8) !RunLogger {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        base_path: []const u8,
+        task_id: []const u8,
+    ) !RunLogger {
         return .{
-            .base_path = logs_root,
-            .task_path = try std.fs.path.join(gpa, &.{ logs_root, task_id, "runs" }),
+            .task_path = try std.fs.path.join(gpa, &.{ base_path, task_id, "runs" }),
         };
     }
 

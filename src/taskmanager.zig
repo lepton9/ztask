@@ -1,4 +1,5 @@
 const std = @import("std");
+const data = @import("data.zig");
 pub const scheduler = @import("scheduler/scheduler.zig");
 const parse = @import("parse");
 const watcher_zig = @import("watcher/watcher.zig");
@@ -20,6 +21,7 @@ pub const TaskManager = struct {
     mutex: std.Thread.Mutex = .{},
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
+    datastore: data.DataStore,
     /// Task yaml files
     task_files: std.ArrayListUnmanaged([]const u8),
     pool: *RunnerPool,
@@ -36,6 +38,7 @@ pub const TaskManager = struct {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
+            .datastore = .init(data.root_dir),
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
             .task_files = try .initCapacity(gpa, 5),
             .schedulers = .init(self.gpa),
@@ -198,7 +201,7 @@ pub const TaskManager = struct {
         const task = try self.loadTask(task_file);
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| break :blk s;
-            const s = try Scheduler.init(self.gpa, task, self.pool);
+            const s = try Scheduler.init(self.gpa, task, self.pool, &self.datastore);
             try self.schedulers.put(task, s);
             break :blk s;
         };

@@ -1,10 +1,12 @@
 const std = @import("std");
+const data = @import("../data.zig");
 const task_zig = @import("task");
 const dag = @import("dag.zig");
 const log = @import("../logger.zig");
 const queue_zig = @import("../queue.zig");
-const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const localrunner = @import("../runner/localrunner.zig");
+
+const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const LocalRunner = localrunner.LocalRunner;
 const ExecResult = localrunner.ExecResult;
 const Job = task_zig.Job;
@@ -37,6 +39,7 @@ pub const LogQueue = queue_zig.Queue(LogEvent);
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
     status: enum { running, completed, waiting, inactive },
+    datastore: *data.DataStore,
     task: *Task,
     pool: *RunnerPool,
     nodes: []JobNode = undefined,
@@ -52,7 +55,12 @@ pub const Scheduler = struct {
     task_meta: log.TaskRunMetadata,
     job_metas: std.AutoHashMapUnmanaged(*JobNode, log.JobRunMetadata),
 
-    pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        task: *Task,
+        pool: *RunnerPool,
+        datastore: *data.DataStore,
+    ) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
@@ -62,8 +70,11 @@ pub const Scheduler = struct {
             .start_time = std.time.timestamp(),
             .jobs_total = node_n,
         };
+        const tasks_path = try datastore.tasksPath(gpa);
+        defer gpa.free(tasks_path);
         scheduler.* = .{
             .gpa = gpa,
+            .datastore = datastore,
             .task = task,
             .pool = pool,
             .nodes = try scheduler.gpa.alloc(JobNode, node_n),
@@ -72,7 +83,7 @@ pub const Scheduler = struct {
             .result_queue = try ResultQueue.init(gpa, node_n),
             .log_queue = try LogQueue.init(gpa, 10),
             .status = .inactive,
-            .logger = try .init(gpa, task_meta.task_id),
+            .logger = try .init(gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
             .job_metas = .{},
         };
@@ -162,12 +173,12 @@ pub const Scheduler = struct {
     /// Begin running the task
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
+        const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
 
-        // TODO: handle run id
         try self.logger.startTask(
             self.gpa,
             &self.task_meta,
-            try self.gpa.dupe(u8, "1"),
+            try std.fmt.allocPrint(self.gpa, "{d}", .{run_id}),
         );
 
         // Task has no jobs
