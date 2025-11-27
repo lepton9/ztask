@@ -24,11 +24,19 @@ pub const Result = struct {
     result: ExecResult,
 };
 
+const LogEvent = union(enum) {
+    job_started: struct { job_node: *JobNode, timestamp: i64 },
+    job_output: struct { job_node: *JobNode, data: []const u8 },
+    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
+};
+
 pub const ResultQueue = queue_zig.Queue(Result);
+pub const LogQueue = queue_zig.Queue(LogEvent);
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
+    status: enum { running, completed, waiting, inactive },
     task: *Task,
     pool: *RunnerPool,
     nodes: []JobNode = undefined,
@@ -38,10 +46,11 @@ pub const Scheduler = struct {
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
     result_queue: *ResultQueue,
-    status: enum { running, completed, waiting, inactive },
+    log_queue: *LogQueue,
 
     logger: log.RunLogger,
     task_meta: log.TaskRunMetadata,
+    job_metas: std.AutoHashMapUnmanaged(*JobNode, log.JobRunMetadata),
 
     pub fn init(gpa: std.mem.Allocator, task: *Task, pool: *RunnerPool) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
@@ -61,13 +70,24 @@ pub const Scheduler = struct {
             .active_runners = .{},
             .queue = try .initCapacity(gpa, node_n),
             .result_queue = try ResultQueue.init(gpa, node_n),
+            .log_queue = try LogQueue.init(gpa, 10),
             .status = .inactive,
             .logger = try .init(gpa, task_meta.task_id),
             .task_meta = task_meta,
+            .job_metas = .{},
         };
-        try scheduler.active_runners.ensureTotalCapacity(gpa, @intCast(node_n));
+
+        // Build the job node DAG
         try scheduler.buildDAG();
         try scheduler.validateDAG();
+
+        try scheduler.active_runners.ensureTotalCapacity(gpa, @intCast(node_n));
+        try scheduler.job_metas.ensureTotalCapacity(gpa, @intCast(node_n));
+        for (scheduler.nodes) |*node| scheduler.job_metas.putAssumeCapacity(node, .{
+            .job_name = node.ptr.name,
+            .start_time = std.time.timestamp(),
+        });
+
         return scheduler;
     }
 
@@ -78,8 +98,10 @@ pub const Scheduler = struct {
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.result_queue.deinit(self.gpa);
+        self.log_queue.deinit(self.gpa);
         self.logger.deinit();
         self.task_meta.deinit(self.gpa);
+        self.job_metas.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -224,6 +246,7 @@ pub const Scheduler = struct {
     /// Handle completed jobs and schedule more
     pub fn update(self: *Scheduler) void {
         self.handleResults();
+        self.handleLogs();
     }
 
     /// Handle the completed job results
@@ -236,6 +259,10 @@ pub const Scheduler = struct {
             self.pool.release(runner);
             self.onJobCompleted(res.node, res.result);
         }
+    }
+
+    fn handleLogs(self: *Scheduler) void {
+        while (self.log_queue.pop()) |_| {}
     }
 
     /// Handle a completed job

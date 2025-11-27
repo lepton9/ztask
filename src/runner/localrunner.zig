@@ -7,6 +7,7 @@ const JobNode = scheduler.JobNode;
 pub const ExecResult = struct {
     exit_code: i32,
     duration_ns: u64,
+    msg: ?[]const u8 = null,
 };
 
 /// Runner for one job
@@ -19,6 +20,7 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         job: *JobNode,
         results: *scheduler.ResultQueue,
+        logs: *scheduler.LogQueue,
     ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -27,10 +29,15 @@ pub const LocalRunner = struct {
             self,
             job,
             results,
+            logs,
         }) catch {
             return results.pushAssumeCapacity(.{
                 .node = job,
-                .result = .{ .exit_code = 1, .duration_ns = 0 },
+                .result = .{
+                    .exit_code = 1,
+                    .duration_ns = 0,
+                    .msg = "Failed to spawn thread",
+                },
             });
         };
     }
@@ -39,6 +46,7 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         job: *JobNode,
         results: *scheduler.ResultQueue,
+        _: *scheduler.LogQueue,
     ) void {
         var timer = std.time.Timer.start() catch unreachable;
         std.debug.print("- Start {s}\n", .{job.ptr.name});
