@@ -6,6 +6,16 @@ const run_counter: []const u8 = "run_counter";
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
 pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
 
+pub const TaskMetadata = struct {
+    id: []const u8,
+    file_path: []const u8,
+
+    pub fn deinit(self: *TaskMetadata, gpa: std.mem.Allocator) void {
+        gpa.free(self.id);
+        gpa.free(self.file_path);
+    }
+};
+
 pub const TaskRunMetadata = struct {
     task_id: []const u8,
     run_id: ?[]const u8 = null,
@@ -48,6 +58,18 @@ pub const DataStore = struct {
         task_id: []const u8,
     ) ![]u8 {
         return std.fs.path.join(gpa, &.{ self.root, "tasks", task_id });
+    }
+
+    /// Get and allocate the path for task metadata file
+    pub fn taskMetaPath(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) ![]u8 {
+        return std.fs.path.join(
+            gpa,
+            &.{ self.root, "tasks", task_id, "meta.json" },
+        );
     }
 
     /// Get and allocate the path for task run metadata file
@@ -139,6 +161,33 @@ pub const DataStore = struct {
         const job_path = try self.jobRunMetaPath(gpa, task_id, run_id, job_name);
         defer gpa.free(job_path);
         return parseMetaFile(JobRunMetadata, gpa, job_path);
+    }
+
+    /// Load all the task metafiles
+    pub fn loadTasks(self: *DataStore, gpa: std.mem.Allocator) ![]TaskMetadata {
+        const tasks_path = try self.tasksPath(gpa);
+        defer gpa.free(tasks_path);
+        const cwd = std.fs.cwd();
+        var dir = try cwd.openDir(tasks_path, .{ .iterate = true });
+        defer dir.close();
+        var tasks = try std.ArrayList(TaskMetadata).initCapacity(gpa, 5);
+        errdefer {
+            for (tasks.items) |t| t.deinit(gpa);
+            tasks.deinit(gpa);
+        }
+        var it = dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const task_id = std.fs.path.basename(e.name);
+                const task_meta = try self.taskMetaPath(gpa, task_id);
+                defer gpa.free(task_meta);
+                if (parseMetaFile(TaskMetadata, gpa, task_meta) catch null) |meta| {
+                    try tasks.append(gpa, meta);
+                }
+            },
+            else => continue,
+        };
+        return try tasks.toOwnedSlice(gpa);
     }
 };
 
