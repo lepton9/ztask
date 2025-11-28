@@ -33,9 +33,9 @@ pub const RunLogger = struct {
         const run_path = self.run_path orelse return error.NoRunDirectory;
         const file_path = try std.fs.path.join(gpa, &.{ run_path, "meta.json" });
         defer gpa.free(file_path);
-        const json = try toJson(gpa, meta.*);
+        const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try writeFile(file_path, json);
+        try data.writeFile(file_path, json, .{});
     }
 
     /// Write job metadata to a JSON file
@@ -50,9 +50,9 @@ pub const RunLogger = struct {
             &.{ run_path, "jobs", meta.job_name, "meta.json" },
         );
         defer gpa.free(file_path);
-        const json = try toJson(gpa, meta.*);
+        const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try writeFile(file_path, json);
+        try data.writeFile(file_path, json, .{});
     }
 
     /// Record the initial state of the task in a metadata file
@@ -136,19 +136,3 @@ pub const RunLogger = struct {
         try writer.interface.writeAll(content);
     }
 };
-
-/// Encodes value to a JSON string
-fn toJson(gpa: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(gpa);
-    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &out.writer);
-    return try out.toOwnedSlice();
-}
-
-/// Write all the content to the file
-fn writeFile(path: []const u8, content: []const u8) !void {
-    const cwd = std.fs.cwd();
-    var file = try cwd.createFile(path, .{ .truncate = false });
-    defer file.close();
-    var writer = file.writer(&.{});
-    try writer.interface.writeAll(content);
-}

@@ -189,6 +189,19 @@ pub const DataStore = struct {
         };
         return try tasks.toOwnedSlice(gpa);
     }
+
+    /// Save task metadata to a JSON file
+    pub fn writeTaskMeta(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        meta: *const TaskMetadata,
+    ) !void {
+        const path = try self.taskMetaPath(gpa, meta.id);
+        defer gpa.free(path);
+        const content = try toJson(gpa, meta);
+        defer gpa.free(content);
+        try writeFile(path, content, .{ .make_path = true });
+    }
 };
 
 /// Parse a file from JSON to type `T`
@@ -206,4 +219,32 @@ fn parseMetaFile(
         return error.InvalidMetaDataFile;
     defer json.deinit();
     return json.value;
+}
+
+/// Encodes value to a JSON string
+pub fn toJson(gpa: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.io.Writer.Allocating = .init(gpa);
+    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+pub const WriteOptions = struct {
+    truncate: bool = false,
+    make_path: bool = false,
+};
+
+/// Write all the content to the file
+pub fn writeFile(
+    path: []const u8,
+    content: []const u8,
+    options: WriteOptions,
+) !void {
+    const cwd = std.fs.cwd();
+    if (options.make_path) if (std.fs.path.dirname(path)) |dir| {
+        try cwd.makePath(dir);
+    };
+    var file = try cwd.createFile(path, .{ .truncate = options.truncate });
+    defer file.close();
+    var writer = file.writer(&.{});
+    try writer.interface.writeAll(content);
 }
