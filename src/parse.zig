@@ -47,7 +47,7 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     errdefer {
         var it = jobs.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
-        jobs.deinit();
+        jobs.deinit(gpa);
     }
 
     const t = try Task.init(gpa, name);
@@ -60,12 +60,12 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
 fn parseJobs(
     gpa: std.mem.Allocator,
     map: yaml.Yaml.Map,
-) !std.StringArrayHashMap(task.Job) {
-    var jobs = std.StringArrayHashMap(task.Job).init(gpa);
+) !std.StringArrayHashMapUnmanaged(task.Job) {
+    var jobs: std.StringArrayHashMapUnmanaged(task.Job) = .{};
     errdefer {
         var it = jobs.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
-        jobs.deinit();
+        jobs.deinit(gpa);
     }
     if (map.get("jobs")) |jobs_val| {
         const jobs_map = jobs_val.asMap() orelse return ParseError.InvalidFieldType;
@@ -81,7 +81,7 @@ fn parseJobs(
 
             // Add new job
             const job = try parseJob(gpa, job_name, job_map);
-            try jobs.put(job.name, job);
+            try jobs.put(gpa, job.name, job);
         }
     }
     return jobs;

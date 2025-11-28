@@ -9,6 +9,7 @@ pub const JobRunStatus = enum { pending, running, success, failed, interrupted }
 pub const TaskMetadata = struct {
     id: []const u8,
     file_path: []const u8,
+    name: []const u8,
 
     pub fn deinit(self: *TaskMetadata, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
@@ -41,9 +42,14 @@ pub const JobRunMetadata = struct {
 
 pub const DataStore = struct {
     root: []const u8,
+    tasks: std.StringHashMapUnmanaged(TaskMetadata),
 
     pub fn init(root: []const u8) DataStore {
-        return .{ .root = root };
+        return .{ .root = root, .tasks = .{} };
+    }
+
+    pub fn deinit(self: *DataStore, gpa: std.mem.Allocator) void {
+        self.tasks.deinit(gpa);
     }
 
     /// Get and allocate the tasks directory path
@@ -164,30 +170,24 @@ pub const DataStore = struct {
     }
 
     /// Load all the task metafiles
-    pub fn loadTasks(self: *DataStore, gpa: std.mem.Allocator) ![]TaskMetadata {
+    pub fn loadTasks(self: *DataStore, gpa: std.mem.Allocator) !void {
         const tasks_path = try self.tasksPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
         var dir = try cwd.openDir(tasks_path, .{ .iterate = true });
         defer dir.close();
-        var tasks = try std.ArrayList(TaskMetadata).initCapacity(gpa, 5);
-        errdefer {
-            for (tasks.items) |t| t.deinit(gpa);
-            tasks.deinit(gpa);
-        }
         var it = dir.iterate();
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
                 const task_id = std.fs.path.basename(e.name);
-                const task_meta = try self.taskMetaPath(gpa, task_id);
-                defer gpa.free(task_meta);
-                if (parseMetaFile(TaskMetadata, gpa, task_meta) catch null) |meta| {
-                    try tasks.append(gpa, meta);
+                const meta_file = try self.taskMetaPath(gpa, task_id);
+                defer gpa.free(meta_file);
+                if (parseMetaFile(TaskMetadata, gpa, meta_file) catch null) |meta| {
+                    try self.tasks.put(gpa, meta.id, meta);
                 }
             },
             else => continue,
         };
-        return try tasks.toOwnedSlice(gpa);
     }
 
     /// Save task metadata to a JSON file

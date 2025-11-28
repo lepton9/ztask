@@ -5,12 +5,13 @@ pub const Task = struct {
     name: []const u8,
     file_path: ?[]const u8 = null,
     trigger: ?Trigger = null,
-    jobs: std.StringArrayHashMap(Job) = undefined,
+    jobs: std.StringArrayHashMapUnmanaged(Job),
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8) !*Task {
         const task = try gpa.create(Task);
         task.* = .{
             .name = try gpa.dupe(u8, name),
+            .jobs = .{},
         };
         return task;
     }
@@ -18,7 +19,7 @@ pub const Task = struct {
     pub fn deinit(self: *Task, gpa: std.mem.Allocator) void {
         var it = self.jobs.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
-        self.jobs.deinit();
+        self.jobs.deinit(gpa);
 
         if (self.file_path) |path| gpa.free(path);
         if (self.trigger) |trigger| trigger.deinit(gpa);

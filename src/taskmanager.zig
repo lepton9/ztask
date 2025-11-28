@@ -62,6 +62,7 @@ pub const TaskManager = struct {
         self.task_files.deinit(self.gpa);
         self.watcher.deinit();
         self.watch_map.deinit(self.gpa);
+        self.datastore.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -231,6 +232,16 @@ pub const TaskManager = struct {
         return self.loaded_tasks.get(task_file) orelse blk: {
             const task = try parse.loadTask(self.gpa, task_file);
             try self.loaded_tasks.put(self.gpa, task_file, task);
+
+            // Write task metadata
+            if (task.file_path) |path| {
+                var buf: [64]u8 = undefined;
+                try self.datastore.writeTaskMeta(self.gpa, &.{
+                    .id = try task.id.fmt(&buf),
+                    .name = task.name,
+                    .file_path = path,
+                });
+            }
             break :blk task;
         };
     }
@@ -255,7 +266,11 @@ pub const TaskManager = struct {
                         self.gpa,
                         &.{ dir_path, entry.name },
                     );
-                    try self.task_files.append(self.gpa, path);
+                    defer self.gpa.free(path);
+                    try self.task_files.append(
+                        self.gpa,
+                        try cwd.realpathAlloc(self.gpa, path),
+                    );
                 }
             },
             .directory => {
@@ -277,7 +292,7 @@ pub const TaskManager = struct {
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
         if (parse.isTaskFile(path)) {
-            try self.task_files.append(self.gpa, try self.gpa.dupe(u8, path));
+            try self.task_files.append(self.gpa, cwd.realpathAlloc(self.gpa, path));
         }
     }
 };
