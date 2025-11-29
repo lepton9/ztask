@@ -1,4 +1,6 @@
 const std = @import("std");
+const parse = @import("parse");
+const task = @import("task");
 
 pub const root_dir: []const u8 = "./.ztask/";
 const run_counter: []const u8 = "run_counter";
@@ -43,12 +45,19 @@ pub const JobRunMetadata = struct {
 pub const DataStore = struct {
     root: []const u8,
     tasks: std.StringHashMapUnmanaged(TaskMetadata),
+    task_runs: std.StringHashMapUnmanaged(std.ArrayList(TaskRunMetadata)),
 
     pub fn init(root: []const u8) DataStore {
-        return .{ .root = root, .tasks = .{} };
+        return .{ .root = root, .tasks = .{}, .task_runs = .{} };
     }
 
     pub fn deinit(self: *DataStore, gpa: std.mem.Allocator) void {
+        var it = self.task_runs.iterator();
+        while (it.next()) |e| {
+            var runs = e.value_ptr;
+            runs.deinit(gpa);
+        }
+        self.task_runs.deinit(gpa);
         self.tasks.deinit(gpa);
     }
 
@@ -76,6 +85,15 @@ pub const DataStore = struct {
             gpa,
             &.{ self.root, "tasks", task_id, "meta.json" },
         );
+    }
+
+    /// Get and allocate the path for task runs
+    pub fn taskRunsPath(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) ![]u8 {
+        return std.fs.path.join(gpa, &.{ self.root, "tasks", task_id, "runs" });
     }
 
     /// Get and allocate the path for task run metadata file
@@ -188,6 +206,45 @@ pub const DataStore = struct {
             },
             else => continue,
         };
+    }
+
+    /// Load all the task runs
+    pub fn loadTaskRuns(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !void {
+        const res = try self.task_runs.getOrPut(gpa, task_id);
+        if (!res.found_existing) res.value_ptr.* = .{};
+        var task_runs = res.value_ptr.*;
+
+        const runs_path = try self.taskRunsPath(gpa, task_id);
+        defer gpa.free(runs_path);
+        var dir = try std.fs.cwd().openDir(runs_path, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const run_id = std.fs.path.basename(e.name);
+                const meta_file = try self.taskRunMetaPath(gpa, task_id, run_id);
+                defer gpa.free(meta_file);
+                if (parseMetaFile(TaskRunMetadata, gpa, meta_file) catch null) |meta| {
+                    try task_runs.append(gpa, meta);
+                }
+            },
+            else => continue,
+        };
+    }
+
+    /// Get task metadata with ID
+    pub fn getTaskMetadata(self: *DataStore, task_id: []const u8) ?*TaskMetadata {
+        return self.tasks.getPtr(task_id);
+    }
+
+    /// Parse and load task from file
+    pub fn loadTask(self: *DataStore, task_id: []const u8) ?*task.Task {
+        const meta = self.tasks.getPtr(task_id) orelse return null;
+        return try parse.loadTask(self.gpa, meta.file_path);
     }
 
     /// Save task metadata to a JSON file
