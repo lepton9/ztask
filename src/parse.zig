@@ -158,7 +158,7 @@ fn parseJob(
     };
 }
 
-fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
+pub fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
     var yaml_parser: yaml.Yaml = .{ .source = buf };
     defer yaml_parser.deinit(gpa);
     yaml_parser.load(gpa) catch |err| return switch (err) {
@@ -176,7 +176,7 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     const yaml_file = try std.fs.cwd().readFileAlloc(gpa, path, max_size);
     defer gpa.free(yaml_file);
     const t = try parseTaskBuffer(gpa, yaml_file);
-    t.file_path = try gpa.dupe(u8, path);
+    t.file_path = try std.fs.cwd().realpathAlloc(gpa, path);
     if (t.id.value == 0) t.id = task.Id.fromStr(t.file_path.?);
     return t;
 }

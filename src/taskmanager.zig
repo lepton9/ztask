@@ -186,7 +186,11 @@ pub const TaskManager = struct {
     /// Unload a task and its scheduler from memory
     fn unloadTask(self: *TaskManager, t: *Task) void {
         if (self.schedulers.fetchRemove(t)) |kv| {
-            _ = self.loaded_tasks.orderedRemove(t.file_path.?);
+            // TODO: use only task ids
+            if (t.file_path) |path| _ = self.loaded_tasks.orderedRemove(path) else {
+                var buf: [64]u8 = undefined;
+                _ = self.loaded_tasks.orderedRemove(t.id.fmt(&buf) catch "");
+            }
             kv.value.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
@@ -330,4 +334,30 @@ test "manager_simple" {
     try std.testing.expect(
         task_manager.schedulers.getEntry(task2).?.value_ptr.*.status == .completed,
     );
+}
+
+test "force_interrupt" {
+    const gpa = std.testing.allocator;
+    const task_file =
+        \\ name: task
+        \\ id: 1
+        \\ jobs:
+        \\   run:
+        \\     steps:
+        \\       - command: "echo asd"
+        \\       - command: "ls"
+        \\   cat:
+        \\     steps:
+        \\       - command: "cat README.md"
+    ;
+    var task_buf: [64]u8 = undefined;
+    const task_manager = try TaskManager.init(gpa);
+    defer task_manager.deinit();
+    const task = try parse.parseTaskBuffer(gpa, task_file);
+    const task_id = try task.id.fmt(&task_buf);
+    try task_manager.loaded_tasks.put(gpa, task_id, task);
+    try task_manager.start();
+    _ = try task_manager.beginTask(task_id);
+    // Interrupt while running
+    task_manager.stop();
 }
