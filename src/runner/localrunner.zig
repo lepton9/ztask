@@ -106,11 +106,11 @@ pub const LocalRunner = struct {
     }
 
     fn runCommandStep(
-        _: *LocalRunner,
+        self: *LocalRunner,
         gpa: std.mem.Allocator,
         step: *task.Step,
-        _: *JobNode,
-        _: *scheduler.LogQueue,
+        job: *JobNode,
+        logs: *scheduler.LogQueue,
     ) !i32 {
         // Create args
         var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
@@ -118,11 +118,49 @@ pub const LocalRunner = struct {
         var it = std.mem.splitScalar(u8, step.value, ' ');
         while (it.next()) |arg| try argv.append(gpa, arg);
 
+        var buffer: [4096]u8 = undefined;
+
         // Spawn child process
         var child = std.process.Child.init(argv.items, gpa);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
-        child.spawn() catch return -1;
+        try child.spawn();
+
+        var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
+            .stdout = child.stdout.?,
+            .stderr = child.stderr.?,
+        });
+        defer poller.deinit();
+
+        // Read output
+        while (try poller.poll()) {
+            if (!self.running.load(.seq_cst)) {
+                const term = try child.kill();
+                return switch (term) {
+                    .Exited => |code| @intCast(code),
+                    .Signal => |sig| @intCast(sig),
+                    else => 1,
+                };
+            }
+
+            if (readLogs(poller.reader(.stdout), &buffer)) |log| {
+                std.debug.print("{s}\n", .{log});
+                logs.push(gpa, .{ .job_output = .{
+                    .job_node = job,
+                    .step = step,
+                    .data = log,
+                } }) catch {};
+            }
+
+            if (readLogs(poller.reader(.stderr), &buffer)) |log| {
+                std.debug.print("{s}\n", .{log});
+                logs.push(gpa, .{ .job_output = .{
+                    .job_node = job,
+                    .step = step,
+                    .data = log,
+                } }) catch {};
+            }
+        }
 
         const term = try child.wait();
         return switch (term) {
@@ -132,3 +170,11 @@ pub const LocalRunner = struct {
         };
     }
 };
+
+fn readLogs(reader: *std.Io.Reader, buffer: []u8) ?[]u8 {
+    const read = reader.readSliceShort(buffer) catch |err| {
+        std.debug.print("err: {}\n", .{err});
+        return null;
+    };
+    return buffer[0..read];
+}
