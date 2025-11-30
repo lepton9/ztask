@@ -214,7 +214,7 @@ pub const Scheduler = struct {
             self.gpa,
             self.job_metas.getPtr(node) orelse unreachable,
         ) catch {};
-        runner.runJob(node, self.result_queue, self.log_queue);
+        runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
     }
 
     /// Request executor from the pool

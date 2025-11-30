@@ -55,11 +55,11 @@ pub const LocalRunner = struct {
         std.debug.print("- Start job {s}\n", .{job.ptr.name});
 
         logs.push(gpa, .{ .job_started = .{
-            .job = job,
+            .job_node = job,
             .timestamp = std.time.milliTimestamp(),
-        } });
+        } }) catch {};
 
-        var exit_code = 0;
+        var exit_code: i32 = 0;
         var err_msg: ?[]const u8 = null;
 
         for (job.ptr.steps) |*step| {
@@ -70,20 +70,21 @@ pub const LocalRunner = struct {
             }
             std.debug.print("{s}: step: {s}\n", .{ job.ptr.name, step.value });
             switch (step.kind) {
-                .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| {
+                .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| blk: {
                     std.debug.print("step err: {}\n", .{err});
+                    break :blk 1;
                 },
-                else => @panic("TODO"),
+                // else => @panic("TODO"),
             }
 
             if (exit_code != 0) break;
         }
 
         logs.push(gpa, .{ .job_finished = .{
-            .job = job,
+            .job_node = job,
             .exit_code = exit_code,
             .timestamp = std.time.milliTimestamp(),
-        } });
+        } }) catch {};
         results.pushAssumeCapacity(
             .{ .node = job, .result = .{
                 .exit_code = exit_code,
@@ -105,10 +106,29 @@ pub const LocalRunner = struct {
     }
 
     fn runCommandStep(
-        self: *LocalRunner,
+        _: *LocalRunner,
         gpa: std.mem.Allocator,
         step: *task.Step,
-        job: *JobNode,
-        logs: *scheduler.LogQueue,
-    ) !i32 {}
+        _: *JobNode,
+        _: *scheduler.LogQueue,
+    ) !i32 {
+        // Create args
+        var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
+        defer argv.deinit(gpa);
+        var it = std.mem.splitScalar(u8, step.value, ' ');
+        while (it.next()) |arg| try argv.append(gpa, arg);
+
+        // Spawn child process
+        var child = std.process.Child.init(argv.items, gpa);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch return -1;
+
+        const term = try child.wait();
+        return switch (term) {
+            .Exited => |code| @intCast(code),
+            .Signal => |sig| @intCast(sig),
+            else => 1,
+        };
+    }
 };

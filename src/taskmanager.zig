@@ -296,7 +296,7 @@ pub const TaskManager = struct {
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
         if (parse.isTaskFile(path)) {
-            try self.task_files.append(self.gpa, cwd.realpathAlloc(self.gpa, path));
+            try self.task_files.append(self.gpa, try cwd.realpathAlloc(self.gpa, path));
         }
     }
 };
