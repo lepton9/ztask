@@ -280,7 +280,7 @@ fn parseMetaFile(
 
 /// Encodes value to a JSON string
 pub fn toJson(gpa: std.mem.Allocator, value: anytype) ![]u8 {
-    var out: std.io.Writer.Allocating = .init(gpa);
+    var out: std.Io.Writer.Allocating = .init(gpa);
     try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &out.writer);
     return try out.toOwnedSlice();
 }

@@ -118,8 +118,6 @@ pub const LocalRunner = struct {
         var it = std.mem.splitScalar(u8, step.value, ' ');
         while (it.next()) |arg| try argv.append(gpa, arg);
 
-        var buffer: [4096]u8 = undefined;
-
         // Spawn child process
         var child = std.process.Child.init(argv.items, gpa);
         child.stdout_behavior = .Pipe;
@@ -143,23 +141,8 @@ pub const LocalRunner = struct {
                 };
             }
 
-            if (readLogs(poller.reader(.stdout), &buffer)) |log| {
-                std.debug.print("{s}\n", .{log});
-                logs.push(gpa, .{ .job_output = .{
-                    .job_node = job,
-                    .step = step,
-                    .data = log,
-                } }) catch {};
-            }
-
-            if (readLogs(poller.reader(.stderr), &buffer)) |log| {
-                std.debug.print("{s}\n", .{log});
-                logs.push(gpa, .{ .job_output = .{
-                    .job_node = job,
-                    .step = step,
-                    .data = log,
-                } }) catch {};
-            }
+            pollLogs(gpa, poller.reader(.stdout), step, job, logs);
+            pollLogs(gpa, poller.reader(.stderr), step, job, logs);
         }
 
         const term = try child.wait();
@@ -171,10 +154,21 @@ pub const LocalRunner = struct {
     }
 };
 
-fn readLogs(reader: *std.Io.Reader, buffer: []u8) ?[]u8 {
-    const read = reader.readSliceShort(buffer) catch |err| {
-        std.debug.print("err: {}\n", .{err});
-        return null;
-    };
-    return buffer[0..read];
+fn pollLogs(
+    gpa: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    step: *task.Step,
+    job: *JobNode,
+    logs: *scheduler.LogQueue,
+) void {
+    const data = reader.readAlloc(gpa, 256) catch return;
+    logs.push(gpa, .{ .job_output = .{
+        .job_node = job,
+        .step = step,
+        .data = data,
+    } }) catch {};
+}
+
+fn readLogs(reader: *std.Io.Reader, gpa: std.mem.Allocator) ?[]u8 {
+    return reader.readAlloc(gpa, 256) catch null;
 }

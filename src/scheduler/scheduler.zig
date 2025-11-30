@@ -264,6 +264,8 @@ pub const Scheduler = struct {
             else => {},
         };
 
+        self.handleLogs();
+
         // Log task metadata
         self.task_meta.status = .interrupted;
         self.task_meta.jobs_completed = self.completedJobs();
@@ -298,6 +300,7 @@ pub const Scheduler = struct {
             },
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                defer self.gpa.free(e.data); // Allocated by runner
                 self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
