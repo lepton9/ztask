@@ -1,9 +1,9 @@
 const std = @import("std");
 const scheduler = @import("../scheduler/scheduler.zig");
+const task = @import("task");
 const Scheduler = scheduler.Scheduler;
 const JobNode = scheduler.JobNode;
 
-// TODO: stdin and stderr logs
 pub const ExecResult = struct {
     exit_code: i32,
     duration_ns: u64,
@@ -18,6 +18,7 @@ pub const LocalRunner = struct {
 
     pub fn runJob(
         self: *LocalRunner,
+        gpa: std.mem.Allocator,
         job: *JobNode,
         results: *scheduler.ResultQueue,
         logs: *scheduler.LogQueue,
@@ -27,6 +28,7 @@ pub const LocalRunner = struct {
         _ = self.running.swap(true, .seq_cst);
         self.thread = std.Thread.spawn(.{}, runFn, .{
             self,
+            gpa,
             job,
             results,
             logs,
@@ -44,21 +46,51 @@ pub const LocalRunner = struct {
 
     fn runFn(
         self: *LocalRunner,
+        gpa: std.mem.Allocator,
         job: *JobNode,
         results: *scheduler.ResultQueue,
-        _: *scheduler.LogQueue,
+        logs: *scheduler.LogQueue,
     ) void {
         var timer = std.time.Timer.start() catch unreachable;
-        std.debug.print("- Start {s}\n", .{job.ptr.name});
-        for (job.ptr.steps) |step| {
-            if (!self.running.load(.seq_cst)) return; // TODO: push to results?
+        std.debug.print("- Start job {s}\n", .{job.ptr.name});
+
+        logs.push(gpa, .{ .job_started = .{
+            .job = job,
+            .timestamp = std.time.milliTimestamp(),
+        } });
+
+        var exit_code = 0;
+        var err_msg: ?[]const u8 = null;
+
+        for (job.ptr.steps) |*step| {
+            if (!self.running.load(.seq_cst)) {
+                exit_code = 1;
+                err_msg = "Interrupted";
+                break;
+            }
             std.debug.print("{s}: step: {s}\n", .{ job.ptr.name, step.value });
-            std.Thread.sleep(1 * 1_000_000_000);
+            switch (step.kind) {
+                .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| {
+                    std.debug.print("step err: {}\n", .{err});
+                },
+                else => @panic("TODO"),
+            }
+
+            if (exit_code != 0) break;
         }
-        results.pushAssumeCapacity(.{
-            .node = job,
-            .result = .{ .exit_code = 0, .duration_ns = timer.read() },
-        });
+
+        logs.push(gpa, .{ .job_finished = .{
+            .job = job,
+            .exit_code = exit_code,
+            .timestamp = std.time.milliTimestamp(),
+        } });
+        results.pushAssumeCapacity(
+            .{ .node = job, .result = .{
+                .exit_code = exit_code,
+                .duration_ns = timer.read(),
+                .msg = err_msg,
+            } },
+        );
         _ = self.running.swap(false, .seq_cst);
     }
 
@@ -71,4 +103,12 @@ pub const LocalRunner = struct {
         _ = self.running.swap(false, .seq_cst);
         self.joinThread();
     }
+
+    fn runCommandStep(
+        self: *LocalRunner,
+        gpa: std.mem.Allocator,
+        step: *task.Step,
+        job: *JobNode,
+        logs: *scheduler.LogQueue,
+    ) !i32 {}
 };

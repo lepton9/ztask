@@ -28,7 +28,7 @@ pub const Result = struct {
 
 const LogEvent = union(enum) {
     job_started: struct { job_node: *JobNode, timestamp: i64 },
-    job_output: struct { job_node: *JobNode, data: []const u8 },
+    job_output: struct { job_node: *JobNode, step: *task_zig.Step, data: []const u8 },
     job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
 };
 
