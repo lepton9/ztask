@@ -130,6 +130,11 @@ pub const LocalRunner = struct {
         });
         defer poller.deinit();
 
+        var stdout_r = poller.reader(.stdout);
+        var stderr_r = poller.reader(.stderr);
+        stdout_r.buffer = try gpa.alloc(u8, 128);
+        stderr_r.buffer = try gpa.alloc(u8, 128);
+
         // Read output
         while (try poller.poll()) {
             if (!self.running.load(.seq_cst)) {
@@ -141,8 +146,8 @@ pub const LocalRunner = struct {
                 };
             }
 
-            pollLogs(gpa, poller.reader(.stdout), step, job, logs);
-            pollLogs(gpa, poller.reader(.stderr), step, job, logs);
+            readLogs(gpa, stdout_r, step, job, logs);
+            readLogs(gpa, stderr_r, step, job, logs);
         }
 
         const term = try child.wait();
@@ -154,21 +159,20 @@ pub const LocalRunner = struct {
     }
 };
 
-fn pollLogs(
+fn readLogs(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
     step: *task.Step,
     job: *JobNode,
     logs: *scheduler.LogQueue,
 ) void {
-    const data = reader.readAlloc(gpa, 256) catch return;
+    const data = gpa.dupe(u8, reader.buffer[0..reader.end]) catch return;
+    reader.seek = 0;
+    reader.end = 0;
+
     logs.push(gpa, .{ .job_output = .{
         .job_node = job,
         .step = step,
         .data = data,
     } }) catch {};
-}
-
-fn readLogs(reader: *std.Io.Reader, gpa: std.mem.Allocator) ?[]u8 {
-    return reader.readAlloc(gpa, 256) catch null;
 }
