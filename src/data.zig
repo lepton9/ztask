@@ -272,10 +272,49 @@ pub const DataStore = struct {
         return self.tasks.getPtr(task_id);
     }
 
+    /// Find task metadata with task file path
+    pub fn findTaskMetaPath(self: *DataStore, file_path: []const u8) ?*TaskMetadata {
+        var it = self.tasks.valueIterator();
+        while (it.next()) |meta| {
+            if (std.mem.eql(u8, file_path, meta.file_path)) return meta;
+        }
+        return null;
+    }
+
     /// Parse and load task from file
-    pub fn loadTask(self: *DataStore, task_id: []const u8) ?*task.Task {
+    pub fn loadTask(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !?*task.Task {
         const meta = self.tasks.getPtr(task_id) orelse return null;
-        return try parse.loadTask(self.gpa, meta.file_path);
+        return parse.loadTask(gpa, meta.file_path);
+    }
+
+    /// Create a new task and metadata from file path
+    pub fn addTask(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        path: []const u8,
+    ) error{ OutOfMemory, InvalidTaskFile, TaskExists }!*TaskMetadata {
+        const cwd = std.fs.cwd();
+        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
+        defer file.close();
+        if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
+        var buf: [64]u8 = undefined;
+        const id = task.Id.fromStr(path);
+        const id_value = id.fmt(&buf) catch "";
+        if (self.tasks.getPtr(id_value)) |_| {
+            return error.TaskExists;
+        }
+        const meta = try TaskMetadata.init(gpa, .{
+            .file_path = path,
+            .id = id_value,
+            .name = "Unknown",
+        });
+        try self.tasks.put(gpa, meta.id, meta);
+        try self.writeTaskMeta(gpa, &meta);
+        return &meta;
     }
 
     /// Save task metadata to a JSON file
