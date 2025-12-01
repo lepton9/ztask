@@ -223,6 +223,7 @@ pub const DataStore = struct {
         const tasks_path = try self.tasksPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
+        try cwd.makePath(tasks_path);
         var dir = try cwd.openDir(tasks_path, .{ .iterate = true });
         defer dir.close();
         var it = dir.iterate();
@@ -296,7 +297,7 @@ pub const DataStore = struct {
         self: *DataStore,
         gpa: std.mem.Allocator,
         path: []const u8,
-    ) error{ OutOfMemory, InvalidTaskFile, TaskExists }!*TaskMetadata {
+    ) !*TaskMetadata {
         const cwd = std.fs.cwd();
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
@@ -307,7 +308,7 @@ pub const DataStore = struct {
         if (self.tasks.getPtr(id_value)) |_| {
             return error.TaskExists;
         }
-        const meta = try TaskMetadata.init(gpa, .{
+        var meta = try TaskMetadata.init(gpa, .{
             .file_path = path,
             .id = id_value,
             .name = "Unknown",

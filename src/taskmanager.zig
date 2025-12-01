@@ -22,12 +22,11 @@ pub const TaskManager = struct {
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     datastore: data.DataStore,
-    /// Task yaml files
-    task_files: std.ArrayList([]const u8),
     pool: *RunnerPool,
 
     /// Active schedulers
     schedulers: std.AutoHashMapUnmanaged(*Task, *Scheduler),
+    /// Tasks that are currently loaded
     loaded_tasks: std.StringArrayHashMapUnmanaged(*Task),
 
     watcher: *Watcher,
@@ -40,26 +39,22 @@ pub const TaskManager = struct {
             .gpa = gpa,
             .datastore = .init(data.root_dir),
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
-            .task_files = try .initCapacity(gpa, 5),
             .schedulers = .{},
             .loaded_tasks = .{},
             .watch_map = .{},
             .watcher = try Watcher.init(gpa),
         };
+        try self.datastore.loadTaskMetas(gpa);
         return self;
     }
 
     pub fn deinit(self: *TaskManager) void {
-        for (self.task_files.items) |path| {
-            self.gpa.free(path);
-        }
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
         self.loaded_tasks.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
         self.pool.deinit();
-        self.task_files.deinit(self.gpa);
         self.watcher.deinit();
         self.watch_map.deinit(self.gpa);
         self.datastore.deinit(self.gpa);
@@ -177,33 +172,30 @@ pub const TaskManager = struct {
                 std.debug.print("Remaining: {d}\n", .{
                     self.loaded_tasks.count() - 1,
                 });
-                self.unloadTask(s.*.task);
+                try self.unloadTask(s.*.task);
             },
             .waiting => {},
         };
     }
 
     /// Unload a task and its scheduler from memory
-    fn unloadTask(self: *TaskManager, t: *Task) void {
+    fn unloadTask(self: *TaskManager, t: *Task) !void {
         if (self.schedulers.fetchRemove(t)) |kv| {
-            // TODO: use only task ids
-            if (t.file_path) |path| _ = self.loaded_tasks.orderedRemove(path) else {
-                var buf: [64]u8 = undefined;
-                _ = self.loaded_tasks.orderedRemove(t.id.fmt(&buf) catch "");
-            }
+            var buf: [64]u8 = undefined;
+            _ = self.loaded_tasks.orderedRemove(try t.id.fmt(&buf));
             kv.value.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
     }
 
-    /// Parse task file and initialize a scheduler to run the task
+    /// Find task file and initialize a scheduler to run the task
     pub fn beginTask(
         self: *TaskManager,
-        task_file: []const u8,
-    ) (error{WatcherAddUnsupported} || anyerror)!void {
+        task_id: []const u8,
+    ) (error{ WatcherAddUnsupported, TaskNotFound } || anyerror)!void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const task = try self.loadTask(task_file);
+        const task = try self.loadTask(task_id);
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| break :blk s;
             const s = try Scheduler.init(self.gpa, task, self.pool, &self.datastore);
@@ -232,10 +224,18 @@ pub const TaskManager = struct {
     }
 
     /// Parse task file and load the task to memory
-    fn loadTask(self: *TaskManager, task_file: []const u8) !*Task {
-        return self.loaded_tasks.get(task_file) orelse blk: {
-            const task = try parse.loadTask(self.gpa, task_file);
-            try self.loaded_tasks.put(self.gpa, task_file, task);
+    pub fn loadTaskWithPath(self: *TaskManager, file_path: []const u8) !*Task {
+        const meta = self.datastore.findTaskMetaPath(file_path) orelse
+            return error.TaskNotFound;
+        return self.loadTask(meta.id);
+    }
+
+    /// Parse task file and load the task to memory
+    pub fn loadTask(self: *TaskManager, task_id: []const u8) !*Task {
+        return self.loaded_tasks.get(task_id) orelse blk: {
+            const task = try self.datastore.loadTask(self.gpa, task_id) orelse
+                return error.TaskNotFound;
+            try self.loaded_tasks.put(self.gpa, task_id, task);
 
             // Write task metadata
             if (task.file_path) |path| {
@@ -250,9 +250,20 @@ pub const TaskManager = struct {
         };
     }
 
-    /// Find all task files from a given directory
+    /// Create metadata for a task from file path
+    pub fn addTask(self: *TaskManager, file_path: []const u8) !void {
+        if (!std.fs.path.isAbsolute(file_path)) {
+            const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
+            defer self.gpa.free(real_path);
+            _ = try self.datastore.addTask(self.gpa, real_path);
+            return;
+        }
+        _ = try self.datastore.addTask(self.gpa, file_path);
+    }
+
+    /// Add all task files from a given directory
     /// Recurse all sub directories if the `recursive` flag is `true`
-    pub fn findTaskFiles(
+    pub fn addTasksInDir(
         self: *TaskManager,
         dir_path: []const u8,
         recursive: bool,
@@ -265,17 +276,14 @@ pub const TaskManager = struct {
         var it = dir.iterate();
         while (it.next() catch null) |entry| switch (entry.kind) {
             .file => {
-                if (parse.isTaskFile(entry.name)) {
-                    const path = try std.fs.path.join(
-                        self.gpa,
-                        &.{ dir_path, entry.name },
-                    );
-                    defer self.gpa.free(path);
-                    try self.task_files.append(
-                        self.gpa,
-                        try cwd.realpathAlloc(self.gpa, path),
-                    );
-                }
+                const path = try std.fs.path.join(self.gpa, &.{ dir_path, entry.name });
+                defer self.gpa.free(path);
+                const real_path = try cwd.realpathAlloc(self.gpa, path);
+                defer self.gpa.free(real_path);
+                self.addTask(real_path) catch |err| switch (err) {
+                    error.TaskExists => continue,
+                    else => return err,
+                };
             },
             .directory => {
                 if (!recursive) continue;
@@ -284,20 +292,10 @@ pub const TaskManager = struct {
                     &.{ dir_path, entry.name },
                 );
                 defer self.gpa.free(path);
-                try self.findTaskFiles(path, recursive);
+                try self.addTasksInDir(path, recursive);
             },
             else => continue,
         };
-    }
-
-    /// Find one task file from given path
-    pub fn findTaskFile(self: *TaskManager, path: []const u8) !void {
-        const cwd = std.fs.cwd();
-        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
-        defer file.close();
-        if (parse.isTaskFile(path)) {
-            try self.task_files.append(self.gpa, try cwd.realpathAlloc(self.gpa, path));
-        }
     }
 };
 
