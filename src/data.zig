@@ -13,9 +13,18 @@ pub const TaskMetadata = struct {
     file_path: []const u8,
     name: []const u8,
 
+    pub fn init(gpa: std.mem.Allocator, meta: TaskMetadata) !TaskMetadata {
+        return .{
+            .id = try gpa.dupe(u8, meta.id),
+            .file_path = try gpa.dupe(u8, meta.file_path),
+            .name = try gpa.dupe(u8, meta.name),
+        };
+    }
+
     pub fn deinit(self: *TaskMetadata, gpa: std.mem.Allocator) void {
         gpa.free(self.id);
         gpa.free(self.file_path);
+        gpa.free(self.name);
     }
 };
 
@@ -27,6 +36,13 @@ pub const TaskRunMetadata = struct {
     status: TaskRunStatus = .running,
     jobs_total: usize,
     jobs_completed: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator, meta: TaskRunMetadata) !TaskRunMetadata {
+        var self = meta;
+        self.task_id = try gpa.dupe(u8, meta.task_id);
+        if (meta.run_id) |id| self.run_id = try gpa.dupe(u8, id);
+        return self;
+    }
 
     pub fn deinit(self: *TaskRunMetadata, gpa: std.mem.Allocator) void {
         gpa.free(self.task_id);
@@ -40,6 +56,16 @@ pub const JobRunMetadata = struct {
     end_time: ?i64 = null,
     exit_code: ?i32 = null,
     status: JobRunStatus = .pending,
+
+    pub fn init(gpa: std.mem.Allocator, meta: JobRunMetadata) !JobRunMetadata {
+        var self = meta;
+        self.job_name = try gpa.dupe(u8, meta.job_name);
+        return self;
+    }
+
+    pub fn deinit(self: *JobRunMetadata, gpa: std.mem.Allocator) void {
+        gpa.free(self.job_name);
+    }
 };
 
 pub const DataStore = struct {
@@ -58,6 +84,11 @@ pub const DataStore = struct {
             runs.deinit(gpa);
         }
         self.task_runs.deinit(gpa);
+
+        var tasks_it = self.tasks.iterator();
+        while (tasks_it.next()) |e| {
+            e.value_ptr.deinit(gpa);
+        }
         self.tasks.deinit(gpa);
     }
 
@@ -188,7 +219,7 @@ pub const DataStore = struct {
     }
 
     /// Load all the task metafiles
-    pub fn loadTasks(self: *DataStore, gpa: std.mem.Allocator) !void {
+    pub fn loadTaskMetas(self: *DataStore, gpa: std.mem.Allocator) !void {
         const tasks_path = try self.tasksPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
@@ -275,7 +306,7 @@ fn parseMetaFile(
     const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{}) catch
         return error.InvalidMetaDataFile;
     defer json.deinit();
-    return json.value;
+    return try T.init(gpa, json.value);
 }
 
 /// Encodes value to a JSON string
