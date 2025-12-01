@@ -51,7 +51,11 @@ pub const TaskManager = struct {
     pub fn deinit(self: *TaskManager) void {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
-        for (self.loaded_tasks.values()) |t| t.deinit(self.gpa);
+        var lt_it = self.loaded_tasks.iterator();
+        while (lt_it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            e.value_ptr.*.deinit(self.gpa);
+        }
         self.loaded_tasks.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
         self.pool.deinit();
@@ -169,9 +173,6 @@ pub const TaskManager = struct {
             },
             .inactive => {
                 std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path.?});
-                std.debug.print("Remaining: {d}\n", .{
-                    self.loaded_tasks.count() - 1,
-                });
                 try self.unloadTask(s.*.task);
             },
             .waiting => {},
@@ -182,7 +183,8 @@ pub const TaskManager = struct {
     fn unloadTask(self: *TaskManager, t: *Task) !void {
         if (self.schedulers.fetchRemove(t)) |kv| {
             var buf: [64]u8 = undefined;
-            _ = self.loaded_tasks.orderedRemove(try t.id.fmt(&buf));
+            const lt = self.loaded_tasks.fetchOrderedRemove(try t.id.fmt(&buf));
+            if (lt) |e| self.gpa.free(e.key);
             kv.value.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
@@ -235,12 +237,12 @@ pub const TaskManager = struct {
         return self.loaded_tasks.get(task_id) orelse blk: {
             const task = try self.datastore.loadTask(self.gpa, task_id) orelse
                 return error.TaskNotFound;
-            try self.loaded_tasks.put(self.gpa, task_id, task);
+            const id = try self.gpa.dupe(u8, task_id); // TODO: store task id in task
+            try self.loaded_tasks.put(self.gpa, id, task);
 
-            // Write task metadata
             if (task.file_path) |path| {
                 var buf: [64]u8 = undefined;
-                try self.datastore.writeTaskMeta(self.gpa, &.{
+                try self.datastore.updateTaskMeta(self.gpa, task_id, .{
                     .id = try task.id.fmt(&buf),
                     .name = task.name,
                     .file_path = path,
@@ -309,14 +311,16 @@ test "manager_simple" {
         \\ name: task2
         \\ id: 2
     ;
-    var task1_buf: [64]u8 = undefined;
-    var task2_buf: [64]u8 = undefined;
+    var buf: [64]u8 = undefined;
     const task_manager = try TaskManager.init(gpa);
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    try task_manager.loaded_tasks.put(gpa, try task1.id.fmt(&task1_buf), task1);
-    try task_manager.loaded_tasks.put(gpa, try task2.id.fmt(&task2_buf), task2);
+    const task1_id = try gpa.dupe(u8, try task1.id.fmt(&buf));
+    const task2_id = try gpa.dupe(u8, try task2.id.fmt(&buf));
+
+    try task_manager.loaded_tasks.put(gpa, task1_id, task1);
+    try task_manager.loaded_tasks.put(gpa, task2_id, task2);
 
     try std.testing.expect(task_manager.schedulers.count() == 0);
 
@@ -338,7 +342,7 @@ test "force_interrupt" {
     const gpa = std.testing.allocator;
     const task_file =
         \\ name: task
-        \\ id: 1
+        \\ id: 3
         \\ jobs:
         \\   run:
         \\     steps:
@@ -352,10 +356,13 @@ test "force_interrupt" {
     const task_manager = try TaskManager.init(gpa);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
-    const task_id = try task.id.fmt(&task_buf);
+    const task_id = try gpa.dupe(u8, try task.id.fmt(&task_buf));
     try task_manager.loaded_tasks.put(gpa, task_id, task);
     try task_manager.start();
     _ = try task_manager.beginTask(task_id);
     // Interrupt while running
     task_manager.stop();
+
+    var it = task_manager.schedulers.valueIterator();
+    while (it.next()) |s| try std.testing.expect(s.*.status == .inactive);
 }

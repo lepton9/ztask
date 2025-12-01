@@ -26,6 +26,11 @@ pub const TaskMetadata = struct {
         gpa.free(self.file_path);
         gpa.free(self.name);
     }
+
+    fn update(self: *TaskMetadata, gpa: std.mem.Allocator, meta: TaskMetadata) !void {
+        self.deinit(gpa);
+        self.* = try .init(gpa, meta);
+    }
 };
 
 pub const TaskRunMetadata = struct {
@@ -318,6 +323,17 @@ pub const DataStore = struct {
         return &meta;
     }
 
+    pub fn updateTaskMeta(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        updated_meta: TaskMetadata,
+    ) !void {
+        var meta = self.getTaskMetadata(task_id) orelse return error.TaskNotFound;
+        try meta.update(gpa, updated_meta);
+        try self.writeTaskMeta(gpa, meta);
+    }
+
     /// Save task metadata to a JSON file
     pub fn writeTaskMeta(
         self: *DataStore,
@@ -328,7 +344,7 @@ pub const DataStore = struct {
         defer gpa.free(path);
         const content = try toJson(gpa, meta);
         defer gpa.free(content);
-        try writeFile(path, content, .{ .make_path = true });
+        try writeFile(path, content, .{ .make_path = true, .truncate = true });
     }
 };
 
