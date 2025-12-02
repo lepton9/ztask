@@ -81,6 +81,18 @@ pub const TaskManager = struct {
         self.stopSchedulers();
     }
 
+    /// Checks if there are any schedulers waiting or running tasks
+    pub fn hasTasksRunning(self: *TaskManager) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.schedulers.valueIterator();
+        while (it.next()) |s| switch (s.*.status) {
+            .running, .waiting => return true,
+            else => continue,
+        };
+        return false;
+    }
+
     /// End all running schedulers
     fn stopSchedulers(self: *TaskManager) void {
         var it = self.schedulers.valueIterator();
@@ -103,7 +115,7 @@ pub const TaskManager = struct {
                 s.*.status = .inactive;
                 self.removeFromWatchList(s);
             },
-            .inactive => {},
+            else => {},
         }
     }
 
@@ -161,20 +173,18 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
-            .running => {
-                s.*.update();
-                continue;
-            },
+            .running => s.*.update(),
             .completed => {
-                std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path.?});
+                std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path orelse ""});
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
             },
             .inactive => {
-                std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path.?});
+                std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path orelse ""});
                 try self.unloadTask(s.*.task);
             },
+            .interrupted => s.*.status = .inactive,
             .waiting => {},
         };
     }
@@ -254,6 +264,8 @@ pub const TaskManager = struct {
 
     /// Create metadata for a task from file path
     pub fn addTask(self: *TaskManager, file_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (!std.fs.path.isAbsolute(file_path)) {
             const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
             defer self.gpa.free(real_path);
@@ -364,5 +376,55 @@ test "force_interrupt" {
     task_manager.stop();
 
     var it = task_manager.schedulers.valueIterator();
-    while (it.next()) |s| try std.testing.expect(s.*.status == .inactive);
+    while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
+}
+
+test "complete_tasks" {
+    const gpa = std.testing.allocator;
+    const task1_file =
+        \\ name: task1
+        \\ id: 4
+        \\ jobs:
+        \\   version:
+        \\     steps:
+        \\       - command: "zig version"
+        \\   help:
+        \\     steps:
+        \\       - command: "zig help"
+    ;
+    const task2_file =
+        \\ name: task2
+        \\ id: 5
+        \\ jobs:
+        \\   version:
+        \\     steps:
+        \\       - command: "zig version"
+        \\     deps: [help]
+        \\   help:
+        \\     steps:
+        \\       - command: "zig help"
+    ;
+    var buf: [64]u8 = undefined;
+    const task_manager = try TaskManager.init(gpa);
+    defer task_manager.deinit();
+    const task1 = try parse.parseTaskBuffer(gpa, task1_file);
+    const task2 = try parse.parseTaskBuffer(gpa, task2_file);
+    const task1_id = try gpa.dupe(u8, try task1.id.fmt(&buf));
+    const task2_id = try gpa.dupe(u8, try task2.id.fmt(&buf));
+    try task_manager.loaded_tasks.put(gpa, task1_id, task1);
+    try task_manager.loaded_tasks.put(gpa, task2_id, task2);
+
+    try task_manager.start();
+
+    // Start tasks
+    for (task_manager.loaded_tasks.keys()) |key| {
+        _ = try task_manager.beginTask(key);
+    }
+    // Wait for completion
+    while (task_manager.hasTasksRunning()) {}
+
+    try std.testing.expect(task_manager.loaded_tasks.count() == 0);
+    try std.testing.expect(task_manager.schedulers.count() == 0);
+
+    task_manager.stop();
 }

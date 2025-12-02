@@ -38,7 +38,7 @@ pub const LogQueue = queue_zig.Queue(LogEvent);
 /// Scheduler for executing one task
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
-    status: enum { running, completed, waiting, inactive },
+    status: enum { running, completed, waiting, inactive, interrupted },
     datastore: *data.DataStore,
     task: *Task,
     pool: *RunnerPool,
@@ -234,7 +234,7 @@ pub const Scheduler = struct {
 
     /// Force stop if scheduler is running and skip remaining jobs
     pub fn forceStop(self: *Scheduler) void {
-        self.status = .inactive;
+        self.status = if (self.status == .running) .interrupted else .inactive;
         self.handleResults();
         self.queue.clearRetainingCapacity();
 

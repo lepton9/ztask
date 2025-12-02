@@ -35,7 +35,7 @@ pub const RunLogger = struct {
         defer gpa.free(file_path);
         const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try data.writeFile(file_path, json, .{});
+        try data.writeFile(file_path, json, .{ .truncate = true });
     }
 
     /// Write job metadata to a JSON file
@@ -52,7 +52,7 @@ pub const RunLogger = struct {
         defer gpa.free(file_path);
         const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try data.writeFile(file_path, json, .{});
+        try data.writeFile(file_path, json, .{ .truncate = true });
     }
 
     /// Record the initial state of the task in a metadata file
