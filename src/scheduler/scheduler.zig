@@ -198,15 +198,25 @@ pub const Scheduler = struct {
         std.debug.assert(self.queue.items.len > 0);
     }
 
-    /// Try to put more jobs to queue
-    pub fn tryScheduleJobs(self: *Scheduler) void {
+    /// Try to run more jobs from the queue
+    fn tryScheduleJobs(self: *Scheduler) void {
         for (0..self.queue.items.len) |_| {
-            if (!self.requestRunner()) return;
+            if (!self.tryScheduleNext()) return;
         }
     }
 
-    /// Run the next job from queue with the provided runner
-    fn runNextJob(self: *Scheduler, runner: *LocalRunner) void {
+    /// Try to run the next job from queue
+    fn tryScheduleNext(self: *Scheduler) bool {
+        if (self.queue.items.len == 0) return false;
+        const node = self.queue.items[0];
+        return switch (node.ptr.run_on) {
+            .local => self.requestRunner(),
+            .remote => @panic("TODO"),
+        };
+    }
+
+    /// Run the next job from queue with the provided local runner
+    fn runNextJobLocal(self: *Scheduler, runner: *LocalRunner) void {
         if (self.queue.items.len == 0) return;
         const node = self.queue.orderedRemove(0);
         self.active_runners.putAssumeCapacity(node, runner);
@@ -218,9 +228,9 @@ pub const Scheduler = struct {
     }
 
     /// Request executor from the pool
-    pub fn requestRunner(self: *Scheduler) bool {
+    fn requestRunner(self: *Scheduler) bool {
         if (self.pool.tryAcquire()) |runner| {
-            self.runNextJob(runner);
+            self.runNextJobLocal(runner);
             return true;
         }
         self.pool.waitForRunner(self);
