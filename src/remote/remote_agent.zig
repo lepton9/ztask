@@ -22,7 +22,7 @@ const RemoteAgent = struct {
     /// Jobs currently running
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
-    address: std.net.Address,
+    address: ?std.net.Address = null,
     conn: ?std.net.Stream = null,
 
     pub fn init(gpa: std.mem.Allocator) !*RemoteAgent {
@@ -48,10 +48,40 @@ const RemoteAgent = struct {
 
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
-        while (self.running.load(.seq_cst)) {}
+        while (self.running.load(.seq_cst)) {
+            self.handleResults();
+            self.handleLogs();
+        }
     }
 
     pub fn connect(_: *RemoteAgent) void {}
+
+    /// Handle the completed job results
+    fn handleResults(self: *RemoteAgent) void {
+        while (self.result_queue.pop()) |res| {
+            const kv = self.active_runners.fetchRemove(res.node) orelse unreachable;
+            const runner = kv.value;
+            runner.joinThread();
+            self.pool.release(runner);
+            // TODO: handle sending result message to server
+        }
+    }
+
+    /// Handle the job log events in the queue
+    fn handleLogs(self: *RemoteAgent) void {
+        while (self.log_queue.pop()) |event| switch (event) {
+            .job_started => |_| {
+                // TODO: send metadata to server
+            },
+            .job_output => |e| {
+                defer self.gpa.free(e.data); // Allocated by runner
+                // TODO: send log to server
+            },
+            .job_finished => |_| {
+                // TODO: send metadata to server
+            },
+        };
+    }
 
     /// Run the next job from queue with the provided local runner
     fn runNextJobLocal(self: *RemoteAgent, runner: *LocalRunner) void {
