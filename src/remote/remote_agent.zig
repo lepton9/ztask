@@ -53,8 +53,32 @@ const RemoteAgent = struct {
 
     pub fn connect(_: *RemoteAgent) void {}
 
+    /// Run the next job from queue with the provided local runner
+    fn runNextJobLocal(self: *RemoteAgent, runner: *LocalRunner) void {
+        if (self.queue.items.len == 0) {
+            self.pool.release(runner);
+            return;
+        }
+        const node = self.queue.orderedRemove(0);
+        self.active_runners.putAssumeCapacity(node, runner);
+        runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
+    }
+
+    /// Request a runner from the pool
+    fn requestRunner(self: *RemoteAgent) bool {
+        if (self.pool.tryAcquire()) |runner| {
+            self.runNextJob(runner);
+            return true;
+        }
+        self.pool.waitForRunner(
+            .{ .ptr = self, .callback = &RemoteAgent.onRunnerAvailable },
+        );
+        return false;
+    }
+
     /// Callback to receive a runner
-    fn onRunnerAvailable(_: *anyopaque) void {
-        // const self: *@This() = @ptrCast(@alignCast(opq));
+    fn onRunnerAvailable(opq: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(opq));
+        _ = self.requestRunner();
     }
 };

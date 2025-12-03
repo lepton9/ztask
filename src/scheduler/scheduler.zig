@@ -206,7 +206,10 @@ pub const Scheduler = struct {
 
     /// Run the next job from queue with the provided local runner
     fn runNextJobLocal(self: *Scheduler, runner: *LocalRunner) void {
-        if (self.queue.items.len == 0) return;
+        if (self.queue.items.len == 0) {
+            self.pool.release(runner);
+            return;
+        }
         const node = self.queue.orderedRemove(0);
         self.active_runners.putAssumeCapacity(node, runner);
         self.logger.startJob(
