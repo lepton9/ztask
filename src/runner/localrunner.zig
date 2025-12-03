@@ -1,8 +1,23 @@
 const std = @import("std");
-const scheduler = @import("../scheduler/scheduler.zig");
+const queue = @import("../queue.zig");
 const task = @import("task");
-const Scheduler = scheduler.Scheduler;
-const JobNode = scheduler.JobNode;
+
+const Node = @import("../scheduler/dag.zig").Node;
+pub const JobNode = Node(task.Job);
+
+pub const Result = struct {
+    node: *JobNode,
+    result: ExecResult,
+};
+
+pub const LogEvent = union(enum) {
+    job_started: struct { job_node: *JobNode, timestamp: i64 },
+    job_output: struct { job_node: *JobNode, step: *task.Step, data: []const u8 },
+    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
+};
+
+pub const ResultQueue = queue.Queue(Result);
+pub const LogQueue = queue.Queue(LogEvent);
 
 pub const ExecResult = struct {
     exit_code: i32,
@@ -20,8 +35,8 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         job: *JobNode,
-        results: *scheduler.ResultQueue,
-        logs: *scheduler.LogQueue,
+        results: *ResultQueue,
+        logs: *LogQueue,
     ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -48,8 +63,8 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         job: *JobNode,
-        results: *scheduler.ResultQueue,
-        logs: *scheduler.LogQueue,
+        results: *ResultQueue,
+        logs: *LogQueue,
     ) void {
         var timer = std.time.Timer.start() catch unreachable;
         std.debug.print("- Start job {s}\n", .{job.ptr.name});
@@ -110,7 +125,7 @@ pub const LocalRunner = struct {
         gpa: std.mem.Allocator,
         step: *task.Step,
         job: *JobNode,
-        logs: *scheduler.LogQueue,
+        logs: *LogQueue,
     ) !i32 {
         // Create args
         var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
@@ -164,7 +179,7 @@ fn readLogs(
     reader: *std.Io.Reader,
     step: *task.Step,
     job: *JobNode,
-    logs: *scheduler.LogQueue,
+    logs: *LogQueue,
 ) void {
     const data = gpa.dupe(u8, reader.buffer[0..reader.end]) catch return;
     reader.seek = 0;

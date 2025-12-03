@@ -3,7 +3,6 @@ const data = @import("../data.zig");
 const task_zig = @import("task");
 const dag = @import("dag.zig");
 const log = @import("../logger.zig");
-const queue_zig = @import("../queue.zig");
 const localrunner = @import("../runner/localrunner.zig");
 
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
@@ -16,24 +15,14 @@ const ErrorDAG = dag.ErrorDAG;
 
 test {
     _ = dag;
-    _ = queue_zig;
+    _ = @import("../queue.zig");
 }
 
-pub const JobNode = Node(Job);
-
-pub const Result = struct {
-    node: *JobNode,
-    result: ExecResult,
-};
-
-const LogEvent = union(enum) {
-    job_started: struct { job_node: *JobNode, timestamp: i64 },
-    job_output: struct { job_node: *JobNode, step: *task_zig.Step, data: []const u8 },
-    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
-};
-
-pub const ResultQueue = queue_zig.Queue(Result);
-pub const LogQueue = queue_zig.Queue(LogEvent);
+const JobNode = localrunner.JobNode;
+const Result = localrunner.Result;
+const LogEvent = localrunner.LogEvent;
+const ResultQueue = localrunner.ResultQueue;
+const LogQueue = localrunner.LogQueue;
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
@@ -227,7 +216,7 @@ pub const Scheduler = struct {
         runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
     }
 
-    /// Request executor from the pool
+    /// Request a runner from the pool
     fn requestRunner(self: *Scheduler) bool {
         if (self.pool.tryAcquire()) |runner| {
             self.runNextJobLocal(runner);
@@ -239,7 +228,7 @@ pub const Scheduler = struct {
         return false;
     }
 
-    /// Callback to receive an executor
+    /// Callback to receive a runner
     fn onRunnerAvailable(opq: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
         _ = self.requestRunner();
