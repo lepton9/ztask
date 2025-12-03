@@ -1,6 +1,7 @@
 const std = @import("std");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
+const protocol = @import("protocol.zig");
 
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
@@ -10,9 +11,12 @@ const LogQueue = localrunner.LogQueue;
 // TODO: configurable
 const BASE_RUNNERS_N = 10;
 
-const RemoteAgent = struct {
+pub const RemoteAgent = struct {
     gpa: std.mem.Allocator,
     running: std.atomic.Value(bool) = .init(false),
+    hostname: []const u8 = "remoterunner1", // TODO:
+    buffer: [256]u8 = undefined,
+
     pool: *runnerpool.RunnerPool,
     result_queue: *ResultQueue,
     log_queue: *LogQueue,
@@ -28,6 +32,7 @@ const RemoteAgent = struct {
     pub fn init(gpa: std.mem.Allocator) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
         agent.* = .{
+            .gpa = gpa,
             .pool = try runnerpool.RunnerPool.init(gpa, BASE_RUNNERS_N),
             .result_queue = try ResultQueue.init(gpa, BASE_RUNNERS_N),
             .log_queue = try LogQueue.init(gpa, 10),
@@ -37,7 +42,7 @@ const RemoteAgent = struct {
         return agent;
     }
 
-    pub fn deinit(self: *RemoteAgent) !*RemoteAgent {
+    pub fn deinit(self: *RemoteAgent) void {
         self.pool.deinit();
         self.result_queue.deinit(self.gpa);
         self.log_queue.deinit(self.gpa);
@@ -49,12 +54,31 @@ const RemoteAgent = struct {
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
+            // send heartbeat packet
+            // listen for packets
             self.handleResults();
             self.handleLogs();
         }
     }
 
-    pub fn connect(_: *RemoteAgent) void {}
+    pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
+        if (self.conn) |_| return error.AlreadyConnected;
+        self.conn = try std.net.tcpConnectToAddress(addr);
+        try self.register();
+    }
+
+    fn register(_: *RemoteAgent) !void {}
+
+    // Send message to server
+    fn sendFrame(self: *RemoteAgent, payload: []const u8) !void {
+        const conn = self.conn orelse return error.NotConnected;
+        return protocol.sendFrame(&conn, &self.buffer, payload);
+    }
+
+    // TODO:
+    fn listen(_: *RemoteAgent) !void {
+        // const msg = connection.readFrame();
+    }
 
     /// Handle the completed job results
     fn handleResults(self: *RemoteAgent) void {
