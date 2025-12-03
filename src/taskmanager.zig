@@ -28,6 +28,8 @@ pub const TaskManager = struct {
     schedulers: std.AutoHashMapUnmanaged(*Task, *Scheduler),
     /// Tasks that are currently loaded
     loaded_tasks: std.StringArrayHashMapUnmanaged(*Task),
+    /// Tasks to unload from memory
+    to_unload: std.ArrayList(*Task),
 
     watcher: *Watcher,
     /// Maps paths to active schedulers
@@ -41,6 +43,7 @@ pub const TaskManager = struct {
             .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
             .schedulers = .{},
             .loaded_tasks = .{},
+            .to_unload = try .initCapacity(gpa, 1),
             .watch_map = .{},
             .watcher = try Watcher.init(gpa),
         };
@@ -57,6 +60,7 @@ pub const TaskManager = struct {
             e.value_ptr.*.deinit(self.gpa);
         }
         self.loaded_tasks.deinit(self.gpa);
+        self.to_unload.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
         self.pool.deinit();
         self.watcher.deinit();
@@ -182,11 +186,15 @@ pub const TaskManager = struct {
             },
             .inactive => {
                 std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path orelse ""});
-                try self.unloadTask(s.*.task);
+                try self.to_unload.append(self.gpa, s.*.task);
             },
             .interrupted => s.*.status = .inactive,
             .waiting => {},
         };
+
+        // Unload any tasks
+        for (self.to_unload.items) |task| try self.unloadTask(task);
+        self.to_unload.clearRetainingCapacity();
     }
 
     /// Unload a task and its scheduler from memory
@@ -195,7 +203,9 @@ pub const TaskManager = struct {
             var buf: [64]u8 = undefined;
             const lt = self.loaded_tasks.fetchOrderedRemove(try t.id.fmt(&buf));
             if (lt) |e| self.gpa.free(e.key);
-            kv.value.deinit(); // Free scheduler
+            var s = kv.value;
+            self.removeFromWatchList(s);
+            s.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
     }
@@ -422,9 +432,8 @@ test "complete_tasks" {
     }
     // Wait for completion
     while (task_manager.hasTasksRunning()) {}
+    task_manager.stop();
 
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
     try std.testing.expect(task_manager.schedulers.count() == 0);
-
-    task_manager.stop();
 }
