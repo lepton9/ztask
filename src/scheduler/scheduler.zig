@@ -233,12 +233,15 @@ pub const Scheduler = struct {
             self.runNextJobLocal(runner);
             return true;
         }
-        self.pool.waitForRunner(self);
+        self.pool.waitForRunner(
+            .{ .ptr = self, .callback = &Scheduler.onRunnerAvailable },
+        );
         return false;
     }
 
     /// Callback to receive an executor
-    pub fn onRunnerAvailable(self: *Scheduler) void {
+    fn onRunnerAvailable(opq: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(opq));
         _ = self.requestRunner();
     }
 

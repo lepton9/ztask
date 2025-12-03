@@ -1,20 +1,27 @@
 const std = @import("std");
 const LocalRunner = @import("localrunner.zig").LocalRunner;
-const Scheduler = @import("../scheduler/scheduler.zig").Scheduler;
+
+/// A waiter waiting for a free runner
+pub fn Waiter(comptime T: type) type {
+    return struct {
+        ptr: *T,
+        callback: *const fn (*T) void,
+    };
+}
 
 pub const RunnerPool = struct {
     gpa: std.mem.Allocator,
     runners: []LocalRunner,
     free_idx: std.ArrayList(usize),
-    waiters: std.ArrayList(*Scheduler),
+    waiters: std.ArrayList(Waiter(anyopaque)),
 
     pub fn init(gpa: std.mem.Allocator, n: usize) !*RunnerPool {
         const pool = try gpa.create(RunnerPool);
         pool.* = .{
             .gpa = gpa,
             .runners = try gpa.alloc(LocalRunner, n),
-            .free_idx = try std.ArrayList(usize).initCapacity(gpa, n),
-            .waiters = try std.ArrayList(*Scheduler).initCapacity(gpa, 3),
+            .free_idx = try .initCapacity(gpa, n),
+            .waiters = try .initCapacity(gpa, 3),
         };
         for (pool.runners, 0..) |*runner, i| {
             pool.free_idx.appendAssumeCapacity(i);
@@ -47,15 +54,15 @@ pub const RunnerPool = struct {
         self.notifyNextWaiter();
     }
 
-    /// Notify a waiting scheduler that a runner is available
+    /// Notify the next waiter that a runner is available
     fn notifyNextWaiter(self: *RunnerPool) void {
         if (self.waiters.pop()) |waiter| {
-            waiter.onRunnerAvailable();
+            waiter.callback(waiter.ptr);
         }
     }
 
-    /// Put scheduler to a waiting queue
-    pub fn waitForRunner(self: *RunnerPool, scheduler: *Scheduler) void {
-        self.waiters.append(self.gpa, scheduler) catch {};
+    /// Put a new waiter to the waiting queue
+    pub fn waitForRunner(self: *RunnerPool, w: Waiter(anyopaque)) void {
+        self.waiters.append(self.gpa, w) catch {};
     }
 };
