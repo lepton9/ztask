@@ -6,12 +6,9 @@ const LogQueue = localrunner.LogQueue;
 
 pub const RemoteManager = struct {
     gpa: std.mem.Allocator,
-    running: std.atomic.Value(bool) = .init(false),
-    server: std.net.Server,
-    accept_thread: ?std.Thread = null,
+    server: ?std.net.Server = null,
 
-    result_queue: *ResultQueue,
-    log_queue: *LogQueue,
+    // agents: std.AutoHashMapUnmanaged([]const u8, AgentHandle),
 
     pub fn init(gpa: std.mem.Allocator) !*RemoteManager {
         const manager = try gpa.create(RemoteManager);
@@ -22,26 +19,29 @@ pub const RemoteManager = struct {
     }
 
     pub fn deinit(self: *RemoteManager) void {
+        self.stop();
         self.gpa.destroy(self);
     }
 
-    pub fn start(self: *RemoteManager) void {
-        if (self.running.load(.seq_cst) or self.accept_thread != null)
-            return error.AlreadyRunning;
-        self.running.store(true, .seq_cst);
-        errdefer self.running.store(false, .seq_cst);
-        self.accept_thread = try .spawn(.{}, acceptLoop, .{self});
+    pub fn start(self: *RemoteManager, addr: std.net.Address) !void {
+        errdefer self.stop();
+        self.server = try addr.listen(.{ .force_nonblocking = true });
     }
 
     pub fn stop(self: *RemoteManager) void {
-        if (!self.running.load(.seq_cst)) return;
-        self.running.swap(false, .seq_cst);
-        if (self.accept_thread) |t| t.join();
+        if (self.server) |*s| s.deinit();
+        self.server = null;
     }
 
-    fn acceptLoop(self: *RemoteManager) void {
-        while (self.running.load(.seq_cst)) {}
+    pub fn update(self: *RemoteManager) !void {
+        var server = if (self.server) |*s| s else return;
+        const conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => return,
+            else => {
+                std.debug.print("remote manager err: {}\n", .{err});
+                return;
+            },
+        };
+        std.log.debug("New connection: {any}\n", .{conn.address});
     }
-
-    pub fn update(_: *RemoteManager) void {}
 };
