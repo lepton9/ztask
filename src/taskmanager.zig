@@ -91,8 +91,8 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
-            .running, .waiting => return true,
-            else => continue,
+            .inactive => continue,
+            else => return true,
         };
         return false;
     }
