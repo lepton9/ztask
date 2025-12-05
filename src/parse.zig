@@ -15,6 +15,7 @@ pub const ParseError = error{
     DuplicateKey,
     InvalidStep,
     InvalidStepKind,
+    InvalidTrigger,
     InvalidFieldType,
 };
 
@@ -30,17 +31,19 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
         break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
     };
 
-    var trigger: ?task.Trigger = null;
-    errdefer if (trigger) |t| t.deinit(gpa);
-
     // Trigger
-    if (map.get("on")) |on_val| {
+    const trigger: ?task.Trigger = blk: {
+        const on_val = map.get("on") orelse break :blk null;
         const on = on_val.asMap() orelse return ParseError.InvalidFieldType;
         if (on.get("watch")) |watch| {
             const path = watch.asScalar() orelse return ParseError.InvalidFieldType;
-            trigger = .{ .watch = .{ .path = try gpa.dupe(u8, path), .type = .file } };
+            break :blk .{
+                .watch = .{ .path = try gpa.dupe(u8, path), .type = .file },
+            };
         }
-    }
+        return ParseError.InvalidTrigger;
+    };
+    errdefer if (trigger) |t| t.deinit(gpa);
 
     // Parse all jobs
     var jobs = try parseJobs(gpa, map);
@@ -199,6 +202,19 @@ test "missing_name" {
     ;
     try std.testing.expect(
         parseTaskBuffer(std.testing.allocator, source) == ParseError.UnnamedTask,
+    );
+}
+
+test "empty_trigger" {
+    const source =
+        \\ name: trigger
+        \\ on:
+        \\ jobs:
+        \\   jobname:
+        \\     steps: []
+    ;
+    try std.testing.expect(
+        parseTaskBuffer(std.testing.allocator, source) == ParseError.InvalidTrigger,
     );
 }
 
