@@ -5,11 +5,19 @@ const watcher = @import("../watcher.zig");
 const FileWatcher = watcher.FileWatcher;
 const EventQueue = watcher.EventQueue;
 const EventType = watcher.EventType;
+const splitPath = watcher.splitPath;
+
+const Dir = struct {
+    dirname: []const u8,
+    watch_self: bool = false,
+    file_table: std.StringHashMapUnmanaged([]const u8),
+};
 
 pub const FileWatcherLinux = struct {
     fd: i32,
-    wd_map: std.AutoHashMap(i32, []const u8),
-    buffer: [65536]u8 = undefined,
+    wd_map: std.AutoHashMapUnmanaged(i32, Dir),
+    dir_to_wd: std.StringHashMapUnmanaged(i32),
+    buffer: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined,
 
     pub fn filewatcher(gpa: std.mem.Allocator) !FileWatcher {
         return .{
@@ -28,7 +36,8 @@ pub const FileWatcherLinux = struct {
         const w = try gpa.create(FileWatcherLinux);
         w.* = .{
             .fd = try std.posix.inotify_init1(std.os.linux.IN.NONBLOCK),
-            .wd_map = std.AutoHashMap(i32, []const u8).init(gpa),
+            .wd_map = .{},
+            .dir_to_wd = .{},
         };
         return w;
     }
@@ -36,30 +45,56 @@ pub const FileWatcherLinux = struct {
     fn deinit(opq: *anyopaque, gpa: std.mem.Allocator) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
         std.posix.close(self.fd);
-        self.wd_map.deinit();
+        var it = self.wd_map.iterator();
+        while (it.next()) |e| {
+            e.value_ptr.file_table.deinit(gpa);
+        }
+        self.dir_to_wd.deinit(gpa);
+        self.wd_map.deinit(gpa);
         gpa.destroy(self);
     }
 
     /// Add a file path to watch list
-    fn addWatch(opq: *anyopaque, path: []const u8) !void {
+    fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        // TODO: handle dirs and wildcards
-        const wd = try std.posix.inotify_add_watch(
+        // TODO: handle wildcards
+
+        const p = try splitPath(path);
+
+        const wd = std.posix.inotify_add_watch(
             self.fd,
-            path,
-            linux.IN.MODIFY | linux.IN.CLOSE_WRITE | linux.IN.ATTRIB |
-                linux.IN.MOVE_SELF | linux.IN.DELETE_SELF | linux.IN.IGNORED,
-        );
-        try self.wd_map.put(wd, path);
+            p.dirname,
+            linux.IN.CLOSE_WRITE | linux.IN.ONLYDIR | linux.IN.DELETE | linux.IN.EXCL_UNLINK,
+        ) catch |err| blk: {
+            break :blk self.dir_to_wd.get(p.dirname) orelse return err;
+        };
+
+        try self.dir_to_wd.put(gpa, p.dirname, wd);
+        const res = try self.wd_map.getOrPut(gpa, wd);
+        if (!res.found_existing) {
+            res.value_ptr.* = .{ .dirname = p.dirname, .file_table = .{} };
+        }
+
+        if (p.basename) |base| {
+            try res.value_ptr.*.file_table.put(gpa, base, path);
+        } else res.value_ptr.watch_self = true;
     }
 
+    /// Remove a path from watch list
     fn removeWatch(opq: *anyopaque, path: []const u8) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        var it = self.wd_map.iterator();
-        while (it.next()) |e| if (std.mem.eql(u8, e.value_ptr.*, path)) {
-            _ = self.wd_map.remove(e.key_ptr.*);
-            return;
-        };
+        const p = splitPath(path) catch return;
+        const wd = self.dir_to_wd.get(p.dirname) orelse return;
+
+        var dir = self.wd_map.get(wd) orelse return;
+        if (p.basename) |base| {
+            _ = dir.file_table.remove(base);
+        } else dir.watch_self = false;
+
+        if (!dir.watch_self and dir.file_table.count() == 0) {
+            _ = self.wd_map.remove(wd);
+            _ = self.dir_to_wd.remove(dir.dirname);
+        }
     }
 
     /// Get the amount of paths to watch
@@ -74,16 +109,18 @@ pub const FileWatcherLinux = struct {
         out: *EventQueue,
     ) !void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        const event_size = @sizeOf(std.os.linux.inotify_event);
-        var buf = self.buffer;
 
-        const n = try std.posix.read(self.fd, &buf);
+        const bytes_read = try std.posix.read(self.fd, &self.buffer);
+        var ptr: [*]u8 = &self.buffer;
+        const end_ptr = ptr + bytes_read;
 
-        var offset: usize = 0;
-        while (offset < n) {
-            const ev: *align(1) std.os.linux.inotify_event =
-                @ptrCast(&buf[offset]);
-            const path = self.wd_map.get(ev.wd) orelse break;
+        while (@intFromPtr(ptr) < @intFromPtr(end_ptr)) {
+            const ev = @as(*const linux.inotify_event, @ptrCast(@alignCast(ptr)));
+            defer ptr = @alignCast(ptr + @sizeOf(linux.inotify_event) + ev.len);
+            const dir = self.wd_map.get(ev.wd) orelse continue;
+            // const basename_ptr = ptr + @sizeOf(linux.inotify_event);
+            // const basename = std.mem.span(@as([*:0]u8, @ptrCast(basename_ptr)));
+
             const kind: EventType = if (ev.mask & std.os.linux.IN.MODIFY != 0)
                 .modified
             else if (ev.mask & std.os.linux.IN.CREATE != 0)
@@ -91,19 +128,15 @@ pub const FileWatcherLinux = struct {
             else
                 .deleted;
 
+            const path = if (ev.getName()) |name|
+                dir.file_table.get(name) orelse dir.dirname
+            else
+                dir.dirname;
+
             try out.push(gpa, .{ .fileEvent = .{
                 .path = path,
                 .kind = kind,
             } });
-
-            if (ev.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF |
-                linux.IN.IGNORED) != 0)
-            {
-                _ = self.wd_map.remove(ev.wd);
-                try addWatch(self, path);
-            }
-
-            offset += event_size + ev.len;
         }
     }
 };

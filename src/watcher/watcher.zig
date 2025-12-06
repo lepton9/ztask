@@ -68,7 +68,10 @@ pub const Watcher = struct {
 
             // Poll watchers for events
             if (self.file_watcher) |fw|
-                fw.pollEvents(self.gpa, self.queue) catch {};
+                fw.pollEvents(self.gpa, self.queue) catch |err| {
+                    if (err == error.WouldBlock) continue;
+                    std.log.err("{}", .{err});
+                };
         }
     }
 
@@ -88,7 +91,7 @@ pub const Watcher = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.file_watcher) |fw| {
-            try fw.addWatch(path);
+            try fw.addWatch(self.gpa, path);
             self.cond.signal();
         } else return error.UnsupportedPlatform;
     }
@@ -107,7 +110,11 @@ pub const FileWatcher = struct {
     ptr: *anyopaque,
     vtable: struct {
         deinit: *const fn (opq: *anyopaque, gpa: std.mem.Allocator) void,
-        addWatch: *const fn (opq: *anyopaque, path: []const u8) anyerror!void,
+        addWatch: *const fn (
+            opq: *anyopaque,
+            gpa: std.mem.Allocator,
+            path: []const u8,
+        ) anyerror!void,
         removeWatch: *const fn (opq: *anyopaque, path: []const u8) void,
         watchCount: *const fn (opq: *anyopaque) u32,
         pollEvents: *const fn (
@@ -130,8 +137,8 @@ pub const FileWatcher = struct {
     }
 
     /// Add a file path to watch list
-    fn addWatch(self: *FileWatcher, path: []const u8) !void {
-        return self.vtable.addWatch(self.ptr, path);
+    fn addWatch(self: *FileWatcher, gpa: std.mem.Allocator, path: []const u8) !void {
+        return self.vtable.addWatch(self.ptr, gpa, path);
     }
 
     /// Remove a file from the watch list
@@ -163,3 +170,14 @@ pub const FileWatcher = struct {
         };
     }
 };
+
+/// Split path string to a directory name and a file basename
+pub fn splitPath(path: []const u8) !struct { dirname: []const u8, basename: ?[]const u8 } {
+    if (std.mem.eql(u8, path, "")) return .{ .dirname = ".", .basename = null };
+    const stat = try std.fs.cwd().statFile(path);
+    if (stat.kind == .directory) return .{ .dirname = path, .basename = null };
+    return .{
+        .dirname = std.fs.path.dirname(path) orelse if (path[0] == '/') "/" else ".",
+        .basename = std.fs.path.basename(path),
+    };
+}
