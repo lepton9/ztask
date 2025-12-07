@@ -17,6 +17,7 @@ pub const FileWatcherLinux = struct {
     fd: i32,
     wd_map: std.AutoHashMapUnmanaged(i32, Dir),
     dir_to_wd: std.StringHashMapUnmanaged(i32),
+    watch_count: u32 = 0,
     buffer: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined,
 
     pub fn filewatcher(gpa: std.mem.Allocator) !FileWatcher {
@@ -35,7 +36,7 @@ pub const FileWatcherLinux = struct {
     fn init(gpa: std.mem.Allocator) !*FileWatcherLinux {
         const w = try gpa.create(FileWatcherLinux);
         w.* = .{
-            .fd = try std.posix.inotify_init1(std.os.linux.IN.NONBLOCK),
+            .fd = try std.posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC),
             .wd_map = .{},
             .dir_to_wd = .{},
         };
@@ -77,7 +78,11 @@ pub const FileWatcherLinux = struct {
 
         if (p.basename) |base| {
             try res.value_ptr.*.file_table.put(gpa, base, path);
-        } else res.value_ptr.watch_self = true;
+            self.watch_count += 1;
+        } else if (!res.value_ptr.watch_self) {
+            res.value_ptr.watch_self = true;
+            self.watch_count += 1;
+        }
     }
 
     /// Remove a path from watch list
@@ -95,12 +100,13 @@ pub const FileWatcherLinux = struct {
             _ = self.wd_map.remove(wd);
             _ = self.dir_to_wd.remove(dir.dirname);
         }
+        self.watch_count -= 1;
     }
 
     /// Get the amount of paths to watch
     fn watchCount(opq: *anyopaque) u32 {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        return self.wd_map.count();
+        return self.watch_count;
     }
 
     fn pollEvents(
