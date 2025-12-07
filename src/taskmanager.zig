@@ -52,6 +52,7 @@ pub const TaskManager = struct {
     }
 
     pub fn deinit(self: *TaskManager) void {
+        self.stop();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         var lt_it = self.loaded_tasks.iterator();
@@ -79,10 +80,10 @@ pub const TaskManager = struct {
     /// Stop the task manager thread
     pub fn stop(self: *TaskManager) void {
         _ = self.running.swap(false, .seq_cst);
-        if (self.thread) |t| t.join();
-        self.thread = null;
         self.watcher.stop();
         self.stopSchedulers();
+        if (self.thread) |t| t.join();
+        self.thread = null;
     }
 
     /// Checks if there are any schedulers waiting or running tasks
@@ -102,14 +103,14 @@ pub const TaskManager = struct {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| {
             // TODO: free the scheduler?
+            self.mutex.lock();
+            defer self.mutex.unlock();
             self.stopScheduler(s.*);
         }
     }
 
     /// Set scheduler to inactive
     pub fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
         switch (s.*.status) {
             .running => {
                 s.*.forceStop();
