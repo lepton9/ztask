@@ -1,6 +1,7 @@
 const std = @import("std");
 const data = @import("data.zig");
 pub const scheduler = @import("scheduler/scheduler.zig");
+pub const remotemanager = @import("remote/remote_manager.zig");
 const parse = @import("parse");
 const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("task");
@@ -31,6 +32,8 @@ pub const TaskManager = struct {
     /// Tasks to unload from memory
     to_unload: std.ArrayList(*Task),
 
+    remote_manager: *remotemanager.RemoteManager,
+
     watcher: *Watcher,
     /// Maps paths to active schedulers
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
@@ -45,6 +48,7 @@ pub const TaskManager = struct {
             .loaded_tasks = .{},
             .to_unload = try .initCapacity(gpa, 1),
             .watch_map = .{},
+            .remote_manager = try remotemanager.RemoteManager.init(gpa),
             .watcher = try Watcher.init(gpa),
         };
         try self.datastore.loadTaskMetas(gpa);
@@ -64,6 +68,7 @@ pub const TaskManager = struct {
         self.to_unload.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
         self.pool.deinit();
+        self.remote_manager.deinit();
         self.watcher.deinit();
         self.watch_map.deinit(self.gpa);
         self.datastore.deinit(self.gpa);
@@ -74,6 +79,9 @@ pub const TaskManager = struct {
     pub fn start(self: *TaskManager) !void {
         _ = self.running.swap(true, .seq_cst);
         try self.watcher.start();
+        try self.remote_manager.start(
+            try std.net.Address.parseIp4("127.0.0.1", 5555),
+        );
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -81,6 +89,7 @@ pub const TaskManager = struct {
     pub fn stop(self: *TaskManager) void {
         _ = self.running.swap(false, .seq_cst);
         self.watcher.stop();
+        self.remote_manager.stop();
         self.stopSchedulers();
         if (self.thread) |t| t.join();
         self.thread = null;
@@ -154,6 +163,7 @@ pub const TaskManager = struct {
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
             self.checkWatcher() catch unreachable;
+            self.remote_manager.update() catch unreachable;
             self.updateSchedulers() catch {};
         }
     }
