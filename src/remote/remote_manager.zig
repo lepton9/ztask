@@ -1,6 +1,8 @@
 const std = @import("std");
+const posix = std.posix;
 const localrunner = @import("../runner/localrunner.zig");
 const scheduler_zig = @import("../scheduler/scheduler.zig");
+const protocol = @import("protocol.zig");
 
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
@@ -36,6 +38,7 @@ pub const AgentHandle = struct {
     name: []const u8,
     conn: std.net.Server.Connection,
     last_heartbeat: i64,
+    read_buffer: [4096]u8 = undefined,
 };
 
 pub const RemoteManager = struct {
@@ -83,8 +86,7 @@ pub const RemoteManager = struct {
     /// Update state
     pub fn update(self: *RemoteManager) !void {
         try self.tryAcceptAgent();
-        // try self.dispatchJobs();
-        // Update agents, results, logs, dispatch
+        try self.dispatchJobs();
         var it = self.agents.iterator();
         while (it.next()) |e| {
             const agent = e.value_ptr;
@@ -93,8 +95,25 @@ pub const RemoteManager = struct {
     }
 
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
-        try self.tryReadFrame(agent);
+        while (self.tryReadFrame(agent) catch null) |_| {
+            // const msg = protocol.parseMessage(payload);
+            // try self.handleMessage(msg);
+        }
     }
+
+    fn tryReadFrame(self: *RemoteManager, agent: *AgentHandle) !?void {
+        const msg = try protocol.readFrameBuf(
+            self.gpa,
+            &agent.conn.stream,
+            &agent.read_buffer,
+        );
+        if (msg) |m| std.debug.print("msg: '{s}'\n", .{m});
+        return null;
+
+        // Parse message
+    }
+
+    // fn handleMessage(self: *RemoteManager, agent: *AgentHandle, msg:) !void {}
 
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
@@ -110,9 +129,10 @@ pub const RemoteManager = struct {
         self: *RemoteManager,
         _: *AgentHandle,
         req: DispatchRequest,
-    ) ?*AgentHandle {
+    ) !void {
         try self.dispatched_jobs.put(self.gpa, @intFromPtr(req.job_node), req);
         // Send to agent
+        // try self.sendJobFrame(agent, req.job_node);
     }
 
     fn findAgent(self: *RemoteManager, name: []const u8) ?*AgentHandle {
@@ -138,6 +158,14 @@ pub const RemoteManager = struct {
 
     /// Save new agent
     fn newAgent(self: *RemoteManager, conn: std.net.Server.Connection) !void {
+        const timeout = posix.timeval{ .sec = 0, .usec = 1 };
+        try posix.setsockopt(
+            conn.stream.handle,
+            posix.SOL.SOCKET,
+            posix.SO.RCVTIMEO,
+            &std.mem.toBytes(timeout),
+        );
+
         const res = try self.agents.getOrPut(self.gpa, .fromConn(conn));
         if (!res.found_existing) {
             res.value_ptr.* = .{

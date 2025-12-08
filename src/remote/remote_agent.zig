@@ -63,16 +63,21 @@ pub const RemoteAgent = struct {
 
     pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
         if (self.conn) |_| return error.AlreadyConnected;
-        self.conn = try std.net.tcpConnectToAddress(addr);
+        self.conn = try tcpConnectNonBlocking(addr, 10);
         try self.register();
     }
 
-    fn register(_: *RemoteAgent) !void {}
+    fn register(self: *RemoteAgent) !void {
+        const reg = protocol.Register{ .hostname = self.hostname };
+        const payload = try reg.encode(self.gpa);
+        try self.sendFrame(payload);
+        std.debug.print("sent: {s}\n", .{payload});
+    }
 
     // Send message to server
     fn sendFrame(self: *RemoteAgent, payload: []const u8) !void {
-        const conn = self.conn orelse return error.NotConnected;
-        return protocol.sendFrame(&conn, &self.buffer, payload);
+        var conn = self.conn orelse return error.NotConnected;
+        return protocol.sendFrame(&conn, payload);
     }
 
     // TODO:
@@ -136,3 +141,45 @@ pub const RemoteAgent = struct {
         _ = self.requestRunner();
     }
 };
+
+pub const TcpConnectError = error{
+    ConnectionFailed,
+    ConnectTimeout,
+};
+
+const posix = std.posix;
+
+pub fn tcpConnectNonBlocking(
+    address: std.net.Address,
+    _: i32,
+) !std.net.Stream {
+    // Create non-blocking socket
+    const sock_flags = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | (if (@import("builtin").target.os.tag == .windows) 0 else posix.SOCK.CLOEXEC);
+
+    const sockfd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
+    errdefer std.net.Stream.close(.{ .handle = sockfd });
+
+    // Start connecting
+    while (true) {
+        break std.posix.connect(sockfd, &address.any, address.getOsSockLen()) catch |e|
+            return switch (e) {
+                std.posix.ConnectError.WouldBlock => {
+                    continue;
+                },
+                else => error.Unexpected,
+            };
+    }
+    return std.net.Stream{ .handle = sockfd };
+}
+
+pub fn tcpConnect(address: std.net.Address) std.net.TcpConnectToAddressError!std.net.Stream {
+    const nonblock = std.posix.SOCK.NONBLOCK;
+    const sock_flags = std.posix.SOCK.STREAM | nonblock |
+        (if (@import("builtin").target.os.tag == .windows) 0 else std.posix.SOCK.CLOEXEC);
+    const sockfd = try std.posix.socket(address.any.family, sock_flags, std.posix.IPPROTO.TCP);
+    errdefer std.net.Stream.close(.{ .handle = sockfd });
+
+    try std.posix.connect(sockfd, &address.any, address.getOsSockLen());
+
+    return std.net.Stream{ .handle = sockfd };
+}
