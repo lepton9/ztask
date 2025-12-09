@@ -10,6 +10,60 @@ pub const MsgType = enum(u8) {
     cancel_job = 0x21,
 };
 
+pub const FrameReader = struct {
+    state: enum { ReadingLen, ReadingBody } = .ReadingLen,
+    len_buf: [4]u8 = undefined,
+    len_read: usize = 0,
+    body_len: usize = 0,
+    body_read: usize = 0,
+
+    pub fn readFrame(
+        self: *FrameReader,
+        stream: *std.net.Stream,
+        buffer: []u8,
+    ) !?[]u8 {
+        // Read length
+        if (self.state == .ReadingLen) {
+            const remaining = self.len_buf[self.len_read..];
+            const n = std.posix.read(stream.handle, remaining) catch |err| switch (err) {
+                error.WouldBlock => return null,
+                else => return err,
+            };
+
+            if (n == 0) return null;
+            self.len_read += n;
+            if (self.len_read < 4) return null;
+
+            const full_len = std.mem.readInt(u32, &self.len_buf, .little);
+            if (full_len == 0 or full_len > buffer.len)
+                return error.InvalidFrame;
+
+            self.body_len = full_len;
+            self.body_read = 0;
+            self.state = .ReadingBody;
+        }
+
+        // Read body
+        const remaining = buffer[self.body_read..self.body_len];
+        const n = std.posix.read(stream.handle, remaining) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            else => return err,
+        };
+
+        if (n == 0) return null;
+        self.body_read += n;
+
+        if (self.body_read < self.body_len) return null;
+
+        const frame = buffer[0..self.body_len];
+
+        self.state = .ReadingLen;
+        self.len_read = 0;
+
+        return frame;
+    }
+};
+
 /// Send message to server
 ///
 /// [[4 bytes: length N]] [[1 byte: msg type]] [[N-1 bytes: payload]]
@@ -42,26 +96,13 @@ pub fn readFrameBuf(
     stream: *std.net.Stream,
     buffer: []u8,
 ) !?[]u8 {
-    // var buf: [1024]u8 = undefined;
-    // var stream_reader = stream.reader(&buf);
-    // var stream_reader = stream.reader(buffer.items);
-    // var reader: *std.Io.Reader = stream_reader.interface();
-    // std.debug.print("trying reading, len: {d}\n", .{reader.bufferedLen()});
-    // const len = reader.peekInt(u32, .little) catch {
-    //     std.debug.print("invalid len\n", .{});
-    //     return null;
-    // };
 
+    // [[4 bytes: length N]] [[1 byte: msg type]] [[N-1 bytes: payload]]
     const len = std.posix.read(stream.handle, buffer) catch {
         // std.debug.print("err: {}\n", .{err});
         return null;
     };
     if (len == 0) return error.InvalidFrame;
-    // std.debug.print("read len: {d}\n", .{len});
-    // if (len == 0) return error.InvalidFrame;
-    // try buffer.ensureTotalCapacity(gpa, len);
-    // _ = reader.peek(len) catch return null;
-    // try reader.readSliceAll(buffer.items);
     return buffer[0..len];
 }
 
