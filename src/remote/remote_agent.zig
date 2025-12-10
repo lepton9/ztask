@@ -2,6 +2,7 @@ const std = @import("std");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
+const connection = @import("connection.zig");
 
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
@@ -26,7 +27,7 @@ pub const RemoteAgent = struct {
     /// Jobs currently running
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
-    connection: protocol.Connection,
+    connection: connection.Connection,
 
     pub fn init(gpa: std.mem.Allocator) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
@@ -68,8 +69,8 @@ pub const RemoteAgent = struct {
     }
 
     fn register(self: *RemoteAgent) !void {
-        const reg = protocol.Register{ .hostname = self.hostname };
-        const payload = try reg.encode(self.gpa);
+        const reg = protocol.RegisterMsg{ .hostname = self.hostname };
+        const payload = try reg.serialize(self.gpa);
         try self.connection.sendFrame(payload);
         std.debug.print("sent: {s}\n", .{payload});
     }

@@ -3,6 +3,7 @@ const posix = std.posix;
 const localrunner = @import("../runner/localrunner.zig");
 const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
+const connection = @import("connection.zig");
 
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
@@ -12,10 +13,10 @@ const ConnKey = struct {
     ip: u32,
     port: u16,
 
-    pub fn fromConn(conn: std.net.Server.Connection) ConnKey {
+    pub fn fromAddr(addr: std.net.Address) ConnKey {
         return .{
-            .ip = conn.address.in.sa.addr,
-            .port = conn.address.in.sa.port,
+            .ip = addr.in.sa.addr,
+            .port = addr.in.sa.port,
         };
     }
 
@@ -36,7 +37,7 @@ pub const DispatchRequest = struct {
 
 pub const AgentHandle = struct {
     name: []const u8,
-    connection: protocol.Connection,
+    connection: connection.Connection,
     last_heartbeat: i64,
 };
 
@@ -162,7 +163,7 @@ pub const RemoteManager = struct {
             &std.mem.toBytes(timeout),
         );
 
-        const res = try self.agents.getOrPut(self.gpa, .fromConn(conn));
+        const res = try self.agents.getOrPut(self.gpa, .fromAddr(conn.address));
         if (!res.found_existing) {
             res.value_ptr.* = .{
                 .name = "remoterunner1",
