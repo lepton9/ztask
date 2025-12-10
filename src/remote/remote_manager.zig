@@ -188,9 +188,5 @@ pub const RemoteManager = struct {
                 .last_heartbeat = std.time.timestamp(),
             };
         }
-        std.log.debug("New connection: {any}, total: {d}\n", .{
-            conn.address,
-            self.agents.count(),
-        });
     }
 };

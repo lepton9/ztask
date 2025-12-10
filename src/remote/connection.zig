@@ -128,7 +128,7 @@ fn tcpConnectNonBlocking(address: std.net.Address) !std.net.Stream {
         (if (builtin.target.os.tag == .windows) 0 else posix.SOCK.CLOEXEC);
 
     const sockfd = try posix.socket(address.any.family, sock_flags, posix.IPPROTO.TCP);
-    errdefer std.net.Stream.close(.{ .handle = sockfd });
+    errdefer posix.close(sockfd);
 
     // Start connecting
     while (true) {

@@ -58,7 +58,7 @@ pub const RemoteAgent = struct {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
             // self.heartbeat() catch {};
-            // listen for packets
+            self.tryReadMessages() catch {};
             self.handleResults();
             self.handleLogs();
         }
@@ -68,6 +68,21 @@ pub const RemoteAgent = struct {
     pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
         try self.connection.connect(addr);
         try self.register();
+    }
+
+    /// Listen for incoming messages
+    fn tryReadMessages(self: *RemoteAgent) !void {
+        while (self.connection.readNextFrame(self.gpa) catch null) |msg| {
+            const parsed = try protocol.parseMessage(msg);
+            try self.handleMessage(parsed);
+        }
+    }
+
+    /// Handle parsed message
+    fn handleMessage(_: *RemoteAgent, msg: protocol.ParsedMessage) !void {
+        switch (msg) {
+            else => {},
+        }
     }
 
     /// Send a register packet
