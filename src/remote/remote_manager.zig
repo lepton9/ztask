@@ -44,6 +44,11 @@ pub const AgentHandle = struct {
         if (self.name) |n| gpa.free(n);
         self.name = try gpa.dupe(u8, name);
     }
+
+    fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
+        if (self.name) |name| gpa.free(name);
+        self.connection.deinit(gpa);
+    }
 };
 
 pub const RemoteManager = struct {
@@ -71,7 +76,7 @@ pub const RemoteManager = struct {
         self.dispatched_jobs.deinit(self.gpa);
 
         var it = self.agents.valueIterator();
-        while (it.next()) |a| a.connection.deinit(self.gpa);
+        while (it.next()) |a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
         self.gpa.destroy(self);
     }
@@ -120,7 +125,8 @@ pub const RemoteManager = struct {
     ) !void {
         std.debug.print("parsed: '{any}'\n", .{msg});
         switch (msg) {
-            .Register => |r| try agent.setName(self.gpa, r.hostname),
+            .Register => |m| try agent.setName(self.gpa, m.hostname),
+            .Heartbeat => |m| agent.last_heartbeat = m,
         }
     }
 

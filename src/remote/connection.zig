@@ -97,8 +97,6 @@ pub const Connection = struct {
         if (self.closed) return error.NotConnected;
         var header: [4]u8 = undefined;
         std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
-        std.debug.print("header: {d}\n", .{msg.len});
-        std.debug.print("msg: {s}\n", .{msg});
 
         var vec = [2]posix.iovec_const{
             .{ .len = 4, .base = &header },

@@ -53,26 +53,36 @@ pub const RemoteAgent = struct {
         self.gpa.destroy(self);
     }
 
+    /// The main run loop
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
-            // send heartbeat packet
+            // self.heartbeat() catch {};
             // listen for packets
             self.handleResults();
             self.handleLogs();
         }
     }
 
+    /// Try to connect to the server at the address
     pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
         try self.connection.connect(addr);
         try self.register();
     }
 
+    /// Send a register packet
     fn register(self: *RemoteAgent) !void {
         const reg = protocol.RegisterMsg{ .hostname = self.hostname };
         const payload = try reg.serialize(self.gpa);
+        defer self.gpa.free(payload);
         try self.connection.sendFrame(payload);
         std.debug.print("sent: {s}\n", .{payload});
+    }
+
+    /// Send a heartbeat packet
+    fn heartbeat(self: *RemoteAgent) !void {
+        var buf: [1]u8 = .{@intFromEnum(protocol.MsgType.heartbeat)};
+        try self.connection.sendFrame(&buf);
     }
 
     // TODO:

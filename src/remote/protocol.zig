@@ -14,6 +14,7 @@ pub const MsgType = enum(u8) {
 
 pub const ParsedMessage = union(enum) {
     Register: RegisterMsg,
+    Heartbeat: i64,
 };
 
 pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8) {
@@ -26,6 +27,7 @@ pub fn parseMessage(payload: []const u8) !ParsedMessage {
     const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
     return switch (msg_type) {
         .register => .{ .Register = try RegisterMsg.parse(payload) },
+        .heartbeat => .{ .Heartbeat = std.time.timestamp() },
         else => @panic("TODO"),
     };
 }
