@@ -38,7 +38,6 @@ pub const AgentHandle = struct {
     name: []const u8,
     connection: protocol.Connection,
     last_heartbeat: i64,
-    read_buffer: [4096]u8 = undefined,
 };
 
 pub const RemoteManager = struct {
@@ -65,6 +64,9 @@ pub const RemoteManager = struct {
         self.agents.deinit(self.gpa);
         self.dispatch_queue.deinit(self.gpa);
         self.dispatched_jobs.deinit(self.gpa);
+
+        var it = self.agents.valueIterator();
+        while (it.next()) |a| a.connection.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -79,6 +81,9 @@ pub const RemoteManager = struct {
 
     /// Stop the server
     pub fn stop(self: *RemoteManager) void {
+        var it = self.agents.valueIterator();
+        while (it.next()) |a| a.connection.close();
+
         if (self.server) |*s| s.deinit();
         self.server = null;
     }
@@ -94,8 +99,8 @@ pub const RemoteManager = struct {
         }
     }
 
-    fn updateAgent(_: *RemoteManager, agent: *AgentHandle) !void {
-        while (agent.connection.readNextFrame() catch null) |msg| {
+    fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
+        while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
             std.debug.print("msg: '{s}'\n", .{msg});
             // Parse message
 
@@ -161,7 +166,7 @@ pub const RemoteManager = struct {
         if (!res.found_existing) {
             res.value_ptr.* = .{
                 .name = "remoterunner1",
-                .connection = try .init(self.gpa, conn),
+                .connection = try .initConn(self.gpa, conn),
                 .last_heartbeat = std.time.timestamp(),
             };
         }
