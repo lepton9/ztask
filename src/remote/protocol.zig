@@ -12,10 +12,22 @@ pub const MsgType = enum(u8) {
     cancel_job = 0x21,
 };
 
+pub const ParsedMessage = union(enum) {
+    Register: RegisterMsg,
+};
+
 pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8) {
     var buf = try std.ArrayList(u8).initCapacity(gpa, 1);
     buf.appendAssumeCapacity(@intFromEnum(msg_type));
     return buf;
+}
+
+pub fn parseMessage(payload: []const u8) !ParsedMessage {
+    const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
+    return switch (msg_type) {
+        .register => .{ .Register = try RegisterMsg.parse(payload) },
+        else => @panic("TODO"),
+    };
 }
 
 pub const RegisterMsg = struct {
@@ -28,9 +40,8 @@ pub const RegisterMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !RegisterMsg {
-        if (msg.len < 1) return error.InvalidPayload;
-        if (@as(MsgType, @enumFromInt(msg[0])) != .register) return error.InvalidMsgType;
-        const hostname = msg[1..];
+        if (msg.len == 0) return error.InvalidPayload;
+        const hostname = msg;
         return .{ .hostname = hostname };
     }
 };

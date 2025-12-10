@@ -36,9 +36,14 @@ pub const DispatchRequest = struct {
 };
 
 pub const AgentHandle = struct {
-    name: []const u8,
+    name: ?[]const u8 = null,
     connection: connection.Connection,
     last_heartbeat: i64,
+
+    fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
+        if (self.name) |n| gpa.free(n);
+        self.name = try gpa.dupe(u8, name);
+    }
 };
 
 pub const RemoteManager = struct {
@@ -62,12 +67,12 @@ pub const RemoteManager = struct {
 
     pub fn deinit(self: *RemoteManager) void {
         self.stop();
-        self.agents.deinit(self.gpa);
         self.dispatch_queue.deinit(self.gpa);
         self.dispatched_jobs.deinit(self.gpa);
 
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.connection.deinit(self.gpa);
+        self.agents.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -103,14 +108,21 @@ pub const RemoteManager = struct {
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
         while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
             std.debug.print("msg: '{s}'\n", .{msg});
-            // Parse message
-
-            // const msg = protocol.parseMessage(payload);
-            // try self.handleMessage(msg);
+            const parsed = try protocol.parseMessage(msg);
+            try self.handleMessage(agent, parsed);
         }
     }
 
-    // fn handleMessage(self: *RemoteManager, agent: *AgentHandle, msg:) !void {}
+    fn handleMessage(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.ParsedMessage,
+    ) !void {
+        std.debug.print("parsed: '{any}'\n", .{msg});
+        switch (msg) {
+            .Register => |r| try agent.setName(self.gpa, r.hostname),
+        }
+    }
 
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
@@ -135,7 +147,7 @@ pub const RemoteManager = struct {
     fn findAgent(self: *RemoteManager, name: []const u8) ?*AgentHandle {
         var it = self.agents.valueIterator();
         while (it.next()) |agent| {
-            if (std.mem.eql(u8, agent.name, name)) return agent;
+            if (std.mem.eql(u8, agent.name orelse continue, name)) return agent;
         }
         return null;
     }
@@ -166,7 +178,6 @@ pub const RemoteManager = struct {
         const res = try self.agents.getOrPut(self.gpa, .fromAddr(conn.address));
         if (!res.found_existing) {
             res.value_ptr.* = .{
-                .name = "remoterunner1",
                 .connection = try .initConn(self.gpa, conn),
                 .last_heartbeat = std.time.timestamp(),
             };
