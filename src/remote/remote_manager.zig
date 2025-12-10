@@ -36,7 +36,7 @@ pub const DispatchRequest = struct {
 
 pub const AgentHandle = struct {
     name: []const u8,
-    conn: std.net.Server.Connection,
+    connection: protocol.Connection,
     last_heartbeat: i64,
     read_buffer: [4096]u8 = undefined,
 };
@@ -94,23 +94,14 @@ pub const RemoteManager = struct {
         }
     }
 
-    fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
-        while (self.tryReadFrame(agent) catch null) |_| {
+    fn updateAgent(_: *RemoteManager, agent: *AgentHandle) !void {
+        while (agent.connection.readNextFrame() catch null) |msg| {
+            std.debug.print("msg: '{s}'\n", .{msg});
+            // Parse message
+
             // const msg = protocol.parseMessage(payload);
             // try self.handleMessage(msg);
         }
-    }
-
-    fn tryReadFrame(self: *RemoteManager, agent: *AgentHandle) !?void {
-        const msg = try protocol.readFrameBuf(
-            self.gpa,
-            &agent.conn.stream,
-            &agent.read_buffer,
-        );
-        if (msg) |m| std.debug.print("msg: '{s}'\n", .{m});
-        return null;
-
-        // Parse message
     }
 
     // fn handleMessage(self: *RemoteManager, agent: *AgentHandle, msg:) !void {}
@@ -170,7 +161,7 @@ pub const RemoteManager = struct {
         if (!res.found_existing) {
             res.value_ptr.* = .{
                 .name = "remoterunner1",
-                .conn = conn,
+                .connection = try .init(self.gpa, conn),
                 .last_heartbeat = std.time.timestamp(),
             };
         }
