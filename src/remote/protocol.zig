@@ -15,6 +15,11 @@ pub const MsgType = enum(u8) {
 pub const ParsedMessage = union(enum) {
     Register: RegisterMsg,
     Heartbeat: i64,
+    JobStart: JobStartMsg,
+    JobLog: JobLogMsg,
+    JobEnd: JobEndMsg,
+    RunJob: RunJobMsg,
+    CancelJob: CancelJobMsg,
 };
 
 pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8) {
@@ -35,13 +40,13 @@ pub fn parseMessage(payload: []const u8) !ParsedMessage {
 pub const RegisterMsg = struct {
     hostname: []const u8,
 
-    pub fn serialize(self: RegisterMsg, gpa: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
         var buf = try beginPayload(gpa, .register);
         try buf.appendSlice(gpa, self.hostname);
         return buf.toOwnedSlice(gpa);
     }
 
-    pub fn parse(msg: []const u8) !RegisterMsg {
+    pub fn parse(msg: []const u8) !@This() {
         if (msg.len == 0) return error.InvalidPayload;
         const hostname = msg;
         return .{ .hostname = hostname };
@@ -52,7 +57,7 @@ pub const RunJobMsg = struct {
     job_id: u64,
     steps: []const u8, // JSON
 
-    pub fn serialize(self: RunJobMsg, gpa: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, id[0..8], self.job_id, .little);
         var buf = try beginPayload(gpa, .run_job);
@@ -61,29 +66,105 @@ pub const RunJobMsg = struct {
         return buf.toOwnedSlice(gpa);
     }
 
-    pub fn parse(msg: []const u8) !RunJobMsg {
+    pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 8) return error.InvalidPayload;
         const job_id = readU64Le(msg);
         const steps = msg[8..];
         return .{ .job_id = job_id, .steps = steps };
     }
+
+    // TODO:
+    // pub fn parseSteps(self: RunJobMsg) []task.Step {}
 };
 
 pub const CancelJobMsg = struct {
     job_id: u64,
 
-    pub fn serialize(self: RunJobMsg, gpa: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
+        var buf = try beginPayload(gpa, .cancel_job);
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, id[0..8], self.job_id, .little);
-        var buf = try beginPayload(gpa, .cancel_job);
         try buf.appendSlice(gpa, id);
         return buf.toOwnedSlice(gpa);
     }
 
-    pub fn parse(msg: []const u8) !RunJobMsg {
+    pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 8) return error.InvalidPayload;
         const job_id = readU64Le(msg);
         return .{ .job_id = job_id };
+    }
+};
+
+pub const JobStartMsg = struct {
+    job_id: u64,
+    timestamp: i64,
+
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
+        var payload = try beginPayload(gpa, .job_start);
+        var buffer: [8]u8 = undefined;
+        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
+        try payload.appendSlice(gpa, buffer);
+        std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
+        try payload.appendSlice(gpa, buffer);
+        return payload.toOwnedSlice(gpa);
+    }
+
+    pub fn parse(msg: []const u8) !@This() {
+        if (msg.len < 16) return error.InvalidPayload;
+        const job_id = readU64Le(msg);
+        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
+        return .{ .job_id = job_id, .timestamp = timestamp };
+    }
+};
+
+pub const JobEndMsg = struct {
+    job_id: u64,
+    timestamp: i64,
+    exit_code: i32,
+
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
+        var payload = try beginPayload(gpa, .job_finish);
+        var buffer: [8]u8 = undefined;
+        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
+        try payload.appendSlice(gpa, buffer);
+        std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
+        try payload.appendSlice(gpa, buffer);
+        std.mem.writeInt(i32, buffer[0..4], self.exit_code, .little);
+        try payload.appendSlice(gpa, buffer[0..4]);
+        return payload.toOwnedSlice(gpa);
+    }
+
+    pub fn parse(msg: []const u8) !@This() {
+        if (msg.len < 20) return error.InvalidPayload;
+        const job_id = readU64Le(msg);
+        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
+        const exit_code = std.mem.readInt(i32, msg[16..20], .little);
+        return .{ .job_id = job_id, .timestamp = timestamp, .exit_code = exit_code };
+    }
+};
+
+pub const JobLogMsg = struct {
+    job_id: u64,
+    step: u32,
+    data: []const u8,
+
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
+        var payload = try beginPayload(gpa, .job_log);
+        var buffer: [8]u8 = undefined;
+        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
+        try payload.appendSlice(gpa, buffer);
+        std.mem.writeInt(u32, buffer[0..4], self.step, .little);
+        try payload.appendSlice(gpa, buffer[0..4]);
+        try payload.appendSlice(gpa, self.data);
+        return payload.toOwnedSlice(gpa);
+    }
+
+    pub fn parse(msg: []const u8) !@This() {
+        if (msg.len < 12) return error.InvalidPayload;
+        const job_id = readU64Le(msg);
+        const step = readU32Le(msg[8..]);
+        const data = msg[12..];
+        return .{ .job_id = job_id, .step = step, .data = data };
     }
 };
 
