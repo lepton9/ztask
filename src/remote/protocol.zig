@@ -1,4 +1,5 @@
 const std = @import("std");
+const task = @import("task");
 const builtin = @import("builtin");
 const posix = std.posix;
 
@@ -77,8 +78,21 @@ pub const RunJobMsg = struct {
         return .{ .job_id = job_id, .steps = steps };
     }
 
-    // TODO:
-    // pub fn parseSteps(self: RunJobMsg) []task.Step {}
+    /// Serialize the step slice to a JSON string
+    pub fn serializeSteps(gpa: std.mem.Allocator, steps: []task.Step) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        try std.json.Stringify.value(steps, .{}, &out.writer);
+        return try out.toOwnedSlice();
+    }
+
+    /// Parse `task.Step` list from a JSON string
+    pub fn parseSteps(self: RunJobMsg, gpa: std.mem.Allocator) ![]task.Step {
+        const Parsed = std.json.Parsed([]task.Step);
+        const json: Parsed = std.json.parseFromSlice([]task.Step, gpa, self.steps, .{}) catch
+            return error.InvalidStepsFormat;
+        defer json.deinit();
+        return try gpa.dupe(task.Step, json.value);
+    }
 };
 
 pub const CancelJobMsg = struct {
