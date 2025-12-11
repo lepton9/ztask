@@ -18,6 +18,7 @@ pub const Status = enum {
 pub fn Node(comptime T: type) type {
     return struct {
         ptr: *T,
+        id: u64 = 0,
         status: Status = .pending,
         /// Nodes that depend on this node
         dependents: std.ArrayList(*@This()),

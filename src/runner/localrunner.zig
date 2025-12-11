@@ -12,7 +12,7 @@ pub const Result = struct {
 
 pub const LogEvent = union(enum) {
     job_started: struct { job_node: *JobNode, timestamp: i64 },
-    job_output: struct { job_node: *JobNode, step: *task.Step, data: []const u8 },
+    job_output: struct { job_node: *JobNode, step: u32, data: []const u8 },
     job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
 };
 
@@ -133,6 +133,11 @@ pub const LocalRunner = struct {
         var it = std.mem.splitScalar(u8, step.value, ' ');
         while (it.next()) |arg| try argv.append(gpa, arg);
 
+        const step_index: usize = @divExact(
+            @intFromPtr(step) - @intFromPtr(job.ptr.steps.ptr),
+            @sizeOf(task.Step),
+        );
+
         // Spawn child process
         var child = std.process.Child.init(argv.items, gpa);
         child.stdout_behavior = .Pipe;
@@ -161,8 +166,8 @@ pub const LocalRunner = struct {
                 };
             }
 
-            readLogs(gpa, stdout_r, step, job, logs);
-            readLogs(gpa, stderr_r, step, job, logs);
+            readLogs(gpa, stdout_r, step_index, job, logs);
+            readLogs(gpa, stderr_r, step_index, job, logs);
         }
 
         const term = try child.wait();
@@ -177,7 +182,7 @@ pub const LocalRunner = struct {
 fn readLogs(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
-    step: *task.Step,
+    step_index: usize,
     job: *JobNode,
     logs: *LogQueue,
 ) void {
@@ -187,7 +192,7 @@ fn readLogs(
 
     logs.push(gpa, .{ .job_output = .{
         .job_node = job,
-        .step = step,
+        .step = @intCast(step_index),
         .data = data,
     } }) catch {};
 }

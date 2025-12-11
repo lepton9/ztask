@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 pub const MsgType = enum(u8) {
+    // info = 0x00,
     register = 0x01,
     heartbeat = 0x02,
     job_start = 0x10,
@@ -121,9 +122,9 @@ pub const JobStartMsg = struct {
         var payload = try beginPayload(gpa, .job_start);
         var buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, buffer);
+        try payload.appendSlice(gpa, &buffer);
         std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
-        try payload.appendSlice(gpa, buffer);
+        try payload.appendSlice(gpa, &buffer);
         return payload.toOwnedSlice(gpa);
     }
 
@@ -144,9 +145,9 @@ pub const JobEndMsg = struct {
         var payload = try beginPayload(gpa, .job_finish);
         var buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, buffer);
+        try payload.appendSlice(gpa, &buffer);
         std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
-        try payload.appendSlice(gpa, buffer);
+        try payload.appendSlice(gpa, &buffer);
         std.mem.writeInt(i32, buffer[0..4], self.exit_code, .little);
         try payload.appendSlice(gpa, buffer[0..4]);
         return payload.toOwnedSlice(gpa);
@@ -170,7 +171,7 @@ pub const JobLogMsg = struct {
         var payload = try beginPayload(gpa, .job_log);
         var buffer: [8]u8 = undefined;
         std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, buffer);
+        try payload.appendSlice(gpa, &buffer);
         std.mem.writeInt(u32, buffer[0..4], self.step, .little);
         try payload.appendSlice(gpa, buffer[0..4]);
         try payload.appendSlice(gpa, self.data);

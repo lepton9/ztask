@@ -44,18 +44,22 @@ pub const RemoteAgent = struct {
             .active_runners = .{},
             .connection = try .init(gpa),
         };
+        try agent.active_runners.ensureTotalCapacity(gpa, BASE_RUNNERS_N);
         return agent;
     }
 
     pub fn deinit(self: *RemoteAgent) void {
-        self.pool.deinit();
-        self.result_queue.deinit(self.gpa);
         var it = self.jobs.iterator();
-        while (it.next()) |_| {} // TODO: free jobs
+        while (it.next()) |e| {
+            e.value_ptr.node.deinit(self.gpa);
+            e.value_ptr.job.deinit(self.gpa);
+        }
         self.jobs.deinit(self.gpa);
+        self.result_queue.deinit(self.gpa);
         self.log_queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
+        self.pool.deinit();
         self.connection.deinit(self.gpa);
         self.gpa.destroy(self);
     }
@@ -65,9 +69,10 @@ pub const RemoteAgent = struct {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
             // self.heartbeat() catch {};
+            self.tryRunNext();
             self.tryReadMessages() catch {};
             self.handleResults();
-            self.handleLogs();
+            self.handleLogs() catch {};
         }
     }
 
@@ -88,28 +93,32 @@ pub const RemoteAgent = struct {
     /// Handle parsed message
     fn handleMessage(self: *RemoteAgent, msg: protocol.ParsedMessage) !void {
         switch (msg) {
-            .RunJob => |m| try self.runJob(m),
+            .RunJob => |m| try self.queueJob(m),
             .CancelJob => |m| try self.cancelJob(m),
             else => {}, // Not relevant for agent
         }
     }
 
-    fn runJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
+    /// Add a job to the back of the run queue
+    fn queueJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
         const res = try self.jobs.getOrPut(self.gpa, msg.job_id);
         if (res.found_existing) return error.JobRunning;
 
-        // TODO: init job steps
-        var job = task.Job{
-            .name = "",
+        res.value_ptr.*.job = .{
+            .name = try std.fmt.allocPrint(self.gpa, "{x}", .{msg.job_id}),
+            .steps = try msg.parseSteps(self.gpa),
         };
-        const node: JobNode = .{
-            .ptr = &job,
+        res.value_ptr.*.node = .{
+            .ptr = &res.value_ptr.*.job,
+            .id = msg.job_id,
             .dependents = .empty,
         };
-        res.value_ptr.* = .{ .job = job, .node = node };
-        // TODO: run job, send start message
+        try self.queue.append(self.gpa, &res.value_ptr.node);
     }
 
+    /// Cancel a job from running
+    /// Force stop the runner if active
+    /// Otherwise remove from the queue
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) !void {
         // TODO: send message if not found
         const e = self.jobs.getPtr(msg.job_id) orelse return error.JobNotFound;
@@ -121,9 +130,9 @@ pub const RemoteAgent = struct {
                 break;
             }
         }
-        // TODO: free job, need steps initialized
-        e.node.deinit(self.gpa);
-        // e.job.deinit(self.gpa);
+        var kv = self.jobs.fetchRemove(msg.job_id) orelse unreachable;
+        kv.value.node.deinit(self.gpa);
+        kv.value.job.deinit(self.gpa);
     }
 
     /// Send a register packet
@@ -153,28 +162,53 @@ pub const RemoteAgent = struct {
             const runner = kv.value;
             runner.joinThread();
             self.pool.release(runner);
-            // TODO: handle sending result message to server
         }
     }
 
     /// Handle the job log events in the queue
-    fn handleLogs(self: *RemoteAgent) void {
+    fn handleLogs(self: *RemoteAgent) !void {
         while (self.log_queue.pop()) |event| switch (event) {
-            .job_started => |_| {
-                // TODO: send metadata to server
+            .job_started => |e| {
+                const msg: protocol.JobStartMsg = .{
+                    .job_id = e.job_node.id,
+                    .timestamp = e.timestamp,
+                };
+                const payload = try msg.serialize(self.gpa);
+                defer self.gpa.free(payload);
+                try self.connection.sendFrame(payload);
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
-                // TODO: send log to server
+                const msg: protocol.JobLogMsg = .{
+                    .job_id = e.job_node.id,
+                    .data = e.data,
+                    .step = e.step,
+                };
+                const payload = try msg.serialize(self.gpa);
+                defer self.gpa.free(payload);
+                try self.connection.sendFrame(payload);
             },
-            .job_finished => |_| {
-                // TODO: send metadata to server
+            .job_finished => |e| {
+                const msg: protocol.JobEndMsg = .{
+                    .job_id = e.job_node.id,
+                    .timestamp = e.timestamp,
+                    .exit_code = e.exit_code,
+                };
+                const payload = try msg.serialize(self.gpa);
+                defer self.gpa.free(payload);
+                try self.connection.sendFrame(payload);
             },
         };
     }
 
+    /// Try to run the next job from the queue if there is one
+    fn tryRunNext(self: *RemoteAgent) void {
+        if (self.queue.items.len == 0) return;
+        self.requestRunner();
+    }
+
     /// Run the next job from queue with the provided local runner
-    fn runNextJobLocal(self: *RemoteAgent, runner: *LocalRunner) void {
+    fn runNextJob(self: *RemoteAgent, runner: *LocalRunner) void {
         if (self.queue.items.len == 0) {
             self.pool.release(runner);
             return;
@@ -185,20 +219,19 @@ pub const RemoteAgent = struct {
     }
 
     /// Request a runner from the pool
-    fn requestRunner(self: *RemoteAgent) bool {
+    fn requestRunner(self: *RemoteAgent) void {
         if (self.pool.tryAcquire()) |runner| {
             self.runNextJob(runner);
-            return true;
+            return;
         }
         self.pool.waitForRunner(
             .{ .ptr = self, .callback = &RemoteAgent.onRunnerAvailable },
         );
-        return false;
     }
 
     /// Callback to receive a runner
     fn onRunnerAvailable(opq: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        _ = self.requestRunner();
+        self.requestRunner();
     }
 };
