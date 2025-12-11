@@ -127,6 +127,7 @@ pub const RemoteManager = struct {
         switch (msg) {
             .Register => |m| try agent.setName(self.gpa, m.hostname),
             .Heartbeat => |m| agent.last_heartbeat = m,
+            else => {},
         }
     }
 

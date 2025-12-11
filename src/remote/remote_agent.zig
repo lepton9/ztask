@@ -1,4 +1,5 @@
 const std = @import("std");
+const task = @import("task");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
@@ -22,6 +23,8 @@ pub const RemoteAgent = struct {
     result_queue: *ResultQueue,
     log_queue: *LogQueue,
 
+    /// All currently loaded jobs
+    jobs: std.AutoHashMapUnmanaged(u64, struct { job: task.Job, node: JobNode }),
     /// Queue of jobs to run
     queue: std.ArrayList(*JobNode),
     /// Jobs currently running
@@ -36,6 +39,7 @@ pub const RemoteAgent = struct {
             .pool = try runnerpool.RunnerPool.init(gpa, BASE_RUNNERS_N),
             .result_queue = try ResultQueue.init(gpa, BASE_RUNNERS_N),
             .log_queue = try LogQueue.init(gpa, 10),
+            .jobs = .{},
             .queue = try .initCapacity(gpa, BASE_RUNNERS_N),
             .active_runners = .{},
             .connection = try .init(gpa),
@@ -46,6 +50,9 @@ pub const RemoteAgent = struct {
     pub fn deinit(self: *RemoteAgent) void {
         self.pool.deinit();
         self.result_queue.deinit(self.gpa);
+        var it = self.jobs.iterator();
+        while (it.next()) |_| {} // TODO: free jobs
+        self.jobs.deinit(self.gpa);
         self.log_queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
@@ -79,10 +86,44 @@ pub const RemoteAgent = struct {
     }
 
     /// Handle parsed message
-    fn handleMessage(_: *RemoteAgent, msg: protocol.ParsedMessage) !void {
+    fn handleMessage(self: *RemoteAgent, msg: protocol.ParsedMessage) !void {
         switch (msg) {
-            else => {},
+            .RunJob => |m| try self.runJob(m),
+            .CancelJob => |m| try self.cancelJob(m),
+            else => {}, // Not relevant for agent
         }
+    }
+
+    fn runJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
+        const res = try self.jobs.getOrPut(self.gpa, msg.job_id);
+        if (res.found_existing) return error.JobRunning;
+
+        // TODO: init job steps
+        var job = task.Job{
+            .name = "",
+        };
+        const node: JobNode = .{
+            .ptr = &job,
+            .dependents = .empty,
+        };
+        res.value_ptr.* = .{ .job = job, .node = node };
+        // TODO: run job, send start message
+    }
+
+    fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) !void {
+        // TODO: send message if not found
+        const e = self.jobs.getPtr(msg.job_id) orelse return error.JobNotFound;
+        if (self.active_runners.get(&e.node)) |runner| {
+            runner.forceStop();
+        } else for (self.queue.items, 0..) |node, i| {
+            if (@intFromPtr(node) == @intFromPtr(&e.node)) {
+                _ = self.queue.orderedRemove(i);
+                break;
+            }
+        }
+        // TODO: free job, need steps initialized
+        e.node.deinit(self.gpa);
+        // e.job.deinit(self.gpa);
     }
 
     /// Send a register packet

@@ -31,9 +31,13 @@ pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8
 pub fn parseMessage(payload: []const u8) !ParsedMessage {
     const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
     return switch (msg_type) {
-        .register => .{ .Register = try RegisterMsg.parse(payload) },
+        .register => .{ .Register = try .parse(payload) },
         .heartbeat => .{ .Heartbeat = std.time.timestamp() },
-        else => @panic("TODO"),
+        .job_start => .{ .JobStart = try .parse(payload) },
+        .job_log => .{ .JobLog = try .parse(payload) },
+        .job_finish => .{ .JobEnd = try .parse(payload) },
+        .run_job => .{ .RunJob = try .parse(payload) },
+        .cancel_job => .{ .CancelJob = try .parse(payload) },
     };
 }
 
