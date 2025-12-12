@@ -391,7 +391,6 @@ test "force_interrupt" {
     const task = try parse.parseTaskBuffer(gpa, task_file);
     const task_id = try gpa.dupe(u8, try task.id.fmt(&task_buf));
     try task_manager.loaded_tasks.put(gpa, task_id, task);
-    try task_manager.start();
     _ = try task_manager.beginTask(task_id);
     // Interrupt while running
     task_manager.stop();
