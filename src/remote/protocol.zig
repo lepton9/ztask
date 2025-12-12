@@ -24,12 +24,15 @@ pub const ParsedMessage = union(enum) {
     CancelJob: CancelJobMsg,
 };
 
+/// Initializes a message prefixed with the given type
 pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8) {
     var buf = try std.ArrayList(u8).initCapacity(gpa, 1);
     buf.appendAssumeCapacity(@intFromEnum(msg_type));
     return buf;
 }
 
+/// Parses the payload to a message type
+/// Type is determined by the first byte
 pub fn parseMessage(payload: []const u8) !ParsedMessage {
     if (payload.len == 0) return error.EmptyMessage;
     const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
@@ -283,4 +286,13 @@ test "cancel_job" {
     defer alloc.free(serialized);
     const parsed: CancelJobMsg = try .parse(serialized);
     try std.testing.expect(msg.job_id == parsed.job_id);
+}
+
+test "heartbeat" {
+    const alloc = std.testing.allocator;
+    var payload = try beginPayload(alloc, .heartbeat);
+    defer payload.deinit(alloc);
+    const parsed = try parseMessage(payload.items);
+    try std.testing.expect(payload.items.len == 1);
+    try std.testing.expect(parsed == .Heartbeat);
 }
