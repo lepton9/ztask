@@ -31,6 +31,7 @@ pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8
 }
 
 pub fn parseMessage(payload: []const u8) !ParsedMessage {
+    if (payload.len == 0) return error.EmptyMessage;
     const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
     return switch (msg_type) {
         .register => .{ .Register = try .parse(payload) },
@@ -53,8 +54,8 @@ pub const RegisterMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len == 0) return error.InvalidPayload;
-        const hostname = msg;
+        if (msg.len < 1) return error.InvalidPayload;
+        const hostname = msg[1..];
         return .{ .hostname = hostname };
     }
 };
@@ -73,9 +74,10 @@ pub const RunJobMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8) return error.InvalidPayload;
-        const job_id = readU64Le(msg);
-        const steps = msg[8..];
+        if (msg.len < 8 + 1) return error.InvalidPayload;
+        const body = msg[1..];
+        const job_id = readU64Le(body);
+        const steps = body[8..];
         return .{ .job_id = job_id, .steps = steps };
     }
 
@@ -108,8 +110,9 @@ pub const CancelJobMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8) return error.InvalidPayload;
-        const job_id = readU64Le(msg);
+        if (msg.len < 8 + 1) return error.InvalidPayload;
+        const body = msg[1..];
+        const job_id = readU64Le(body);
         return .{ .job_id = job_id };
     }
 };
@@ -129,9 +132,10 @@ pub const JobStartMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 16) return error.InvalidPayload;
-        const job_id = readU64Le(msg);
-        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
+        if (msg.len < 16 + 1) return error.InvalidPayload;
+        const body = msg[1..];
+        const job_id = readU64Le(body);
+        const timestamp = std.mem.readInt(i64, body[8..16], .little);
         return .{ .job_id = job_id, .timestamp = timestamp };
     }
 };
@@ -154,10 +158,11 @@ pub const JobEndMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 20) return error.InvalidPayload;
-        const job_id = readU64Le(msg);
-        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
-        const exit_code = std.mem.readInt(i32, msg[16..20], .little);
+        if (msg.len < 20 + 1) return error.InvalidPayload;
+        const body = msg[1..];
+        const job_id = readU64Le(body);
+        const timestamp = std.mem.readInt(i64, body[8..16], .little);
+        const exit_code = std.mem.readInt(i32, body[16..20], .little);
         return .{ .job_id = job_id, .timestamp = timestamp, .exit_code = exit_code };
     }
 };
@@ -179,10 +184,11 @@ pub const JobLogMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 12) return error.InvalidPayload;
-        const job_id = readU64Le(msg);
-        const step = readU32Le(msg[8..]);
-        const data = msg[12..];
+        if (msg.len < 12 + 1) return error.InvalidPayload;
+        const body = msg[1..];
+        const job_id = readU64Le(body);
+        const step = readU32Le(body[8..]);
+        const data = body[12..];
         return .{ .job_id = job_id, .step = step, .data = data };
     }
 };
