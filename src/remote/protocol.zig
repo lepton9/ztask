@@ -68,7 +68,7 @@ pub const RunJobMsg = struct {
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, id[0..8], self.job_id, .little);
         var buf = try beginPayload(gpa, .run_job);
-        try buf.appendSlice(gpa, id);
+        try buf.appendSlice(gpa, &id);
         try buf.appendSlice(gpa, self.steps);
         return buf.toOwnedSlice(gpa);
     }
@@ -105,7 +105,7 @@ pub const CancelJobMsg = struct {
         var buf = try beginPayload(gpa, .cancel_job);
         var id: [8]u8 = undefined;
         std.mem.writeInt(u64, id[0..8], self.job_id, .little);
-        try buf.appendSlice(gpa, id);
+        try buf.appendSlice(gpa, &id);
         return buf.toOwnedSlice(gpa);
     }
 
@@ -203,4 +203,84 @@ fn readU64Le(s: []const u8) u64 {
 /// Slice length must be over 4 bytes
 fn readU32Le(s: []const u8) u32 {
     return std.mem.readInt(u32, s[0..4], .little);
+}
+
+test "register" {
+    const alloc = std.testing.allocator;
+    const msg: RegisterMsg = .{ .hostname = "test" };
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: RegisterMsg = try .parse(serialized);
+    try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
+}
+
+test "job_start" {
+    const alloc = std.testing.allocator;
+    const msg: JobStartMsg = .{ .job_id = 1, .timestamp = std.time.timestamp() };
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: JobStartMsg = try .parse(serialized);
+    try std.testing.expect(msg.job_id == parsed.job_id);
+    try std.testing.expect(msg.timestamp == parsed.timestamp);
+}
+
+test "job_log" {
+    const alloc = std.testing.allocator;
+    const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: JobLogMsg = try .parse(serialized);
+    try std.testing.expect(msg.job_id == parsed.job_id);
+    try std.testing.expect(msg.step == parsed.step);
+    try std.testing.expect(std.mem.eql(u8, msg.data, parsed.data));
+}
+
+test "job_end" {
+    const alloc = std.testing.allocator;
+    const msg: JobEndMsg = .{
+        .job_id = 1337,
+        .timestamp = std.time.timestamp(),
+        .exit_code = 0,
+    };
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: JobEndMsg = try .parse(serialized);
+    try std.testing.expect(msg.job_id == parsed.job_id);
+    try std.testing.expect(msg.timestamp == parsed.timestamp);
+    try std.testing.expect(msg.exit_code == parsed.exit_code);
+}
+
+test "run_job" {
+    const alloc = std.testing.allocator;
+    var steps = [_]task.Step{
+        .{ .kind = .command, .value = "command" },
+        .{ .kind = .command, .value = "" },
+    };
+    const msg: RunJobMsg = .{
+        .job_id = 111,
+        .steps = try RunJobMsg.serializeSteps(alloc, &steps),
+    };
+    defer alloc.free(msg.steps);
+
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: RunJobMsg = try .parse(serialized);
+    const parsed_steps = try parsed.parseSteps(alloc);
+    defer alloc.free(parsed_steps);
+
+    try std.testing.expect(msg.job_id == parsed.job_id);
+    try std.testing.expect(std.mem.eql(u8, msg.steps, parsed.steps));
+    for (0..steps.len) |i| {
+        try std.testing.expect(steps[i].kind == parsed_steps[i].kind);
+        try std.testing.expect(std.mem.eql(u8, steps[i].value, parsed_steps[i].value));
+    }
+}
+
+test "cancel_job" {
+    const alloc = std.testing.allocator;
+    const msg: CancelJobMsg = .{ .job_id = 1 };
+    const serialized = try msg.serialize(alloc);
+    defer alloc.free(serialized);
+    const parsed: CancelJobMsg = try .parse(serialized);
+    try std.testing.expect(msg.job_id == parsed.job_id);
 }
