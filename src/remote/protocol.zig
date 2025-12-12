@@ -36,14 +36,15 @@ pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8
 pub fn parseMessage(payload: []const u8) !ParsedMessage {
     if (payload.len == 0) return error.EmptyMessage;
     const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
+    const msg = payload[1..];
     return switch (msg_type) {
-        .register => .{ .Register = try .parse(payload) },
+        .register => .{ .Register = try .parse(msg) },
         .heartbeat => .{ .Heartbeat = std.time.timestamp() },
-        .job_start => .{ .JobStart = try .parse(payload) },
-        .job_log => .{ .JobLog = try .parse(payload) },
-        .job_finish => .{ .JobEnd = try .parse(payload) },
-        .run_job => .{ .RunJob = try .parse(payload) },
-        .cancel_job => .{ .CancelJob = try .parse(payload) },
+        .job_start => .{ .JobStart = try .parse(msg) },
+        .job_log => .{ .JobLog = try .parse(msg) },
+        .job_finish => .{ .JobEnd = try .parse(msg) },
+        .run_job => .{ .RunJob = try .parse(msg) },
+        .cancel_job => .{ .CancelJob = try .parse(msg) },
     };
 }
 
@@ -57,8 +58,8 @@ pub const RegisterMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 1) return error.InvalidPayload;
-        const hostname = msg[1..];
+        if (msg.len == 0) return error.InvalidMsg;
+        const hostname = msg;
         return .{ .hostname = hostname };
     }
 };
@@ -77,10 +78,9 @@ pub const RunJobMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8 + 1) return error.InvalidPayload;
-        const body = msg[1..];
-        const job_id = readU64Le(body);
-        const steps = body[8..];
+        if (msg.len < 8) return error.InvalidMsg;
+        const job_id = readU64Le(msg);
+        const steps = msg[8..];
         return .{ .job_id = job_id, .steps = steps };
     }
 
@@ -113,9 +113,8 @@ pub const CancelJobMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8 + 1) return error.InvalidPayload;
-        const body = msg[1..];
-        const job_id = readU64Le(body);
+        if (msg.len < 8) return error.InvalidMsg;
+        const job_id = readU64Le(msg);
         return .{ .job_id = job_id };
     }
 };
@@ -135,10 +134,9 @@ pub const JobStartMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 16 + 1) return error.InvalidPayload;
-        const body = msg[1..];
-        const job_id = readU64Le(body);
-        const timestamp = std.mem.readInt(i64, body[8..16], .little);
+        if (msg.len < 16) return error.InvalidMsg;
+        const job_id = readU64Le(msg);
+        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
         return .{ .job_id = job_id, .timestamp = timestamp };
     }
 };
@@ -161,11 +159,10 @@ pub const JobEndMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 20 + 1) return error.InvalidPayload;
-        const body = msg[1..];
-        const job_id = readU64Le(body);
-        const timestamp = std.mem.readInt(i64, body[8..16], .little);
-        const exit_code = std.mem.readInt(i32, body[16..20], .little);
+        if (msg.len < 20) return error.InvalidMsg;
+        const job_id = readU64Le(msg);
+        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
+        const exit_code = std.mem.readInt(i32, msg[16..20], .little);
         return .{ .job_id = job_id, .timestamp = timestamp, .exit_code = exit_code };
     }
 };
@@ -187,11 +184,10 @@ pub const JobLogMsg = struct {
     }
 
     pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 12 + 1) return error.InvalidPayload;
-        const body = msg[1..];
-        const job_id = readU64Le(body);
-        const step = readU32Le(body[8..]);
-        const data = body[12..];
+        if (msg.len < 12) return error.InvalidMsg;
+        const job_id = readU64Le(msg);
+        const step = readU32Le(msg[8..]);
+        const data = msg[12..];
         return .{ .job_id = job_id, .step = step, .data = data };
     }
 };
@@ -213,7 +209,8 @@ test "register" {
     const msg: RegisterMsg = .{ .hostname = "test" };
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: RegisterMsg = try .parse(serialized);
+    const parsed_msg = try parseMessage(serialized);
+    const parsed: RegisterMsg = parsed_msg.Register;
     try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
 }
 
@@ -222,7 +219,8 @@ test "job_start" {
     const msg: JobStartMsg = .{ .job_id = 1, .timestamp = std.time.timestamp() };
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: JobStartMsg = try .parse(serialized);
+    const parsed_msg = try parseMessage(serialized);
+    const parsed: JobStartMsg = parsed_msg.JobStart;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
 }
@@ -232,7 +230,8 @@ test "job_log" {
     const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: JobLogMsg = try .parse(serialized);
+    const parsed_msg = try parseMessage(serialized);
+    const parsed: JobLogMsg = parsed_msg.JobLog;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.step == parsed.step);
     try std.testing.expect(std.mem.eql(u8, msg.data, parsed.data));
@@ -247,7 +246,8 @@ test "job_end" {
     };
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: JobEndMsg = try .parse(serialized);
+    const parsed_msg = try parseMessage(serialized);
+    const parsed: JobEndMsg = parsed_msg.JobEnd;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
     try std.testing.expect(msg.exit_code == parsed.exit_code);
@@ -267,7 +267,8 @@ test "run_job" {
 
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: RunJobMsg = try .parse(serialized);
+    const parsed_msg = try parseMessage(serialized);
+    const parsed: RunJobMsg = parsed_msg.RunJob;
     const parsed_steps = try parsed.parseSteps(alloc);
     defer alloc.free(parsed_steps);
 
@@ -284,8 +285,8 @@ test "cancel_job" {
     const msg: CancelJobMsg = .{ .job_id = 1 };
     const serialized = try msg.serialize(alloc);
     defer alloc.free(serialized);
-    const parsed: CancelJobMsg = try .parse(serialized);
-    try std.testing.expect(msg.job_id == parsed.job_id);
+    const parsed = try parseMessage(serialized);
+    try std.testing.expect(msg.job_id == parsed.CancelJob.job_id);
 }
 
 test "heartbeat" {
