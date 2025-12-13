@@ -7,6 +7,7 @@ const connection = @import("connection.zig");
 
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
+const ResultError = localrunner.ResultError;
 const Scheduler = scheduler_zig.Scheduler;
 
 const ConnKey = struct {
@@ -110,6 +111,7 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Update the agent and handle incoming messages
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
         while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
             std.debug.print("msg: '{s}'\n", .{msg});
@@ -118,6 +120,7 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Handle a parsed message sent to the manager
     fn handleMessage(
         self: *RemoteManager,
         agent: *AgentHandle,
@@ -164,26 +167,51 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Dispatch all jobs in the queue to agents
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
             const agent = self.findAgent(req.agent_name) orelse {
-                // TODO: Send result to scheduler with error no runner found
+                const kv = self.dispatched_jobs.fetchRemove(
+                    req.job_node.id,
+                ) orelse return error.NoDispatchedJob;
+                const dispatch = kv.value;
+                try dispatch.scheduler.result_queue.push(self.gpa, .{
+                    .node = dispatch.job_node,
+                    .result = .{
+                        .err = ResultError.NoRunnerFound,
+                        .exit_code = 1,
+                        .runner = .remote,
+                    },
+                });
                 continue;
             };
             try self.dispatchJob(agent, req);
         }
     }
 
+    /// Dispatch job to agent
     fn dispatchJob(
         self: *RemoteManager,
-        _: *AgentHandle,
+        agent: *AgentHandle,
         req: DispatchRequest,
     ) !void {
-        try self.dispatched_jobs.put(self.gpa, @intFromPtr(req.job_node), req);
+        // try self.dispatched_jobs.put(self.gpa, @intFromPtr(req.job_node), req);
+        try self.dispatched_jobs.put(self.gpa, req.job_node.id, req);
         // Send to agent
-        // try self.sendJobFrame(agent, req.job_node);
+        const startMsg: protocol.RunJobMsg = .{
+            .job_id = req.job_node.id,
+            .steps = try protocol.RunJobMsg.serializeSteps(
+                self.gpa,
+                req.job_node.ptr.steps,
+            ),
+        };
+        defer self.gpa.free(startMsg.steps);
+        const msg = try startMsg.serialize(self.gpa);
+        defer self.gpa.free(msg);
+        try agent.connection.sendFrame(msg);
     }
 
+    /// Find an agent based on the name
     fn findAgent(self: *RemoteManager, name: []const u8) ?*AgentHandle {
         var it = self.agents.valueIterator();
         while (it.next()) |agent| {

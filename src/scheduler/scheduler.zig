@@ -285,14 +285,19 @@ pub const Scheduler = struct {
 
     /// Handle the completed job results
     fn handleResults(self: *Scheduler) void {
-        while (self.result_queue.pop()) |res| {
-            const kv = self.active_runners.fetchRemove(res.node) orelse
-                @panic("Active runners should have the runner entry");
-            const runner = kv.value;
-            runner.joinThread();
-            self.pool.release(runner);
-            self.onJobCompleted(res.node, res.result);
-        }
+        while (self.result_queue.pop()) |res| switch (res.result.runner) {
+            .local => {
+                const kv = self.active_runners.fetchRemove(res.node) orelse
+                    @panic("Active runners should have the runner entry");
+                const runner = kv.value;
+                runner.joinThread();
+                self.pool.release(runner);
+                self.onJobCompleted(res.node, res.result);
+            },
+            .remote => {
+                self.onJobCompleted(res.node, res.result);
+            },
+        };
     }
 
     /// Handle the job log events in the queue
@@ -320,8 +325,12 @@ pub const Scheduler = struct {
 
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
-        // TODO: log the job run
+        // TODO: skip rest of the jobs if failed
         node.status = if (result.exit_code == 0) .success else .failed;
+        if (result.err) |_| {
+            // TODO: handle error
+            node.status = .failed;
+        }
         for (node.getDependents()) |dep| {
             dep.dependencyDone();
             if (dep.readyToRun()) {

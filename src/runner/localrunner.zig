@@ -19,9 +19,14 @@ pub const LogEvent = union(enum) {
 pub const ResultQueue = queue.Queue(Result);
 pub const LogQueue = queue.Queue(LogEvent);
 
+pub const ResultError = error{
+    NoRunnerFound,
+};
+
 pub const ExecResult = struct {
     exit_code: i32,
-    duration_ns: u64,
+    runner: enum { local, remote } = .local,
+    err: ?ResultError = null,
     msg: ?[]const u8 = null,
 };
 
@@ -52,7 +57,6 @@ pub const LocalRunner = struct {
                 .node = job,
                 .result = .{
                     .exit_code = 1,
-                    .duration_ns = 0,
                     .msg = "Failed to spawn thread",
                 },
             });
@@ -66,7 +70,6 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
-        var timer = std.time.Timer.start() catch unreachable;
         std.debug.print("- Start job {s}\n", .{job.ptr.name});
 
         logs.push(gpa, .{ .job_started = .{
@@ -103,7 +106,6 @@ pub const LocalRunner = struct {
         results.pushAssumeCapacity(
             .{ .node = job, .result = .{
                 .exit_code = exit_code,
-                .duration_ns = timer.read(),
                 .msg = err_msg,
             } },
         );
