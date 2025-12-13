@@ -231,7 +231,13 @@ pub const TaskManager = struct {
         const task = try self.loadTask(task_id);
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| break :blk s;
-            const s = try Scheduler.init(self.gpa, task, self.pool, &self.datastore);
+            const s = try Scheduler.init(
+                self.gpa,
+                task,
+                self.pool,
+                self.remote_manager,
+                &self.datastore,
+            );
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };

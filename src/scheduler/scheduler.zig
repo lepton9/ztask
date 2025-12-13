@@ -4,6 +4,7 @@ const task_zig = @import("task");
 const dag = @import("dag.zig");
 const log = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
+const remote = @import("../remote/remote_manager.zig");
 
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const LocalRunner = localrunner.LocalRunner;
@@ -31,6 +32,7 @@ pub const Scheduler = struct {
     datastore: *data.DataStore,
     task: *Task,
     pool: *RunnerPool,
+    remote_manager: *remote.RemoteManager,
     nodes: []JobNode = undefined,
     /// Ready queue of jobs that can run
     queue: std.ArrayList(*JobNode),
@@ -48,6 +50,7 @@ pub const Scheduler = struct {
         gpa: std.mem.Allocator,
         task: *Task,
         pool: *RunnerPool,
+        remote_manager: *remote.RemoteManager,
         datastore: *data.DataStore,
     ) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
@@ -66,6 +69,7 @@ pub const Scheduler = struct {
             .datastore = datastore,
             .task = task,
             .pool = pool,
+            .remote_manager = remote_manager,
             .nodes = try scheduler.gpa.alloc(JobNode, node_n),
             .active_runners = .{},
             .queue = try .initCapacity(gpa, node_n),
@@ -198,10 +202,11 @@ pub const Scheduler = struct {
     fn tryScheduleNext(self: *Scheduler) bool {
         if (self.queue.items.len == 0) return false;
         const node = self.queue.items[0];
-        return switch (node.ptr.run_on) {
-            .local => self.requestRunner(),
-            .remote => @panic("TODO"),
-        };
+        switch (node.ptr.run_on) {
+            .local => return self.requestRunner(),
+            .remote => self.runNextJobRemote(),
+        }
+        return true;
     }
 
     /// Run the next job from queue with the provided local runner
@@ -217,6 +222,16 @@ pub const Scheduler = struct {
             self.job_metas.getPtr(node) orelse unreachable,
         ) catch {};
         runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
+    }
+
+    /// Run the next job in the queue with a remote runner
+    fn runNextJobRemote(self: *Scheduler) void {
+        const node = self.queue.orderedRemove(0);
+        self.remote_manager.pushDispatch(.{
+            .agent_name = node.ptr.run_on.remote,
+            .job_node = node,
+            .scheduler = self,
+        }) catch {};
     }
 
     /// Request a runner from the pool
@@ -263,12 +278,7 @@ pub const Scheduler = struct {
         }
         self.active_runners.clearRetainingCapacity();
 
-        // Skip rest of the jobs
-        for (self.nodes) |*node| switch (node.status) {
-            .pending, .ready => node.status = .skipped,
-            else => {},
-        };
-
+        self.skipRemainingJobs();
         self.handleLogs();
 
         // Log task metadata
@@ -325,12 +335,13 @@ pub const Scheduler = struct {
 
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
-        // TODO: skip rest of the jobs if failed
         node.status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |_| {
             // TODO: handle error
             node.status = .failed;
         }
+        if (node.status == .failed) self.skipRemainingJobs();
+
         for (node.getDependents()) |dep| {
             dep.dependencyDone();
             if (dep.readyToRun()) {
@@ -342,6 +353,18 @@ pub const Scheduler = struct {
             self.tryScheduleJobs();
             if (self.allJobsCompleted()) self.completeTask();
         }
+    }
+
+    /// Skip the rest of the jobs that are pending
+    fn skipRemainingJobs(self: *Scheduler) void {
+        while (self.queue.pop()) |node| {
+            node.status = .skipped;
+        }
+
+        for (self.nodes) |*node| switch (node.status) {
+            .pending, .ready => node.status = .skipped,
+            else => {},
+        };
     }
 
     /// Check if task is being executed

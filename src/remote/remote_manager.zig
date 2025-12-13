@@ -111,6 +111,11 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Push a dispatch request to the queue
+    pub fn pushDispatch(self: *RemoteManager, req: DispatchRequest) !void {
+        try self.dispatch_queue.append(self.gpa, req);
+    }
+
     /// Update the agent and handle incoming messages
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
         while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
