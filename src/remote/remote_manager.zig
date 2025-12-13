@@ -127,6 +127,39 @@ pub const RemoteManager = struct {
         switch (msg) {
             .Register => |m| try agent.setName(self.gpa, m.hostname),
             .Heartbeat => |m| agent.last_heartbeat = m,
+            .JobStart => |m| {
+                const req = self.dispatched_jobs.get(m.job_id) orelse
+                    return error.NoDispatchedJob;
+                try req.scheduler.log_queue.push(self.gpa, .{ .job_started = .{
+                    .job_node = req.job_node,
+                    .timestamp = m.timestamp,
+                } });
+            },
+            .JobLog => |m| {
+                const req = self.dispatched_jobs.get(m.job_id) orelse
+                    return error.NoDispatchedJob;
+                try req.scheduler.log_queue.push(self.gpa, .{ .job_output = .{
+                    .job_node = req.job_node,
+                    .step = m.step,
+                    .data = m.data,
+                } });
+            },
+            .JobEnd => |m| {
+                const req = self.dispatched_jobs.get(m.job_id) orelse
+                    return error.NoDispatchedJob;
+                try req.scheduler.log_queue.push(self.gpa, .{ .job_finished = .{
+                    .job_node = req.job_node,
+                    .exit_code = m.exit_code,
+                    .timestamp = m.timestamp,
+                } });
+                try req.scheduler.result_queue.push(self.gpa, .{
+                    .node = req.job_node,
+                    .result = .{
+                        .exit_code = m.exit_code,
+                        .runner = .remote,
+                    },
+                });
+            },
             else => {},
         }
     }
