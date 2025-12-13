@@ -320,7 +320,7 @@ pub const Scheduler = struct {
             },
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
-                defer self.gpa.free(e.data); // Allocated by runner
+                defer self.gpa.free(e.data); // Allocated by runner or remote manager
                 self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
@@ -336,8 +336,9 @@ pub const Scheduler = struct {
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
         node.status = if (result.exit_code == 0) .success else .failed;
-        if (result.err) |_| {
+        if (result.err) |err| {
             // TODO: handle error
+            std.log.err("{}", .{err});
             node.status = .failed;
         }
         if (node.status == .failed) self.skipRemainingJobs();

@@ -69,8 +69,8 @@ pub const RemoteAgent = struct {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
             // self.heartbeat() catch {};
+            self.listen() catch {};
             self.tryRunNext();
-            self.tryReadMessages() catch {};
             self.handleResults();
             self.handleLogs() catch {};
         }
@@ -83,7 +83,7 @@ pub const RemoteAgent = struct {
     }
 
     /// Listen for incoming messages
-    fn tryReadMessages(self: *RemoteAgent) !void {
+    fn listen(self: *RemoteAgent) !void {
         while (self.connection.readNextFrame(self.gpa) catch null) |msg| {
             const parsed = try protocol.parseMessage(msg);
             try self.handleMessage(parsed);
@@ -148,11 +148,6 @@ pub const RemoteAgent = struct {
     fn heartbeat(self: *RemoteAgent) !void {
         var buf: [1]u8 = .{@intFromEnum(protocol.MsgType.heartbeat)};
         try self.connection.sendFrame(&buf);
-    }
-
-    // TODO:
-    fn listen(_: *RemoteAgent) !void {
-        // const msg = connection.readFrame();
     }
 
     /// Handle the completed job results

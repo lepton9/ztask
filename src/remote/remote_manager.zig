@@ -119,7 +119,6 @@ pub const RemoteManager = struct {
     /// Update the agent and handle incoming messages
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
         while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
-            std.debug.print("msg: '{s}'\n", .{msg});
             const parsed = try protocol.parseMessage(msg);
             try self.handleMessage(agent, parsed);
         }
@@ -149,7 +148,7 @@ pub const RemoteManager = struct {
                 try req.scheduler.log_queue.push(self.gpa, .{ .job_output = .{
                     .job_node = req.job_node,
                     .step = m.step,
-                    .data = m.data,
+                    .data = try self.gpa.dupe(u8, m.data),
                 } });
             },
             .JobEnd => |m| {
@@ -176,12 +175,8 @@ pub const RemoteManager = struct {
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
             const agent = self.findAgent(req.agent_name) orelse {
-                const kv = self.dispatched_jobs.fetchRemove(
-                    req.job_node.id,
-                ) orelse return error.NoDispatchedJob;
-                const dispatch = kv.value;
-                try dispatch.scheduler.result_queue.push(self.gpa, .{
-                    .node = dispatch.job_node,
+                try req.scheduler.result_queue.push(self.gpa, .{
+                    .node = req.job_node,
                     .result = .{
                         .err = ResultError.NoRunnerFound,
                         .exit_code = 1,
