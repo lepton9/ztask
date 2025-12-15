@@ -87,10 +87,13 @@ pub const Scheduler = struct {
 
         try scheduler.active_runners.ensureTotalCapacity(gpa, @intCast(node_n));
         try scheduler.job_metas.ensureTotalCapacity(gpa, @intCast(node_n));
-        for (scheduler.nodes) |*node| scheduler.job_metas.putAssumeCapacity(node, .{
-            .job_name = node.ptr.name,
-            .start_time = std.time.timestamp(),
-        });
+        for (scheduler.nodes) |*node| {
+            node.id = @intFromPtr(node); // Set temporary ID for job node
+            scheduler.job_metas.putAssumeCapacity(node, .{
+                .job_name = node.ptr.name,
+                .start_time = std.time.timestamp(),
+            });
+        }
 
         return scheduler;
     }
@@ -227,6 +230,11 @@ pub const Scheduler = struct {
     /// Run the next job in the queue with a remote runner
     fn runNextJobRemote(self: *Scheduler) void {
         const node = self.queue.orderedRemove(0);
+        self.logger.startJob(
+            self.gpa,
+            self.job_metas.getPtr(node) orelse unreachable,
+        ) catch {};
+
         self.remote_manager.pushDispatch(.{
             .agent_name = node.ptr.run_on.remote,
             .job_node = node,
@@ -289,8 +297,8 @@ pub const Scheduler = struct {
 
     /// Update the scheduler and handle pending events
     pub fn update(self: *Scheduler) void {
-        self.handleResults();
         self.handleLogs();
+        self.handleResults();
     }
 
     /// Handle the completed job results

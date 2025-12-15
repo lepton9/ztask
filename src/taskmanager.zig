@@ -111,7 +111,6 @@ pub const TaskManager = struct {
     fn stopSchedulers(self: *TaskManager) void {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| {
-            // TODO: free the scheduler?
             self.mutex.lock();
             defer self.mutex.unlock();
             self.stopScheduler(s.*);
@@ -128,6 +127,7 @@ pub const TaskManager = struct {
             .waiting, .completed => {
                 s.*.status = .inactive;
                 self.removeFromWatchList(s);
+                s.update();
             },
             else => {},
         }
@@ -162,8 +162,9 @@ pub const TaskManager = struct {
     /// Main run loop
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
-            self.checkWatcher() catch unreachable;
-            self.remote_manager.update() catch unreachable;
+            // TODO: handle errors
+            self.checkWatcher() catch {};
+            self.remote_manager.update() catch {};
             self.updateSchedulers() catch {};
         }
     }
@@ -191,6 +192,7 @@ pub const TaskManager = struct {
             .running => s.*.update(),
             .completed => {
                 std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path orelse ""});
+                s.*.update();
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;

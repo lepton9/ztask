@@ -16,7 +16,7 @@ const BASE_RUNNERS_N = 10;
 pub const RemoteAgent = struct {
     gpa: std.mem.Allocator,
     running: std.atomic.Value(bool) = .init(false),
-    hostname: []const u8 = "remoterunner1", // TODO:
+    hostname: []const u8,
     buffer: [256]u8 = undefined,
 
     pool: *runnerpool.RunnerPool,
@@ -32,10 +32,11 @@ pub const RemoteAgent = struct {
 
     connection: connection.Connection,
 
-    pub fn init(gpa: std.mem.Allocator) !*RemoteAgent {
+    pub fn init(gpa: std.mem.Allocator, name: []const u8) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
         agent.* = .{
             .gpa = gpa,
+            .hostname = try gpa.dupe(u8, name),
             .pool = try runnerpool.RunnerPool.init(gpa, BASE_RUNNERS_N),
             .result_queue = try ResultQueue.init(gpa, BASE_RUNNERS_N),
             .log_queue = try LogQueue.init(gpa, 10),
@@ -52,7 +53,10 @@ pub const RemoteAgent = struct {
         var it = self.jobs.iterator();
         while (it.next()) |e| {
             e.value_ptr.node.deinit(self.gpa);
-            e.value_ptr.job.deinit(self.gpa);
+            // e.value_ptr.job.deinit(self.gpa);
+            const job = e.value_ptr.job;
+            self.gpa.free(job.name);
+            self.gpa.free(job.steps);
         }
         self.jobs.deinit(self.gpa);
         self.result_queue.deinit(self.gpa);
@@ -61,6 +65,7 @@ pub const RemoteAgent = struct {
         self.queue.deinit(self.gpa);
         self.pool.deinit();
         self.connection.deinit(self.gpa);
+        self.gpa.free(self.hostname);
         self.gpa.destroy(self);
     }
 
@@ -71,9 +76,14 @@ pub const RemoteAgent = struct {
             // self.heartbeat() catch {};
             self.listen() catch {};
             self.tryRunNext();
-            self.handleResults();
             self.handleLogs() catch {};
+            self.handleResults();
         }
+    }
+
+    /// Stop the agent
+    pub fn stop(self: *RemoteAgent) void {
+        self.running.store(false, .seq_cst);
     }
 
     /// Try to connect to the server at the address

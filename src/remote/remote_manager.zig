@@ -111,6 +111,14 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Get the address the manager server is running on
+    pub fn getAddress(self: *RemoteManager) ?std.net.Address {
+        if (self.server) |server| {
+            return server.listen_address;
+        }
+        return null;
+    }
+
     /// Push a dispatch request to the queue
     pub fn pushDispatch(self: *RemoteManager, req: DispatchRequest) !void {
         try self.dispatch_queue.append(self.gpa, req);
@@ -152,8 +160,9 @@ pub const RemoteManager = struct {
                 } });
             },
             .JobEnd => |m| {
-                const req = self.dispatched_jobs.get(m.job_id) orelse
+                const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse
                     return error.NoDispatchedJob;
+                const req = kv.value;
                 try req.scheduler.log_queue.push(self.gpa, .{ .job_finished = .{
                     .job_node = req.job_node,
                     .exit_code = m.exit_code,
@@ -195,7 +204,6 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         req: DispatchRequest,
     ) !void {
-        // try self.dispatched_jobs.put(self.gpa, @intFromPtr(req.job_node), req);
         try self.dispatched_jobs.put(self.gpa, req.job_node.id, req);
         // Send to agent
         const startMsg: protocol.RunJobMsg = .{
