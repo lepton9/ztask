@@ -219,6 +219,23 @@ pub const RemoteManager = struct {
         try agent.connection.sendFrame(msg);
     }
 
+    /// Cancel a job from running
+    /// Send a cancel request to the remote agent if currently running
+    pub fn cancelJob(self: *RemoteManager, job_id: usize) !void {
+        const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return {
+            for (self.dispatch_queue.items, 0..) |d, i| if (d.job_node.id == job_id) {
+                _ = self.dispatch_queue.orderedRemove(i);
+                break;
+            };
+        };
+        const req = kv.value;
+        const agent = self.findAgent(req.agent_name) orelse return;
+        const msg: protocol.CancelJobMsg = .{ .job_id = req.job_node.id };
+        const payload = try msg.serialize(self.gpa);
+        defer self.gpa.free(payload);
+        try agent.connection.sendFrame(payload);
+    }
+
     /// Find an agent based on the name
     fn findAgent(self: *RemoteManager, name: []const u8) ?*AgentHandle {
         var it = self.agents.valueIterator();

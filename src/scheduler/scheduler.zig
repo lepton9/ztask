@@ -219,6 +219,8 @@ pub const Scheduler = struct {
             return;
         }
         const node = self.queue.orderedRemove(0);
+        node.status = .running;
+
         self.active_runners.putAssumeCapacity(node, runner);
         self.logger.startJob(
             self.gpa,
@@ -230,6 +232,8 @@ pub const Scheduler = struct {
     /// Run the next job in the queue with a remote runner
     fn runNextJobRemote(self: *Scheduler) void {
         const node = self.queue.orderedRemove(0);
+        node.status = .running;
+
         self.logger.startJob(
             self.gpa,
             self.job_metas.getPtr(node) orelse unreachable,
@@ -264,25 +268,15 @@ pub const Scheduler = struct {
     pub fn forceStop(self: *Scheduler) void {
         self.status = if (self.status == .running) .interrupted else .inactive;
         self.handleResults();
-        self.queue.clearRetainingCapacity();
 
-        // Force stop running runners
+        // Force stop running local runners
         var it = self.active_runners.iterator();
         while (it.next()) |e| {
             const runner = e.value_ptr.*;
             const node = e.key_ptr.*;
             runner.forceStop();
             self.pool.release(runner);
-            // Skip job and the dependents
-            node.status = .skipped;
-            for (node.getDependents()) |dep| {
-                dep.status = .skipped;
-            }
-            // Log job metadata
-            var job_meta = self.job_metas.getPtr(node) orelse unreachable;
-            job_meta.status = .interrupted;
-            job_meta.end_time = std.time.timestamp();
-            self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+            self.skipJob(node);
         }
         self.active_runners.clearRetainingCapacity();
 
@@ -293,6 +287,33 @@ pub const Scheduler = struct {
         self.task_meta.status = .interrupted;
         self.task_meta.jobs_completed = self.completedJobs();
         self.logger.endTask(self.gpa, &self.task_meta) catch {};
+    }
+
+    /// Skip the rest of the jobs that are pending
+    fn skipRemainingJobs(self: *Scheduler) void {
+        while (self.queue.pop()) |node| {
+            self.skipJob(node);
+        }
+
+        for (self.nodes) |*node| switch (node.status) {
+            .pending, .ready => self.skipJob(node),
+            .running => {
+                if (node.ptr.run_on == .local) continue;
+                self.remote_manager.cancelJob(node.id) catch {};
+                self.skipJob(node);
+            },
+            else => {},
+        };
+    }
+
+    /// Mark the job as skipped and log the metadata
+    fn skipJob(self: *Scheduler, node: *JobNode) void {
+        node.status = .skipped;
+        // Log job metadata
+        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        job_meta.status = .interrupted;
+        job_meta.end_time = std.time.timestamp();
+        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
     /// Update the scheduler and handle pending events
@@ -362,18 +383,6 @@ pub const Scheduler = struct {
             self.tryScheduleJobs();
             if (self.allJobsCompleted()) self.completeTask();
         }
-    }
-
-    /// Skip the rest of the jobs that are pending
-    fn skipRemainingJobs(self: *Scheduler) void {
-        while (self.queue.pop()) |node| {
-            node.status = .skipped;
-        }
-
-        for (self.nodes) |*node| switch (node.status) {
-            .pending, .ready => node.status = .skipped,
-            else => {},
-        };
     }
 
     /// Check if task is being executed

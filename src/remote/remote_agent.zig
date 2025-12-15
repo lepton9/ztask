@@ -104,7 +104,7 @@ pub const RemoteAgent = struct {
     fn handleMessage(self: *RemoteAgent, msg: protocol.ParsedMessage) !void {
         switch (msg) {
             .RunJob => |m| try self.queueJob(m),
-            .CancelJob => |m| try self.cancelJob(m),
+            .CancelJob => |m| self.cancelJob(m),
             else => {}, // Not relevant for agent
         }
     }
@@ -129,9 +129,9 @@ pub const RemoteAgent = struct {
     /// Cancel a job from running
     /// Force stop the runner if active
     /// Otherwise remove from the queue
-    fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) !void {
+    fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
         // TODO: send message if not found
-        const e = self.jobs.getPtr(msg.job_id) orelse return error.JobNotFound;
+        const e = self.jobs.getPtr(msg.job_id) orelse return;
         if (self.active_runners.get(&e.node)) |runner| {
             runner.forceStop();
         } else for (self.queue.items, 0..) |node, i| {
@@ -142,7 +142,9 @@ pub const RemoteAgent = struct {
         }
         var kv = self.jobs.fetchRemove(msg.job_id) orelse unreachable;
         kv.value.node.deinit(self.gpa);
-        kv.value.job.deinit(self.gpa);
+        const job = kv.value.job;
+        self.gpa.free(job.name);
+        self.gpa.free(job.steps);
     }
 
     /// Send a register packet
@@ -163,10 +165,18 @@ pub const RemoteAgent = struct {
     /// Handle the completed job results
     fn handleResults(self: *RemoteAgent) void {
         while (self.result_queue.pop()) |res| {
+            // Release runner
             const kv = self.active_runners.fetchRemove(res.node) orelse unreachable;
             const runner = kv.value;
             runner.joinThread();
             self.pool.release(runner);
+
+            // Free the job
+            var job_kv = self.jobs.fetchRemove(res.node.id) orelse unreachable;
+            job_kv.value.node.deinit(self.gpa);
+            const job = job_kv.value.job;
+            self.gpa.free(job.name);
+            self.gpa.free(job.steps);
         }
     }
 
