@@ -103,8 +103,8 @@ pub const RemoteAgent = struct {
     /// Handle parsed message
     fn handleMessage(self: *RemoteAgent, msg: protocol.ParsedMessage) !void {
         switch (msg) {
-            .RunJob => |m| try self.queueJob(m),
-            .CancelJob => |m| self.cancelJob(m),
+            .run_job => |m| try self.queueJob(m),
+            .cancel_job => |m| self.cancelJob(m),
             else => {}, // Not relevant for agent
         }
     }

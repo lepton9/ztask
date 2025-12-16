@@ -140,9 +140,9 @@ pub const RemoteManager = struct {
     ) !void {
         std.debug.print("parsed: '{any}'\n", .{msg});
         switch (msg) {
-            .Register => |m| try agent.setName(self.gpa, m.hostname),
-            .Heartbeat => |m| agent.last_heartbeat = m,
-            .JobStart => |m| {
+            .register => |m| try agent.setName(self.gpa, m.hostname),
+            .heartbeat => |m| agent.last_heartbeat = m,
+            .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
                 try req.scheduler.log_queue.push(self.gpa, .{ .job_started = .{
@@ -150,7 +150,7 @@ pub const RemoteManager = struct {
                     .timestamp = m.timestamp,
                 } });
             },
-            .JobLog => |m| {
+            .job_log => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
                 try req.scheduler.log_queue.push(self.gpa, .{ .job_output = .{
@@ -159,7 +159,7 @@ pub const RemoteManager = struct {
                     .data = try self.gpa.dupe(u8, m.data),
                 } });
             },
-            .JobEnd => |m| {
+            .job_finish => |m| {
                 const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse
                     return error.NoDispatchedJob;
                 const req = kv.value;
