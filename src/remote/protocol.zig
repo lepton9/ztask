@@ -3,18 +3,7 @@ const task = @import("task");
 const builtin = @import("builtin");
 const posix = std.posix;
 
-pub const MsgType = enum(u8) {
-    register = 0x01,
-    heartbeat = 0x02,
-    job_start = 0x10,
-    job_log = 0x11,
-    job_finish = 0x12,
-    run_job = 0x20,
-    cancel_job = 0x21,
-};
-
-pub const ParsedMessage = union(MsgType) {
-    // Info: InfoMsg,
+pub const Msg = union(enum) {
     register: RegisterMsg,
     heartbeat: i64,
     job_start: JobStartMsg,
@@ -22,30 +11,60 @@ pub const ParsedMessage = union(MsgType) {
     job_finish: JobEndMsg,
     run_job: RunJobMsg,
     cancel_job: CancelJobMsg,
+
+    const Tag = @typeInfo(Msg).@"union".tag_type.?;
 };
 
-/// Initializes a message prefixed with the given type
-pub fn beginPayload(gpa: std.mem.Allocator, msg_type: MsgType) !std.ArrayList(u8) {
-    var buf = try std.ArrayList(u8).initCapacity(gpa, 1);
-    buf.appendAssumeCapacity(@intFromEnum(msg_type));
-    return buf;
-}
+const MsgUnionInfo = @typeInfo(Msg).@"union";
+const ParseFn = *const fn ([]const u8) anyerror!Msg;
+
+/// Function table for message parse functions
+const parse_table: [MsgUnionInfo.fields.len]ParseFn = blk: {
+    var table: [MsgUnionInfo.fields.len]ParseFn = undefined;
+
+    for (MsgUnionInfo.fields) |field| {
+        const tag = @field(Msg.Tag, field.name);
+        const T = field.type;
+        const info = @typeInfo(T);
+
+        table[@intFromEnum(tag)] = struct {
+            fn f(msg: []const u8) anyerror!Msg {
+                return @unionInit(
+                    Msg,
+                    field.name,
+                    if (info == .@"struct" and @hasDecl(T, "parse"))
+                        try T.parse(msg)
+                    else
+                        0,
+                );
+            }
+        }.f;
+    }
+
+    break :blk table;
+};
 
 /// Parses the payload to a message type
 /// Type is determined by the first byte
-pub fn parseMessage(payload: []const u8) !ParsedMessage {
+pub fn parseMessage(payload: []const u8) !Msg {
     if (payload.len == 0) return error.EmptyMessage;
-    const msg_type: MsgType = @as(MsgType, @enumFromInt(payload[0]));
+    const msg_type = @as(Msg.Tag, @enumFromInt(payload[0]));
     const msg = payload[1..];
-    return switch (msg_type) {
-        .register => .{ .Register = try .parse(msg) },
-        .heartbeat => .{ .Heartbeat = std.time.timestamp() },
-        .job_start => .{ .JobStart = try .parse(msg) },
-        .job_log => .{ .JobLog = try .parse(msg) },
-        .job_finish => .{ .JobEnd = try .parse(msg) },
-        .run_job => .{ .RunJob = try .parse(msg) },
-        .cancel_job => .{ .CancelJob = try .parse(msg) },
-    };
+    return parseDispatch(msg_type, msg);
+}
+
+fn parseDispatch(msg_type: Msg.Tag, payload: []const u8) !Msg {
+    return parse_table[@intFromEnum(msg_type)](payload);
+}
+
+/// Initializes a message prefixed with the given type
+fn beginPayload(
+    gpa: std.mem.Allocator,
+    msg_type: Msg.Tag,
+) !std.ArrayList(u8) {
+    var buf = try std.ArrayList(u8).initCapacity(gpa, 1);
+    buf.appendAssumeCapacity(@intFromEnum(msg_type));
+    return buf;
 }
 
 pub const RegisterMsg = struct {
@@ -152,7 +171,7 @@ pub const JobLogMsg = struct {
 /// Serialize a struct to a payload with message type prefix
 pub fn serializePayload(
     comptime T: type,
-    comptime M: MsgType,
+    comptime M: Msg.Tag,
     gpa: std.mem.Allocator,
     value: T,
 ) ![]const u8 {

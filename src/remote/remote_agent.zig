@@ -101,7 +101,7 @@ pub const RemoteAgent = struct {
     }
 
     /// Handle parsed message
-    fn handleMessage(self: *RemoteAgent, msg: protocol.ParsedMessage) !void {
+    fn handleMessage(self: *RemoteAgent, msg: protocol.Msg) !void {
         switch (msg) {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
@@ -158,7 +158,7 @@ pub const RemoteAgent = struct {
 
     /// Send a heartbeat packet
     fn heartbeat(self: *RemoteAgent) !void {
-        var buf: [1]u8 = .{@intFromEnum(protocol.MsgType.heartbeat)};
+        var buf: [1]u8 = .{@intFromEnum(protocol.Msg.heartbeat)};
         try self.connection.sendFrame(&buf);
     }
 

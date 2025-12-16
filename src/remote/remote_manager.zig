@@ -136,7 +136,7 @@ pub const RemoteManager = struct {
     fn handleMessage(
         self: *RemoteManager,
         agent: *AgentHandle,
-        msg: protocol.ParsedMessage,
+        msg: protocol.Msg,
     ) !void {
         std.debug.print("parsed: '{any}'\n", .{msg});
         switch (msg) {
