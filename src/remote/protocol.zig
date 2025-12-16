@@ -192,6 +192,75 @@ pub const JobLogMsg = struct {
     }
 };
 
+pub fn serializeAlloc(
+    comptime T: type,
+    comptime M: MsgType,
+    gpa: std.mem.Allocator,
+    value: T,
+) ![]const u8 {
+    const info = @typeInfo(T);
+    if (info != .@"struct")
+        @compileError("serializeAlloc requires a struct");
+
+    var msg = try beginPayload(gpa, M);
+    var buf: [64]u8 = undefined;
+
+    inline for (info.@"struct".fields) |field| {
+        const FieldType = field.type;
+        const field_val = @field(value, field.name);
+
+        switch (@typeInfo(FieldType)) {
+            .int => |i| {
+                const bytes = @divExact(i.bits, 8);
+                std.mem.writeInt(FieldType, &buf, @intCast(field_val), .little);
+                try msg.append(gpa, buf[0..bytes]);
+            },
+            .pointer => |p| {
+                if (p.size != .slice or p.child != u8)
+                    @compileError("Only []const u8 slices supported");
+                // TODO: length prefix
+                try msg.appendSlice(gpa, field_val);
+            },
+            else => @compileError("Unsupported field type"),
+        }
+    }
+    return msg.toOwnedSlice(gpa);
+}
+
+pub fn deserialize(comptime T: type, msg: []const u8) T {
+    var out: T = undefined;
+    var pos: usize = 0;
+
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("deserialize requires a struct");
+
+    inline for (info.@"struct".fields) |field| {
+        // if (pos > msg.len) @compileError("Failed to read the full struct");
+        const FieldType = field.type;
+
+        switch (@typeInfo(FieldType)) {
+            .int => |i| {
+                const bytes = @divExact(i.bits, 8);
+                const int = std.mem.readInt(FieldType, msg[pos..bytes], .little);
+                @field(out, field.name) = int;
+                pos += bytes;
+            },
+
+            .pointer => |p| {
+                if (p.size != .slice or p.child != u8)
+                    @compileError("only []const u8 slices supported");
+                // TODO: length prefix
+
+                @field(out, field.name) = msg[pos..];
+                pos += msg.len - pos;
+            },
+
+            else => @compileError("Unsupported field type"),
+        }
+    }
+    return out;
+}
+
 /// Reads a u64 little endian integer from the slice
 /// Slice length must be over 8 bytes
 fn readU64Le(s: []const u8) u64 {
