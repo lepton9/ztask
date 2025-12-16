@@ -51,16 +51,13 @@ pub fn parseMessage(payload: []const u8) !ParsedMessage {
 pub const RegisterMsg = struct {
     hostname: []const u8,
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var buf = try beginPayload(gpa, .register);
-        try buf.appendSlice(gpa, self.hostname);
-        return buf.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .register, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len == 0) return error.InvalidMsg;
-        const hostname = msg;
-        return .{ .hostname = hostname };
+        return deserialize(@This(), msg);
     }
 };
 
@@ -68,20 +65,13 @@ pub const RunJobMsg = struct {
     job_id: u64,
     steps: []const u8, // JSON
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var id: [8]u8 = undefined;
-        std.mem.writeInt(u64, id[0..8], self.job_id, .little);
-        var buf = try beginPayload(gpa, .run_job);
-        try buf.appendSlice(gpa, &id);
-        try buf.appendSlice(gpa, self.steps);
-        return buf.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .run_job, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 8) return error.InvalidMsg;
-        const job_id = readU64Le(msg);
-        const steps = msg[8..];
-        return .{ .job_id = job_id, .steps = steps };
+        return deserialize(@This(), msg);
     }
 
     /// Serialize the step slice to a JSON string
@@ -97,25 +87,21 @@ pub const RunJobMsg = struct {
         const json: Parsed = std.json.parseFromSlice([]task.Step, gpa, self.steps, .{}) catch
             return error.InvalidStepsFormat;
         defer json.deinit();
-        return try gpa.dupe(task.Step, json.value);
+        const steps = json.value;
+        return try gpa.dupe(task.Step, steps);
     }
 };
 
 pub const CancelJobMsg = struct {
     job_id: u64,
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var buf = try beginPayload(gpa, .cancel_job);
-        var id: [8]u8 = undefined;
-        std.mem.writeInt(u64, id[0..8], self.job_id, .little);
-        try buf.appendSlice(gpa, &id);
-        return buf.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .cancel_job, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 8) return error.InvalidMsg;
-        const job_id = readU64Le(msg);
-        return .{ .job_id = job_id };
+        return deserialize(@This(), msg);
     }
 };
 
@@ -123,21 +109,13 @@ pub const JobStartMsg = struct {
     job_id: u64,
     timestamp: i64,
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var payload = try beginPayload(gpa, .job_start);
-        var buffer: [8]u8 = undefined;
-        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, &buffer);
-        std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
-        try payload.appendSlice(gpa, &buffer);
-        return payload.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .job_start, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 16) return error.InvalidMsg;
-        const job_id = readU64Le(msg);
-        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
-        return .{ .job_id = job_id, .timestamp = timestamp };
+        return deserialize(@This(), msg);
     }
 };
 
@@ -146,24 +124,13 @@ pub const JobEndMsg = struct {
     timestamp: i64,
     exit_code: i32,
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var payload = try beginPayload(gpa, .job_finish);
-        var buffer: [8]u8 = undefined;
-        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, &buffer);
-        std.mem.writeInt(i64, buffer[0..8], self.timestamp, .little);
-        try payload.appendSlice(gpa, &buffer);
-        std.mem.writeInt(i32, buffer[0..4], self.exit_code, .little);
-        try payload.appendSlice(gpa, buffer[0..4]);
-        return payload.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .job_finish, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 20) return error.InvalidMsg;
-        const job_id = readU64Le(msg);
-        const timestamp = std.mem.readInt(i64, msg[8..16], .little);
-        const exit_code = std.mem.readInt(i32, msg[16..20], .little);
-        return .{ .job_id = job_id, .timestamp = timestamp, .exit_code = exit_code };
+        return deserialize(@This(), msg);
     }
 };
 
@@ -172,26 +139,17 @@ pub const JobLogMsg = struct {
     step: u32,
     data: []const u8,
 
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]u8 {
-        var payload = try beginPayload(gpa, .job_log);
-        var buffer: [8]u8 = undefined;
-        std.mem.writeInt(u64, buffer[0..8], self.job_id, .little);
-        try payload.appendSlice(gpa, &buffer);
-        std.mem.writeInt(u32, buffer[0..4], self.step, .little);
-        try payload.appendSlice(gpa, buffer[0..4]);
-        try payload.appendSlice(gpa, self.data);
-        return payload.toOwnedSlice(gpa);
+    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
+        return serializeAlloc(@This(), .job_log, gpa, self);
     }
 
     pub fn parse(msg: []const u8) !@This() {
         if (msg.len < 12) return error.InvalidMsg;
-        const job_id = readU64Le(msg);
-        const step = readU32Le(msg[8..]);
-        const data = msg[12..];
-        return .{ .job_id = job_id, .step = step, .data = data };
+        return deserialize(@This(), msg);
     }
 };
 
+/// Serialize a struct to a string
 pub fn serializeAlloc(
     comptime T: type,
     comptime M: MsgType,
@@ -212,8 +170,13 @@ pub fn serializeAlloc(
         switch (@typeInfo(FieldType)) {
             .int => |i| {
                 const bytes = @divExact(i.bits, 8);
-                std.mem.writeInt(FieldType, &buf, @intCast(field_val), .little);
-                try msg.append(gpa, buf[0..bytes]);
+                std.mem.writeInt(
+                    FieldType,
+                    buf[0..bytes],
+                    @intCast(field_val),
+                    .little,
+                );
+                try msg.appendSlice(gpa, buf[0..bytes]);
             },
             .pointer => |p| {
                 if (p.size != .slice or p.child != u8)
@@ -221,12 +184,13 @@ pub fn serializeAlloc(
                 // TODO: length prefix
                 try msg.appendSlice(gpa, field_val);
             },
-            else => @compileError("Unsupported field type"),
+            else => @compileError("Unsupported field type" ++ @typeInfo(FieldType)),
         }
     }
     return msg.toOwnedSlice(gpa);
 }
 
+/// Deserialize a struct to a type
 pub fn deserialize(comptime T: type, msg: []const u8) T {
     var out: T = undefined;
     var pos: usize = 0;
@@ -235,42 +199,32 @@ pub fn deserialize(comptime T: type, msg: []const u8) T {
     if (info != .@"struct") @compileError("deserialize requires a struct");
 
     inline for (info.@"struct".fields) |field| {
-        // if (pos > msg.len) @compileError("Failed to read the full struct");
+        if (pos > msg.len) @panic("Failed to deserialize the full struct");
         const FieldType = field.type;
 
         switch (@typeInfo(FieldType)) {
             .int => |i| {
                 const bytes = @divExact(i.bits, 8);
-                const int = std.mem.readInt(FieldType, msg[pos..bytes], .little);
+                const int = std.mem.readInt(
+                    FieldType,
+                    @ptrCast(msg[pos .. pos + bytes]),
+                    .little,
+                );
                 @field(out, field.name) = int;
                 pos += bytes;
             },
-
             .pointer => |p| {
                 if (p.size != .slice or p.child != u8)
                     @compileError("only []const u8 slices supported");
                 // TODO: length prefix
 
                 @field(out, field.name) = msg[pos..];
-                pos += msg.len - pos;
+                pos = msg.len;
             },
-
-            else => @compileError("Unsupported field type"),
+            else => @compileError("Unsupported field type" ++ @typeInfo(FieldType)),
         }
     }
     return out;
-}
-
-/// Reads a u64 little endian integer from the slice
-/// Slice length must be over 8 bytes
-fn readU64Le(s: []const u8) u64 {
-    return std.mem.readInt(u64, s[0..8], .little);
-}
-
-/// Reads a u32 little endian integer from the slice
-/// Slice length must be over 4 bytes
-fn readU32Le(s: []const u8) u32 {
-    return std.mem.readInt(u32, s[0..4], .little);
 }
 
 test "register" {
