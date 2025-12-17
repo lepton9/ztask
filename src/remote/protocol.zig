@@ -206,8 +206,11 @@ fn serializeField(
         .pointer => |p| {
             if (p.size != .slice or p.child != u8)
                 @compileError("Only []const u8 slices supported");
-            // TODO: length prefix
-            try msg.appendSlice(gpa, field);
+            const size = @sizeOf(u32);
+            const slice: []const u8 = @ptrCast(field);
+            std.mem.writeInt(u32, buf[0..size], @intCast(slice.len), .little);
+            try msg.appendSlice(gpa, buf[0..size]); // length prefix
+            try msg.appendSlice(gpa, slice);
         },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
@@ -235,14 +238,64 @@ fn deserializeField(
         .pointer => |p| {
             if (p.size != .slice or p.child != u8)
                 @compileError("only []const u8 slices supported");
-            // TODO: length prefix
+            const size = @sizeOf(u32);
+            if (pos.* + size > buffer.len) return error.InvalidMsg;
+
+            // Read slice length
+            const len = std.mem.readInt(
+                u32,
+                @ptrCast(buffer[pos.* .. pos.* + size]),
+                .little,
+            );
+            pos.* += size;
+            if (pos.* + len > buffer.len) return error.InvalidMsg;
+
             const idx = pos.*;
-            pos.* = buffer.len;
-            return buffer[idx..];
+            pos.* += len;
+            return buffer[idx..pos.*];
         },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
     }
+}
+
+test "integer" {
+    const alloc = std.testing.allocator;
+    const msg: u64 = 123;
+    const msg1: i16 = -10;
+    const serialized = try serializeAlloc(u64, alloc, msg);
+    const serialized1 = try serializeAlloc(i16, alloc, msg1);
+    defer alloc.free(serialized);
+    defer alloc.free(serialized1);
+    const parsed_msg = try deserialize(u64, serialized);
+    const parsed_msg1 = try deserialize(i16, serialized1);
+    try std.testing.expect(msg == parsed_msg);
+    try std.testing.expect(msg1 == parsed_msg1);
+}
+
+test "struct_multiple_slices" {
+    const alloc = std.testing.allocator;
+    const T: type = struct { a: []const u8, b: []const u8, c: []const u8 };
+    const s: T = .{ .a = "asd", .b = "", .c = "Some text" };
+    const serialized = try serializeAlloc(T, alloc, s);
+    defer alloc.free(serialized);
+    const parsed: T = try deserialize(T, serialized);
+    try std.testing.expect(std.mem.eql(u8, s.a, parsed.a));
+    try std.testing.expect(std.mem.eql(u8, s.b, parsed.b));
+    try std.testing.expect(std.mem.eql(u8, s.c, parsed.c));
+}
+
+test "struct_mix_fields" {
+    const alloc = std.testing.allocator;
+    const T: type = struct { a: []const u8, b: u32, c: []const u8, d: i64 };
+    const s: T = .{ .a = "asd", .b = 67, .c = "\"Testing\"", .d = 987654321 };
+    const serialized = try serializeAlloc(T, alloc, s);
+    defer alloc.free(serialized);
+    const parsed: T = try deserialize(T, serialized);
+    try std.testing.expect(std.mem.eql(u8, s.a, parsed.a));
+    try std.testing.expect(s.b == parsed.b);
+    try std.testing.expect(std.mem.eql(u8, s.c, parsed.c));
+    try std.testing.expect(s.d == parsed.d);
 }
 
 test "register" {
