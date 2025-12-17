@@ -12,14 +12,43 @@ pub const Msg = union(enum) {
     run_job: RunJobMsg,
     cancel_job: CancelJobMsg,
 
-    const Tag = @typeInfo(Msg).@"union".tag_type.?;
+    const Tag = std.meta.Tag(Msg);
 };
 
 const MsgUnionInfo = @typeInfo(Msg).@"union";
 const ParseFn = *const fn ([]const u8) anyerror!Msg;
+const SerializeFn = *const fn (std.mem.Allocator, Msg) anyerror![]const u8;
 
-/// Function table for message parse functions
-const parse_table: [MsgUnionInfo.fields.len]ParseFn = blk: {
+pub const MsgParser = struct {
+    parse_table: [MsgUnionInfo.fields.len]ParseFn,
+    serialize_table: [MsgUnionInfo.fields.len]SerializeFn,
+
+    pub fn init() MsgParser {
+        return .{
+            .parse_table = comptime initParseTable(),
+            .serialize_table = comptime initSerializeTable(),
+        };
+    }
+
+    pub fn parse(self: *MsgParser, payload: []const u8) !Msg {
+        if (payload.len == 0) return error.EmptyMessage;
+        const msg_type = @as(Msg.Tag, @enumFromInt(payload[0]));
+        const msg = payload[1..];
+        return self.parse_table[@intFromEnum(msg_type)](msg);
+    }
+
+    pub fn serialize(
+        self: *MsgParser,
+        gpa: std.mem.Allocator,
+        msg: Msg,
+    ) ![]const u8 {
+        const tag = std.meta.activeTag(msg);
+        return self.serialize_table[@intFromEnum(tag)](gpa, msg);
+    }
+};
+
+/// Initialize function table for message parse functions
+fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
     var table: [MsgUnionInfo.fields.len]ParseFn = undefined;
 
     for (MsgUnionInfo.fields) |field| {
@@ -32,29 +61,38 @@ const parse_table: [MsgUnionInfo.fields.len]ParseFn = blk: {
                 return @unionInit(
                     Msg,
                     field.name,
-                    if (info == .@"struct" and @hasDecl(T, "parse"))
-                        try T.parse(msg)
+                    // TODO: impl for others
+                    if (info == .@"struct")
+                        deserialize(T, msg)
                     else
                         0,
                 );
             }
         }.f;
     }
-
-    break :blk table;
-};
-
-/// Parses the payload to a message type
-/// Type is determined by the first byte
-pub fn parseMessage(payload: []const u8) !Msg {
-    if (payload.len == 0) return error.EmptyMessage;
-    const msg_type = @as(Msg.Tag, @enumFromInt(payload[0]));
-    const msg = payload[1..];
-    return parseDispatch(msg_type, msg);
+    return table;
 }
 
-fn parseDispatch(msg_type: Msg.Tag, payload: []const u8) !Msg {
-    return parse_table[@intFromEnum(msg_type)](payload);
+fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
+    var table: [MsgUnionInfo.fields.len]SerializeFn = undefined;
+
+    for (MsgUnionInfo.fields) |field| {
+        const tag = @field(Msg.Tag, field.name);
+        const T = field.type;
+        const info = @typeInfo(T);
+
+        table[@intFromEnum(tag)] = struct {
+            fn f(gpa: std.mem.Allocator, value: Msg) anyerror![]const u8 {
+                const value_field = @field(value, field.name);
+                // TODO: impl for others
+                return if (info == .@"struct")
+                    try serializePayload(T, tag, gpa, value_field)
+                else
+                    "";
+            }
+        }.f;
+    }
+    return table;
 }
 
 /// Initializes a message prefixed with the given type
