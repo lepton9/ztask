@@ -200,7 +200,7 @@ fn serializeField(
     switch (@typeInfo(T)) {
         .int => |i| {
             const bytes = @divExact(i.bits, 8);
-            std.mem.writeInt(T, buf[0..bytes], @intCast(field), .little);
+            std.mem.writeInt(T, buf[0..bytes], field, .little);
             try msg.appendSlice(gpa, buf[0..bytes]);
         },
         .pointer => |p| {
@@ -211,6 +211,10 @@ fn serializeField(
             std.mem.writeInt(u32, buf[0..size], @intCast(slice.len), .little);
             try msg.appendSlice(gpa, buf[0..size]); // length prefix
             try msg.appendSlice(gpa, slice);
+        },
+        .bool => {
+            std.mem.writeInt(u8, buf[0..1], @intFromBool(field), .little);
+            try msg.appendSlice(gpa, buf[0..1]);
         },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
@@ -254,6 +258,11 @@ fn deserializeField(
             pos.* += len;
             return buffer[idx..pos.*];
         },
+        .bool => {
+            const b = std.mem.readInt(u8, @ptrCast(buffer[pos.* .. pos.* + 1]), .little);
+            pos.* += 1;
+            return (b != 0);
+        },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
     }
@@ -271,6 +280,22 @@ test "integer" {
     const parsed_msg1 = try deserialize(i16, serialized1);
     try std.testing.expect(msg == parsed_msg);
     try std.testing.expect(msg1 == parsed_msg1);
+}
+
+test "boolean" {
+    const alloc = std.testing.allocator;
+    const T: type = struct { a: bool, b: bool };
+    const s: T = .{ .a = false, .b = true };
+    const b: bool = true;
+    const serialized_s = try serializeAlloc(T, alloc, s);
+    const serialized_b = try serializeAlloc(bool, alloc, b);
+    defer alloc.free(serialized_s);
+    defer alloc.free(serialized_b);
+    const parsed_s = try deserialize(T, serialized_s);
+    const parsed_b = try deserialize(bool, serialized_b);
+    try std.testing.expect(b == parsed_b);
+    try std.testing.expect(s.a == parsed_s.a);
+    try std.testing.expect(s.b == parsed_s.b);
 }
 
 test "struct_multiple_slices" {
