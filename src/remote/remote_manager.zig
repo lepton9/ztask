@@ -54,6 +54,7 @@ pub const AgentHandle = struct {
 
 pub const RemoteManager = struct {
     gpa: std.mem.Allocator,
+    parser: protocol.MsgParser = .init(),
     server: ?std.net.Server = null,
     agents: std.AutoHashMapUnmanaged(ConnKey, AgentHandle),
 
@@ -127,7 +128,7 @@ pub const RemoteManager = struct {
     /// Update the agent and handle incoming messages
     fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
         while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
-            const parsed = try protocol.parseMessage(msg);
+            const parsed = try self.parser.parse(msg);
             try self.handleMessage(agent, parsed);
         }
     }
@@ -141,7 +142,7 @@ pub const RemoteManager = struct {
         std.debug.print("parsed: '{any}'\n", .{msg});
         switch (msg) {
             .register => |m| try agent.setName(self.gpa, m.hostname),
-            .heartbeat => |m| agent.last_heartbeat = m,
+            .heartbeat => agent.last_heartbeat = std.time.timestamp(),
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
@@ -214,7 +215,9 @@ pub const RemoteManager = struct {
             ),
         };
         defer self.gpa.free(startMsg.steps);
-        const msg = try startMsg.serialize(self.gpa);
+        const msg = try self.parser.serialize(self.gpa, .{
+            .run_job = startMsg,
+        });
         defer self.gpa.free(msg);
         try agent.connection.sendFrame(msg);
     }
@@ -231,7 +234,9 @@ pub const RemoteManager = struct {
         const req = kv.value;
         const agent = self.findAgent(req.agent_name) orelse return;
         const msg: protocol.CancelJobMsg = .{ .job_id = req.job_node.id };
-        const payload = try msg.serialize(self.gpa);
+        const payload = try self.parser.serialize(self.gpa, .{
+            .cancel_job = msg,
+        });
         defer self.gpa.free(payload);
         try agent.connection.sendFrame(payload);
     }

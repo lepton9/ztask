@@ -30,6 +30,7 @@ pub const RemoteAgent = struct {
     /// Jobs currently running
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
+    parser: protocol.MsgParser = .init(),
     connection: connection.Connection,
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8) !*RemoteAgent {
@@ -95,7 +96,7 @@ pub const RemoteAgent = struct {
     /// Listen for incoming messages
     fn listen(self: *RemoteAgent) !void {
         while (self.connection.readNextFrame(self.gpa) catch null) |msg| {
-            const parsed = try protocol.parseMessage(msg);
+            const parsed = try self.parser.parse(msg);
             try self.handleMessage(parsed);
         }
     }
@@ -150,7 +151,7 @@ pub const RemoteAgent = struct {
     /// Send a register packet
     fn register(self: *RemoteAgent) !void {
         const reg = protocol.RegisterMsg{ .hostname = self.hostname };
-        const payload = try reg.serialize(self.gpa);
+        const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         try self.connection.sendFrame(payload);
         std.debug.print("sent: {s}\n", .{payload});
@@ -188,7 +189,9 @@ pub const RemoteAgent = struct {
                     .job_id = e.job_node.id,
                     .timestamp = e.timestamp,
                 };
-                const payload = try msg.serialize(self.gpa);
+                const payload = try self.parser.serialize(self.gpa, .{
+                    .job_start = msg,
+                });
                 defer self.gpa.free(payload);
                 try self.connection.sendFrame(payload);
             },
@@ -199,7 +202,9 @@ pub const RemoteAgent = struct {
                     .data = e.data,
                     .step = e.step,
                 };
-                const payload = try msg.serialize(self.gpa);
+                const payload = try self.parser.serialize(self.gpa, .{
+                    .job_log = msg,
+                });
                 defer self.gpa.free(payload);
                 try self.connection.sendFrame(payload);
             },
@@ -209,7 +214,9 @@ pub const RemoteAgent = struct {
                     .timestamp = e.timestamp,
                     .exit_code = e.exit_code,
                 };
-                const payload = try msg.serialize(self.gpa);
+                const payload = try self.parser.serialize(self.gpa, .{
+                    .job_finish = msg,
+                });
                 defer self.gpa.free(payload);
                 try self.connection.sendFrame(payload);
             },

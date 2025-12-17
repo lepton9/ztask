@@ -5,7 +5,7 @@ const posix = std.posix;
 
 pub const Msg = union(enum) {
     register: RegisterMsg,
-    heartbeat: i64,
+    heartbeat: void,
     job_start: JobStartMsg,
     job_log: JobLogMsg,
     job_finish: JobEndMsg,
@@ -57,7 +57,7 @@ fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
 
         table[@intFromEnum(tag)] = struct {
             fn f(msg: []const u8) anyerror!Msg {
-                return @unionInit(Msg, field.name, deserialize(T, msg));
+                return @unionInit(Msg, field.name, try deserialize(T, msg));
             }
         }.f;
     }
@@ -83,7 +83,7 @@ fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
 }
 
 /// Initializes a message prefixed with the given type
-fn beginPayload(
+fn initMsgPrefix(
     gpa: std.mem.Allocator,
     msg_type: Msg.Tag,
 ) !std.ArrayList(u8) {
@@ -94,29 +94,11 @@ fn beginPayload(
 
 pub const RegisterMsg = struct {
     hostname: []const u8,
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .register, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len == 0) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 };
 
 pub const RunJobMsg = struct {
     job_id: u64,
     steps: []const u8, // JSON
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .run_job, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 
     /// Serialize the step slice to a JSON string
     pub fn serializeSteps(gpa: std.mem.Allocator, steps: []task.Step) ![]const u8 {
@@ -138,59 +120,23 @@ pub const RunJobMsg = struct {
 
 pub const CancelJobMsg = struct {
     job_id: u64,
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .cancel_job, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 8) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 };
 
 pub const JobStartMsg = struct {
     job_id: u64,
     timestamp: i64,
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .job_start, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 16) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 };
 
 pub const JobEndMsg = struct {
     job_id: u64,
     timestamp: i64,
     exit_code: i32,
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .job_finish, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 20) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 };
 
 pub const JobLogMsg = struct {
     job_id: u64,
     step: u32,
     data: []const u8,
-
-    pub fn serialize(self: @This(), gpa: std.mem.Allocator) ![]const u8 {
-        return serializePayload(@This(), .job_log, gpa, self);
-    }
-
-    pub fn parse(msg: []const u8) !@This() {
-        if (msg.len < 12) return error.InvalidMsg;
-        return deserialize(@This(), msg);
-    }
 };
 
 /// Serialize a struct to a payload with message type prefix
@@ -200,7 +146,7 @@ pub fn serializePayload(
     gpa: std.mem.Allocator,
     value: T,
 ) ![]const u8 {
-    var msg = try beginPayload(gpa, M);
+    var msg = try initMsgPrefix(gpa, M);
     const serialized = try serializeAlloc(T, gpa, value);
     defer gpa.free(serialized);
     try msg.appendSlice(gpa, serialized);
@@ -217,11 +163,9 @@ pub fn serializeAlloc(
     var msg = try std.ArrayList(u8).initCapacity(gpa, 128);
 
     switch (info) {
-        .@"struct" => {
-            inline for (info.@"struct".fields) |field| {
-                const field_val = @field(value, field.name);
-                try serializeField(gpa, field.type, field_val, &msg);
-            }
+        .@"struct" => inline for (info.@"struct".fields) |field| {
+            const field_val = @field(value, field.name);
+            try serializeField(gpa, field.type, field_val, &msg);
         },
         else => try serializeField(gpa, T, value, &msg),
     }
@@ -229,19 +173,17 @@ pub fn serializeAlloc(
 }
 
 /// Deserialize a string to a type
-pub fn deserialize(comptime T: type, msg: []const u8) T {
+pub fn deserialize(comptime T: type, msg: []const u8) !T {
     var out: T = undefined;
     var pos: usize = 0;
 
     const info = comptime @typeInfo(T);
 
     switch (info) {
-        .@"struct" => {
-            inline for (info.@"struct".fields) |field| {
-                if (pos > msg.len) @panic("Failed to deserialize the full struct");
-                const FieldType = field.type;
-                @field(out, field.name) = deserializeField(FieldType, msg, &pos);
-            }
+        .@"struct" => inline for (info.@"struct".fields) |field| {
+            if (pos > msg.len) @panic("Failed to deserialize the full struct");
+            const FieldType = field.type;
+            @field(out, field.name) = try deserializeField(FieldType, msg, &pos);
         },
         else => return deserializeField(T, msg, &pos),
     }
@@ -267,6 +209,7 @@ fn serializeField(
             // TODO: length prefix
             try msg.appendSlice(gpa, field);
         },
+        .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
     }
 }
@@ -275,11 +218,11 @@ fn deserializeField(
     comptime T: type,
     buffer: []const u8,
     pos: *usize,
-) T {
+) !T {
     switch (@typeInfo(T)) {
         .int => |i| {
             const bytes = @divExact(i.bits, 8);
-            // if (pos + bytes > msg.len) return error.InvalidMsg;
+            if (pos.* + bytes > buffer.len) return error.InvalidMsg;
 
             const int = std.mem.readInt(
                 T,
@@ -293,31 +236,33 @@ fn deserializeField(
             if (p.size != .slice or p.child != u8)
                 @compileError("only []const u8 slices supported");
             // TODO: length prefix
-
             const idx = pos.*;
             pos.* = buffer.len;
             return buffer[idx..];
         },
+        .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
     }
 }
 
 test "register" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     const msg: RegisterMsg = .{ .hostname = "test" };
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .register = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parseMessage(serialized);
+    const parsed_msg = try parser.parse(serialized);
     const parsed: RegisterMsg = parsed_msg.register;
     try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
 }
 
 test "job_start" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     const msg: JobStartMsg = .{ .job_id = 1, .timestamp = std.time.timestamp() };
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .job_start = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parseMessage(serialized);
+    const parsed_msg = try parser.parse(serialized);
     const parsed: JobStartMsg = parsed_msg.job_start;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -325,10 +270,11 @@ test "job_start" {
 
 test "job_log" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .job_log = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parseMessage(serialized);
+    const parsed_msg = try parser.parse(serialized);
     const parsed: JobLogMsg = parsed_msg.job_log;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.step == parsed.step);
@@ -337,14 +283,15 @@ test "job_log" {
 
 test "job_end" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     const msg: JobEndMsg = .{
         .job_id = 1337,
         .timestamp = std.time.timestamp(),
         .exit_code = 0,
     };
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .job_finish = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parseMessage(serialized);
+    const parsed_msg = try parser.parse(serialized);
     const parsed: JobEndMsg = parsed_msg.job_finish;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -353,6 +300,7 @@ test "job_end" {
 
 test "run_job" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     var steps = [_]task.Step{
         .{ .kind = .command, .value = "command" },
         .{ .kind = .command, .value = "" },
@@ -363,9 +311,9 @@ test "run_job" {
     };
     defer alloc.free(msg.steps);
 
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .run_job = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parseMessage(serialized);
+    const parsed_msg = try parser.parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
     const parsed_steps = try parsed.parseSteps(alloc);
     defer alloc.free(parsed_steps);
@@ -380,18 +328,20 @@ test "run_job" {
 
 test "cancel_job" {
     const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
     const msg: CancelJobMsg = .{ .job_id = 1 };
-    const serialized = try msg.serialize(alloc);
+    const serialized = try parser.serialize(alloc, .{ .cancel_job = msg });
     defer alloc.free(serialized);
-    const parsed = try parseMessage(serialized);
+    const parsed = try parser.parse(serialized);
     try std.testing.expect(msg.job_id == parsed.cancel_job.job_id);
 }
 
 test "heartbeat" {
     const alloc = std.testing.allocator;
-    var payload = try beginPayload(alloc, .heartbeat);
+    var parser = MsgParser.init();
+    var payload = try initMsgPrefix(alloc, .heartbeat);
     defer payload.deinit(alloc);
-    const parsed = try parseMessage(payload.items);
+    const parsed = try parser.parse(payload.items);
     try std.testing.expect(payload.items.len == 1);
     try std.testing.expect(parsed == .heartbeat);
 }
