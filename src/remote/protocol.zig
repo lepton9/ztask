@@ -54,41 +54,28 @@ fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
     for (MsgUnionInfo.fields) |field| {
         const tag = @field(Msg.Tag, field.name);
         const T = field.type;
-        const info = @typeInfo(T);
 
         table[@intFromEnum(tag)] = struct {
             fn f(msg: []const u8) anyerror!Msg {
-                return @unionInit(
-                    Msg,
-                    field.name,
-                    // TODO: impl for others
-                    if (info == .@"struct")
-                        deserialize(T, msg)
-                    else
-                        0,
-                );
+                return @unionInit(Msg, field.name, deserialize(T, msg));
             }
         }.f;
     }
     return table;
 }
 
+/// Initialize function table for message serialization functions
 fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
     var table: [MsgUnionInfo.fields.len]SerializeFn = undefined;
 
     for (MsgUnionInfo.fields) |field| {
         const tag = @field(Msg.Tag, field.name);
         const T = field.type;
-        const info = @typeInfo(T);
 
         table[@intFromEnum(tag)] = struct {
             fn f(gpa: std.mem.Allocator, value: Msg) anyerror![]const u8 {
                 const value_field = @field(value, field.name);
-                // TODO: impl for others
-                return if (info == .@"struct")
-                    try serializePayload(T, tag, gpa, value_field)
-                else
-                    "";
+                return try serializePayload(T, tag, gpa, value_field);
             }
         }.f;
     }
@@ -220,81 +207,99 @@ pub fn serializePayload(
     return msg.toOwnedSlice(gpa);
 }
 
-/// Serialize a struct to a string
+/// Serialize a type to a string
 pub fn serializeAlloc(
     comptime T: type,
     gpa: std.mem.Allocator,
     value: T,
 ) ![]const u8 {
-    const info = @typeInfo(T);
-    if (info != .@"struct")
-        @compileError("serializeAlloc requires a struct");
-
+    const info = comptime @typeInfo(T);
     var msg = try std.ArrayList(u8).initCapacity(gpa, 128);
-    var buf: [64]u8 = undefined;
 
-    inline for (info.@"struct".fields) |field| {
-        const FieldType = field.type;
-        const field_val = @field(value, field.name);
-
-        switch (@typeInfo(FieldType)) {
-            .int => |i| {
-                const bytes = @divExact(i.bits, 8);
-                std.mem.writeInt(
-                    FieldType,
-                    buf[0..bytes],
-                    @intCast(field_val),
-                    .little,
-                );
-                try msg.appendSlice(gpa, buf[0..bytes]);
-            },
-            .pointer => |p| {
-                if (p.size != .slice or p.child != u8)
-                    @compileError("Only []const u8 slices supported");
-                // TODO: length prefix
-                try msg.appendSlice(gpa, field_val);
-            },
-            else => @compileError("Unsupported field type" ++ @typeInfo(FieldType)),
-        }
+    switch (info) {
+        .@"struct" => {
+            inline for (info.@"struct".fields) |field| {
+                const field_val = @field(value, field.name);
+                try serializeField(gpa, field.type, field_val, &msg);
+            }
+        },
+        else => try serializeField(gpa, T, value, &msg),
     }
     return msg.toOwnedSlice(gpa);
 }
 
-/// Deserialize a struct to a type
+/// Deserialize a string to a type
 pub fn deserialize(comptime T: type, msg: []const u8) T {
     var out: T = undefined;
     var pos: usize = 0;
 
-    const info = @typeInfo(T);
-    if (info != .@"struct") @compileError("deserialize requires a struct");
+    const info = comptime @typeInfo(T);
 
-    inline for (info.@"struct".fields) |field| {
-        if (pos > msg.len) @panic("Failed to deserialize the full struct");
-        const FieldType = field.type;
-
-        switch (@typeInfo(FieldType)) {
-            .int => |i| {
-                const bytes = @divExact(i.bits, 8);
-                const int = std.mem.readInt(
-                    FieldType,
-                    @ptrCast(msg[pos .. pos + bytes]),
-                    .little,
-                );
-                @field(out, field.name) = int;
-                pos += bytes;
-            },
-            .pointer => |p| {
-                if (p.size != .slice or p.child != u8)
-                    @compileError("only []const u8 slices supported");
-                // TODO: length prefix
-
-                @field(out, field.name) = msg[pos..];
-                pos = msg.len;
-            },
-            else => @compileError("Unsupported field type" ++ @typeInfo(FieldType)),
-        }
+    switch (info) {
+        .@"struct" => {
+            inline for (info.@"struct".fields) |field| {
+                if (pos > msg.len) @panic("Failed to deserialize the full struct");
+                const FieldType = field.type;
+                @field(out, field.name) = deserializeField(FieldType, msg, &pos);
+            }
+        },
+        else => return deserializeField(T, msg, &pos),
     }
     return out;
+}
+
+fn serializeField(
+    gpa: std.mem.Allocator,
+    comptime T: type,
+    field: T,
+    msg: *std.ArrayList(u8),
+) !void {
+    var buf: [64]u8 = undefined;
+    switch (@typeInfo(T)) {
+        .int => |i| {
+            const bytes = @divExact(i.bits, 8);
+            std.mem.writeInt(T, buf[0..bytes], @intCast(field), .little);
+            try msg.appendSlice(gpa, buf[0..bytes]);
+        },
+        .pointer => |p| {
+            if (p.size != .slice or p.child != u8)
+                @compileError("Only []const u8 slices supported");
+            // TODO: length prefix
+            try msg.appendSlice(gpa, field);
+        },
+        else => @compileError("Unsupported field type" ++ @typeInfo(T)),
+    }
+}
+
+fn deserializeField(
+    comptime T: type,
+    buffer: []const u8,
+    pos: *usize,
+) T {
+    switch (@typeInfo(T)) {
+        .int => |i| {
+            const bytes = @divExact(i.bits, 8);
+            // if (pos + bytes > msg.len) return error.InvalidMsg;
+
+            const int = std.mem.readInt(
+                T,
+                @ptrCast(buffer[pos.* .. pos.* + bytes]),
+                .little,
+            );
+            pos.* += bytes;
+            return int;
+        },
+        .pointer => |p| {
+            if (p.size != .slice or p.child != u8)
+                @compileError("only []const u8 slices supported");
+            // TODO: length prefix
+
+            const idx = pos.*;
+            pos.* = buffer.len;
+            return buffer[idx..];
+        },
+        else => @compileError("Unsupported field type" ++ @typeInfo(T)),
+    }
 }
 
 test "register" {
