@@ -1,7 +1,7 @@
 const std = @import("std");
 const data = @import("data.zig");
-pub const scheduler = @import("scheduler/scheduler.zig");
-pub const remotemanager = @import("remote/remote_manager.zig");
+const scheduler = @import("scheduler/scheduler.zig");
+const remotemanager = @import("remote/remote_manager.zig");
 const parse = @import("parse");
 const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("task");

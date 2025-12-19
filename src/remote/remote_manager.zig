@@ -10,6 +10,8 @@ const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
 const Scheduler = scheduler_zig.Scheduler;
 
+pub const DEFAULT_PORT = 5555;
+
 const ConnKey = struct {
     ip: u32,
     port: u16,

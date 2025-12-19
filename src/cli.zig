@@ -10,6 +10,40 @@ pub const cli_spec: zcli.CliApp = .{
     },
     .commands = &[_]zcli.Cmd{
         .{
+            .name = "run",
+            .desc = "Run a single task",
+            .positionals = &[_]zcli.PosArg{
+                .{ .name = "PATH", .desc = "Path of the task file", .required = true },
+            },
+        },
+        .{
+            .name = "runner",
+            .desc = "Run remote runner agent",
+            .options = &[_]zcli.Opt{
+                .{
+                    .long_name = "name",
+                    .short_name = "n",
+                    .desc = "Name of the runner",
+                    .arg = .{ .name = "NAME", .type = .Text },
+                    .required = true,
+                },
+                .{
+                    .long_name = "address",
+                    .short_name = "a",
+                    .desc = "Address of the main runner server",
+                    .arg = .{ .name = "ADDR", .type = .Text },
+                    .required = true,
+                },
+                .{
+                    .long_name = "port",
+                    .short_name = "p",
+                    .desc = "Port of the main server",
+                    .arg = .{ .name = "PORT", .default = "5555", .type = .Int },
+                    .required = false,
+                },
+            },
+        },
+        .{
             .name = "completion",
             .desc = "Generate shell completions (bash|zsh|fish)",
             .positionals = &[_]zcli.PosArg{

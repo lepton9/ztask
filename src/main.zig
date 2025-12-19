@@ -1,7 +1,8 @@
 const std = @import("std");
 const parse = @import("parse");
 const manager = @import("taskmanager.zig");
-const agent = @import("remote/remote_agent.zig");
+const remotemanager = @import("remote/remote_manager.zig");
+const remote_agent = @import("remote/remote_agent.zig");
 const cli_zig = @import("cli.zig");
 const zcli = cli_zig.zcli;
 const scheduler = manager.scheduler;
@@ -43,31 +44,14 @@ fn generate_completion(
 }
 
 // TODO:
-fn runTui() void {}
-
-fn handleArgs(cli: *zcli.Cli, comptime spec: *const zcli.CliApp) !void {
-    const cmd = cli.cmd orelse return runTui();
-    if (std.mem.eql(u8, cmd.name, "completion"))
-        return try generate_completion(cli, spec);
-    std.process.exit(0); // TODO:
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-
-    // Parse cli args
-    const cli: *zcli.Cli = try zcli.parseArgs(allocator, &cli_zig.cli_spec);
-    defer cli.deinit(allocator);
-    try handleArgs(cli, &cli_zig.cli_spec);
-
-    const task_manager = try manager.TaskManager.init(allocator);
+fn runTui(gpa: std.mem.Allocator) !void {
+    const task_manager = try manager.TaskManager.init(gpa);
     defer task_manager.deinit();
 
     const file = "tasks/remote.yml";
 
-    const real_path = try std.fs.cwd().realpathAlloc(allocator, file);
-    defer allocator.free(real_path);
+    const real_path = try std.fs.cwd().realpathAlloc(gpa, file);
+    defer gpa.free(real_path);
 
     task_manager.addTask(file) catch {};
     const meta = task_manager.datastore.findTaskMetaPath(real_path) orelse {
@@ -87,4 +71,64 @@ pub fn main() !void {
     // std.Thread.sleep(std.time.ns_per_s * 10);
     std.debug.print("Stopping task manager\n", .{});
     task_manager.stop();
+}
+
+fn runAgent(
+    gpa: std.mem.Allocator,
+    name: []const u8,
+    addr: []const u8,
+    port: u16,
+) !void {
+    // TODO: run on thread and take input
+    var agent = try remote_agent.RemoteAgent.init(gpa, name);
+    defer agent.deinit();
+    const address: std.net.Address = try .parseIp4(addr, port);
+    agent.connect(address) catch |err| {
+        std.log.err("{}", .{err});
+    };
+    while (agent.connection.closed) {
+        std.debug.print("Connecting..\n", .{});
+        agent.connect(address) catch |err| {
+            std.log.err("{}", .{err});
+        };
+    }
+    agent.run();
+}
+
+fn handleArgs(
+    gpa: std.mem.Allocator,
+    cli: *zcli.Cli,
+    comptime spec: *const zcli.CliApp,
+) !void {
+    const cmd = cli.cmd orelse return try runTui(gpa);
+    if (std.mem.eql(u8, cmd.name, "run"))
+        return; // TODO:
+    if (std.mem.eql(u8, cmd.name, "runner")) {
+        const name = cli.find_opt("name") orelse unreachable;
+        const addr = cli.find_opt("address") orelse unreachable;
+        const port = if (cli.find_opt("port")) |p|
+            p.value.?.int
+        else
+            remotemanager.DEFAULT_PORT;
+        if (port < 0) return error.InvalidPort;
+        return try runAgent(
+            gpa,
+            name.value.?.string,
+            addr.value.?.string,
+            @truncate(@as(u64, @intCast(port))),
+        );
+    }
+    if (std.mem.eql(u8, cmd.name, "completion"))
+        return try generate_completion(cli, spec);
+    std.process.exit(0); // TODO:
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    // Parse cli args
+    const cli: *zcli.Cli = try zcli.parseArgs(allocator, &cli_zig.cli_spec);
+    defer cli.deinit(allocator);
+    try handleArgs(allocator, cli, &cli_zig.cli_spec);
 }
