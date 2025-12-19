@@ -58,9 +58,21 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
+    // Test module
+    const tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "task", .module = task_mod },
+            .{ .name = "parse", .module = parse_mod },
+        },
+    });
+
     // Testing
     const test_modules = [_]*std.Build.Module{
         exe.root_module,
+        tests_mod,
         parse_mod,
     };
 
