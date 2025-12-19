@@ -1,5 +1,4 @@
 const std = @import("std");
-const remotemanager = @import("remote/remote_manager.zig");
 const run = @import("run.zig");
 const cli_zig = @import("cli.zig");
 const zcli = cli_zig.zcli;
@@ -47,16 +46,18 @@ fn handleArgs(
     if (std.mem.eql(u8, cmd.name, "runner")) {
         const name = cli.find_opt("name") orelse unreachable;
         const addr = cli.find_opt("address") orelse unreachable;
-        const port = if (cli.find_opt("port")) |p|
-            p.value.?.int
-        else
-            remotemanager.DEFAULT_PORT;
-        if (port < 0) return error.InvalidPort;
+        const port: ?u16 = blk: {
+            if (cli.find_opt("port")) |p| {
+                const port = p.value.?.int;
+                if (port < 0) return error.InvalidPort;
+                break :blk @truncate(@as(u64, @intCast(port)));
+            } else break :blk null;
+        };
         return try run.runAgent(
             gpa,
             name.value.?.string,
             addr.value.?.string,
-            @truncate(@as(u64, @intCast(port))),
+            port,
         );
     }
     if (std.mem.eql(u8, cmd.name, "completion"))
