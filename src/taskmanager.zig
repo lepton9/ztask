@@ -269,8 +269,16 @@ pub const TaskManager = struct {
 
     /// Parse task file and load the task to memory
     pub fn loadTaskWithPath(self: *TaskManager, file_path: []const u8) !*Task {
-        const meta = self.datastore.findTaskMetaPath(file_path) orelse
-            return error.TaskNotFound;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const meta = blk: {
+            if (!std.fs.path.isAbsolute(file_path)) {
+                const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
+                defer self.gpa.free(real_path);
+                break :blk self.datastore.findTaskMetaPath(real_path);
+            }
+            break :blk self.datastore.findTaskMetaPath(file_path);
+        } orelse return error.TaskNotFound;
         return self.loadTask(meta.id);
     }
 

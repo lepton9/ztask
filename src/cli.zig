@@ -12,8 +12,17 @@ pub const cli_spec: zcli.CliApp = .{
         .{
             .name = "run",
             .desc = "Run a single task",
-            .positionals = &[_]zcli.PosArg{
-                .{ .name = "PATH", .desc = "Path of the task file", .required = true },
+            .options = &[_]zcli.Opt{
+                .{
+                    .long_name = "path",
+                    .desc = "Path of the task file",
+                    .arg = .{ .name = "PATH", .type = .Path },
+                },
+                .{
+                    .long_name = "id",
+                    .desc = "ID of the task",
+                    .arg = .{ .name = "ID", .type = .Text },
+                },
             },
         },
         .{

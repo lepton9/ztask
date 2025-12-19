@@ -41,9 +41,13 @@ fn handleArgs(
     comptime spec: *const zcli.CliApp,
 ) !void {
     const cmd = cli.cmd orelse return try run.runTui(gpa);
-    if (std.mem.eql(u8, cmd.name, "run"))
-        return; // TODO:
-    if (std.mem.eql(u8, cmd.name, "runner")) {
+    if (std.mem.eql(u8, cmd.name, "run")) {
+        return run.runTask(
+            gpa,
+            if (cli.find_opt("path")) |o| o.value.?.string else null,
+            if (cli.find_opt("id")) |o| o.value.?.string else null,
+        );
+    } else if (std.mem.eql(u8, cmd.name, "runner")) {
         const name = cli.find_opt("name") orelse unreachable;
         const addr = cli.find_opt("address") orelse unreachable;
         const port: ?u16 = blk: {
@@ -59,10 +63,9 @@ fn handleArgs(
             addr.value.?.string,
             port,
         );
-    }
-    if (std.mem.eql(u8, cmd.name, "completion"))
+    } else if (std.mem.eql(u8, cmd.name, "completion")) {
         return try generate_completion(cli, spec);
-    std.process.exit(0); // TODO:
+    }
 }
 
 pub fn main() !void {
