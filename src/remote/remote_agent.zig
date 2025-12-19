@@ -76,7 +76,7 @@ pub const RemoteAgent = struct {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
             if (self.connection.closed) {
-                self.tryReconnect() catch {};
+                self.tryReconnect();
             }
             self.heartbeat() catch {};
             self.listen() catch {};
@@ -98,7 +98,7 @@ pub const RemoteAgent = struct {
     }
 
     /// Retry connecting
-    fn tryReconnect(self: *RemoteAgent) !void {
+    fn tryReconnect(self: *RemoteAgent) void {
         while (true) {
             std.log.info("Reconnecting..", .{});
             self.connect(self.connection.conn.address) catch |err| switch (err) {
@@ -146,6 +146,12 @@ pub const RemoteAgent = struct {
         try self.queue.append(self.gpa, &res.value_ptr.node);
     }
 
+    fn sendMessage(self: *RemoteAgent, message: []const u8) void {
+        self.connection.sendFrame(message) catch {
+            self.tryReconnect();
+        };
+    }
+
     /// Cancel a job from running
     /// Force stop the runner if active
     /// Otherwise remove from the queue
@@ -172,8 +178,8 @@ pub const RemoteAgent = struct {
         const reg = protocol.RegisterMsg{ .hostname = self.hostname };
         const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
-        try self.connection.sendFrame(payload);
-        std.debug.print("sent: {s}\n", .{payload});
+        self.sendMessage(payload);
+        std.log.debug("Sent {s}", .{payload});
     }
 
     /// Send a heartbeat packet
@@ -181,10 +187,8 @@ pub const RemoteAgent = struct {
         if (!self.shouldSendHeartbeat()) return;
         self.connection.setLastAccessed();
         var buf: [1]u8 = .{@intFromEnum(protocol.Msg.heartbeat)};
-        self.connection.sendFrame(&buf) catch |err| {
-            std.log.err("{}", .{err});
-        };
-        std.log.info("sent heartbeat", .{});
+        self.sendMessage(&buf);
+        std.log.info("Sent heartbeat", .{});
     }
 
     /// Return true if last message was long ago
@@ -223,7 +227,7 @@ pub const RemoteAgent = struct {
                     .job_start = msg,
                 });
                 defer self.gpa.free(payload);
-                try self.connection.sendFrame(payload);
+                self.sendMessage(payload);
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
@@ -236,7 +240,7 @@ pub const RemoteAgent = struct {
                     .job_log = msg,
                 });
                 defer self.gpa.free(payload);
-                try self.connection.sendFrame(payload);
+                self.sendMessage(payload);
             },
             .job_finished => |e| {
                 const msg: protocol.JobEndMsg = .{
@@ -248,7 +252,7 @@ pub const RemoteAgent = struct {
                     .job_finish = msg,
                 });
                 defer self.gpa.free(payload);
-                try self.connection.sendFrame(payload);
+                self.sendMessage(payload);
             },
         };
     }

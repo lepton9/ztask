@@ -4,6 +4,7 @@ const remote_agent = @import("remote/remote_agent.zig");
 const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 
 // TODO:
+/// Run the main TUI
 pub fn runTui(gpa: std.mem.Allocator) !void {
     const task_manager = try manager.TaskManager.init(gpa);
     defer task_manager.deinit();
@@ -33,6 +34,7 @@ pub fn runTui(gpa: std.mem.Allocator) !void {
     task_manager.stop();
 }
 
+/// Run the remote runner
 pub fn runAgent(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -43,14 +45,10 @@ pub fn runAgent(
     var agent = try remote_agent.RemoteAgent.init(gpa, name);
     defer agent.deinit();
     const address: std.net.Address = try .parseIp4(addr, port orelse DEFAULT_PORT);
-    agent.connect(address) catch |err| {
-        std.log.err("{}", .{err});
-    };
     while (agent.connection.closed) {
-        std.debug.print("Connecting..\n", .{});
-        agent.connect(address) catch |err| {
-            std.log.err("{}", .{err});
-        };
+        std.log.info("Connecting..", .{});
+        agent.connect(address) catch {};
+        std.Thread.sleep(std.time.ns_per_s);
     }
     agent.run();
 }
