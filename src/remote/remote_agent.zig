@@ -12,6 +12,7 @@ const LogQueue = localrunner.LogQueue;
 
 // TODO: configurable
 const BASE_RUNNERS_N = 10;
+const HEARTBEAT_FREQ_S = 2;
 
 pub const RemoteAgent = struct {
     gpa: std.mem.Allocator,
@@ -74,7 +75,10 @@ pub const RemoteAgent = struct {
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
-            // self.heartbeat() catch {};
+            if (self.connection.closed) {
+                self.tryReconnect() catch {};
+            }
+            self.heartbeat() catch {};
             self.listen() catch {};
             self.tryRunNext();
             self.handleLogs() catch {};
@@ -91,6 +95,21 @@ pub const RemoteAgent = struct {
     pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
         try self.connection.connect(addr);
         try self.register();
+    }
+
+    /// Retry connecting
+    fn tryReconnect(self: *RemoteAgent) !void {
+        while (true) {
+            std.log.info("Reconnecting..", .{});
+            self.connect(self.connection.conn.address) catch |err| switch (err) {
+                error.AlreadyConnected => break,
+                else => {
+                    std.Thread.sleep(std.time.ns_per_s); // Sleep for 1 second
+                    continue;
+                },
+            };
+            break;
+        }
     }
 
     /// Listen for incoming messages
@@ -159,8 +178,19 @@ pub const RemoteAgent = struct {
 
     /// Send a heartbeat packet
     fn heartbeat(self: *RemoteAgent) !void {
+        if (!self.shouldSendHeartbeat()) return;
+        self.connection.setLastAccessed();
         var buf: [1]u8 = .{@intFromEnum(protocol.Msg.heartbeat)};
-        try self.connection.sendFrame(&buf);
+        self.connection.sendFrame(&buf) catch |err| {
+            std.log.err("{}", .{err});
+        };
+        std.log.info("sent heartbeat", .{});
+    }
+
+    /// Return true if last message was long ago
+    fn shouldSendHeartbeat(self: *RemoteAgent) bool {
+        const now = std.time.timestamp();
+        return (now - self.connection.last_msg > HEARTBEAT_FREQ_S);
     }
 
     /// Handle the completed job results

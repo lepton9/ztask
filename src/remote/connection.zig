@@ -8,6 +8,7 @@ pub const Connection = struct {
     read_buf: std.ArrayList(u8),
     /// The position of the beginning of the frame in the buffer
     cursor: usize = 0,
+    last_msg: i64 = 0, // Timestamp
     closed: bool = true,
 
     /// Initialize with an already connected TCP connection
@@ -49,6 +50,11 @@ pub const Connection = struct {
         return self.conn.address;
     }
 
+    /// Set a timestamp for last message sent or received
+    pub fn setLastAccessed(self: *Connection) void {
+        self.last_msg = std.time.timestamp();
+    }
+
     /// Frame format: [[4 bytes length N]][[N bytes payload]]
     pub fn readNextFrame(self: *Connection, gpa: std.mem.Allocator) !?[]u8 {
         if (self.closed) return null;
@@ -66,10 +72,13 @@ pub const Connection = struct {
         const n = posix.read(self.conn.stream.handle, &buffer) catch |err| switch (err) {
             error.WouldBlock => return null,
             else => {
+                std.log.err("{}", .{err});
+                self.close();
                 return err;
             },
         };
         if (n == 0) return null;
+        self.setLastAccessed();
 
         try self.read_buf.appendSlice(gpa, buffer[0..n]);
 
@@ -102,7 +111,10 @@ pub const Connection = struct {
             .{ .len = 4, .base = &header },
             .{ .len = msg.len, .base = msg.ptr },
         };
-        try writeAllVectored(self.conn.stream.handle, &vec);
+        writeAllVectored(self.conn.stream.handle, &vec) catch {
+            return self.close();
+        };
+        self.setLastAccessed();
     }
 };
 
@@ -110,7 +122,10 @@ pub const Connection = struct {
 fn writeAllVectored(socket: posix.socket_t, vec: []posix.iovec_const) !void {
     var i: usize = 0;
     while (true) {
-        var n = try posix.writev(socket, vec[i..]);
+        var n = posix.writev(socket, vec[i..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
         while (n >= vec[i].len) {
             n -= vec[i].len;
             i += 1;
@@ -119,6 +134,15 @@ fn writeAllVectored(socket: posix.socket_t, vec: []posix.iovec_const) !void {
         vec[i].base += n;
         vec[i].len -= n;
     }
+}
+
+/// Check if connected to the socket
+pub fn knock(socket: std.posix.socket_t) bool {
+    const slice: [1]u8 = .{0};
+    _ = posix.sendto(socket, slice[0..0]) catch {
+        return false;
+    };
+    return true;
 }
 
 /// Start a non-blocking TCP connection
@@ -133,11 +157,11 @@ fn tcpConnectNonBlocking(address: std.net.Address) !std.net.Stream {
     // Start connecting
     while (true) {
         break posix.connect(sockfd, &address.any, address.getOsSockLen()) catch |e|
-            return switch (e) {
+            switch (e) {
                 posix.ConnectError.WouldBlock => {
                     continue;
                 },
-                else => error.Unexpected,
+                else => return e,
             };
     }
     return std.net.Stream{ .handle = sockfd };
