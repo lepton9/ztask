@@ -8,7 +8,15 @@ pub const cli_spec: zcli.CliApp = .{
         .auto_version = true,
         .help_max_width = 80,
     },
-    .commands = &[_]zcli.Cmd{},
+    .commands = &[_]zcli.Cmd{
+        .{
+            .name = "completion",
+            .desc = "Generate shell completions (bash|zsh|fish)",
+            .positionals = &[_]zcli.PosArg{
+                .{ .name = "shell", .desc = "Shell name", .required = true },
+            },
+        },
+    },
     .options = &[_]zcli.Opt{
         .{ .long_name = "version", .short_name = "V", .desc = "Print version" },
         .{ .long_name = "help", .short_name = "h", .desc = "Print help" },

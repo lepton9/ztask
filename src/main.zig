@@ -18,12 +18,48 @@ pub const std_options: std.Options = .{
     },
 };
 
+fn write_to_stdout(data: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &writer.interface;
+    try stdout.writeAll(data);
+    try stdout.flush();
+}
+
+fn generate_completion(
+    cli: *zcli.Cli,
+    comptime spec: *const zcli.CliApp,
+) !noreturn {
+    var buf: [8096]u8 = undefined;
+    const shell = cli.find_positional("shell") orelse unreachable;
+    const script = try zcli.complete.getCompletion(
+        &buf,
+        spec,
+        spec.config.name.?,
+        shell.value,
+    );
+    try write_to_stdout(script);
+    std.process.exit(0);
+}
+
+// TODO:
+fn runTui() void {}
+
+fn handleArgs(cli: *zcli.Cli, comptime spec: *const zcli.CliApp) !void {
+    const cmd = cli.cmd orelse return runTui();
+    if (std.mem.eql(u8, cmd.name, "completion"))
+        return try generate_completion(cli, spec);
+    std.process.exit(0); // TODO:
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
+    // Parse cli args
     const cli: *zcli.Cli = try zcli.parseArgs(allocator, &cli_zig.cli_spec);
     defer cli.deinit(allocator);
+    try handleArgs(cli, &cli_zig.cli_spec);
 
     const task_manager = try manager.TaskManager.init(allocator);
     defer task_manager.deinit();
