@@ -1,8 +1,12 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "PROGRAM_NAME", @tagName(zon.name));
 
     // Task module
     const task_mod = b.createModule(.{
@@ -24,16 +28,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // TaskManager
-    const manager_mod = b.createModule(.{
-        .root_source_file = b.path("src/taskmanager.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "parse", .module = parse_mod },
-            .{ .name = "task", .module = task_mod },
-        },
-    });
+    const zcli = b.dependency("zcli", .{ .target = target, .optimize = optimize });
+    const zcli_mod = zcli.module("zcli");
+    const version = @import("build.zig.zon").version;
+    @import("zcli").addVersionInfo(b, zcli_mod, version);
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -43,11 +41,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "task", .module = task_mod },
                 .{ .name = "parse", .module = parse_mod },
-                .{ .name = "taskmanager", .module = manager_mod },
+                .{ .name = "zcli", .module = zcli_mod },
             },
         }),
     });
+    exe.root_module.addOptions("build_options", options);
 
     b.installArtifact(exe);
 
@@ -62,7 +62,6 @@ pub fn build(b: *std.Build) void {
     const test_modules = [_]*std.Build.Module{
         exe.root_module,
         parse_mod,
-        manager_mod,
     };
 
     const test_step = b.step("test", "Run tests");

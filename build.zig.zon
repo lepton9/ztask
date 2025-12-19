@@ -8,6 +8,10 @@
             .url = "git+https://github.com/lepton9/zig-yaml#1ad73ac461fe81f380c109d6ad8fb500f5bb41df",
             .hash = "zig_yaml-0.2.0-C1161pKrAgAwvN-1yN42mPMczz2Vw0ngb2BsbiIxolWS",
         },
+        .zcli = .{
+            .url = "git+https://github.com/lepton9/zcli#1205d464f0028ff06a1cc1f8ec954fbaf3901e5a",
+            .hash = "zcli-0.3.1-Of3s8bQ3AQAWEmZ1p9o4MorsVkkOhMYOMoLILDdqTP6y",
+        },
     },
     .paths = .{
         "build.zig",
