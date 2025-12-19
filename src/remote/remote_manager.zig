@@ -10,6 +10,7 @@ const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
 const Scheduler = scheduler_zig.Scheduler;
 
+pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
 
 const ConnKey = struct {
@@ -221,7 +222,19 @@ pub const RemoteManager = struct {
             .run_job = startMsg,
         });
         defer self.gpa.free(msg);
-        try agent.connection.sendFrame(msg);
+        self.sendMessage(agent, msg) catch {
+            // Remove runner and send an error to scheduler
+            const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
+                unreachable;
+            try kv.value.scheduler.result_queue.push(self.gpa, .{
+                .node = req.job_node,
+                .result = .{
+                    .exit_code = 1,
+                    .err = ResultError.RunnerNotConnected,
+                    .runner = .remote,
+                },
+            });
+        };
     }
 
     /// Cancel a job from running
@@ -240,7 +253,23 @@ pub const RemoteManager = struct {
             .cancel_job = msg,
         });
         defer self.gpa.free(payload);
-        try agent.connection.sendFrame(payload);
+        self.sendMessage(agent, payload) catch {};
+    }
+
+    /// Send a message to the agent
+    /// Remove agent if not connected
+    fn sendMessage(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        message: []const u8,
+    ) !void {
+        agent.connection.sendFrame(message) catch {
+            var kv = self.agents.fetchRemove(
+                .fromAddr(agent.connection.conn.address),
+            );
+            if (kv) |*e| e.value.deinit(self.gpa);
+            return error.NotConnected;
+        };
     }
 
     /// Find an agent based on the name

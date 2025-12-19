@@ -21,6 +21,7 @@ pub const LogQueue = queue.Queue(LogEvent);
 
 pub const ResultError = error{
     NoRunnerFound,
+    RunnerNotConnected,
 };
 
 pub const ExecResult = struct {
@@ -70,7 +71,7 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
-        std.debug.print("- Start job {s}\n", .{job.ptr.name});
+        std.debug.print("- Start job {s} ({d})\n", .{ job.ptr.name, job.id });
 
         logs.push(gpa, .{ .job_started = .{
             .job_node = job,

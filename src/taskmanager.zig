@@ -80,7 +80,10 @@ pub const TaskManager = struct {
         _ = self.running.swap(true, .seq_cst);
         try self.watcher.start();
         try self.remote_manager.start(
-            try std.net.Address.parseIp4("127.0.0.1", 5555),
+            try std.net.Address.parseIp4(
+                remotemanager.DEFAULT_ADDR,
+                remotemanager.DEFAULT_PORT,
+            ),
         );
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }

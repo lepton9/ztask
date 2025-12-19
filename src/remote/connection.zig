@@ -77,7 +77,10 @@ pub const Connection = struct {
                 return err;
             },
         };
-        if (n == 0) return null;
+        if (n == 0) {
+            self.close();
+            return null;
+        }
         self.setLastAccessed();
 
         try self.read_buf.appendSlice(gpa, buffer[0..n]);
@@ -112,7 +115,8 @@ pub const Connection = struct {
             .{ .len = msg.len, .base = msg.ptr },
         };
         writeAllVectored(self.conn.stream.handle, &vec) catch {
-            return self.close();
+            self.close();
+            return error.NotConnected;
         };
         self.setLastAccessed();
     }
