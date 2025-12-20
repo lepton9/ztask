@@ -66,7 +66,7 @@ pub fn runTask(
         };
         if (id) |i| break :blk task_manager.loadTask(i) catch |err| {
             if (err == error.TaskNotFound) {
-                std.log.info("Task not found with ID: {d}", .{i});
+                std.log.info("Task not found with ID: {s}", .{i});
             }
             return;
         };

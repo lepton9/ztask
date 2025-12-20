@@ -12,6 +12,8 @@ const Scheduler = scheduler_zig.Scheduler;
 
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
+/// Try to run job again within time limit (seconds)
+const RETRY_LIMIT_S = 5;
 
 const ConnKey = struct {
     ip: u32,
@@ -37,6 +39,8 @@ pub const DispatchRequest = struct {
     agent_name: []const u8,
     job_node: *localrunner.JobNode,
     scheduler: *Scheduler,
+    /// Timestamp of the first attempt to find an agent after failure
+    first_try_ts: i64 = 0,
 };
 
 pub const AgentHandle = struct {
@@ -188,6 +192,14 @@ pub const RemoteManager = struct {
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
             const agent = self.findAgent(req.agent_name) orelse {
+                var request = req;
+                const now = std.time.timestamp();
+                if (request.first_try_ts == 0) request.first_try_ts = now;
+                // Try to find the remote agent again
+                if (now - request.first_try_ts < RETRY_LIMIT_S) {
+                    try self.dispatch_queue.append(self.gpa, request);
+                    return;
+                }
                 try req.scheduler.result_queue.push(self.gpa, .{
                     .node = req.job_node,
                     .result = .{
