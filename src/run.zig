@@ -85,7 +85,7 @@ pub fn runTask(
 pub fn listTasks(gpa: std.mem.Allocator) !void {
     var datastore = data.DataStore.init(data.root_dir);
     defer datastore.deinit(gpa);
-    try datastore.loadTaskMetas(gpa);
+    try datastore.loadTaskMetas(gpa, .{ .load_runs = false });
 
     var write_buffer: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&write_buffer);

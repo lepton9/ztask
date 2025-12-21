@@ -51,7 +51,7 @@ pub const TaskManager = struct {
             .remote_manager = try remotemanager.RemoteManager.init(gpa),
             .watcher = try Watcher.init(gpa),
         };
-        try self.datastore.loadTaskMetas(gpa);
+        try self.datastore.loadTaskMetas(gpa, .{ .load_runs = false });
         return self;
     }
 

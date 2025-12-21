@@ -207,7 +207,7 @@ pub const DataStore = struct {
     }
 
     /// Load and parse a task run metadata file
-    pub fn loadTaskRunMeta(
+    fn loadTaskRunMeta(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
@@ -219,7 +219,7 @@ pub const DataStore = struct {
     }
 
     /// Load and parse a task run metadata file
-    pub fn loadJobRunMeta(
+    fn loadJobRunMeta(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
@@ -231,8 +231,23 @@ pub const DataStore = struct {
         return parseMetaFile(JobRunMetadata, gpa, job_path);
     }
 
+    /// Load and parse a task metadata file
+    fn loadTaskMeta(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !?TaskMetadata {
+        const meta_path = try self.taskMetaPath(gpa, task_id);
+        defer gpa.free(meta_path);
+        return parseMetaFile(TaskMetadata, gpa, meta_path);
+    }
+
     /// Load all the task metafiles
-    pub fn loadTaskMetas(self: *DataStore, gpa: std.mem.Allocator) !void {
+    pub fn loadTaskMetas(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        options: struct { load_runs: bool = false },
+    ) !void {
         const tasks_path = try self.tasksPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
@@ -243,11 +258,10 @@ pub const DataStore = struct {
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
                 const task_id = std.fs.path.basename(e.name);
-                const meta_file = try self.taskMetaPath(gpa, task_id);
-                defer gpa.free(meta_file);
-                if (parseMetaFile(TaskMetadata, gpa, meta_file) catch null) |meta| {
-                    try self.tasks.put(gpa, meta.id, meta);
-                }
+                const meta = self.loadTaskMeta(gpa, task_id) catch null orelse
+                    continue;
+                try self.tasks.put(gpa, meta.id, meta);
+                if (options.load_runs) try self.loadTaskRuns(gpa, task_id);
             },
             else => continue,
         };
@@ -274,10 +288,7 @@ pub const DataStore = struct {
                 const run_res = try task_runs.getOrPut(gpa, run_id);
                 if (run_res.found_existing) continue;
 
-                // Read metafile
-                const meta_file = try self.taskRunMetaPath(gpa, task_id, run_id);
-                defer gpa.free(meta_file);
-                const parsed_meta = parseMetaFile(TaskRunMetadata, gpa, meta_file);
+                const parsed_meta = self.loadTaskRunMeta(gpa, task_id, run_id);
                 const meta = parsed_meta catch null orelse {
                     _ = task_runs.remove(run_id);
                     continue;
@@ -419,10 +430,7 @@ pub fn writeFile(
 /// Open a directory
 pub fn openDir(
     path: []const u8,
-    options: struct {
-        iterate: bool = false,
-        create: bool = false,
-    },
+    options: struct { iterate: bool = false, create: bool = false },
 ) !std.fs.Dir {
     const cwd = std.fs.cwd();
     const open_options: std.fs.Dir.OpenOptions = .{ .iterate = options.iterate };
