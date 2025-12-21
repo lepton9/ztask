@@ -63,6 +63,8 @@ fn handleArgs(
             addr.value.?.string,
             port,
         );
+    } else if (std.mem.eql(u8, cmd.name, "list")) {
+        return try run.listTasks(gpa);
     } else if (std.mem.eql(u8, cmd.name, "completion")) {
         return try generate_completion(cli, spec);
     }

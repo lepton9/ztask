@@ -53,6 +53,11 @@ pub const cli_spec: zcli.CliApp = .{
             },
         },
         .{
+            .name = "list",
+            .desc = "List all the tasks",
+            .options = &[_]zcli.Opt{},
+        },
+        .{
             .name = "completion",
             .desc = "Generate shell completions (bash|zsh|fish)",
             .positionals = &[_]zcli.PosArg{

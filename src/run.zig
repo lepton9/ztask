@@ -1,4 +1,5 @@
 const std = @import("std");
+const data = @import("data.zig");
 const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
@@ -78,4 +79,39 @@ pub fn runTask(
     try task_manager.start();
     try task_manager.beginTask(try task.id.fmt(&buf));
     while (task_manager.hasTasksRunning()) {}
+}
+
+/// List all the found tasks
+pub fn listTasks(gpa: std.mem.Allocator) !void {
+    var datastore = data.DataStore.init(data.root_dir);
+    defer datastore.deinit(gpa);
+    try datastore.loadTaskMetas(gpa);
+
+    var write_buffer: [1024]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&write_buffer);
+    const stdout = &writer.interface;
+
+    try stdout.print(
+        "{s:<20}{s:<15}{s:<10}{s}\n\n",
+        .{ "ID", "Name", "Runs", "Path" },
+    );
+    try stdout.flush();
+
+    var it = datastore.tasks.iterator();
+    while (it.next()) |e| {
+        const meta = e.value_ptr.*;
+        const task_id = e.key_ptr.*;
+        try datastore.loadTaskRuns(gpa, task_id);
+        const runs = datastore.task_runs.get(task_id) orelse unreachable;
+        try stdout.print(
+            "{s:<20}{s:<15}{d:<10}{s}\n",
+            .{
+                meta.id,
+                meta.name[0..@min(meta.name.len, 15 - 1)],
+                runs.items.len,
+                meta.file_path,
+            },
+        );
+        try stdout.flush();
+    }
 }
