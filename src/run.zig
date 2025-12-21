@@ -58,13 +58,15 @@ pub fn runTask(
     const task_manager = try manager.TaskManager.init(gpa);
     defer task_manager.deinit();
     const task = blk: {
-        if (path) |p| break :blk task_manager.loadTaskWithPath(p) catch |err| {
-            if (err == error.TaskNotFound) {
-                std.log.info("Task not found with path: {s}", .{p});
+        if (path) |p| break :blk task_manager.loadOrCreateWithPath(p) catch |err| {
+            switch (err) {
+                error.ErrorOpenFile => std.log.info("File not found", .{}),
+                error.InvalidTaskFile => std.log.info("Invalid file format", .{}),
+                else => std.log.info("{}", .{err}),
             }
             return;
         };
-        if (id) |i| break :blk task_manager.loadTask(i) catch |err| {
+        if (id) |i| break :blk task_manager.loadTaskWithId(i) catch |err| {
             if (err == error.TaskNotFound) {
                 std.log.info("Task not found with ID: {s}", .{i});
             }

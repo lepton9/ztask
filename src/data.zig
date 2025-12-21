@@ -280,6 +280,7 @@ pub const DataStore = struct {
 
     /// Find task metadata with task file path
     pub fn findTaskMetaPath(self: *DataStore, file_path: []const u8) ?*TaskMetadata {
+        // TODO: check with id from the path
         var it = self.tasks.valueIterator();
         while (it.next()) |meta| {
             if (std.mem.eql(u8, file_path, meta.file_path)) return meta;
@@ -309,7 +310,7 @@ pub const DataStore = struct {
         if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
         var buf: [64]u8 = undefined;
         const id = task.Id.fromStr(path);
-        const id_value = id.fmt(&buf) catch "";
+        const id_value = try id.fmt(&buf);
         if (self.tasks.getPtr(id_value)) |_| {
             return error.TaskExists;
         }

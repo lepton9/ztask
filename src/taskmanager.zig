@@ -267,23 +267,26 @@ pub const TaskManager = struct {
         } else try task_scheduler.trigger();
     }
 
-    /// Parse task file and load the task to memory
-    pub fn loadTaskWithPath(self: *TaskManager, file_path: []const u8) !*Task {
+    /// Load a task from file path or create the meta file
+    pub fn loadOrCreateWithPath(self: *TaskManager, file_path: []const u8) !*Task {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const meta = blk: {
-            if (!std.fs.path.isAbsolute(file_path)) {
-                const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
-                defer self.gpa.free(real_path);
-                break :blk self.datastore.findTaskMetaPath(real_path);
-            }
-            break :blk self.datastore.findTaskMetaPath(file_path);
-        } orelse return error.TaskNotFound;
+        const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
+        defer self.gpa.free(real_path);
+        const meta = self.datastore.findTaskMetaPath(real_path) orelse
+            try self.datastore.addTask(self.gpa, real_path);
         return self.loadTask(meta.id);
     }
 
+    /// Load task with ID
+    pub fn loadTaskWithId(self: *TaskManager, task_id: []const u8) !*Task {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.loadTask(task_id);
+    }
+
     /// Parse task file and load the task to memory
-    pub fn loadTask(self: *TaskManager, task_id: []const u8) !*Task {
+    fn loadTask(self: *TaskManager, task_id: []const u8) !*Task {
         return self.loaded_tasks.get(task_id) orelse blk: {
             const task = try self.datastore.loadTask(self.gpa, task_id) orelse
                 return error.TaskNotFound;
