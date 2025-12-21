@@ -174,7 +174,6 @@ pub const DataStore = struct {
         const cwd = std.fs.cwd();
         const task_dir = try self.taskPath(gpa, task_id);
         defer gpa.free(task_dir);
-        cwd.makePath(task_dir) catch {};
         const counter_file_path = try std.fs.path.join(gpa, &.{
             task_dir,
             run_counter,
@@ -191,10 +190,11 @@ pub const DataStore = struct {
         };
 
         std.mem.writeInt(u64, &buf, next_id + 1, .little);
-
-        var file = try cwd.createFile(counter_file_path, .{});
-        defer file.close();
-        try file.writeAll(&buf);
+        try writeFile(
+            counter_file_path,
+            &buf,
+            .{ .truncate = true, .make_path = true },
+        );
         return next_id;
     }
 
@@ -229,7 +229,7 @@ pub const DataStore = struct {
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
         try cwd.makePath(tasks_path);
-        var dir = try cwd.openDir(tasks_path, .{ .iterate = true });
+        var dir = try openDir(tasks_path, .{ .iterate = true, .create = true });
         defer dir.close();
         var it = dir.iterate();
         while (it.next() catch null) |e| switch (e.kind) {
@@ -253,11 +253,11 @@ pub const DataStore = struct {
     ) !void {
         const res = try self.task_runs.getOrPut(gpa, task_id);
         if (!res.found_existing) res.value_ptr.* = .{};
-        var task_runs = res.value_ptr.*;
+        var task_runs = res.value_ptr;
 
         const runs_path = try self.taskRunsPath(gpa, task_id);
         defer gpa.free(runs_path);
-        var dir = try std.fs.cwd().openDir(runs_path, .{ .iterate = true });
+        var dir = try openDir(runs_path, .{ .iterate = true, .create = true });
         defer dir.close();
         var it = dir.iterate();
         while (it.next() catch null) |e| switch (e.kind) {
@@ -388,8 +388,35 @@ pub fn writeFile(
     if (options.make_path) if (std.fs.path.dirname(path)) |dir| {
         try cwd.makePath(dir);
     };
-    var file = try cwd.createFile(path, .{ .truncate = options.truncate });
+    var file = cwd.createFile(path, .{ .truncate = options.truncate }) catch |err|
+        blk: {
+            if (err != std.fs.File.OpenError.FileNotFound or !options.make_path)
+                return err;
+            if (std.fs.path.dirname(path)) |dir| try cwd.makePath(dir);
+            break :blk try cwd.createFile(path, .{ .truncate = options.truncate });
+        };
+
     defer file.close();
     var writer = file.writer(&.{});
     try writer.interface.writeAll(content);
+}
+
+/// Open a directory
+pub fn openDir(
+    path: []const u8,
+    options: struct {
+        iterate: bool = false,
+        create: bool = false,
+    },
+) !std.fs.Dir {
+    const cwd = std.fs.cwd();
+    const open_options: std.fs.Dir.OpenOptions = .{ .iterate = options.iterate };
+    return cwd.openDir(path, open_options) catch |err| switch (err) {
+        std.fs.Dir.OpenError.FileNotFound => {
+            if (!options.create) return err;
+            try cwd.makePath(path);
+            return try cwd.openDir(path, open_options);
+        },
+        else => return err,
+    };
 }
