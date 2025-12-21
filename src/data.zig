@@ -76,20 +76,28 @@ pub const JobRunMetadata = struct {
 pub const DataStore = struct {
     root: []const u8,
     tasks: std.StringHashMapUnmanaged(TaskMetadata),
-    task_runs: std.StringHashMapUnmanaged(std.ArrayList(TaskRunMetadata)),
+    task_runs: std.StringHashMapUnmanaged(
+        std.StringHashMapUnmanaged(TaskRunMetadata),
+    ),
 
     pub fn init(root: []const u8) DataStore {
         return .{ .root = root, .tasks = .{}, .task_runs = .{} };
     }
 
     pub fn deinit(self: *DataStore, gpa: std.mem.Allocator) void {
+        // Free task runs
         var it = self.task_runs.iterator();
         while (it.next()) |e| {
             var runs = e.value_ptr;
+            var runs_it = runs.iterator();
+            while (runs_it.next()) |re| {
+                re.value_ptr.deinit(gpa);
+            }
             runs.deinit(gpa);
         }
         self.task_runs.deinit(gpa);
 
+        // Free tasks
         var tasks_it = self.tasks.iterator();
         while (tasks_it.next()) |e| {
             e.value_ptr.deinit(gpa);
@@ -263,11 +271,18 @@ pub const DataStore = struct {
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
                 const run_id = std.fs.path.basename(e.name);
+                const run_res = try task_runs.getOrPut(gpa, run_id);
+                if (run_res.found_existing) continue;
+
+                // Read metafile
                 const meta_file = try self.taskRunMetaPath(gpa, task_id, run_id);
                 defer gpa.free(meta_file);
-                if (parseMetaFile(TaskRunMetadata, gpa, meta_file) catch null) |meta| {
-                    try task_runs.append(gpa, meta);
-                }
+                const parsed_meta = parseMetaFile(TaskRunMetadata, gpa, meta_file);
+                const meta = parsed_meta catch null orelse {
+                    _ = task_runs.remove(run_id);
+                    continue;
+                };
+                run_res.value_ptr.* = meta;
             },
             else => continue,
         };

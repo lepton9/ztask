@@ -108,7 +108,7 @@ pub fn listTasks(gpa: std.mem.Allocator) !void {
             .{
                 meta.id,
                 meta.name[0..@min(meta.name.len, 15 - 1)],
-                runs.items.len,
+                runs.count(),
                 meta.file_path,
             },
         );
