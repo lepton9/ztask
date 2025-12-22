@@ -147,7 +147,7 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         msg: protocol.Msg,
     ) !void {
-        std.debug.print("parsed: '{any}'\n", .{msg});
+        std.log.debug("parsed: {any}", .{msg});
         switch (msg) {
             .register => |m| try agent.setName(self.gpa, m.hostname),
             .heartbeat => agent.last_heartbeat = std.time.timestamp(),

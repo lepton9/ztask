@@ -270,6 +270,13 @@ pub fn MutexQueue(comptime T: type) type {
             self.mutex.unlock();
             return self.pop();
         }
+
+        /// Check if the queue is empty
+        pub fn empty(self: *@This()) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.queue.list.first == null;
+        }
     };
 }
 

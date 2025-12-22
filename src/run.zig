@@ -28,7 +28,7 @@ pub fn runTui(gpa: std.mem.Allocator) !void {
         std.debug.print("err: {any}\n", .{err});
     };
 
-    while (task_manager.hasTasksRunning()) {}
+    while (task_manager.hasTasksRunning()) try std.Thread.yield();
 }
 
 /// Run the remote runner
@@ -78,7 +78,7 @@ pub fn runTask(
     var buf: [64]u8 = undefined;
     try task_manager.start();
     try task_manager.beginTask(try task.id.fmt(&buf));
-    while (task_manager.hasTasksRunning()) {}
+    while (task_manager.hasTasksRunning()) try std.Thread.yield();
 }
 
 /// List all the found tasks

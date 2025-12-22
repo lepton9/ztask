@@ -166,9 +166,16 @@ pub const TaskManager = struct {
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
             // TODO: handle errors
-            self.checkWatcher() catch {};
-            self.remote_manager.update() catch {};
-            self.updateSchedulers() catch {};
+            self.checkWatcher() catch |err| {
+                std.log.err("watcher: {}", .{err});
+            };
+            self.remote_manager.update() catch |err| {
+                std.log.err("remote manager: {}", .{err});
+            };
+            self.updateSchedulers() catch |err| {
+                std.log.err("scheduler: {}", .{err});
+            };
+            std.Thread.sleep(std.time.ns_per_ms * 100);
         }
     }
 
@@ -381,7 +388,7 @@ test "manager_simple" {
 
     // Start tasks
     for (task_manager.loaded_tasks.keys()) |key| {
-        _ = try task_manager.beginTask(key);
+        try task_manager.beginTask(key);
     }
     try std.testing.expect(task_manager.schedulers.count() == 2);
 
@@ -413,7 +420,7 @@ test "force_interrupt" {
     const task = try parse.parseTaskBuffer(gpa, task_file);
     const task_id = try gpa.dupe(u8, try task.id.fmt(&task_buf));
     try task_manager.loaded_tasks.put(gpa, task_id, task);
-    _ = try task_manager.beginTask(task_id);
+    try task_manager.beginTask(task_id);
     // Interrupt while running
     task_manager.stop();
 
@@ -460,10 +467,10 @@ test "complete_tasks" {
 
     // Start tasks
     for (task_manager.loaded_tasks.keys()) |key| {
-        _ = try task_manager.beginTask(key);
+        try task_manager.beginTask(key);
     }
     // Wait for completion
-    while (task_manager.hasTasksRunning()) {}
+    while (task_manager.hasTasksRunning()) try std.Thread.yield();
     task_manager.stop();
 
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
