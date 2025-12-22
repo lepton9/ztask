@@ -5,6 +5,7 @@ const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 
+const Queue = @import("../queue.zig").Queue;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
@@ -65,7 +66,7 @@ pub const RemoteManager = struct {
     server: ?std.net.Server = null,
     agents: std.AutoHashMapUnmanaged(ConnKey, AgentHandle),
 
-    dispatch_queue: std.ArrayList(DispatchRequest),
+    dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
 
     pub fn init(gpa: std.mem.Allocator) !*RemoteManager {
@@ -73,7 +74,7 @@ pub const RemoteManager = struct {
         manager.* = .{
             .gpa = gpa,
             .agents = .{},
-            .dispatch_queue = try .initCapacity(gpa, 5),
+            .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
         return manager;
@@ -253,8 +254,9 @@ pub const RemoteManager = struct {
     /// Send a cancel request to the remote agent if currently running
     pub fn cancelJob(self: *RemoteManager, job_id: usize) !void {
         const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return {
-            for (self.dispatch_queue.items, 0..) |d, i| if (d.job_node.id == job_id) {
-                _ = self.dispatch_queue.orderedRemove(i);
+            var it = self.dispatch_queue.iterator();
+            while (it.next()) |node| if (node.value.job_node.id == job_id) {
+                self.dispatch_queue.remove(node);
                 break;
             };
         };

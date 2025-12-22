@@ -5,6 +5,7 @@ const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 
+const Queue = @import("../queue.zig").Queue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
 const ResultQueue = localrunner.ResultQueue;
@@ -27,7 +28,7 @@ pub const RemoteAgent = struct {
     /// All currently loaded jobs
     jobs: std.AutoHashMapUnmanaged(u64, struct { job: task.Job, node: JobNode }),
     /// Queue of jobs to run
-    queue: std.ArrayList(*JobNode),
+    queue: Queue(*JobNode),
     /// Jobs currently running
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
@@ -40,10 +41,10 @@ pub const RemoteAgent = struct {
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
             .pool = try runnerpool.RunnerPool.init(gpa, BASE_RUNNERS_N),
-            .result_queue = try ResultQueue.init(gpa, BASE_RUNNERS_N),
-            .log_queue = try LogQueue.init(gpa, 10),
+            .result_queue = try ResultQueue.initCapacity(gpa, BASE_RUNNERS_N),
+            .log_queue = try LogQueue.init(gpa),
             .jobs = .{},
-            .queue = try .initCapacity(gpa, BASE_RUNNERS_N),
+            .queue = .{},
             .active_runners = .{},
             .connection = try .init(gpa),
         };
@@ -160,10 +161,13 @@ pub const RemoteAgent = struct {
         const e = self.jobs.getPtr(msg.job_id) orelse return;
         if (self.active_runners.get(&e.node)) |runner| {
             runner.forceStop();
-        } else for (self.queue.items, 0..) |node, i| {
-            if (@intFromPtr(node) == @intFromPtr(&e.node)) {
-                _ = self.queue.orderedRemove(i);
-                break;
+        } else {
+            var it = self.queue.iterator();
+            while (it.next()) |node| {
+                if (@intFromPtr(node.value) == @intFromPtr(&e.node)) {
+                    self.queue.remove(node);
+                    break;
+                }
             }
         }
         var kv = self.jobs.fetchRemove(msg.job_id) orelse unreachable;
@@ -259,17 +263,16 @@ pub const RemoteAgent = struct {
 
     /// Try to run the next job from the queue if there is one
     fn tryRunNext(self: *RemoteAgent) void {
-        if (self.queue.items.len == 0) return;
+        if (self.queue.empty()) return;
         self.requestRunner();
     }
 
     /// Run the next job from queue with the provided local runner
     fn runNextJob(self: *RemoteAgent, runner: *LocalRunner) void {
-        if (self.queue.items.len == 0) {
+        const node = self.queue.pop() orelse {
             self.pool.release(runner);
             return;
-        }
-        const node = self.queue.orderedRemove(0);
+        };
         self.active_runners.putAssumeCapacity(node, runner);
         runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
     }
