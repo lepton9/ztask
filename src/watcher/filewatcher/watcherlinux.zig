@@ -139,7 +139,7 @@ pub const FileWatcherLinux = struct {
             else
                 dir.dirname;
 
-            try out.push(gpa, .{ .fileEvent = .{
+            try out.append(gpa, .{ .fileEvent = .{
                 .path = path,
                 .kind = kind,
             } });

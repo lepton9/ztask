@@ -13,7 +13,7 @@ pub const WatchEvent = union(enum) {
     time: @TypeOf(task.Trigger.time),
 };
 
-pub const EventQueue = queue_zig.Queue(WatchEvent);
+pub const EventQueue = queue_zig.MutexQueue(WatchEvent);
 
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
@@ -29,7 +29,7 @@ pub const Watcher = struct {
         const watcher = try gpa.create(Watcher);
         watcher.* = .{
             .gpa = gpa,
-            .queue = try EventQueue.init(gpa, 5),
+            .queue = try EventQueue.init(gpa),
             .file_watcher = FileWatcher.init(gpa) catch null,
         };
         return watcher;
@@ -67,11 +67,12 @@ pub const Watcher = struct {
             if (!self.running.load(.seq_cst)) break;
 
             // Poll watchers for events
-            if (self.file_watcher) |fw|
+            if (self.file_watcher) |fw| {
                 fw.pollEvents(self.gpa, self.queue) catch |err| {
                     if (err == error.WouldBlock) continue;
-                    std.log.err("{}", .{err});
+                    std.log.scoped(.Watcher).err("watcher: {}", .{err});
                 };
+            }
         }
     }
 

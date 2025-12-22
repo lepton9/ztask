@@ -10,15 +10,9 @@ pub fn Queue(comptime T: type) type {
         list: std.DoublyLinkedList = .{},
         free: std.DoublyLinkedList = .{},
 
-        pub fn init(gpa: std.mem.Allocator) !*@This() {
-            const queue = try gpa.create(@This());
-            queue.* = .{};
-            return queue;
-        }
-
         /// Initialize with capacity to hold `n` elements
-        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
-            const queue = try @This().init(gpa);
+        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !@This() {
+            var queue: @This() = .{};
             for (0..n) |_| {
                 const node = try gpa.create(QueueNode);
                 node.* = .{};
@@ -30,7 +24,6 @@ pub fn Queue(comptime T: type) type {
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             while (self.list.pop()) |item| gpa.destroy(getNode(item));
             while (self.free.pop()) |item| gpa.destroy(getNode(item));
-            gpa.destroy(self);
         }
 
         /// Append an item to the back of the queue
@@ -75,7 +68,7 @@ pub fn Queue(comptime T: type) type {
 
 test "queue_simple" {
     const gpa = std.testing.allocator;
-    var q = try Queue(u64).init(gpa);
+    var q = Queue(u64){};
     defer q.deinit(gpa);
     try std.testing.expect(q.empty());
     try std.testing.expect(q.pop() == null);
@@ -126,13 +119,17 @@ pub fn MutexQueue(comptime T: type) type {
     return struct {
         mutex: std.Thread.Mutex = .{},
         cond: std.Thread.Condition = .{},
-        queue: std.ArrayList(T),
+        queue: Queue(T) = .{},
 
-        pub fn init(gpa: std.mem.Allocator, n: usize) !*@This() {
+        pub fn init(gpa: std.mem.Allocator) !*@This() {
             const queue = try gpa.create(@This());
-            queue.* = .{
-                .queue = try std.ArrayList(T).initCapacity(gpa, n),
-            };
+            queue.* = .{};
+            return queue;
+        }
+
+        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
+            const queue = try gpa.create(@This());
+            queue.* = .{ .queue = try .initCapacity(gpa, n) };
             return queue;
         }
 
@@ -142,7 +139,7 @@ pub fn MutexQueue(comptime T: type) type {
         }
 
         /// Push item to back of queue
-        pub fn push(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
             {
                 self.mutex.lock();
                 defer self.mutex.unlock();
@@ -153,7 +150,7 @@ pub fn MutexQueue(comptime T: type) type {
 
         /// Push item to back of queue
         /// Assumes that there is capacity for the element
-        pub fn pushAssumeCapacity(self: *@This(), item: T) void {
+        pub fn appendAssumeCapacity(self: *@This(), item: T) void {
             {
                 self.mutex.lock();
                 defer self.mutex.unlock();
@@ -166,15 +163,14 @@ pub fn MutexQueue(comptime T: type) type {
         pub fn pop(self: *@This()) ?T {
             self.mutex.lock();
             defer self.mutex.unlock();
-            if (self.queue.items.len == 0) return null;
-            return self.queue.orderedRemove(0);
+            return self.queue.pop();
         }
 
         /// Pop the first item from the queue
         /// Block the caller thread until an item gets pushed
         pub fn popBlocking(self: *@This()) ?T {
             self.mutex.lock();
-            if (self.queue.items.len == 0) {
+            if (self.queue.empty()) {
                 self.cond.wait(&self.mutex);
             }
             self.mutex.unlock();
@@ -185,23 +181,22 @@ pub fn MutexQueue(comptime T: type) type {
 
 test "mutex_queue" {
     const gpa = std.testing.allocator;
-    var q = try MutexQueue(usize).init(gpa, 5);
+    var q = try MutexQueue(usize).initCapacity(gpa, 5);
     defer q.deinit(gpa);
     try std.testing.expect(q.pop() == null);
-    q.pushAssumeCapacity(1);
-    q.pushAssumeCapacity(2);
-    q.pushAssumeCapacity(3);
-    try std.testing.expect(q.queue.items.len == 3);
+    q.appendAssumeCapacity(1);
+    q.appendAssumeCapacity(2);
+    q.appendAssumeCapacity(3);
     try std.testing.expect(q.pop() == 1);
     try std.testing.expect(q.pop() == 2);
     try std.testing.expect(q.pop() == 3);
 
     const push_items = struct {
         fn f(qu: *MutexQueue(usize), a: std.mem.Allocator) !void {
-            try qu.push(a, 9);
-            try qu.push(a, 8);
-            try qu.push(a, 7);
-            try qu.push(a, 6);
+            try qu.append(a, 9);
+            try qu.append(a, 8);
+            try qu.append(a, 7);
+            try qu.append(a, 6);
         }
     }.f;
 

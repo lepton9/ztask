@@ -153,7 +153,7 @@ pub const RemoteManager = struct {
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
-                try req.scheduler.log_queue.push(self.gpa, .{ .job_started = .{
+                try req.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
                     .job_node = req.job_node,
                     .timestamp = m.timestamp,
                 } });
@@ -161,7 +161,7 @@ pub const RemoteManager = struct {
             .job_log => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
-                try req.scheduler.log_queue.push(self.gpa, .{ .job_output = .{
+                try req.scheduler.log_queue.append(self.gpa, .{ .job_output = .{
                     .job_node = req.job_node,
                     .step = m.step,
                     .data = try self.gpa.dupe(u8, m.data),
@@ -171,12 +171,12 @@ pub const RemoteManager = struct {
                 const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse
                     return error.NoDispatchedJob;
                 const req = kv.value;
-                try req.scheduler.log_queue.push(self.gpa, .{ .job_finished = .{
+                try req.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
                     .job_node = req.job_node,
                     .exit_code = m.exit_code,
                     .timestamp = m.timestamp,
                 } });
-                try req.scheduler.result_queue.push(self.gpa, .{
+                try req.scheduler.result_queue.append(self.gpa, .{
                     .node = req.job_node,
                     .result = .{
                         .exit_code = m.exit_code,
@@ -200,7 +200,7 @@ pub const RemoteManager = struct {
                     try self.dispatch_queue.append(self.gpa, request);
                     return;
                 }
-                try req.scheduler.result_queue.push(self.gpa, .{
+                try req.scheduler.result_queue.append(self.gpa, .{
                     .node = req.job_node,
                     .result = .{
                         .err = ResultError.NoRunnerFound,
@@ -238,7 +238,7 @@ pub const RemoteManager = struct {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
                 unreachable;
-            try kv.value.scheduler.result_queue.push(self.gpa, .{
+            try kv.value.scheduler.result_queue.append(self.gpa, .{
                 .node = req.job_node,
                 .result = .{
                     .exit_code = 1,

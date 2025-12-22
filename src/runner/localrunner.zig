@@ -16,8 +16,8 @@ pub const LogEvent = union(enum) {
     job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
 };
 
-pub const ResultQueue = queue.Queue(Result);
-pub const LogQueue = queue.Queue(LogEvent);
+pub const ResultQueue = queue.MutexQueue(Result);
+pub const LogQueue = queue.MutexQueue(LogEvent);
 
 pub const ResultError = error{
     NoRunnerFound,
@@ -54,7 +54,7 @@ pub const LocalRunner = struct {
             results,
             logs,
         }) catch {
-            return results.pushAssumeCapacity(.{
+            return results.appendAssumeCapacity(.{
                 .node = job,
                 .result = .{
                     .exit_code = 1,
@@ -73,7 +73,7 @@ pub const LocalRunner = struct {
     ) void {
         std.debug.print("- Start job {s} ({d})\n", .{ job.ptr.name, job.id });
 
-        logs.push(gpa, .{ .job_started = .{
+        logs.append(gpa, .{ .job_started = .{
             .job_node = job,
             .timestamp = std.time.milliTimestamp(),
         } }) catch {};
@@ -99,18 +99,19 @@ pub const LocalRunner = struct {
             if (exit_code != 0) break;
         }
 
-        logs.push(gpa, .{ .job_finished = .{
+        logs.append(gpa, .{ .job_finished = .{
             .job_node = job,
             .exit_code = exit_code,
             .timestamp = std.time.milliTimestamp(),
         } }) catch {};
-        results.pushAssumeCapacity(
+        results.appendAssumeCapacity(
             .{ .node = job, .result = .{
                 .exit_code = exit_code,
                 .msg = err_msg,
             } },
         );
         _ = self.running.swap(false, .seq_cst);
+        std.debug.print("- Finish job {s} ({d})\n", .{ job.ptr.name, job.id });
     }
 
     pub fn joinThread(self: *LocalRunner) void {
@@ -193,7 +194,7 @@ fn readLogs(
     reader.seek = 0;
     reader.end = 0;
 
-    logs.push(gpa, .{ .job_output = .{
+    logs.append(gpa, .{ .job_output = .{
         .job_node = job,
         .step = @intCast(step_index),
         .data = data,
