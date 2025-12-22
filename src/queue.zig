@@ -54,6 +54,13 @@ pub fn Queue(comptime T: type) type {
             return value;
         }
 
+        /// Peek at the first item of the queue
+        pub fn peek(self: *@This()) ?T {
+            const link = self.list.first orelse return null;
+            const node: *QueueNode = getNode(link);
+            return node.value;
+        }
+
         /// Check if the queue is empty
         pub fn empty(self: *@This()) bool {
             return self.list.first == null;
@@ -112,6 +119,19 @@ test "queue_allocated_items" {
     try std.testing.expect(std.mem.eql(u8, q.pop().?, ""));
     try std.testing.expect(std.mem.eql(u8, q.pop().?, "Some text"));
     try std.testing.expect(std.mem.eql(u8, q.pop().?, "queue"));
+}
+
+test "queue_peek" {
+    const gpa = std.testing.allocator;
+    var q = Queue(*usize){};
+    defer q.deinit(gpa);
+    var n1: usize = 111;
+    var n2: usize = 222;
+    try q.append(gpa, &n1);
+    try q.append(gpa, &n2);
+    try std.testing.expect(q.peek().?.* == 111);
+    try std.testing.expect(@intFromPtr(q.peek().?) == @intFromPtr(q.pop().?));
+    try std.testing.expect(@intFromPtr(q.peek().?) == @intFromPtr(q.pop().?));
 }
 
 /// Thread safe queue

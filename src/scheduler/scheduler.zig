@@ -6,6 +6,7 @@ const log = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const remote = @import("../remote/remote_manager.zig");
 
+const Queue = @import("../queue.zig").Queue;
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const LocalRunner = localrunner.LocalRunner;
 const ExecResult = localrunner.ExecResult;
@@ -35,7 +36,7 @@ pub const Scheduler = struct {
     remote_manager: *remote.RemoteManager,
     nodes: []JobNode = undefined,
     /// Ready queue of jobs that can run
-    queue: std.ArrayList(*JobNode),
+    queue: Queue(*JobNode),
     /// Runners currently running jobs
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
@@ -191,34 +192,23 @@ pub const Scheduler = struct {
             }
         }
         // Queue should have at least one node
-        std.debug.assert(self.queue.items.len > 0);
+        std.debug.assert(!self.queue.empty());
     }
 
     /// Try to run more jobs from the queue
     fn tryScheduleJobs(self: *Scheduler) void {
-        for (0..self.queue.items.len) |_| {
-            if (!self.tryScheduleNext()) return;
-        }
-    }
-
-    /// Try to run the next job from queue
-    fn tryScheduleNext(self: *Scheduler) bool {
-        if (self.queue.items.len == 0) return false;
-        const node = self.queue.items[0];
-        switch (node.ptr.run_on) {
-            .local => return self.requestRunner(),
+        while (self.queue.peek()) |node| switch (node.ptr.run_on) {
+            .local => if (!self.requestRunner()) break,
             .remote => self.runNextJobRemote(),
-        }
-        return true;
+        };
     }
 
     /// Run the next job from queue with the provided local runner
     fn runNextJobLocal(self: *Scheduler, runner: *LocalRunner) void {
-        if (self.queue.items.len == 0) {
+        const node = self.queue.pop() orelse {
             self.pool.release(runner);
             return;
-        }
-        const node = self.queue.orderedRemove(0);
+        };
         node.status = .running;
 
         self.active_runners.putAssumeCapacity(node, runner);
@@ -231,7 +221,7 @@ pub const Scheduler = struct {
 
     /// Run the next job in the queue with a remote runner
     fn runNextJobRemote(self: *Scheduler) void {
-        const node = self.queue.orderedRemove(0);
+        const node = self.queue.pop() orelse return;
         node.status = .running;
 
         self.logger.startJob(
