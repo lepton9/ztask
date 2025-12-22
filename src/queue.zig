@@ -1,7 +1,128 @@
 const std = @import("std");
 
-/// Thread safe queue
 pub fn Queue(comptime T: type) type {
+    const QueueNode = struct {
+        value: T = undefined,
+        link: std.DoublyLinkedList.Node = .{},
+    };
+
+    return struct {
+        list: std.DoublyLinkedList = .{},
+        free: std.DoublyLinkedList = .{},
+
+        pub fn init(gpa: std.mem.Allocator) !*@This() {
+            const queue = try gpa.create(@This());
+            queue.* = .{};
+            return queue;
+        }
+
+        /// Initialize with capacity to hold `n` elements
+        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
+            const queue = try @This().init(gpa);
+            for (0..n) |_| {
+                const node = try gpa.create(QueueNode);
+                node.* = .{};
+                queue.free.append(&node.link);
+            }
+            return queue;
+        }
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            while (self.list.pop()) |item| gpa.destroy(getNode(item));
+            while (self.free.pop()) |item| gpa.destroy(getNode(item));
+            gpa.destroy(self);
+        }
+
+        /// Append an item to the back of the queue
+        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+            const node: *QueueNode = if (self.free.pop()) |n|
+                getNode(n)
+            else
+                try gpa.create(QueueNode);
+            node.* = .{ .value = item };
+            self.list.append(&node.link);
+        }
+
+        /// Append an item to the back of the queue
+        /// Assumes that there is capacity for the item
+        pub fn appendAssumeCapacity(self: *@This(), item: T) void {
+            const node: *QueueNode = getNode(self.free.pop() orelse unreachable);
+            node.* = .{ .value = item };
+            self.list.append(&node.link);
+        }
+
+        /// Pop the first item from the queue if there is one
+        pub fn pop(self: *@This()) ?T {
+            const link = self.list.popFirst() orelse return null;
+            const node: *QueueNode = getNode(link);
+            const value = node.value;
+            node.value = undefined;
+            self.free.append(&node.link);
+            return value;
+        }
+
+        /// Check if the queue is empty
+        pub fn empty(self: *@This()) bool {
+            return self.list.first == null;
+        }
+
+        /// Return the parent queue node of the link node
+        fn getNode(link: *std.DoublyLinkedList.Node) *QueueNode {
+            return @fieldParentPtr("link", link);
+        }
+    };
+}
+
+test "queue_simple" {
+    const gpa = std.testing.allocator;
+    var q = try Queue(u64).init(gpa);
+    defer q.deinit(gpa);
+    try std.testing.expect(q.empty());
+    try std.testing.expect(q.pop() == null);
+    try q.append(gpa, 1);
+    try q.append(gpa, 2);
+    try std.testing.expect(!q.empty());
+    try std.testing.expect(q.pop().? == 1);
+    try std.testing.expect(q.pop().? == 2);
+}
+
+test "queue_assume_capacity" {
+    const gpa = std.testing.allocator;
+    const N = 5;
+    var q = try Queue(i64).initCapacity(gpa, N);
+    defer q.deinit(gpa);
+    const arr: [N]i64 = .{ -1, 123, 999, 21, 0 };
+    for (arr) |i| q.appendAssumeCapacity(i);
+    for (arr) |i| try std.testing.expect(q.pop().? == i);
+}
+
+test "queue_allocated_items" {
+    const gpa = std.testing.allocator;
+    var q = try Queue([]const u8).initCapacity(gpa, 5);
+    defer q.deinit(gpa);
+
+    const str1 = try gpa.dupe(u8, "test");
+    defer gpa.free(str1);
+    const str2 = try gpa.dupe(u8, "");
+    defer gpa.free(str2);
+    const str3 = try gpa.dupe(u8, "Some text");
+    defer gpa.free(str3);
+    const str4 = try gpa.dupe(u8, "queue");
+    defer gpa.free(str4);
+
+    try q.append(gpa, str1);
+    q.appendAssumeCapacity(str2);
+    q.appendAssumeCapacity(str3);
+    try q.append(gpa, str4);
+
+    try std.testing.expect(std.mem.eql(u8, q.pop().?, "test"));
+    try std.testing.expect(std.mem.eql(u8, q.pop().?, ""));
+    try std.testing.expect(std.mem.eql(u8, q.pop().?, "Some text"));
+    try std.testing.expect(std.mem.eql(u8, q.pop().?, "queue"));
+}
+
+/// Thread safe queue
+pub fn MutexQueue(comptime T: type) type {
     return struct {
         mutex: std.Thread.Mutex = .{},
         cond: std.Thread.Condition = .{},
@@ -62,9 +183,9 @@ pub fn Queue(comptime T: type) type {
     };
 }
 
-test "queue" {
+test "mutex_queue" {
     const gpa = std.testing.allocator;
-    var q = try Queue(usize).init(gpa, 5);
+    var q = try MutexQueue(usize).init(gpa, 5);
     defer q.deinit(gpa);
     try std.testing.expect(q.pop() == null);
     q.pushAssumeCapacity(1);
@@ -76,7 +197,7 @@ test "queue" {
     try std.testing.expect(q.pop() == 3);
 
     const push_items = struct {
-        fn f(qu: *Queue(usize), a: std.mem.Allocator) !void {
+        fn f(qu: *MutexQueue(usize), a: std.mem.Allocator) !void {
             try qu.push(a, 9);
             try qu.push(a, 8);
             try qu.push(a, 7);
@@ -90,71 +211,4 @@ test "queue" {
     try std.testing.expect(q.popBlocking() == 7);
     try std.testing.expect(q.popBlocking() == 6);
     thread.join();
-}
-
-pub fn QueueFifo(comptime T: type) type {
-    const QueueNode = struct {
-        value: T = undefined,
-        link: std.DoublyLinkedList.Node = .{},
-    };
-
-    return struct {
-        list: std.DoublyLinkedList = .{},
-        free: std.DoublyLinkedList = .{},
-
-        pub fn init(gpa: std.mem.Allocator) !*@This() {
-            const queue = try gpa.create(@This());
-            queue.* = .{};
-            return queue;
-        }
-
-        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
-            const queue = try @This().init(gpa);
-            for (0..n) |_| {
-                const node = try gpa.create(QueueNode);
-                node.* = .{};
-                queue.free.append(&node.link);
-            }
-            return queue;
-        }
-
-        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-            while (self.list.pop()) |item| gpa.destroy(getNode(item));
-            while (self.free.pop()) |item| gpa.destroy(getNode(item));
-            gpa.destroy(self);
-        }
-
-        /// Append an item to the back of the queue
-        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
-            const node: *QueueNode = if (self.free.pop()) |n|
-                getNode(n)
-            else
-                try gpa.create(QueueNode);
-            node.* = .{ .value = item };
-            self.list.append(&node.link);
-        }
-
-        /// Append an item to the back of the queue
-        /// Assumes that there is capacity for the item
-        pub fn appendAssumeCapacity(self: *@This(), item: T) void {
-            const node: *QueueNode = getNode(self.free.pop() orelse unreachable);
-            node.* = .{ .value = item };
-            self.list.append(&node.link);
-        }
-
-        /// Pop the first item from the queue if there is one
-        pub fn pop(self: *@This()) ?T {
-            const link = self.list.popFirst() orelse return null;
-            const node: *QueueNode = getNode(link);
-            const value = node.value;
-            node.value = undefined;
-            self.free.append(&node.link);
-            return value;
-        }
-
-        /// Return the parent queue node of the link node
-        fn getNode(link: *std.DoublyLinkedList.Node) *QueueNode {
-            return @fieldParentPtr("link", link);
-        }
-    };
 }
