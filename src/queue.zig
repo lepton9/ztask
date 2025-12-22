@@ -91,3 +91,70 @@ test "queue" {
     try std.testing.expect(q.popBlocking() == 6);
     thread.join();
 }
+
+pub fn QueueFifo(comptime T: type) type {
+    const QueueNode = struct {
+        value: T = undefined,
+        link: std.DoublyLinkedList.Node = .{},
+    };
+
+    return struct {
+        list: std.DoublyLinkedList = .{},
+        free: std.DoublyLinkedList = .{},
+
+        pub fn init(gpa: std.mem.Allocator) !*@This() {
+            const queue = try gpa.create(@This());
+            queue.* = .{};
+            return queue;
+        }
+
+        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
+            const queue = try @This().init(gpa);
+            for (0..n) |_| {
+                const node = try gpa.create(QueueNode);
+                node.* = .{};
+                queue.free.append(&node.link);
+            }
+            return queue;
+        }
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            while (self.list.pop()) |item| gpa.destroy(getNode(item));
+            while (self.free.pop()) |item| gpa.destroy(getNode(item));
+            gpa.destroy(self);
+        }
+
+        /// Append an item to the back of the queue
+        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+            const node: *QueueNode = if (self.free.pop()) |n|
+                getNode(n)
+            else
+                try gpa.create(QueueNode);
+            node.* = .{ .value = item };
+            self.list.append(&node.link);
+        }
+
+        /// Append an item to the back of the queue
+        /// Assumes that there is capacity for the item
+        pub fn appendAssumeCapacity(self: *@This(), item: T) void {
+            const node: *QueueNode = getNode(self.free.pop() orelse unreachable);
+            node.* = .{ .value = item };
+            self.list.append(&node.link);
+        }
+
+        /// Pop the first item from the queue if there is one
+        pub fn pop(self: *@This()) ?T {
+            const link = self.list.popFirst() orelse return null;
+            const node: *QueueNode = getNode(link);
+            const value = node.value;
+            node.value = undefined;
+            self.free.append(&node.link);
+            return value;
+        }
+
+        /// Return the parent queue node of the link node
+        fn getNode(link: *std.DoublyLinkedList.Node) *QueueNode {
+            return @fieldParentPtr("link", link);
+        }
+    };
+}
