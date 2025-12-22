@@ -32,7 +32,8 @@ pub const MsgParser = struct {
 
     pub fn parse(self: *MsgParser, payload: []const u8) !Msg {
         if (payload.len == 0) return error.EmptyMessage;
-        const msg_type = @as(Msg.Tag, @enumFromInt(payload[0]));
+        const msg_type = std.enums.fromInt(Msg.Tag, payload[0]) orelse
+            return error.InvalidMsgType;
         const msg = payload[1..];
         return self.parse_table[@intFromEnum(msg_type)](msg);
     }
@@ -422,4 +423,13 @@ test "heartbeat" {
     const parsed = try parser.parse(payload.items);
     try std.testing.expect(payload.items.len == 1);
     try std.testing.expect(parsed == .heartbeat);
+}
+
+test "invalid_message_type" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    var payload = try std.ArrayList(u8).initCapacity(alloc, 1);
+    defer payload.deinit(alloc);
+    payload.appendAssumeCapacity(255);
+    try std.testing.expect(parser.parse(payload.items) == error.InvalidMsgType);
 }
