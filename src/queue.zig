@@ -70,6 +70,36 @@ pub fn Queue(comptime T: type) type {
         fn getNode(link: *std.DoublyLinkedList.Node) *QueueNode {
             return @fieldParentPtr("link", link);
         }
+
+        /// Remove an element from the queue
+        pub fn remove(self: *@This(), node: *QueueNode) void {
+            self.list.remove(&node.link);
+            self.free.append(&node.link);
+        }
+
+        /// Remove an element from the queue by the value ptr
+        pub fn removeValue(self: *@This(), value: *T) void {
+            const node: *QueueNode = @fieldParentPtr("value", value);
+            self.list.remove(&node.link);
+            self.free.append(&node.link);
+        }
+
+        /// Get an iterator for the queue
+        /// Starts iterating from the first node
+        pub fn iterator(self: *const @This()) Iterator {
+            return .{ .current = self.list.first };
+        }
+
+        pub const Iterator = struct {
+            current: ?*std.DoublyLinkedList.Node,
+
+            pub fn next(self: *Iterator) ?*QueueNode {
+                const link = self.current orelse return null;
+                const node = getNode(link);
+                self.current = node.link.next;
+                return node;
+            }
+        };
     };
 }
 
@@ -86,7 +116,7 @@ test "queue_simple" {
     try std.testing.expect(q.pop().? == 2);
 }
 
-test "queue_assume_capacity" {
+test "assume_capacity" {
     const gpa = std.testing.allocator;
     const N = 5;
     var q = try Queue(i64).initCapacity(gpa, N);
@@ -96,7 +126,7 @@ test "queue_assume_capacity" {
     for (arr) |i| try std.testing.expect(q.pop().? == i);
 }
 
-test "queue_allocated_items" {
+test "allocated_items" {
     const gpa = std.testing.allocator;
     var q = try Queue([]const u8).initCapacity(gpa, 5);
     defer q.deinit(gpa);
@@ -121,7 +151,7 @@ test "queue_allocated_items" {
     try std.testing.expect(std.mem.eql(u8, q.pop().?, "queue"));
 }
 
-test "queue_peek" {
+test "peek" {
     const gpa = std.testing.allocator;
     var q = Queue(*usize){};
     defer q.deinit(gpa);
@@ -132,6 +162,50 @@ test "queue_peek" {
     try std.testing.expect(q.peek().?.* == 111);
     try std.testing.expect(@intFromPtr(q.peek().?) == @intFromPtr(q.pop().?));
     try std.testing.expect(@intFromPtr(q.peek().?) == @intFromPtr(q.pop().?));
+}
+
+test "remove" {
+    const gpa = std.testing.allocator;
+    const N = 5;
+    var q = try Queue(i64).initCapacity(gpa, N);
+    defer q.deinit(gpa);
+    const arr: [N]i64 = .{ 1, 2, 3, 4, 5 };
+    for (arr) |i| q.appendAssumeCapacity(i);
+    var it = q.iterator();
+    while (it.next()) |node| {
+        q.remove(node);
+    }
+    try std.testing.expect(q.empty());
+}
+
+test "remove_by_value" {
+    const gpa = std.testing.allocator;
+    const N = 5;
+    var q = try Queue(i64).initCapacity(gpa, N);
+    defer q.deinit(gpa);
+    const arr: [N]i64 = .{ 1, 2, 3, 4, 5 };
+    for (arr) |i| q.appendAssumeCapacity(i);
+    var it = q.iterator();
+    while (it.next()) |node| {
+        q.removeValue(&node.value);
+    }
+    try std.testing.expect(q.empty());
+}
+
+test "iterator" {
+    const gpa = std.testing.allocator;
+    const N = 5;
+    var q = try Queue(i64).initCapacity(gpa, N);
+    defer q.deinit(gpa);
+    const arr: [N]i64 = .{ 1, 2, 3, 4, 5 };
+    for (arr) |i| q.appendAssumeCapacity(i);
+    var it = q.iterator();
+    var count: usize = 0;
+    while (it.next()) |node| {
+        defer count += 1;
+        try std.testing.expect(node.value == arr[count]);
+    }
+    try std.testing.expect(count == N);
 }
 
 /// Thread safe queue
