@@ -59,6 +59,25 @@ pub const Connection = struct {
     pub fn readNextFrame(self: *Connection, gpa: std.mem.Allocator) !?[]u8 {
         if (self.closed) return null;
 
+        // Read more bytes
+        var buffer: [4096]u8 = undefined;
+        while (true) {
+            const n = posix.read(self.conn.stream.handle, &buffer) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    std.log.err("{}", .{err});
+                    self.close();
+                    return err;
+                },
+            };
+            if (n == 0) {
+                self.close();
+                return error.EndOfStream;
+            }
+            try self.read_buf.appendSlice(gpa, buffer[0..n]);
+            self.setLastAccessed();
+        }
+
         // Compact buffer
         if (self.cursor > 0 and self.cursor > self.read_buf.capacity / 2) {
             const remaining = self.read_buf.items[self.cursor..];
@@ -66,24 +85,6 @@ pub const Connection = struct {
             self.read_buf.items.len = remaining.len;
             self.cursor = 0;
         }
-
-        // Read more bytes
-        var buffer: [4096]u8 = undefined;
-        const n = posix.read(self.conn.stream.handle, &buffer) catch |err| switch (err) {
-            error.WouldBlock => return null,
-            else => {
-                std.log.err("{}", .{err});
-                self.close();
-                return err;
-            },
-        };
-        if (n == 0) {
-            self.close();
-            return null;
-        }
-        self.setLastAccessed();
-
-        try self.read_buf.appendSlice(gpa, buffer[0..n]);
 
         const available = self.read_buf.items.len - self.cursor;
         if (available < 4) return null;
