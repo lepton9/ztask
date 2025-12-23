@@ -16,26 +16,6 @@ pub const DEFAULT_PORT = 5555;
 /// Try to run job again within time limit (seconds)
 const RETRY_LIMIT_S = 5;
 
-const ConnKey = struct {
-    ip: u32,
-    port: u16,
-
-    pub fn fromAddr(addr: std.net.Address) ConnKey {
-        return .{
-            .ip = addr.in.sa.addr,
-            .port = addr.in.sa.port,
-        };
-    }
-
-    pub fn hash(self: ConnKey) u32 {
-        return @as(u32, @intCast(self.ip)) ^ @as(u32, @intCast(self.port));
-    }
-
-    pub fn eql(self: ConnKey, other: ConnKey) bool {
-        return self.ip == other.ip and self.port == other.port;
-    }
-};
-
 pub const DispatchRequest = struct {
     agent_name: []const u8,
     job_node: *localrunner.JobNode,
@@ -64,7 +44,9 @@ pub const RemoteManager = struct {
     gpa: std.mem.Allocator,
     parser: protocol.MsgParser = .init(),
     server: ?std.net.Server = null,
-    agents: std.AutoHashMapUnmanaged(ConnKey, AgentHandle),
+
+    agents: std.AutoHashMapUnmanaged(posix.socket_t, AgentHandle),
+    polls: std.ArrayList(posix.pollfd),
 
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
@@ -74,6 +56,7 @@ pub const RemoteManager = struct {
         manager.* = .{
             .gpa = gpa,
             .agents = .{},
+            .polls = try .initCapacity(gpa, 5),
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
@@ -88,6 +71,7 @@ pub const RemoteManager = struct {
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
+        self.polls.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -98,6 +82,12 @@ pub const RemoteManager = struct {
             .force_nonblocking = true,
             .reuse_address = true,
         });
+        self.polls.clearAndFree(self.gpa);
+        try self.polls.append(self.gpa, .{
+            .fd = self.server.?.stream.handle,
+            .revents = 0,
+            .events = posix.POLL.IN,
+        });
     }
 
     /// Stop the server
@@ -107,15 +97,29 @@ pub const RemoteManager = struct {
 
         if (self.server) |*s| s.deinit();
         self.server = null;
+        self.polls.clearAndFree(self.gpa);
     }
 
     /// Update state
     pub fn update(self: *RemoteManager) !void {
-        try self.tryAcceptAgent();
+        try self.poll();
         try self.dispatchJobs();
-        var it = self.agents.iterator();
-        while (it.next()) |e| {
-            const agent = e.value_ptr;
+    }
+
+    /// Poll the sockets for events
+    fn poll(self: *RemoteManager) !void {
+        _ = try posix.poll(self.polls.items[0..self.polls.items.len], 0);
+
+        // Listener socket
+        if (self.polls.items[0].revents != 0) {
+            try self.tryAcceptAgent();
+        }
+        if (self.polls.items.len < 2) return;
+
+        // Agents
+        for (self.polls.items[1..]) |p| {
+            if (p.revents == 0) continue;
+            const agent = self.agents.getPtr(p.fd) orelse unreachable;
             try self.updateAgent(agent);
         }
     }
@@ -279,7 +283,7 @@ pub const RemoteManager = struct {
     ) !void {
         agent.connection.sendFrame(message) catch {
             var kv = self.agents.fetchRemove(
-                .fromAddr(agent.connection.conn.address),
+                agent.connection.conn.stream.handle,
             );
             if (kv) |*e| e.value.deinit(self.gpa);
             return error.NotConnected;
@@ -298,8 +302,6 @@ pub const RemoteManager = struct {
     /// Accept new connections
     fn tryAcceptAgent(self: *RemoteManager) !void {
         const server = if (self.server) |*s| s else return;
-
-
 
         var address: std.net.Address = undefined;
         var address_len: posix.socklen_t = @sizeOf(std.net.Address);
@@ -323,12 +325,17 @@ pub const RemoteManager = struct {
 
     /// Save new agent
     fn newAgent(self: *RemoteManager, conn: std.net.Server.Connection) !void {
-        const res = try self.agents.getOrPut(self.gpa, .fromAddr(conn.address));
+        const res = try self.agents.getOrPut(self.gpa, conn.stream.handle);
         if (!res.found_existing) {
             res.value_ptr.* = .{
                 .connection = try .initConn(self.gpa, conn),
                 .last_heartbeat = std.time.timestamp(),
             };
+            try self.polls.append(self.gpa, .{
+                .fd = conn.stream.handle,
+                .revents = 0,
+                .events = posix.POLL.IN,
+            });
         }
     }
 };
