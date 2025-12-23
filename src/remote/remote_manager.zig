@@ -297,27 +297,32 @@ pub const RemoteManager = struct {
 
     /// Accept new connections
     fn tryAcceptAgent(self: *RemoteManager) !void {
-        var server = if (self.server) |*s| s else return;
-        const conn = server.accept() catch |err| switch (err) {
+        const server = if (self.server) |*s| s else return;
+
+
+
+        var address: std.net.Address = undefined;
+        var address_len: posix.socklen_t = @sizeOf(std.net.Address);
+        const socket = posix.accept(
+            server.stream.handle,
+            &address.any,
+            &address_len,
+            posix.SOCK.NONBLOCK,
+        ) catch |err| switch (err) {
             error.WouldBlock => return,
             else => {
                 std.debug.print("remote manager err: {}\n", .{err});
                 return;
             },
         };
-        try self.newAgent(conn);
+        try self.newAgent(.{
+            .address = address,
+            .stream = .{ .handle = socket },
+        });
     }
 
     /// Save new agent
     fn newAgent(self: *RemoteManager, conn: std.net.Server.Connection) !void {
-        const timeout = posix.timeval{ .sec = 0, .usec = 1 };
-        try posix.setsockopt(
-            conn.stream.handle,
-            posix.SOL.SOCKET,
-            posix.SO.RCVTIMEO,
-            &std.mem.toBytes(timeout),
-        );
-
         const res = try self.agents.getOrPut(self.gpa, .fromAddr(conn.address));
         if (!res.found_existing) {
             res.value_ptr.* = .{
