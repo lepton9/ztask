@@ -169,7 +169,7 @@ pub const TaskManager = struct {
             self.checkWatcher() catch |err| {
                 std.log.err("watcher: {}", .{err});
             };
-            self.remote_manager.update() catch |err| {
+            self.updateRemoteManager() catch |err| {
                 std.log.err("remote manager: {}", .{err});
             };
             self.updateSchedulers() catch |err| {
@@ -177,6 +177,13 @@ pub const TaskManager = struct {
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }
+    }
+
+    /// Handle events in remote manager
+    fn updateRemoteManager(self: *TaskManager) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_manager.update();
     }
 
     /// Handle watcher events and trigger corresponding schedulers
