@@ -338,4 +338,17 @@ pub const RemoteManager = struct {
             });
         }
     }
+
+    /// Remove a connected agent based on the name
+    fn removeAgent(self: *RemoteManager, name: []const u8) !void {
+        if (self.polls.items.len < 2) return error.NoConnectedAgents;
+        for (self.polls.items[1..], 1..) |pfd, i| {
+            const agent = self.agents.get(pfd.fd) orelse continue;
+            if (!std.mem.eql(u8, agent.name orelse continue, name)) continue;
+            var kv = self.agents.fetchRemove(pfd.fd) orelse unreachable;
+            kv.value.deinit(self.gpa);
+            _ = self.polls.swapRemove(i);
+            break;
+        }
+    }
 };
