@@ -293,6 +293,7 @@ pub const DataStore = struct {
                     _ = task_runs.remove(run_id);
                     continue;
                 };
+                run_res.key_ptr.* = meta.run_id orelse unreachable;
                 run_res.value_ptr.* = meta;
             },
             else => continue,
