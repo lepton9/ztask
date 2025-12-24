@@ -13,9 +13,13 @@ test "remote_job" {
         \\ name: task6
         \\ id: 6
         \\ jobs:
-        \\   jobremote:
+        \\   jobremote1:
         \\     steps:
-        \\       - command: "ls ."
+        \\       - command: "ls"
+        \\     run_on: remote:runner1
+        \\   jobremote2:
+        \\     steps:
+        \\       - command: "ls"
         \\     run_on: remote:runner1
     ;
     var buf: [64]u8 = undefined;
@@ -32,7 +36,7 @@ test "remote_job" {
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
 
     try task_manager.beginTask(task_id);
-    while (task_manager.hasTasksRunning()) try std.Thread.yield();
+    task_manager.waitUntilIdle();
 
     agent.stop();
     t.join();

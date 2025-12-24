@@ -22,6 +22,8 @@ pub const TaskManager = struct {
     mutex: std.Thread.Mutex = .{},
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
+    /// Condition for tasks currently running
+    idle_cond: std.Thread.Condition = .{},
     datastore: data.DataStore,
     pool: *RunnerPool,
 
@@ -96,18 +98,6 @@ pub const TaskManager = struct {
         self.stopSchedulers();
         if (self.thread) |t| t.join();
         self.thread = null;
-    }
-
-    /// Checks if there are any schedulers waiting or running tasks
-    pub fn hasTasksRunning(self: *TaskManager) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var it = self.schedulers.valueIterator();
-        while (it.next()) |s| switch (s.*.status) {
-            .inactive => continue,
-            else => return true,
-        };
-        return false;
     }
 
     /// End all running schedulers
@@ -204,6 +194,13 @@ pub const TaskManager = struct {
     fn updateSchedulers(self: *TaskManager) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // No tasks running or waiting
+        if (self.schedulers.count() == 0) {
+            self.idle_cond.broadcast();
+            return;
+        }
+
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
             .running => s.*.update(),
@@ -237,6 +234,16 @@ pub const TaskManager = struct {
             self.removeFromWatchList(s);
             s.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
+        }
+    }
+
+    /// Wait until the idle condition is signaled
+    pub fn waitUntilIdle(self: *TaskManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (self.schedulers.count() > 0) {
+            self.idle_cond.wait(&self.mutex);
         }
     }
 
@@ -477,8 +484,7 @@ test "complete_tasks" {
         try task_manager.beginTask(key);
     }
     // Wait for completion
-    while (task_manager.hasTasksRunning()) try std.Thread.yield();
-    task_manager.stop();
+    task_manager.waitUntilIdle();
 
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
     try std.testing.expect(task_manager.schedulers.count() == 0);
