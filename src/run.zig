@@ -3,11 +3,12 @@ const data = @import("data.zig");
 const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 
-const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
-const BASE_RUNNERS_N = 10;
+pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
+pub const BASE_RUNNERS_N = 10;
+pub const MAX_RUNNERS_N = 100;
 
 pub const TuiOptions = struct {
-    runners_n: u16 = BASE_RUNNERS_N,
+    runners_n: u8 = BASE_RUNNERS_N,
 };
 
 // TODO:
@@ -41,7 +42,7 @@ pub const AgentOptions = struct {
     name: []const u8,
     addr: []const u8,
     port: u16 = DEFAULT_PORT,
-    runners_n: u16 = BASE_RUNNERS_N,
+    runners_n: u8 = BASE_RUNNERS_N,
 };
 
 /// Run the remote runner
@@ -65,7 +66,7 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
 pub const RunOptions = struct {
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
-    runners_n: u16 = BASE_RUNNERS_N,
+    runners_n: u8 = BASE_RUNNERS_N,
 };
 
 /// Run a single task either with path or ID

@@ -42,10 +42,16 @@ fn handleArgs(
 ) !void {
     const cmd = cli.cmd orelse return try run.runTui(gpa, .{});
     if (std.mem.eql(u8, cmd.name, "run")) {
-        return run.runTask(gpa, .{
+        var opts: run.RunOptions = .{
             .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
             .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
-        });
+        };
+        if (cli.find_opt("runners")) |opt| {
+            const n = opt.value.?.int;
+            if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
+            opts.runners_n = @intCast(n);
+        }
+        return run.runTask(gpa, opts);
     } else if (std.mem.eql(u8, cmd.name, "runner")) {
         const name = cli.find_opt("name") orelse unreachable;
         const addr = cli.find_opt("address") orelse unreachable;
@@ -61,6 +67,11 @@ fn handleArgs(
             .addr = addr.value.?.string,
         };
         if (port) |p| opts.port = p;
+        if (cli.find_opt("runners")) |opt| {
+            const n = opt.value.?.int;
+            if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
+            opts.runners_n = @intCast(n);
+        }
         return try run.runAgent(gpa, opts);
     } else if (std.mem.eql(u8, cmd.name, "list")) {
         return try run.listTasks(gpa);
