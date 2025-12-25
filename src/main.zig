@@ -40,13 +40,12 @@ fn handleArgs(
     cli: *zcli.Cli,
     comptime spec: *const zcli.CliApp,
 ) !void {
-    const cmd = cli.cmd orelse return try run.runTui(gpa);
+    const cmd = cli.cmd orelse return try run.runTui(gpa, .{});
     if (std.mem.eql(u8, cmd.name, "run")) {
-        return run.runTask(
-            gpa,
-            if (cli.find_opt("path")) |o| o.value.?.string else null,
-            if (cli.find_opt("id")) |o| o.value.?.string else null,
-        );
+        return run.runTask(gpa, .{
+            .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
+            .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
+        });
     } else if (std.mem.eql(u8, cmd.name, "runner")) {
         const name = cli.find_opt("name") orelse unreachable;
         const addr = cli.find_opt("address") orelse unreachable;
@@ -57,12 +56,12 @@ fn handleArgs(
                 break :blk @truncate(@as(u64, @intCast(port)));
             } else break :blk null;
         };
-        return try run.runAgent(
-            gpa,
-            name.value.?.string,
-            addr.value.?.string,
-            port,
-        );
+        var opts: run.AgentOptions = .{
+            .name = name.value.?.string,
+            .addr = addr.value.?.string,
+        };
+        if (port) |p| opts.port = p;
+        return try run.runAgent(gpa, opts);
     } else if (std.mem.eql(u8, cmd.name, "list")) {
         return try run.listTasks(gpa);
     } else if (std.mem.eql(u8, cmd.name, "completion")) {

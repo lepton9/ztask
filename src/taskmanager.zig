@@ -10,8 +10,6 @@ const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 const Watcher = watcher_zig.Watcher;
 
-const BASE_RUNNERS_N = 10;
-
 test {
     _ = scheduler;
 }
@@ -40,12 +38,12 @@ pub const TaskManager = struct {
     /// Maps paths to active schedulers
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
-    pub fn init(gpa: std.mem.Allocator) !*TaskManager {
+    pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
             .datastore = .init(data.root_dir),
-            .pool = try RunnerPool.init(gpa, BASE_RUNNERS_N),
+            .pool = try RunnerPool.init(gpa, runners_n),
             .schedulers = .{},
             .loaded_tasks = .{},
             .to_unload = try .initCapacity(gpa, 1),

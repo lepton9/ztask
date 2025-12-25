@@ -11,8 +11,6 @@ const JobNode = localrunner.JobNode;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
-// TODO: configurable
-const BASE_RUNNERS_N = 10;
 const HEARTBEAT_FREQ_S = 2;
 
 pub const RemoteAgent = struct {
@@ -35,20 +33,24 @@ pub const RemoteAgent = struct {
     parser: protocol.MsgParser = .init(),
     connection: connection.Connection,
 
-    pub fn init(gpa: std.mem.Allocator, name: []const u8) !*RemoteAgent {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        name: []const u8,
+        runners_n: u16,
+    ) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
         agent.* = .{
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
-            .pool = try runnerpool.RunnerPool.init(gpa, BASE_RUNNERS_N),
-            .result_queue = try ResultQueue.initCapacity(gpa, BASE_RUNNERS_N),
+            .pool = try runnerpool.RunnerPool.init(gpa, runners_n),
+            .result_queue = try ResultQueue.initCapacity(gpa, runners_n),
             .log_queue = try LogQueue.init(gpa),
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
             .connection = try .init(gpa),
         };
-        try agent.active_runners.ensureTotalCapacity(gpa, BASE_RUNNERS_N);
+        try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
     }
 

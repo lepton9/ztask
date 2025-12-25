@@ -2,12 +2,18 @@ const std = @import("std");
 const data = @import("data.zig");
 const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
+
 const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
+const BASE_RUNNERS_N = 10;
+
+pub const TuiOptions = struct {
+    runners_n: u16 = BASE_RUNNERS_N,
+};
 
 // TODO:
 /// Run the main TUI
-pub fn runTui(gpa: std.mem.Allocator) !void {
-    const task_manager = try manager.TaskManager.init(gpa);
+pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
+    const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
     defer task_manager.deinit();
 
     const file = "tasks/remote.yml";
@@ -31,17 +37,23 @@ pub fn runTui(gpa: std.mem.Allocator) !void {
     task_manager.waitUntilIdle();
 }
 
-/// Run the remote runner
-pub fn runAgent(
-    gpa: std.mem.Allocator,
+pub const AgentOptions = struct {
     name: []const u8,
     addr: []const u8,
-    port: ?u16,
-) !void {
+    port: u16 = DEFAULT_PORT,
+    runners_n: u16 = BASE_RUNNERS_N,
+};
+
+/// Run the remote runner
+pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
     // TODO: run on thread and take input
-    var agent = try remote_agent.RemoteAgent.init(gpa, name);
+    var agent = try remote_agent.RemoteAgent.init(
+        gpa,
+        options.name,
+        options.runners_n,
+    );
     defer agent.deinit();
-    const address: std.net.Address = try .parseIp4(addr, port orelse DEFAULT_PORT);
+    const address: std.net.Address = try .parseIp4(options.addr, options.port);
     while (agent.connection.closed) {
         std.log.info("Connecting..", .{});
         agent.connect(address) catch {};
@@ -50,24 +62,28 @@ pub fn runAgent(
     agent.run();
 }
 
+pub const RunOptions = struct {
+    path: ?[]const u8 = null,
+    id: ?[]const u8 = null,
+    runners_n: u16 = BASE_RUNNERS_N,
+};
+
 /// Run a single task either with path or ID
-pub fn runTask(
-    gpa: std.mem.Allocator,
-    path: ?[]const u8,
-    id: ?[]const u8,
-) !void {
-    const task_manager = try manager.TaskManager.init(gpa);
+pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
+    const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
     defer task_manager.deinit();
     const task = blk: {
-        if (path) |p| break :blk task_manager.loadOrCreateWithPath(p) catch |err| {
-            switch (err) {
-                error.ErrorOpenFile => std.log.info("File not found", .{}),
-                error.InvalidTaskFile => std.log.info("Invalid file format", .{}),
-                else => std.log.info("{}", .{err}),
-            }
-            return;
-        };
-        if (id) |i| break :blk task_manager.loadTaskWithId(i) catch |err| {
+        if (options.path) |p| {
+            break :blk task_manager.loadOrCreateWithPath(p) catch |err| {
+                switch (err) {
+                    error.ErrorOpenFile => std.log.info("File not found", .{}),
+                    error.InvalidTaskFile => std.log.info("Invalid file format", .{}),
+                    else => std.log.info("{}", .{err}),
+                }
+                return;
+            };
+        }
+        if (options.id) |i| break :blk task_manager.loadTaskWithId(i) catch |err| {
             if (err == error.TaskNotFound) {
                 std.log.info("Task not found with ID: {s}", .{i});
             }
