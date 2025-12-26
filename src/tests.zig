@@ -23,14 +23,14 @@ test "remote_job" {
         \\     run_on: remote:runner1
     ;
     var buf: [64]u8 = undefined;
-    const task_manager = try manager.TaskManager.init(gpa);
+    const task_manager = try manager.TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     const task_id = try gpa.dupe(u8, try task.id.fmt(&buf));
     try task_manager.loaded_tasks.put(gpa, task_id, task);
     try task_manager.start();
 
-    var agent = try remote_agent.RemoteAgent.init(gpa, "runner1");
+    var agent = try remote_agent.RemoteAgent.init(gpa, "runner1", 5);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});

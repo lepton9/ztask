@@ -386,7 +386,7 @@ test "manager_simple" {
         \\ id: 2
     ;
     var buf: [64]u8 = undefined;
-    const task_manager = try TaskManager.init(gpa);
+    const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
@@ -427,7 +427,7 @@ test "force_interrupt" {
         \\       - command: "cat README.md"
     ;
     var task_buf: [64]u8 = undefined;
-    const task_manager = try TaskManager.init(gpa);
+    const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     const task_id = try gpa.dupe(u8, try task.id.fmt(&task_buf));
@@ -466,7 +466,7 @@ test "complete_tasks" {
         \\       - command: "zig help"
     ;
     var buf: [64]u8 = undefined;
-    const task_manager = try TaskManager.init(gpa);
+    const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
