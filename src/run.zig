@@ -22,9 +22,8 @@ pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
     defer task_manager.deinit();
     try task_manager.start();
 
-    const model = try gpa.create(Model);
-    defer gpa.destroy(model);
-    model.* = .{};
+    const model = try Model.init(gpa);
+    defer model.deinit(gpa);
 
     try app.run(model.widget(), .{});
     task_manager.stop();
