@@ -2,6 +2,9 @@ const std = @import("std");
 const data = @import("data.zig");
 const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
+const vaxis = @import("vaxis");
+const vxfw = vaxis.vxfw;
+const Model = @import("tui/model.zig").Model;
 
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const BASE_RUNNERS_N = 10;
@@ -11,31 +14,20 @@ pub const TuiOptions = struct {
     runners_n: u8 = BASE_RUNNERS_N,
 };
 
-// TODO:
-/// Run the main TUI
 pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
-    const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
-    defer task_manager.deinit();
+    var app = try vxfw.App.init(gpa);
+    defer app.deinit();
 
-    const file = "tasks/remote.yml";
+    _ = options;
+    // const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
+    // defer task_manager.deinit();
 
-    const real_path = try std.fs.cwd().realpathAlloc(gpa, file);
-    defer gpa.free(real_path);
+    const model = try gpa.create(Model);
+    defer gpa.destroy(model);
 
-    task_manager.addTask(file) catch {};
-    const meta = task_manager.datastore.findTaskMetaPath(real_path) orelse {
-        std.debug.print("No file found: {s}\n", .{real_path});
-        return;
-    };
-    try task_manager.start();
+    model.* = .{};
 
-    std.Thread.sleep(std.time.ns_per_s * 5);
-
-    task_manager.beginTask(meta.id) catch |err| {
-        std.debug.print("err: {any}\n", .{err});
-    };
-
-    task_manager.waitUntilIdle();
+    try app.run(model.widget(), .{});
 }
 
 pub const AgentOptions = struct {
