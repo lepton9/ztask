@@ -18,16 +18,16 @@ pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
     var app = try vxfw.App.init(gpa);
     defer app.deinit();
 
-    _ = options;
-    // const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
-    // defer task_manager.deinit();
+    const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
+    defer task_manager.deinit();
+    try task_manager.start();
 
     const model = try gpa.create(Model);
     defer gpa.destroy(model);
-
     model.* = .{};
 
     try app.run(model.widget(), .{});
+    task_manager.stop();
 }
 
 pub const AgentOptions = struct {

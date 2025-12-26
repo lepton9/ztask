@@ -3,6 +3,8 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const Widget = vxfw.Widget;
 
+const UPDATE_TICK_MS = 10;
+
 /// Main TUI state
 pub const Model = struct {
     // TODO: state
@@ -18,9 +20,11 @@ pub const Model = struct {
     /// Event handler callback
     fn eventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
-        _ = self;
         switch (event) {
-            .init => {},
+            .init => {
+                try ctx.tick(UPDATE_TICK_MS, self.widget());
+            },
+            .tick => try onTick(self, ctx),
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
                     ctx.quit = true;
@@ -48,5 +52,13 @@ pub const Model = struct {
             .buffer = &.{},
             .children = children,
         };
+    }
+
+    fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
+        const self: *Model = @ptrCast(@alignCast(ptr));
+        _ = self;
+        // TODO: Update state
+        std.log.info("tick", .{});
+        return ctx.consumeAndRedraw();
     }
 };
