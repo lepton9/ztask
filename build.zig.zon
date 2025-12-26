@@ -1,6 +1,6 @@
 .{
     .name = .ztask,
-    .version = "0.0.0",
+    .version = "0.1.0",
     .fingerprint = 0x67a0b4a4055f624,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
@@ -11,6 +11,10 @@
         .zcli = .{
             .url = "git+https://github.com/lepton9/zcli#5b1517b7fd84886f6c91cc2651a599d4d67eabe7",
             .hash = "zcli-0.3.2-Of3s8V43AQBFJ8Su557FMMM6AbIuSNl0yX-M53MS7RX9",
+        },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#11f53c701ae6b5633582d957d57e1683de7b568a",
+            .hash = "vaxis-0.5.1-BWNV_HYyCQBQdG0dLmhA3NUD-CmNPH6cVOXz-QylF2WX",
         },
     },
     .paths = .{

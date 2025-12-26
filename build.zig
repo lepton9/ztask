@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) void {
     const version = @import("build.zig.zon").version;
     @import("zcli").addVersionInfo(b, zcli_mod, version);
 
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const vaxis_mod = vaxis.module("vaxis");
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "ztask",
@@ -44,6 +50,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "task", .module = task_mod },
                 .{ .name = "parse", .module = parse_mod },
                 .{ .name = "zcli", .module = zcli_mod },
+                .{ .name = "vaxis", .module = vaxis_mod },
             },
         }),
     });
