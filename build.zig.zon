@@ -13,8 +13,8 @@
             .hash = "zcli-0.3.2-Of3s8V43AQBFJ8Su557FMMM6AbIuSNl0yX-M53MS7RX9",
         },
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#11f53c701ae6b5633582d957d57e1683de7b568a",
-            .hash = "vaxis-0.5.1-BWNV_HYyCQBQdG0dLmhA3NUD-CmNPH6cVOXz-QylF2WX",
+            .url = "git+https://github.com/rockorager/libvaxis.git#e70ca957a6bc2b62a9afab1091a57cfb00e8111c",
+            .hash = "vaxis-0.5.1-BWNV_LIyCQA41kkRpB2A6FaGPb2jblX54Flc4NpaWAty",
         },
     },
     .paths = .{
