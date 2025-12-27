@@ -1,7 +1,9 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+
 const Widget = vxfw.Widget;
+const AllocError = std.mem.Allocator.Error;
 
 const UPDATE_TICK_MS = 200;
 
@@ -13,7 +15,7 @@ pub const Model = struct {
     pub fn init(gpa: std.mem.Allocator) !*Model {
         const model = try gpa.create(Model);
         model.* = .{
-            .task_split = .{ .model = model },
+            .task_split = try .init(gpa, model),
         };
         return model;
     }
@@ -25,8 +27,8 @@ pub const Model = struct {
     pub fn widget(self: *Model) Widget {
         return .{
             .userdata = self,
-            .eventHandler = Model.eventHandler,
-            .drawFn = Model.drawFn,
+            .eventHandler = eventHandler,
+            .drawFn = drawFn,
         };
     }
 
@@ -35,6 +37,7 @@ pub const Model = struct {
         const self: *Model = @ptrCast(@alignCast(ptr));
         switch (event) {
             .init => {
+                try ctx.requestFocus(self.task_split.task_list.widget());
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
             },
             .tick => {
@@ -74,7 +77,7 @@ pub const Model = struct {
         const task_split_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 1, .col = 0 },
             .surface = try self.task_split.draw(ctx.withConstraints(
-                .{ .width = 20, .height = 2 },
+                .{ .width = 2, .height = 2 },
                 .{ .width = max_size.width, .height = max_size.height - 1 },
             )),
         };
@@ -95,8 +98,39 @@ pub const Model = struct {
         const self: *Model = @ptrCast(@alignCast(ptr));
         _ = self;
         // TODO: Update state
-        std.log.info("tick {d}", .{std.time.timestamp()});
+        // std.log.info("tick {d}", .{std.time.timestamp()});
         return try ctx.queueRefresh();
+    }
+};
+
+const TaskModel = struct {
+    name: []const u8,
+    id: u64,
+    text: vxfw.Text,
+
+    fn widget(self: *@This()) Widget {
+        return .{
+            .userdata = self,
+            .drawFn = vxfw.Text.draw,
+        };
+    }
+
+    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+
+        const task_name: vxfw.SubSurface = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try self.text.draw(ctx),
+        };
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+        children[0] = task_name;
+
+        return .{
+            .size = ctx.max.size(),
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 };
 
@@ -106,6 +140,26 @@ const TaskSplit = struct {
     // list of tasks
     // status of task
     // list of runs
+    task_list: vxfw.ListView,
+    tasks: std.ArrayList(TaskModel),
+    task_widgets: std.ArrayList(Widget),
+
+    fn init(gpa: std.mem.Allocator, model: *Model) !@This() {
+        var tasks = try std.ArrayList(TaskModel).initCapacity(gpa, 5);
+        try tasks.append(gpa, .{ .name = "test1", .id = 1, .text = .{ .text = "test1" } });
+        try tasks.append(gpa, .{ .name = "test2", .id = 2, .text = .{ .text = "test2" } });
+
+        var task_widgets = try std.ArrayList(Widget).initCapacity(gpa, 5);
+        try task_widgets.append(gpa, tasks.items[0].text.widget());
+        try task_widgets.append(gpa, tasks.items[1].text.widget());
+
+        return .{
+            .model = model,
+            .task_list = .{ .children = .{ .slice = task_widgets.items } },
+            .tasks = tasks,
+            .task_widgets = task_widgets,
+        };
+    }
 
     fn widget(self: *@This()) vxfw.Widget {
         return .{
@@ -115,35 +169,41 @@ const TaskSplit = struct {
         };
     }
 
-    fn eventHandler(
-        ptr: *anyopaque,
-        ctx: *vxfw.EventContext,
-        event: vxfw.Event,
-    ) anyerror!void {
+    fn eventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        _ = self;
-        _ = ctx;
         switch (event) {
             .init => {},
-            .key_press => |_| {},
+            .key_press => |key| {
+                if (key.matches('j', .{})) {
+                    self.task_list.nextItem(ctx);
+                } else if (key.matches('k', .{})) {
+                    self.task_list.prevItem(ctx);
+                }
+            },
             .focus_in => {},
             else => {},
         }
     }
 
-    fn drawFn(
-        ptr: *anyopaque,
-        ctx: vxfw.DrawContext,
-    ) std.mem.Allocator.Error!vxfw.Surface {
+    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return self.draw(ctx);
     }
 
-    fn draw(
-        self: *@This(),
-        ctx: vxfw.DrawContext,
-    ) std.mem.Allocator.Error!vxfw.Surface {
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 0);
+    fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        const max_size = ctx.max.size();
+
+        const task_list_surf: vxfw.SubSurface = .{
+            .origin = .{ .row = 1, .col = 1 },
+            .surface = try self.task_list.draw(ctx.withConstraints(
+                .{ .width = 2, .height = 2 },
+                .{ .width = max_size.width / 2, .height = max_size.height / 2 },
+            )),
+        };
+
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+        children[0] = task_list_surf;
+
         return .{
             .size = ctx.max.size(),
             .widget = self.widget(),
