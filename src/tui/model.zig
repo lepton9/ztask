@@ -10,7 +10,7 @@ const UPDATE_TICK_MS = 200;
 /// Main TUI state
 pub const Model = struct {
     // TODO: state
-    task_split: TaskSplit,
+    task_split: *TaskSplit,
 
     pub fn init(gpa: std.mem.Allocator) !*Model {
         const model = try gpa.create(Model);
@@ -56,10 +56,7 @@ pub const Model = struct {
     }
 
     /// Draw function callback for the Model
-    fn drawFn(
-        ptr: *anyopaque,
-        ctx: vxfw.DrawContext,
-    ) std.mem.Allocator.Error!vxfw.Surface {
+    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const self: *Model = @ptrCast(@alignCast(ptr));
         const max_size = ctx.max.size();
 
@@ -106,21 +103,25 @@ pub const Model = struct {
 const TaskModel = struct {
     name: []const u8,
     id: u64,
-    text: vxfw.Text,
 
     fn widget(self: *@This()) Widget {
-        return .{
-            .userdata = self,
-            .drawFn = vxfw.Text.draw,
-        };
+        return .{ .userdata = self, .drawFn = drawTypeErased };
     }
 
-    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
+    fn drawTypeErased(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        var self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.draw(ctx.withConstraints(
+            .{ .width = 1, .height = 1 },
+            .{ .width = 20, .height = 1 },
+        ));
+    }
+
+    fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        var text: vxfw.Text = .{ .text = self.name };
 
         const task_name: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try self.text.draw(ctx),
+            .surface = try text.draw(ctx),
         };
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
         children[0] = task_name;
@@ -141,24 +142,27 @@ const TaskSplit = struct {
     // status of task
     // list of runs
     task_list: vxfw.ListView,
-    tasks: std.ArrayList(TaskModel),
-    task_widgets: std.ArrayList(Widget),
+    tasks: std.ArrayList(*TaskModel),
 
-    fn init(gpa: std.mem.Allocator, model: *Model) !@This() {
-        var tasks = try std.ArrayList(TaskModel).initCapacity(gpa, 5);
-        try tasks.append(gpa, .{ .name = "test1", .id = 1, .text = .{ .text = "test1" } });
-        try tasks.append(gpa, .{ .name = "test2", .id = 2, .text = .{ .text = "test2" } });
+    fn init(gpa: std.mem.Allocator, model: *Model) !*@This() {
+        const task_split = try gpa.create(TaskSplit);
 
-        var task_widgets = try std.ArrayList(Widget).initCapacity(gpa, 5);
-        try task_widgets.append(gpa, tasks.items[0].text.widget());
-        try task_widgets.append(gpa, tasks.items[1].text.widget());
+        var tasks = try std.ArrayList(*TaskModel).initCapacity(gpa, 5);
+        // TODO: get real data
+        for (0..2) |i| {
+            const t = try gpa.create(TaskModel);
+            t.* = .{ .name = "test1", .id = i };
+            try tasks.append(gpa, t);
+        }
 
-        return .{
+        task_split.* = .{
             .model = model,
-            .task_list = .{ .children = .{ .slice = task_widgets.items } },
+            .task_list = .{
+                .children = .{ .builder = .{ .userdata = task_split, .buildFn = taskWidget } },
+            },
             .tasks = tasks,
-            .task_widgets = task_widgets,
         };
+        return task_split;
     }
 
     fn widget(self: *@This()) vxfw.Widget {
@@ -210,5 +214,12 @@ const TaskSplit = struct {
             .buffer = &.{},
             .children = children,
         };
+    }
+
+    fn taskWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        if (idx >= self.tasks.items.len) return null;
+        const item = self.tasks.items[idx];
+        return item.widget();
     }
 };
