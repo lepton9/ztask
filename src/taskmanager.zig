@@ -38,6 +38,12 @@ pub const TaskManager = struct {
     /// Maps paths to active schedulers
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
+    // // TODO: task based dirty
+    // data_dirty: std.atomic.Value(struct { tasks: bool, runs: bool }) = .init(.{
+    //     .tasks = false,
+    //     .runs = false,
+    // }),
+
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
         self.* = .{
@@ -373,6 +379,75 @@ pub const TaskManager = struct {
             else => continue,
         };
     }
+
+    pub fn dataChanged(self: *TaskManager, state: UiState) bool {
+        // TODO: check dirty data
+        _ = self;
+        _ = state;
+        return true;
+    }
+
+    pub fn buildSnapshot(
+        self: *TaskManager,
+        arena: std.mem.Allocator,
+        state: UiState,
+    ) !UiSnapshot {
+        // TODO: check dirty data for task
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // TODO: may need to alloc strings etc
+        const tasks = blk: {
+            var tasks = try arena.alloc(
+                data.TaskMetadata,
+                self.datastore.tasks.count(),
+            );
+            var idx: usize = 0;
+            var it = self.datastore.tasks.iterator();
+            while (it.next()) |e| {
+                const task_meta = e.value_ptr.*;
+                tasks[idx] = task_meta;
+                idx += 1;
+            }
+            break :blk tasks;
+        };
+
+        const runs = blk: {
+            if (state.selected_task == null or
+                self.datastore.task_runs.get(state.selected_task.?) == null)
+                break :blk try arena.alloc(data.TaskRunMetadata, 0);
+            const task_runs = self.datastore.task_runs.get(state.selected_task.?).?;
+            var runs = try arena.alloc(data.TaskRunMetadata, task_runs.count());
+            var idx: usize = 0;
+            var it = task_runs.valueIterator();
+            while (it.next()) |r| {
+                runs[idx] = r.*;
+                idx += 1;
+            }
+            break :blk runs;
+        };
+
+        return .{
+            .tasks = tasks,
+            .selected_task_id = state.selected_task,
+            .selected_task_runs = runs,
+            .selected_active_run = null, // TODO:
+            .now = std.time.timestamp(),
+        };
+    }
+};
+
+pub const UiState = struct {
+    selected_task: ?[]const u8 = null,
+};
+
+/// Snapshot of the current state
+pub const UiSnapshot = struct {
+    tasks: []data.TaskMetadata,
+    selected_task_id: ?[]const u8,
+    selected_task_runs: []data.TaskRunMetadata,
+    selected_active_run: ?data.TaskRunMetadata,
+    now: i64,
 };
 
 test "manager_simple" {
