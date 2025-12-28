@@ -7,7 +7,7 @@ const vxfw = vaxis.vxfw;
 const Widget = vxfw.Widget;
 const AllocError = std.mem.Allocator.Error;
 
-const UPDATE_TICK_MS = 200;
+const UPDATE_TICK_MS = 300;
 
 fn isQuit(key: vaxis.Key) bool {
     if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -25,7 +25,6 @@ pub const Model = struct {
     task_split: *TaskSplit,
     taskmanager: *tm.TaskManager,
     snapshot: tm.UiSnapshot,
-    selected_task: ?[]const u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
@@ -37,7 +36,6 @@ pub const Model = struct {
             .taskmanager = manager,
             .snapshot = try manager.buildSnapshot(arena.allocator(), .{}),
         };
-        try model.task_split.buildTaskList(gpa);
         return model;
     }
 
@@ -59,8 +57,9 @@ pub const Model = struct {
         const self: *Model = @ptrCast(@alignCast(ptr));
         switch (event) {
             .init => {
-                try ctx.requestFocus(self.task_split.task_list.widget());
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
+                try self.task_split.buildTaskList(self.gpa);
+                try ctx.requestFocus(self.task_split.task_list.widget());
             },
             .tick => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
@@ -70,6 +69,11 @@ pub const Model = struct {
                 if (isQuit(key)) {
                     ctx.quit = true;
                     return;
+                }
+                if (key.matches(vaxis.Key.tab, .{})) {
+                    // Next area
+                } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+                    // Prev area
                 }
             },
             .focus_in => {},
@@ -83,18 +87,25 @@ pub const Model = struct {
         const max_size = ctx.max.size();
 
         // Status text
-        const status_text = try ctx.arena.dupe(u8, "Status text test");
+        const status_text = try ctx.arena.dupe(u8, "Test text");
         const status_widget: vxfw.Text = .{ .text = status_text };
+        const status_border: vxfw.Border = .{
+            .child = status_widget.widget(),
+            .labels = &[_]vxfw.Border.BorderLabel{.{
+                .text = "Status",
+                .alignment = .top_left,
+            }},
+        };
         const status_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try status_widget.draw(ctx.withConstraints(
-                .{ .width = 0, .height = 1 },
+            .surface = try status_border.draw(ctx.withConstraints(
+                .{ .width = 20, .height = 1 },
                 .{ .width = max_size.width, .height = 1 },
             )),
         };
 
         const task_split_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 1, .col = 0 },
+            .origin = .{ .row = 2, .col = 0 },
             .surface = try self.task_split.draw(ctx.withConstraints(
                 .{ .width = 2, .height = 2 },
                 .{ .width = max_size.width, .height = max_size.height - 1 },
@@ -125,14 +136,12 @@ pub const Model = struct {
 
     /// Request a snapshot of the UI from TaskManager
     fn requestSnapshot(self: *Model) !bool {
-        if (!self.taskmanager.dataChanged(.{
-            .selected_task = self.selected_task,
-        })) return false;
+        const selected_id = if (self.task_split.selectedTask()) |t| t.id else null;
+        const state: tm.UiState = .{ .selected_task = selected_id };
+        if (!self.taskmanager.dataChanged(state)) return false;
         _ = self.arena.reset(.retain_capacity);
         const arena = self.arena.allocator();
-        const snapshot = try self.taskmanager.buildSnapshot(arena, .{
-            .selected_task = self.selected_task,
-        });
+        const snapshot = try self.taskmanager.buildSnapshot(arena, state);
         self.snapshot = snapshot;
         return true;
     }
@@ -211,6 +220,8 @@ const TaskSplit = struct {
                     self.task_list.nextItem(ctx);
                 } else if (key.matches('k', .{})) {
                     self.task_list.prevItem(ctx);
+                } else if (key.matches(vaxis.Key.enter, .{})) {
+                    // Goto runs tab
                 }
             },
             .focus_in => {},
@@ -253,6 +264,7 @@ const TaskSplit = struct {
         for (0..tasks_snap.len) |i| {
             self.tasks.appendAssumeCapacity(.{ .meta = &tasks_snap[i] });
         }
+        self.task_list.item_count = @intCast(self.tasks.items.len);
     }
 
     /// Build the widget for a task at the index
@@ -262,5 +274,11 @@ const TaskSplit = struct {
         if (idx >= tasks.len) return null;
         const item = &tasks[idx];
         return item.widget();
+    }
+
+    fn selectedTask(self: *@This()) ?*data.TaskMetadata {
+        if (self.task_list.cursor >= self.task_list.item_count orelse 0)
+            return null;
+        return self.tasks.items[self.task_list.cursor].meta;
     }
 };
