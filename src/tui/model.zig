@@ -1,4 +1,6 @@
 const std = @import("std");
+const tm = @import("../taskmanager.zig");
+const data = @import("../data.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
@@ -7,21 +9,41 @@ const AllocError = std.mem.Allocator.Error;
 
 const UPDATE_TICK_MS = 200;
 
+fn isQuit(key: vaxis.Key) bool {
+    if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
+        return true;
+    }
+    return false;
+}
+
 /// Main TUI state
 pub const Model = struct {
     // TODO: state
-    task_split: *TaskSplit,
+    gpa: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
 
-    pub fn init(gpa: std.mem.Allocator) !*Model {
+    task_split: *TaskSplit,
+    taskmanager: *tm.TaskManager,
+    snapshot: tm.UiSnapshot,
+    selected_task: ?[]const u8 = null,
+
+    pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
+        var arena = std.heap.ArenaAllocator.init(gpa);
         model.* = .{
+            .gpa = gpa,
+            .arena = arena,
             .task_split = try .init(gpa, model),
+            .taskmanager = manager,
+            .snapshot = try manager.buildSnapshot(arena.allocator(), .{}),
         };
+        try model.task_split.buildTaskList(gpa);
         return model;
     }
 
-    pub fn deinit(self: *Model, gpa: std.mem.Allocator) void {
-        gpa.destroy(self);
+    pub fn deinit(self: *Model) void {
+        self.arena.deinit();
+        self.gpa.destroy(self);
     }
 
     pub fn widget(self: *Model) Widget {
@@ -45,7 +67,7 @@ pub const Model = struct {
                 try onTick(self, ctx);
             },
             .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
+                if (isQuit(key)) {
                     ctx.quit = true;
                     return;
                 }
@@ -93,16 +115,31 @@ pub const Model = struct {
 
     fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
-        _ = self;
         // TODO: Update state
         // std.log.info("tick {d}", .{std.time.timestamp()});
-        return try ctx.queueRefresh();
+        if (try self.requestSnapshot()) {
+            try self.task_split.buildTaskList(self.gpa);
+            try ctx.queueRefresh();
+        }
+    }
+
+    /// Request a snapshot of the UI from TaskManager
+    fn requestSnapshot(self: *Model) !bool {
+        if (!self.taskmanager.dataChanged(.{
+            .selected_task = self.selected_task,
+        })) return false;
+        _ = self.arena.reset(.retain_capacity);
+        const arena = self.arena.allocator();
+        const snapshot = try self.taskmanager.buildSnapshot(arena, .{
+            .selected_task = self.selected_task,
+        });
+        self.snapshot = snapshot;
+        return true;
     }
 };
 
 const TaskModel = struct {
-    name: []const u8,
-    id: u64,
+    meta: *data.TaskMetadata,
 
     fn widget(self: *@This()) Widget {
         return .{ .userdata = self, .drawFn = drawTypeErased };
@@ -117,7 +154,7 @@ const TaskModel = struct {
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var text: vxfw.Text = .{ .text = self.name };
+        var text: vxfw.Text = .{ .text = self.meta.name };
 
         const task_name: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -142,25 +179,17 @@ const TaskSplit = struct {
     // status of task
     // list of runs
     task_list: vxfw.ListView,
-    tasks: std.ArrayList(*TaskModel),
+    tasks: std.ArrayList(TaskModel),
 
     fn init(gpa: std.mem.Allocator, model: *Model) !*@This() {
         const task_split = try gpa.create(TaskSplit);
 
-        var tasks = try std.ArrayList(*TaskModel).initCapacity(gpa, 5);
-        // TODO: get real data
-        for (0..2) |i| {
-            const t = try gpa.create(TaskModel);
-            t.* = .{ .name = "test1", .id = i };
-            try tasks.append(gpa, t);
-        }
-
         task_split.* = .{
             .model = model,
-            .task_list = .{
-                .children = .{ .builder = .{ .userdata = task_split, .buildFn = taskWidget } },
-            },
-            .tasks = tasks,
+            .task_list = .{ .children = .{
+                .builder = .{ .userdata = task_split, .buildFn = taskWidget },
+            } },
+            .tasks = try std.ArrayList(TaskModel).initCapacity(gpa, 0),
         };
         return task_split;
     }
@@ -216,10 +245,22 @@ const TaskSplit = struct {
         };
     }
 
+    /// Update the task list
+    fn buildTaskList(self: *@This(), gpa: std.mem.Allocator) !void {
+        const tasks_snap = self.model.?.snapshot.tasks;
+        self.tasks.clearRetainingCapacity();
+        try self.tasks.ensureTotalCapacity(gpa, tasks_snap.len);
+        for (0..tasks_snap.len) |i| {
+            self.tasks.appendAssumeCapacity(.{ .meta = &tasks_snap[i] });
+        }
+    }
+
+    /// Build the widget for a task at the index
     fn taskWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        if (idx >= self.tasks.items.len) return null;
-        const item = self.tasks.items[idx];
+        const tasks = self.tasks.items;
+        if (idx >= tasks.len) return null;
+        const item = &tasks[idx];
         return item.widget();
     }
 };
