@@ -236,9 +236,10 @@ const TaskListItem = struct {
 const TaskSplit = struct {
     model: ?*Model = null,
 
-    task_list_view: vxfw.ListView,
     tasks_models: std.ArrayList(TaskListItem),
-    selected_task_view: TaskView = .{},
+
+    task_list_view: vxfw.ListView,
+    selected_task_view: TaskView,
 
     fn init(gpa: std.mem.Allocator, model: *Model) !*@This() {
         const task_split = try gpa.create(TaskSplit);
@@ -249,6 +250,7 @@ const TaskSplit = struct {
                 .builder = .{ .userdata = task_split, .buildFn = taskWidget },
             } },
             .tasks_models = try std.ArrayList(TaskListItem).initCapacity(gpa, 0),
+            .selected_task_view = .{},
         };
         task_split.task_list_view.item_count = 0;
         return task_split;
@@ -283,11 +285,18 @@ const TaskSplit = struct {
                     self.task_list_view.prevItem(ctx);
                     try self.updateSelected();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    // TODO: Goto task view
+                    try ctx.requestFocus(self.selected_task_view.widget());
+                } else if (key.matches(vaxis.Key.escape, .{})) {
+                    try ctx.requestFocus(self.widget());
                 }
             },
             .focus_in => {
                 try self.updateSelected();
+                ctx.consumeAndRedraw();
+                // try ctx.requestFocus(self.task_list_view.widget());
+            },
+            .focus_out => {
+                ctx.consumeAndRedraw();
             },
             else => {},
         }
@@ -409,11 +418,18 @@ const TaskView = struct {
         event: vxfw.Event,
     ) anyerror!void {
         _ = self;
-        _ = ctx;
+        // _ = ctx;
         switch (event) {
             .init => {},
-            .key_press => |_| {},
-            .focus_in => {},
+            .key_press => |key| {
+                if (key.matches('j', .{})) {
+                    ctx.consumeEvent();
+                } else if (key.matches('k', .{})) {
+                    ctx.consumeEvent();
+                } else if (key.matches(vaxis.Key.enter, .{})) {
+                    //
+                }
+            },
             else => {},
         }
     }
@@ -423,7 +439,7 @@ const TaskView = struct {
         var buffer: [512]u8 = undefined;
         var task_text = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
-        // TODO: mode text
+        // TODO: more text
         try task_text.appendSlice(ctx.arena, std.fmt.bufPrint(
             &buffer,
             "Task: {s}\nID: {s}",
