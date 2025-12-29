@@ -39,7 +39,7 @@ pub const TaskManager = struct {
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
     /// Has any tasks been added, removed or modified
-    tasks_changed: std.atomic.Value(bool) = .init(true),
+    tasks_changed: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -377,7 +377,8 @@ pub const TaskManager = struct {
         };
     }
 
-    pub fn taskRunning(self: *const TaskManager, task_id: []const u8) bool {
+    /// Check if the task is currently running or waiting
+    pub fn taskRunning(self: *TaskManager, task_id: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const task = self.loaded_tasks.get(task_id) orelse return false;
@@ -385,41 +386,23 @@ pub const TaskManager = struct {
     }
 
     /// Check if any data has changed
-    pub fn dataChanged(self: *const TaskManager, state: UiState) bool {
-        _ = state; // TODO:
+    pub fn tasksModified(self: *const TaskManager) bool {
         return self.tasks_changed.load(.seq_cst);
     }
 
-    /// Build a snapshot of the current state for the TUI
-    pub fn buildSnapshot(
+    /// Build the current state of the task based on ID
+    pub fn buildTaskState(
         self: *TaskManager,
         arena: std.mem.Allocator,
-        state: UiState,
-    ) !UiSnapshot {
+        task_id: []const u8,
+    ) !TaskState {
         self.mutex.lock();
         defer self.mutex.unlock();
-        // self.data_dirty.store(false, .seq_cst);
-
-        const tasks = blk: {
-            var tasks = try arena.alloc(
-                data.TaskMetadata,
-                self.datastore.tasks.count(),
-            );
-            var idx: usize = 0;
-            var it = self.datastore.tasks.iterator();
-            while (it.next()) |e| {
-                var task_meta = e.value_ptr.*;
-                tasks[idx] = try task_meta.copy(arena);
-                idx += 1;
-            }
-            break :blk tasks;
-        };
 
         const runs: ?[]data.TaskRunMetadata = blk: {
-            if (state.selected_task == null) break :blk null;
-            if (self.datastore.task_runs.get(state.selected_task.?) == null)
+            if (self.datastore.task_runs.get(task_id) == null)
                 break :blk try arena.alloc(data.TaskRunMetadata, 0);
-            const task_runs = self.datastore.task_runs.get(state.selected_task.?).?;
+            const task_runs = self.datastore.task_runs.get(task_id).?;
             var runs = try arena.alloc(data.TaskRunMetadata, task_runs.count());
             var idx: usize = 0;
             var it = task_runs.valueIterator();
@@ -431,26 +414,45 @@ pub const TaskManager = struct {
         };
 
         return .{
-            .tasks = tasks,
-            .selected_task_id = state.selected_task,
-            .selected_task_runs = runs,
-            .selected_active_run = null, // TODO:
-            .now = std.time.timestamp(),
+            .task_id = task_id,
+            .task_runs = runs,
+            .active_run = null,
         };
+    }
+
+    /// Build a snapshot of the current state for the TUI
+    pub fn buildTaskList(
+        self: *TaskManager,
+        gpa: std.mem.Allocator,
+    ) ![]data.TaskMetadata {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // self.data_dirty.store(false, .seq_cst);
+
+        const tasks = blk: {
+            var tasks = try gpa.alloc(
+                data.TaskMetadata,
+                self.datastore.tasks.count(),
+            );
+            var idx: usize = 0;
+            var it = self.datastore.tasks.iterator();
+            while (it.next()) |e| {
+                var task_meta = e.value_ptr.*;
+                tasks[idx] = try task_meta.copy(gpa);
+                idx += 1;
+            }
+            break :blk tasks;
+        };
+
+        return tasks;
     }
 };
 
-pub const UiState = struct {
-    selected_task: ?[]const u8 = null,
-};
-
 /// Snapshot of the current state
-pub const UiSnapshot = struct {
-    tasks: []data.TaskMetadata,
-    selected_task_id: ?[]const u8,
-    selected_task_runs: ?[]data.TaskRunMetadata,
-    selected_active_run: ?data.TaskRunMetadata,
-    now: i64,
+pub const TaskState = struct {
+    task_id: ?[]const u8 = null,
+    task_runs: ?[]data.TaskRunMetadata = null,
+    active_run: ?data.TaskRunMetadata = null,
 };
 
 test "manager_simple" {

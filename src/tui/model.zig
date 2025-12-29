@@ -16,25 +16,38 @@ fn isQuit(key: vaxis.Key) bool {
     return false;
 }
 
+/// Snapshot of the current state
+pub const UiSnapshot = struct {
+    updated: i64,
+    // Allocated with gpa
+    tasks: []data.TaskMetadata,
+    // Allocated with arena
+    selected_task_id: ?[]const u8 = null,
+    selected_task_runs: ?[]data.TaskRunMetadata = null,
+    selected_active_run: ?data.TaskRunMetadata = null,
+};
+
 /// Main TUI state
 pub const Model = struct {
-    // TODO: state
     gpa: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
 
     task_split: *TaskSplit,
+
     taskmanager: *tm.TaskManager,
-    snapshot: tm.UiSnapshot,
+    snapshot: UiSnapshot,
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
-        var arena = std.heap.ArenaAllocator.init(gpa);
         model.* = .{
             .gpa = gpa,
-            .arena = arena,
+            .arena = std.heap.ArenaAllocator.init(gpa),
             .task_split = try .init(gpa, model),
             .taskmanager = manager,
-            .snapshot = try manager.buildSnapshot(arena.allocator(), .{}),
+            .snapshot = .{
+                .tasks = try manager.buildTaskList(gpa),
+                .updated = std.time.timestamp(),
+            },
         };
         return model;
     }
@@ -126,25 +139,62 @@ pub const Model = struct {
 
     fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
-        // TODO: Update state
-        // std.log.info("tick {d}", .{std.time.timestamp()});
         if (try self.requestSnapshot()) {
-            try self.task_split.buildTaskList(self.gpa);
-            try self.task_split.updateSelected();
             try ctx.queueRefresh();
         }
     }
 
     /// Request a snapshot of the UI from TaskManager
     fn requestSnapshot(self: *Model) !bool {
-        const selected_id = if (self.task_split.selectedTask()) |t| t.id else null;
-        const state: tm.UiState = .{ .selected_task = selected_id };
-        if (!self.taskmanager.dataChanged(state)) return false;
+        const modified = self.taskmanager.tasksModified();
+
+        // Update task list
+        if (modified) {
+            for (self.snapshot.tasks) |*meta| meta.deinit(self.gpa);
+            self.gpa.free(self.snapshot.tasks);
+            const tasks = try self.taskmanager.buildTaskList(self.gpa);
+            self.snapshot.tasks = tasks;
+            self.snapshot.updated = std.time.timestamp();
+            try self.task_split.buildTaskList(self.gpa);
+        }
+
+        // Update selected task
+        if (self.task_split.selectedTask()) |t| {
+            if (!self.taskmanager.taskRunning(t.id)) return modified;
+            _ = self.arena.reset(.retain_capacity);
+            const arena = self.arena.allocator();
+            const selected_task = try self.taskmanager.buildTaskState(
+                arena,
+                t.id,
+            );
+            self.setSelectedState(selected_task);
+            self.task_split.setSelectedState(selected_task);
+            return true;
+        }
+        return modified;
+    }
+
+    fn updateSelectedTask(self: *Model) !?tm.TaskState {
         _ = self.arena.reset(.retain_capacity);
         const arena = self.arena.allocator();
-        const snapshot = try self.taskmanager.buildSnapshot(arena, state);
-        self.snapshot = snapshot;
-        return true;
+        if (self.task_split.selectedTask()) |t| {
+            const selected_task = try self.taskmanager.buildTaskState(arena, t.id);
+            self.setSelectedState(selected_task);
+            return selected_task;
+        }
+        return null;
+    }
+
+    fn setSelectedState(self: *Model, state: tm.TaskState) void {
+        self.snapshot.selected_task_id = state.task_id;
+        self.snapshot.selected_task_runs = state.task_runs;
+        self.snapshot.selected_active_run = state.active_run;
+        self.snapshot.updated = std.time.timestamp();
+    }
+
+    /// Return the current snapshot of the UI state
+    fn getSnapshot(self: *const Model) UiSnapshot {
+        return self.snapshot;
     }
 };
 
@@ -184,13 +234,10 @@ const TaskListItem = struct {
 
 const TaskSplit = struct {
     model: ?*Model = null,
-    // TODO: split
-    // list of tasks
-    // status of task
-    // list of runs
+
     task_list_view: vxfw.ListView,
     tasks_models: std.ArrayList(TaskListItem),
-    selected_task: TaskView = .{},
+    selected_task_view: TaskView = .{},
 
     fn init(gpa: std.mem.Allocator, model: *Model) !*@This() {
         const task_split = try gpa.create(TaskSplit);
@@ -215,19 +262,22 @@ const TaskSplit = struct {
 
     fn eventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        // FIX: not getting focused
         switch (event) {
-            .init => {},
+            .init => {
+                try self.updateSelected();
+            },
             .key_press => |key| {
                 if (key.matches('j', .{})) {
                     self.task_list_view.nextItem(ctx);
-                    // TODO: fetch new
                     try self.updateSelected();
+                    // try ctx.queueRefresh();
                 } else if (key.matches('k', .{})) {
                     self.task_list_view.prevItem(ctx);
-                    // TODO: fetch new
                     try self.updateSelected();
+                    // try ctx.queueRefresh();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    // Goto runs tab
+                    // TODO: Goto task view
                 }
             },
             .focus_in => {},
@@ -247,7 +297,7 @@ const TaskSplit = struct {
         var flex_children =
             try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
         flex_children.appendAssumeCapacity(.init(self.task_list_view.widget(), 1));
-        flex_children.appendAssumeCapacity(.init(self.selected_task.widget(), 1));
+        flex_children.appendAssumeCapacity(.init(self.selected_task_view.widget(), 1));
         const flex: vxfw.FlexRow = .{
             .children = try flex_children.toOwnedSlice(ctx.arena),
         };
@@ -273,7 +323,8 @@ const TaskSplit = struct {
 
     /// Update the task list
     fn buildTaskList(self: *@This(), gpa: std.mem.Allocator) !void {
-        const tasks_snap = self.model.?.snapshot.tasks;
+        const snapshot = self.model.?.getSnapshot();
+        const tasks_snap = snapshot.tasks;
         self.tasks_models.clearRetainingCapacity();
         try self.tasks_models.ensureTotalCapacity(gpa, tasks_snap.len);
         for (0..tasks_snap.len) |i| {
@@ -284,12 +335,20 @@ const TaskSplit = struct {
 
     /// Update selected task
     fn updateSelected(self: *@This()) !void {
-        const snapshot = &self.model.?.snapshot;
+        const state = try self.model.?.updateSelectedTask();
+        self.setSelectedState(state);
+    }
+
+    fn setSelectedState(self: *@This(), state_maybe: ?tm.TaskState) void {
+        const state = state_maybe orelse {
+            self.selected_task_view = .{};
+            return;
+        };
         const selected = self.selectedTask();
-        self.selected_task = .{
+        self.selected_task_view = .{
             .task = selected,
-            .task_runs = snapshot.selected_task_runs,
-            .active_run = if (snapshot.selected_active_run) |*ar| ar else null,
+            .task_runs = state.task_runs,
+            .active_run = if (state.active_run) |*ar| ar else null,
         };
     }
 
@@ -311,9 +370,9 @@ const TaskSplit = struct {
 };
 
 const TaskView = struct {
-    task: ?*data.TaskMetadata = null,
+    task: ?*const data.TaskMetadata = null,
     task_runs: ?[]data.TaskRunMetadata = null,
-    active_run: ?*data.TaskRunMetadata = null,
+    active_run: ?*const data.TaskRunMetadata = null,
 
     fn widget(self: *@This()) Widget {
         return .{ .userdata = self, .drawFn = drawTypeErased };
