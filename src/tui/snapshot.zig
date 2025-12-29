@@ -3,17 +3,23 @@ const std = @import("std");
 
 /// Snapshot of the current state
 pub const UiSnapshot = struct {
-    updated: i64 = std.time.timestamp(),
+    updated: i64,
     // Allocated with gpa
     tasks: []UiTaskSnap,
     // Allocated with arena
     selected_task: ?UiTaskDetail = null,
 };
 
+pub const TaskStatus = mergeEnums(
+    enum { inactive, waiting },
+    data.TaskRunStatus,
+);
+
 pub const UiTaskSnap = struct {
     id: []const u8,
     file_path: []const u8,
     name: []const u8,
+    status: TaskStatus,
 };
 
 pub const UiTaskDetail = struct {
@@ -36,3 +42,38 @@ pub const UiJobSnap = struct {
     end_time: ?i64 = null,
     exit_code: ?i32 = null,
 };
+
+/// Merge two enums into one
+fn mergeEnums(comptime A: type, comptime B: type) type {
+    const a_info = @typeInfo(A).@"enum";
+    const b_info = @typeInfo(B).@"enum";
+
+    comptime var fields: []const std.builtin.Type.EnumField =
+        &[_]std.builtin.Type.EnumField{};
+    var i: u32 = 0;
+
+    // Append fields from A
+    inline for (a_info.fields) |f| {
+        fields = fields ++ [_]std.builtin.Type.EnumField{
+            .{ .name = f.name, .value = i },
+        };
+        i += 1;
+    }
+
+    // Append fields from B
+    inline for (b_info.fields) |f| {
+        fields = fields ++ [_]std.builtin.Type.EnumField{
+            .{ .name = f.name, .value = i },
+        };
+        i += 1;
+    }
+
+    return @Type(.{
+        .@"enum" = .{
+            .tag_type = u8,
+            .fields = fields,
+            .decls = &.{},
+            .is_exhaustive = true,
+        },
+    });
+}
