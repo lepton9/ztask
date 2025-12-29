@@ -8,6 +8,7 @@ const Widget = vxfw.Widget;
 const AllocError = std.mem.Allocator.Error;
 
 const UPDATE_TICK_MS = 300;
+const BORDER_COLOR: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
 
 fn isQuit(key: vaxis.Key) bool {
     if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -36,6 +37,9 @@ pub const Model = struct {
 
     taskmanager: *tm.TaskManager,
     snapshot: UiSnapshot,
+
+    /// Active TUI section
+    active: enum { status, task_list, task_view } = .status,
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
@@ -119,10 +123,13 @@ pub const Model = struct {
         };
 
         const task_split_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 2, .col = 0 },
+            .origin = .{ .row = status_surf.surface.size.height, .col = 0 },
             .surface = try self.task_split.draw(ctx.withConstraints(
                 .{ .width = 2, .height = 2 },
-                .{ .width = max_size.width, .height = max_size.height - 1 },
+                .{
+                    .width = max_size.width,
+                    .height = max_size.height - status_surf.surface.size.height,
+                },
             )),
         };
 
@@ -234,7 +241,7 @@ const TaskListItem = struct {
 };
 
 const TaskSplit = struct {
-    model: ?*Model = null,
+    model: *Model,
 
     tasks_models: std.ArrayList(TaskListItem),
 
@@ -250,7 +257,7 @@ const TaskSplit = struct {
                 .builder = .{ .userdata = task_split, .buildFn = taskWidget },
             } },
             .tasks_models = try std.ArrayList(TaskListItem).initCapacity(gpa, 0),
-            .selected_task_view = .{},
+            .selected_task_view = .{ .parent = task_split },
         };
         task_split.task_list_view.item_count = 0;
         return task_split;
@@ -291,6 +298,7 @@ const TaskSplit = struct {
                 }
             },
             .focus_in => {
+                self.model.active = .task_list;
                 try self.updateSelected();
                 ctx.consumeAndRedraw();
                 // try ctx.requestFocus(self.task_list_view.widget());
@@ -305,20 +313,45 @@ const TaskSplit = struct {
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const max_size = ctx.max.size();
 
-        // TODO: bordered
         var flex_children =
             try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
-        flex_children.appendAssumeCapacity(.init(self.task_list_view.widget(), 1));
-        flex_children.appendAssumeCapacity(.init(self.selected_task_view.widget(), 1));
+
+        const list_bordered: vxfw.Border = .{
+            .child = self.task_list_view.widget(),
+            .labels = &[_]vxfw.Border.BorderLabel{.{
+                .text = "Tasks",
+                .alignment = .top_left,
+            }},
+            .style = .{ .fg = switch (self.model.active) {
+                .task_list => BORDER_COLOR,
+                else => .default,
+            } },
+        };
+
+        const task_bordered: vxfw.Border = .{
+            .child = self.selected_task_view.widget(),
+            .labels = &[_]vxfw.Border.BorderLabel{.{
+                .text = "Current",
+                .alignment = .top_left,
+            }},
+            .style = .{ .fg = switch (self.model.active) {
+                .task_view => BORDER_COLOR,
+                else => .default,
+            } },
+        };
+
+        flex_children.appendAssumeCapacity(.init(list_bordered.widget(), 1));
+        flex_children.appendAssumeCapacity(.init(task_bordered.widget(), 3));
+
         const flex: vxfw.FlexRow = .{
             .children = try flex_children.toOwnedSlice(ctx.arena),
         };
 
         const flex_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 1, .col = 1 },
+            .origin = .{ .row = 0, .col = 0 },
             .surface = try flex.draw(ctx.withConstraints(
                 .{ .width = 2, .height = 2 },
-                .{ .width = max_size.width, .height = max_size.height },
+                .{ .width = max_size.width - 1, .height = max_size.height },
             )),
         };
 
@@ -335,7 +368,7 @@ const TaskSplit = struct {
 
     /// Update the task list
     fn buildTaskList(self: *@This(), gpa: std.mem.Allocator) !void {
-        const snapshot = self.model.?.getSnapshot();
+        const snapshot = self.model.getSnapshot();
         const tasks_snap = snapshot.tasks;
         self.tasks_models.clearRetainingCapacity();
         try self.tasks_models.ensureTotalCapacity(gpa, tasks_snap.len);
@@ -347,17 +380,18 @@ const TaskSplit = struct {
 
     /// Update selected task
     fn updateSelected(self: *@This()) !void {
-        const state = try self.model.?.updateSelectedTask();
+        const state = try self.model.updateSelectedTask();
         self.setSelectedState(state);
     }
 
     fn setSelectedState(self: *@This(), state_maybe: ?tm.TaskState) void {
         const state = state_maybe orelse {
-            self.selected_task_view = .{};
+            self.selected_task_view = .{ .parent = self };
             return;
         };
         const selected = self.selectedTask();
         self.selected_task_view = .{
+            .parent = self,
             .task = selected,
             .task_runs = state.task_runs,
             .active_run = if (state.active_run) |*ar| ar else null,
@@ -382,6 +416,8 @@ const TaskSplit = struct {
 };
 
 const TaskView = struct {
+    parent: *TaskSplit,
+
     task: ?*const data.TaskMetadata = null,
     task_runs: ?[]data.TaskRunMetadata = null,
     active_run: ?*const data.TaskRunMetadata = null,
@@ -417,7 +453,7 @@ const TaskView = struct {
         ctx: *vxfw.EventContext,
         event: vxfw.Event,
     ) anyerror!void {
-        _ = self;
+        // _ = self;
         // _ = ctx;
         switch (event) {
             .init => {},
@@ -429,6 +465,9 @@ const TaskView = struct {
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     //
                 }
+            },
+            .focus_in => {
+                self.parent.model.active = .task_view;
             },
             else => {},
         }
