@@ -71,8 +71,9 @@ pub const Model = struct {
         switch (event) {
             .init => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
+                _ = try self.requestSnapshot();
                 try self.task_split.buildTaskList(self.gpa);
-                try ctx.requestFocus(self.task_split.task_list_view.widget());
+                try ctx.requestFocus(self.task_split.widget());
             },
             .tick => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
@@ -249,45 +250,47 @@ const TaskSplit = struct {
             } },
             .tasks_models = try std.ArrayList(TaskListItem).initCapacity(gpa, 0),
         };
+        task_split.task_list_view.item_count = 0;
         return task_split;
     }
 
     fn widget(self: *@This()) vxfw.Widget {
         return .{
             .userdata = self,
-            .eventHandler = eventHandler,
-            .drawFn = drawFn,
+            .eventHandler = eventHandlerTypeErased,
+            .drawFn = drawTypeErased,
         };
     }
 
-    fn eventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
+    fn eventHandlerTypeErased(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        // FIX: not getting focused
+        return self.eventHandler(ctx, event);
+    }
+
+    fn drawTypeErased(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.draw(ctx);
+    }
+
+    fn eventHandler(self: *@This(), ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         switch (event) {
-            .init => {
-                try self.updateSelected();
-            },
+            .init => {},
             .key_press => |key| {
                 if (key.matches('j', .{})) {
                     self.task_list_view.nextItem(ctx);
                     try self.updateSelected();
-                    // try ctx.queueRefresh();
                 } else if (key.matches('k', .{})) {
                     self.task_list_view.prevItem(ctx);
                     try self.updateSelected();
-                    // try ctx.queueRefresh();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     // TODO: Goto task view
                 }
             },
-            .focus_in => {},
+            .focus_in => {
+                try self.updateSelected();
+            },
             else => {},
         }
-    }
-
-    fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.draw(ctx);
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
@@ -375,23 +378,20 @@ const TaskView = struct {
     active_run: ?*const data.TaskRunMetadata = null,
 
     fn widget(self: *@This()) Widget {
-        return .{ .userdata = self, .drawFn = drawTypeErased };
+        return .{
+            .userdata = self,
+            .drawFn = drawTypeErased,
+            .eventHandler = eventHandlerTypeErased,
+        };
     }
 
-    fn eventHandler(
+    fn eventHandlerTypeErased(
         ptr: *anyopaque,
         ctx: *vxfw.EventContext,
         event: vxfw.Event,
     ) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        _ = self;
-        _ = ctx;
-        switch (event) {
-            .init => {},
-            .key_press => |_| {},
-            .focus_in => {},
-            else => {},
-        }
+        return self.eventHandler(ctx, event);
     }
 
     fn drawTypeErased(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
@@ -401,6 +401,21 @@ const TaskView = struct {
             .{ .width = 20, .height = 2 },
             .{ .width = max.width, .height = max.height },
         ));
+    }
+
+    fn eventHandler(
+        self: *@This(),
+        ctx: *vxfw.EventContext,
+        event: vxfw.Event,
+    ) anyerror!void {
+        _ = self;
+        _ = ctx;
+        switch (event) {
+            .init => {},
+            .key_press => |_| {},
+            .focus_in => {},
+            else => {},
+        }
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
