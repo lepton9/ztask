@@ -31,6 +31,14 @@ pub const TaskMetadata = struct {
         self.deinit(gpa);
         self.* = try .init(gpa, meta);
     }
+
+    pub fn copy(self: *const TaskMetadata, gpa: std.mem.Allocator) !@This() {
+        return .{
+            .id = try gpa.dupe(u8, self.id),
+            .file_path = try gpa.dupe(u8, self.file_path),
+            .name = try gpa.dupe(u8, self.name),
+        };
+    }
 };
 
 pub const TaskRunMetadata = struct {
@@ -52,6 +60,18 @@ pub const TaskRunMetadata = struct {
     pub fn deinit(self: *TaskRunMetadata, gpa: std.mem.Allocator) void {
         gpa.free(self.task_id);
         if (self.run_id) |id| gpa.free(id);
+    }
+
+    pub fn copy(self: *const TaskRunMetadata, gpa: std.mem.Allocator) !@This() {
+        return .{
+            .task_id = try gpa.dupe(u8, self.task_id),
+            .run_id = if (self.run_id) |id| try gpa.dupe(u8, id) else null,
+            .start_time = self.start_time,
+            .end_time = self.end_time,
+            .status = self.status,
+            .jobs_total = self.jobs_total,
+            .jobs_completed = self.jobs_completed,
+        };
     }
 };
 

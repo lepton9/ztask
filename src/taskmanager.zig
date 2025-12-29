@@ -38,11 +38,8 @@ pub const TaskManager = struct {
     /// Maps paths to active schedulers
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
-    // // TODO: task based dirty
-    // data_dirty: std.atomic.Value(struct { tasks: bool, runs: bool }) = .init(.{
-    //     .tasks = false,
-    //     .runs = false,
-    // }),
+    /// Has any tasks been added, removed or modified
+    tasks_changed: std.atomic.Value(bool) = .init(true),
 
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -380,23 +377,29 @@ pub const TaskManager = struct {
         };
     }
 
-    pub fn dataChanged(self: *TaskManager, state: UiState) bool {
-        // TODO: check dirty data
-        _ = self;
-        _ = state;
-        return true;
+    pub fn taskRunning(self: *const TaskManager, task_id: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const task = self.loaded_tasks.get(task_id) orelse return false;
+        return self.schedulers.get(task) != null;
     }
 
+    /// Check if any data has changed
+    pub fn dataChanged(self: *const TaskManager, state: UiState) bool {
+        _ = state; // TODO:
+        return self.tasks_changed.load(.seq_cst);
+    }
+
+    /// Build a snapshot of the current state for the TUI
     pub fn buildSnapshot(
         self: *TaskManager,
         arena: std.mem.Allocator,
         state: UiState,
     ) !UiSnapshot {
-        // TODO: check dirty data for task
         self.mutex.lock();
         defer self.mutex.unlock();
+        // self.data_dirty.store(false, .seq_cst);
 
-        // TODO: may need to alloc strings etc
         const tasks = blk: {
             var tasks = try arena.alloc(
                 data.TaskMetadata,
@@ -405,23 +408,23 @@ pub const TaskManager = struct {
             var idx: usize = 0;
             var it = self.datastore.tasks.iterator();
             while (it.next()) |e| {
-                const task_meta = e.value_ptr.*;
-                tasks[idx] = task_meta;
+                var task_meta = e.value_ptr.*;
+                tasks[idx] = try task_meta.copy(arena);
                 idx += 1;
             }
             break :blk tasks;
         };
 
-        const runs = blk: {
-            if (state.selected_task == null or
-                self.datastore.task_runs.get(state.selected_task.?) == null)
+        const runs: ?[]data.TaskRunMetadata = blk: {
+            if (state.selected_task == null) break :blk null;
+            if (self.datastore.task_runs.get(state.selected_task.?) == null)
                 break :blk try arena.alloc(data.TaskRunMetadata, 0);
             const task_runs = self.datastore.task_runs.get(state.selected_task.?).?;
             var runs = try arena.alloc(data.TaskRunMetadata, task_runs.count());
             var idx: usize = 0;
             var it = task_runs.valueIterator();
             while (it.next()) |r| {
-                runs[idx] = r.*;
+                runs[idx] = try r.copy(arena);
                 idx += 1;
             }
             break :blk runs;
@@ -445,7 +448,7 @@ pub const UiState = struct {
 pub const UiSnapshot = struct {
     tasks: []data.TaskMetadata,
     selected_task_id: ?[]const u8,
-    selected_task_runs: []data.TaskRunMetadata,
+    selected_task_runs: ?[]data.TaskRunMetadata,
     selected_active_run: ?data.TaskRunMetadata,
     now: i64,
 };
