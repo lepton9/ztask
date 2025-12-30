@@ -1,5 +1,6 @@
 const std = @import("std");
 const data = @import("data.zig");
+const snap = @import("tui/snapshot.zig");
 const scheduler = @import("scheduler/scheduler.zig");
 const remotemanager = @import("remote/remote_manager.zig");
 const parse = @import("parse");
@@ -322,6 +323,7 @@ pub const TaskManager = struct {
                     .name = task.name,
                     .file_path = path,
                 });
+                self.tasks_changed.store(true, .seq_cst);
             }
             break :blk task;
         };
@@ -338,6 +340,7 @@ pub const TaskManager = struct {
             return;
         }
         _ = try self.datastore.addTask(self.gpa, file_path);
+        self.tasks_changed.store(true, .seq_cst);
     }
 
     /// Add all task files from a given directory
@@ -395,11 +398,11 @@ pub const TaskManager = struct {
         self: *TaskManager,
         arena: std.mem.Allocator,
         task_id: []const u8,
-    ) !TaskState {
+    ) !snap.UiTaskDetail {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const runs: ?[]data.TaskRunMetadata = blk: {
+        const runs: []data.TaskRunMetadata = blk: {
             if (self.datastore.task_runs.get(task_id) == null)
                 break :blk try arena.alloc(data.TaskRunMetadata, 0);
             const task_runs = self.datastore.task_runs.get(task_id).?;
@@ -415,8 +418,8 @@ pub const TaskManager = struct {
 
         return .{
             .task_id = task_id,
-            .task_runs = runs,
-            .active_run = null,
+            .past_runs = runs,
+            .active_run = null, // TODO: get active run if running
         };
     }
 
@@ -424,21 +427,39 @@ pub const TaskManager = struct {
     pub fn buildTaskList(
         self: *TaskManager,
         gpa: std.mem.Allocator,
-    ) ![]data.TaskMetadata {
+    ) ![]snap.UiTaskSnap {
         self.mutex.lock();
         defer self.mutex.unlock();
-        // self.data_dirty.store(false, .seq_cst);
+        self.tasks_changed.store(false, .seq_cst);
 
         const tasks = blk: {
             var tasks = try gpa.alloc(
-                data.TaskMetadata,
+                snap.UiTaskSnap,
                 self.datastore.tasks.count(),
             );
             var idx: usize = 0;
             var it = self.datastore.tasks.iterator();
             while (it.next()) |e| {
-                var task_meta = e.value_ptr.*;
-                tasks[idx] = try task_meta.copy(gpa);
+                const task_meta = e.value_ptr.*;
+                tasks[idx] = .{
+                    .meta = try task_meta.copy(gpa),
+                    .status = status: {
+                        const task = self.loaded_tasks.get(task_meta.id) orelse
+                            break :status .inactive;
+                        const s = self.schedulers.get(task) orelse
+                            break :status .inactive;
+                        break :status switch (s.status) {
+                            .inactive => .inactive,
+                            .waiting => .waiting,
+                            .running => .running,
+                            .interrupted => .interrupted,
+                            .completed => switch (s.taskStatus()) {
+                                .success => .success,
+                                else => .failed,
+                            },
+                        };
+                    },
+                };
                 idx += 1;
             }
             break :blk tasks;
@@ -446,13 +467,6 @@ pub const TaskManager = struct {
 
         return tasks;
     }
-};
-
-/// Snapshot of the current state
-pub const TaskState = struct {
-    task_id: ?[]const u8 = null,
-    task_runs: ?[]data.TaskRunMetadata = null,
-    active_run: ?data.TaskRunMetadata = null,
 };
 
 test "manager_simple" {

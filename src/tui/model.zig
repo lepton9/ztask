@@ -1,11 +1,13 @@
 const std = @import("std");
 const tm = @import("../taskmanager.zig");
 const data = @import("../data.zig");
+const snap = @import("snapshot.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
 const Widget = vxfw.Widget;
 const AllocError = std.mem.Allocator.Error;
+const UiSnapshot = snap.UiSnapshot;
 
 const UPDATE_TICK_MS = 300;
 const BORDER_COLOR: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
@@ -16,17 +18,6 @@ fn isQuit(key: vaxis.Key) bool {
     }
     return false;
 }
-
-/// Snapshot of the current state
-pub const UiSnapshot = struct {
-    updated: i64,
-    // Allocated with gpa
-    tasks: []data.TaskMetadata,
-    // Allocated with arena
-    selected_task_id: ?[]const u8 = null,
-    selected_task_runs: ?[]data.TaskRunMetadata = null,
-    selected_active_run: ?data.TaskRunMetadata = null,
-};
 
 /// Main TUI state
 pub const Model = struct {
@@ -158,7 +149,7 @@ pub const Model = struct {
 
         // Update task list
         if (modified) {
-            for (self.snapshot.tasks) |*meta| meta.deinit(self.gpa);
+            for (self.snapshot.tasks) |*ts| ts.meta.deinit(self.gpa);
             self.gpa.free(self.snapshot.tasks);
             const tasks = try self.taskmanager.buildTaskList(self.gpa);
             self.snapshot.tasks = tasks;
@@ -168,12 +159,12 @@ pub const Model = struct {
 
         // Update selected task
         if (self.task_split.selectedTask()) |t| {
-            if (!self.taskmanager.taskRunning(t.id)) return modified;
+            if (!self.taskmanager.taskRunning(t.meta.id)) return modified;
             _ = self.arena.reset(.retain_capacity);
             const arena = self.arena.allocator();
             const selected_task = try self.taskmanager.buildTaskState(
                 arena,
-                t.id,
+                t.meta.id,
             );
             self.setSelectedState(selected_task);
             self.task_split.setSelectedState(selected_task);
@@ -182,21 +173,22 @@ pub const Model = struct {
         return modified;
     }
 
-    fn updateSelectedTask(self: *Model) !?tm.TaskState {
+    fn updateSelectedTask(self: *Model) !?snap.UiTaskDetail {
         _ = self.arena.reset(.retain_capacity);
         const arena = self.arena.allocator();
         if (self.task_split.selectedTask()) |t| {
-            const selected_task = try self.taskmanager.buildTaskState(arena, t.id);
+            const selected_task = try self.taskmanager.buildTaskState(
+                arena,
+                t.meta.id,
+            );
             self.setSelectedState(selected_task);
             return selected_task;
         }
         return null;
     }
 
-    fn setSelectedState(self: *Model, state: tm.TaskState) void {
-        self.snapshot.selected_task_id = state.task_id;
-        self.snapshot.selected_task_runs = state.task_runs;
-        self.snapshot.selected_active_run = state.active_run;
+    fn setSelectedState(self: *Model, state: snap.UiTaskDetail) void {
+        self.snapshot.selected_task = state;
         self.snapshot.updated = std.time.timestamp();
     }
 
@@ -207,13 +199,16 @@ pub const Model = struct {
 };
 
 const TaskListItem = struct {
-    meta: *data.TaskMetadata,
+    task: *const snap.UiTaskSnap,
 
     fn widget(self: *@This()) Widget {
         return .{ .userdata = self, .drawFn = drawTypeErased };
     }
 
-    fn drawTypeErased(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+    fn drawTypeErased(
+        ptr: *anyopaque,
+        ctx: vxfw.DrawContext,
+    ) AllocError!vxfw.Surface {
         var self: *@This() = @ptrCast(@alignCast(ptr));
         return self.draw(ctx.withConstraints(
             .{ .width = 1, .height = 1 },
@@ -222,7 +217,7 @@ const TaskListItem = struct {
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var text: vxfw.Text = .{ .text = self.meta.name };
+        var text: vxfw.Text = .{ .text = self.task.meta.name };
 
         const task_name: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -373,7 +368,7 @@ const TaskSplit = struct {
         self.tasks_models.clearRetainingCapacity();
         try self.tasks_models.ensureTotalCapacity(gpa, tasks_snap.len);
         for (0..tasks_snap.len) |i| {
-            self.tasks_models.appendAssumeCapacity(.{ .meta = &tasks_snap[i] });
+            self.tasks_models.appendAssumeCapacity(.{ .task = &tasks_snap[i] });
         }
         self.task_list_view.item_count = @intCast(self.tasks_models.items.len);
     }
@@ -384,18 +379,9 @@ const TaskSplit = struct {
         self.setSelectedState(state);
     }
 
-    fn setSelectedState(self: *@This(), state_maybe: ?tm.TaskState) void {
-        const state = state_maybe orelse {
-            self.selected_task_view = .{ .parent = self };
-            return;
-        };
-        const selected = self.selectedTask();
-        self.selected_task_view = .{
-            .parent = self,
-            .task = selected,
-            .task_runs = state.task_runs,
-            .active_run = if (state.active_run) |*ar| ar else null,
-        };
+    /// Set selected task data state
+    fn setSelectedState(self: *@This(), state_maybe: ?snap.UiTaskDetail) void {
+        self.selected_task_view.setData(self.selectedTask(), state_maybe);
     }
 
     /// Build the widget for a task at the index
@@ -408,19 +394,18 @@ const TaskSplit = struct {
     }
 
     /// Get the selected task metadata
-    fn selectedTask(self: *@This()) ?*data.TaskMetadata {
+    fn selectedTask(self: *@This()) ?*const snap.UiTaskSnap {
         if (self.task_list_view.cursor >= self.task_list_view.item_count orelse 0)
             return null;
-        return self.tasks_models.items[self.task_list_view.cursor].meta;
+        return self.tasks_models.items[self.task_list_view.cursor].task;
     }
 };
 
 const TaskView = struct {
     parent: *TaskSplit,
 
-    task: ?*const data.TaskMetadata = null,
-    task_runs: ?[]data.TaskRunMetadata = null,
-    active_run: ?*const data.TaskRunMetadata = null,
+    task: ?*const snap.UiTaskSnap = null,
+    task_details: ?snap.UiTaskDetail = null,
 
     fn widget(self: *@This()) Widget {
         return .{
@@ -474,7 +459,7 @@ const TaskView = struct {
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        if (self.task == null) return .empty(self.widget());
+        const task = self.task orelse return .empty(self.widget());
         var buffer: [512]u8 = undefined;
         var task_text = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
@@ -482,7 +467,7 @@ const TaskView = struct {
         try task_text.appendSlice(ctx.arena, std.fmt.bufPrint(
             &buffer,
             "Task: {s}\nID: {s}",
-            .{ self.task.?.name, self.task.?.id },
+            .{ task.meta.name, task.meta.id },
         ) catch "");
 
         var text: vxfw.Text = .{ .text = try task_text.toOwnedSlice(ctx.arena) };
@@ -501,5 +486,15 @@ const TaskView = struct {
             .buffer = &.{},
             .children = children,
         };
+    }
+
+    /// Set the data for the selected task
+    fn setData(
+        self: *@This(),
+        selected: ?*const snap.UiTaskSnap,
+        state: ?snap.UiTaskDetail,
+    ) void {
+        self.task = selected;
+        self.task_details = state;
     }
 };

@@ -16,16 +16,14 @@ pub const TaskStatus = mergeEnums(
 );
 
 pub const UiTaskSnap = struct {
-    id: []const u8,
-    file_path: []const u8,
-    name: []const u8,
+    meta: data.TaskMetadata,
     status: TaskStatus,
 };
 
 pub const UiTaskDetail = struct {
     task_id: []const u8,
-    active_run: ?UiTaskRunSnap,
     past_runs: []data.TaskRunMetadata,
+    active_run: ?UiTaskRunSnap = null,
 };
 
 pub const UiTaskRunSnap = struct {

@@ -402,7 +402,7 @@ pub const Scheduler = struct {
     }
 
     /// Get status of the task
-    fn taskStatus(self: *Scheduler) data.TaskRunStatus {
+    pub fn taskStatus(self: *Scheduler) data.TaskRunStatus {
         var status: data.TaskRunStatus = .success;
         for (self.nodes) |node| switch (node.status) {
             .failed => return .failed,
