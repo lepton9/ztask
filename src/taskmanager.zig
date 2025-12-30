@@ -380,12 +380,18 @@ pub const TaskManager = struct {
         };
     }
 
+    /// Get a scheduler for a task based on task id if loaded
+    fn getScheduler(self: *TaskManager, task_id: []const u8) ?*Scheduler {
+        const task = self.loaded_tasks.get(task_id) orelse
+            return null;
+        return self.schedulers.get(task) orelse null;
+    }
+
     /// Check if the task is currently running or waiting
     pub fn taskRunning(self: *TaskManager, task_id: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const task = self.loaded_tasks.get(task_id) orelse return false;
-        return self.schedulers.get(task) != null;
+        return self.getScheduler(task_id) != null;
     }
 
     /// Check if any data has changed
@@ -444,9 +450,7 @@ pub const TaskManager = struct {
                 tasks[idx] = .{
                     .meta = try task_meta.copy(gpa),
                     .status = status: {
-                        const task = self.loaded_tasks.get(task_meta.id) orelse
-                            break :status .inactive;
-                        const s = self.schedulers.get(task) orelse
+                        const s = self.getScheduler(task_meta.id) orelse
                             break :status .inactive;
                         break :status switch (s.status) {
                             .inactive => .inactive,

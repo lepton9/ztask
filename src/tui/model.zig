@@ -198,43 +198,6 @@ pub const Model = struct {
     }
 };
 
-const TaskListItem = struct {
-    task: *const snap.UiTaskSnap,
-
-    fn widget(self: *@This()) Widget {
-        return .{ .userdata = self, .drawFn = drawTypeErased };
-    }
-
-    fn drawTypeErased(
-        ptr: *anyopaque,
-        ctx: vxfw.DrawContext,
-    ) AllocError!vxfw.Surface {
-        var self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.draw(ctx.withConstraints(
-            .{ .width = 1, .height = 1 },
-            .{ .width = 20, .height = 1 },
-        ));
-    }
-
-    fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var text: vxfw.Text = .{ .text = self.task.meta.name };
-
-        const task_name: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try text.draw(ctx),
-        };
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-        children[0] = task_name;
-
-        return .{
-            .size = ctx.max.size(),
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
-        };
-    }
-};
-
 const TaskSplit = struct {
     model: *Model,
 
@@ -296,7 +259,6 @@ const TaskSplit = struct {
                 self.model.active = .task_list;
                 try self.updateSelected();
                 ctx.consumeAndRedraw();
-                // try ctx.requestFocus(self.task_list_view.widget());
             },
             .focus_out => {
                 ctx.consumeAndRedraw();
@@ -326,7 +288,7 @@ const TaskSplit = struct {
         const task_bordered: vxfw.Border = .{
             .child = self.selected_task_view.widget(),
             .labels = &[_]vxfw.Border.BorderLabel{.{
-                .text = "Current",
+                .text = "Selected",
                 .alignment = .top_left,
             }},
             .style = .{ .fg = switch (self.model.active) {
@@ -466,12 +428,16 @@ const TaskView = struct {
         // TODO: more text
         try task_text.appendSlice(ctx.arena, std.fmt.bufPrint(
             &buffer,
-            "Task: {s}\nID: {s}",
-            .{ task.meta.name, task.meta.id },
+            \\Task: {s}
+            \\ID: {s}
+            \\File: {s}
+        ,
+            .{ task.meta.name, task.meta.id, task.meta.file_path },
         ) catch "");
 
         var text: vxfw.Text = .{ .text = try task_text.toOwnedSlice(ctx.arena) };
-        // TODO: runs button
+        // TODO: display past runs
+        // display active run and job status, if running
 
         const task_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
@@ -496,5 +462,42 @@ const TaskView = struct {
     ) void {
         self.task = selected;
         self.task_details = state;
+    }
+};
+
+const TaskListItem = struct {
+    task: *const snap.UiTaskSnap,
+
+    fn widget(self: *@This()) Widget {
+        return .{ .userdata = self, .drawFn = drawTypeErased };
+    }
+
+    fn drawTypeErased(
+        ptr: *anyopaque,
+        ctx: vxfw.DrawContext,
+    ) AllocError!vxfw.Surface {
+        var self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.draw(ctx.withConstraints(
+            .{ .width = 1, .height = 1 },
+            .{ .width = 20, .height = 1 },
+        ));
+    }
+
+    fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        var text: vxfw.Text = .{ .text = self.task.meta.name };
+
+        const task_name: vxfw.SubSurface = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try text.draw(ctx),
+        };
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+        children[0] = task_name;
+
+        return .{
+            .size = ctx.max.size(),
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 };
