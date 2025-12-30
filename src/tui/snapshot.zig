@@ -4,10 +4,8 @@ const std = @import("std");
 /// Snapshot of the current state
 pub const UiSnapshot = struct {
     updated: i64,
-    // Allocated with gpa
-    tasks: []UiTaskSnap,
-    // Allocated with arena
-    selected_task: ?UiTaskDetail = null,
+    tasks: []UiTaskSnap, // Allocated with gpa
+    selected_task: ?UiTaskDetail = null, // Allocated with arena
 };
 
 pub const TaskStatus = mergeEnums(
@@ -27,9 +25,16 @@ pub const UiTaskDetail = struct {
 };
 
 pub const UiTaskRunSnap = struct {
-    run_id: []const u8,
-    start_time: i64,
-    status: data.TaskRunStatus = .running,
+    state: union {
+        /// Currently running
+        run: struct {
+            run_id: []const u8,
+            start_time: i64,
+            status: data.TaskRunStatus = .running,
+        },
+        /// Currently waiting for a trigger
+        wait: void,
+    },
     jobs: []UiJobSnap,
 };
 

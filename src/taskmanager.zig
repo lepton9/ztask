@@ -422,10 +422,30 @@ pub const TaskManager = struct {
             break :blk runs;
         };
 
+        // TODO: get active run if running
+        const active_run: ?snap.UiTaskRunSnap = blk: {
+            const sched = self.getScheduler(task_id) orelse break :blk null;
+            const run_meta = sched.task_meta;
+            if (sched.status == .waiting or run_meta.run_id == null) break :blk .{
+                .state = .wait,
+                .jobs = &[].{}, // TODO:
+            };
+            break :blk .{
+                .state = .{
+                    .run = .{
+                        .run_id = run_meta.run_id orelse unreachable,
+                        .start_time = run_meta.start_time,
+                        .status = run_meta.status,
+                    },
+                },
+                .jobs = &[].{}, // TODO:
+            };
+        };
+
         return .{
             .task_id = task_id,
             .past_runs = runs,
-            .active_run = null, // TODO: get active run if running
+            .active_run = active_run,
         };
     }
 
