@@ -25,7 +25,7 @@ pub const RunLogger = struct {
     }
 
     /// Write task metadata to a JSON file
-    pub fn logTaskMetadata(
+    fn logTaskRunMetadata(
         self: *RunLogger,
         gpa: std.mem.Allocator,
         meta: *TaskRunMetadata,
@@ -66,7 +66,7 @@ pub const RunLogger = struct {
         self.run_path = try std.fs.path.join(gpa, &.{ self.task_path, run_id });
         try std.fs.cwd().makePath(self.run_path.?);
 
-        // Reset task metadata
+        // Set task metadata
         meta.start_time = std.time.timestamp();
         meta.end_time = null;
         meta.status = .running;
@@ -74,7 +74,7 @@ pub const RunLogger = struct {
         if (meta.run_id) |id| gpa.free(id);
         meta.run_id = run_id;
 
-        try self.logTaskMetadata(gpa, meta);
+        try self.logTaskRunMetadata(gpa, meta);
     }
 
     /// Record the final status of the task in a metadata file
@@ -84,7 +84,12 @@ pub const RunLogger = struct {
         meta: *TaskRunMetadata,
     ) !void {
         meta.end_time = std.time.timestamp();
-        try self.logTaskMetadata(gpa, meta);
+        try self.logTaskRunMetadata(gpa, meta);
+        // Reset run id
+        if (meta.run_id) |id| {
+            gpa.free(id);
+            meta.run_id = null;
+        }
     }
 
     /// Record the initial state of the job in a metadata file
