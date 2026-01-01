@@ -337,6 +337,7 @@ pub const TaskManager = struct {
             const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
             defer self.gpa.free(real_path);
             _ = try self.datastore.addTask(self.gpa, real_path);
+            self.tasks_changed.store(true, .seq_cst);
             return;
         }
         _ = try self.datastore.addTask(self.gpa, file_path);
@@ -422,13 +423,30 @@ pub const TaskManager = struct {
             break :blk runs;
         };
 
-        // TODO: get active run if running
         const active_run: ?snap.UiTaskRunSnap = blk: {
             const sched = self.getScheduler(task_id) orelse break :blk null;
             const run_meta = sched.task_meta;
+
+            // Get job snapshots
+            const jobs: []snap.UiJobSnap = jobs: {
+                const job_nodes = sched.nodes;
+                var jobs = try arena.alloc(snap.UiJobSnap, job_nodes.len);
+                for (job_nodes, 0..) |*node, i| {
+                    const job_meta = sched.job_metas.get(node) orelse unreachable;
+                    jobs[i] = .{
+                        .job_name = try arena.dupe(u8, job_meta.job_name),
+                        .status = job_meta.status,
+                        .start_time = job_meta.start_time,
+                        .end_time = job_meta.end_time,
+                        .exit_code = job_meta.exit_code,
+                    };
+                }
+                break :jobs jobs;
+            };
+
             if (sched.status == .waiting or run_meta.run_id == null) break :blk .{
-                .state = .wait,
-                .jobs = &[].{}, // TODO:
+                .state = .{ .wait = void{} },
+                .jobs = jobs,
             };
             break :blk .{
                 .state = .{
@@ -438,7 +456,7 @@ pub const TaskManager = struct {
                         .status = run_meta.status,
                     },
                 },
-                .jobs = &[].{}, // TODO:
+                .jobs = jobs,
             };
         };
 
