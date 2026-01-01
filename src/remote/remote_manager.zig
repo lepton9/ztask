@@ -313,7 +313,7 @@ pub const RemoteManager = struct {
         ) catch |err| switch (err) {
             error.WouldBlock => return,
             else => {
-                std.debug.print("remote manager err: {}\n", .{err});
+                std.log.err("remote manager err: {}", .{err});
                 return;
             },
         };

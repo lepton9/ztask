@@ -4,7 +4,7 @@ const cli_zig = @import("cli.zig");
 const zcli = cli_zig.zcli;
 
 pub const std_options: std.Options = .{
-    // .log_level = .info,
+    .log_level = .info,
     .log_scope_levels = &[_]std.log.ScopeLevel{
         .{ .scope = .parser, .level = .info },
         .{ .scope = .tokenizer, .level = .info },

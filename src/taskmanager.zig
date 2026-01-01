@@ -207,16 +207,12 @@ pub const TaskManager = struct {
         while (it.next()) |s| switch (s.*.status) {
             .running => s.*.update(),
             .completed => {
-                std.debug.print("Task done: '{s}'\n", .{s.*.task.file_path orelse ""});
                 s.*.update();
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
             },
-            .inactive => {
-                std.debug.print("Unloading task: '{s}'\n", .{s.*.task.file_path orelse ""});
-                try self.to_unload.append(self.gpa, s.*.task);
-            },
+            .inactive => try self.to_unload.append(self.gpa, s.*.task),
             .interrupted => s.*.status = .inactive,
             .waiting => {},
         };

@@ -71,7 +71,7 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
-        std.debug.print("- Start job {s} ({d})\n", .{ job.ptr.name, job.id });
+        std.log.debug("- Start job {s} ({d})", .{ job.ptr.name, job.id });
 
         logs.append(gpa, .{ .job_started = .{
             .job_node = job,
@@ -87,10 +87,10 @@ pub const LocalRunner = struct {
                 err_msg = "Interrupted";
                 break;
             }
-            std.debug.print("{s}: step: {s}\n", .{ job.ptr.name, step.value });
+            std.log.debug("{s}: step: {s}", .{ job.ptr.name, step.value });
             switch (step.kind) {
                 .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| blk: {
-                    std.debug.print("step err: {}\n", .{err});
+                    std.log.debug("step err: {}", .{err});
                     break :blk 1;
                 },
                 // else => @panic("TODO"),
@@ -111,7 +111,7 @@ pub const LocalRunner = struct {
             } },
         );
         _ = self.running.swap(false, .seq_cst);
-        std.debug.print("- Finish job {s} ({d})\n", .{ job.ptr.name, job.id });
+        std.log.debug("- Finish job {s} ({d})", .{ job.ptr.name, job.id });
     }
 
     pub fn joinThread(self: *LocalRunner) void {
