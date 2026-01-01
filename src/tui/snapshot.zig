@@ -25,7 +25,7 @@ pub const UiTaskDetail = struct {
 };
 
 pub const UiTaskRunSnap = struct {
-    state: union {
+    state: union(enum) {
         /// Currently running
         run: struct {
             run_id: []const u8,

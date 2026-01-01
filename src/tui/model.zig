@@ -422,29 +422,71 @@ const TaskView = struct {
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const task = self.task orelse return .empty(self.widget());
-        var buffer: [512]u8 = undefined;
-        var task_text = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
+        const details = self.task_details orelse return .empty(self.widget());
+        var buf: [512]u8 = undefined;
+        var task_buf = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
-        // TODO: more text
-        try task_text.appendSlice(ctx.arena, std.fmt.bufPrint(
-            &buffer,
+        try task_buf.appendSlice(ctx.arena, std.fmt.bufPrint(
+            &buf,
             \\Task: {s}
             \\ID: {s}
             \\File: {s}
+            \\Status: {s}
         ,
-            .{ task.meta.name, task.meta.id, task.meta.file_path },
+            .{
+                task.meta.name,
+                task.meta.id,
+                task.meta.file_path,
+                @tagName(task.status),
+            },
         ) catch "");
 
-        var text: vxfw.Text = .{ .text = try task_text.toOwnedSlice(ctx.arena) };
-        // TODO: display past runs
-        // display active run and job status, if running
-
+        var task_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
         const task_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try text.draw(ctx),
+            .origin = .{ .row = 0, .col = 1 },
+            .surface = try task_text.draw(ctx),
         };
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
+
+        if (details.active_run) |active| {
+            switch (active.state) {
+                .wait => try task_buf.appendSlice(
+                    ctx.arena,
+                    std.fmt.bufPrint(&buf, "Waiting for trigger...\n", .{}) catch "",
+                ),
+                .run => |run| {
+                    try task_buf.appendSlice(
+                        ctx.arena,
+                        std.fmt.bufPrint(&buf,
+                            \\Run {s}: {s}
+                            \\Start time {d}
+                        , .{ run.run_id, @tagName(run.status), run.start_time }) catch "",
+                    );
+                },
+            }
+            // Display jobs
+            for (active.jobs) |job| {
+                // TODO: make an interactive dropdown or something
+                try task_buf.appendSlice(
+                    ctx.arena,
+                    std.fmt.bufPrint(&buf, "{s} {s}\n", .{
+                        job.job_name,
+                        @tagName(job.status),
+                    }) catch "",
+                );
+            }
+        }
+
+        var run_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
+        const run_surf: vxfw.SubSurface = .{
+            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
+            .surface = try run_text.draw(ctx),
+        };
+
+        // TODO: display past runs
+
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
         children[0] = task_surf;
+        children[1] = run_surf;
 
         return .{
             .size = ctx.max.size(),
