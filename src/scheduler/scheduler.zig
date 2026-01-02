@@ -276,7 +276,7 @@ pub const Scheduler = struct {
         // Log task metadata
         self.task_meta.status = .interrupted;
         self.task_meta.jobs_completed = self.completedJobs();
-        self.logger.endTask(self.gpa, &self.task_meta) catch {};
+        self.endTask() catch {};
     }
 
     /// Skip the rest of the jobs that are pending
@@ -388,8 +388,19 @@ pub const Scheduler = struct {
     fn completeTask(self: *Scheduler) void {
         self.task_meta.status = self.taskStatus();
         self.task_meta.jobs_completed = self.completedJobs();
-        self.logger.endTask(self.gpa, &self.task_meta) catch {};
+        self.endTask() catch {};
         self.status = .completed;
+    }
+
+    /// Log the end of task and add the new task run to datastore
+    fn endTask(self: *Scheduler) !void {
+        try self.logger.endTask(self.gpa, &self.task_meta);
+        try self.datastore.addNewTaskRun(self.gpa, self.task_meta);
+        // Reset run id
+        if (self.task_meta.run_id) |id| {
+            self.gpa.free(id);
+            self.task_meta.run_id = null;
+        }
     }
 
     /// Get total number of completed jobs

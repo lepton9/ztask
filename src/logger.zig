@@ -85,11 +85,6 @@ pub const RunLogger = struct {
     ) !void {
         meta.end_time = std.time.timestamp();
         try self.logTaskRunMetadata(gpa, meta);
-        // Reset run id
-        if (meta.run_id) |id| {
-            gpa.free(id);
-            meta.run_id = null;
-        }
     }
 
     /// Record the initial state of the job in a metadata file

@@ -113,6 +113,7 @@ pub const DataStore = struct {
             while (runs_it.next()) |re| {
                 re.value_ptr.deinit(gpa);
             }
+            gpa.free(e.key_ptr.*);
             runs.deinit(gpa);
         }
         self.task_runs.deinit(gpa);
@@ -294,7 +295,10 @@ pub const DataStore = struct {
         task_id: []const u8,
     ) !void {
         const res = try self.task_runs.getOrPut(gpa, task_id);
-        if (!res.found_existing) res.value_ptr.* = .{};
+        if (!res.found_existing) {
+            res.key_ptr.* = try gpa.dupe(u8, task_id);
+            res.value_ptr.* = .{};
+        }
         var task_runs = res.value_ptr;
 
         const runs_path = try self.taskRunsPath(gpa, task_id);
@@ -326,10 +330,10 @@ pub const DataStore = struct {
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-    ) !std.StringHashMapUnmanaged(TaskRunMetadata) {
-        return self.task_runs.get(task_id) orelse {
+    ) !*std.StringHashMapUnmanaged(TaskRunMetadata) {
+        return self.task_runs.getPtr(task_id) orelse {
             try self.loadTaskRuns(gpa, task_id);
-            return self.task_runs.get(task_id) orelse unreachable;
+            return self.task_runs.getPtr(task_id) orelse unreachable;
         };
     }
 
@@ -382,6 +386,22 @@ pub const DataStore = struct {
         try self.tasks.put(gpa, meta.id, meta);
         try self.writeTaskMeta(gpa, &meta);
         return &meta;
+    }
+
+    /// Add a new task run to the task runs hashmap
+    pub fn addNewTaskRun(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        meta: TaskRunMetadata,
+    ) !void {
+        const run_id = meta.run_id orelse return error.NoRunId;
+        const meta_copy = try meta.copy(gpa);
+        const runs = try self.getTaskRuns(gpa, meta.task_id);
+        const res = try runs.getOrPut(gpa, run_id);
+        if (res.found_existing) {
+            res.value_ptr.deinit(gpa);
+        }
+        res.value_ptr.* = meta_copy;
     }
 
     /// Update the task metafile in disk and the datastore hashmap
