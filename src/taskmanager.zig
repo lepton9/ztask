@@ -415,9 +415,7 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
 
         const runs: []data.TaskRunMetadata = blk: {
-            if (self.datastore.task_runs.get(task_id) == null)
-                break :blk try arena.alloc(data.TaskRunMetadata, 0);
-            const task_runs = self.datastore.task_runs.get(task_id).?;
+            const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
             var runs = try arena.alloc(data.TaskRunMetadata, task_runs.count());
             var idx: usize = 0;
             var it = task_runs.valueIterator();

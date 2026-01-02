@@ -137,6 +137,7 @@ pub const Model = struct {
         };
     }
 
+    /// Handle tick event
     fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
         if (try self.requestSnapshot()) {
@@ -173,6 +174,7 @@ pub const Model = struct {
         return modified;
     }
 
+    /// Fetch new data for selected task
     fn updateSelectedTask(self: *Model) !?snap.UiTaskDetail {
         _ = self.arena_task.reset(.retain_capacity);
         const arena = self.arena_task.allocator();
@@ -187,6 +189,7 @@ pub const Model = struct {
         return null;
     }
 
+    /// Set the selected task state
     fn setSelectedState(self: *Model, state: snap.UiTaskDetail) void {
         self.snapshot.selected_task = state;
         self.snapshot.updated = std.time.timestamp();
@@ -458,12 +461,14 @@ const TaskView = struct {
             \\ID: {s}
             \\File: {s}
             \\Status: {s}
+            \\Total runs: {d}
         ,
             .{
                 task.meta.name,
                 task.meta.id,
                 task.meta.file_path,
                 @tagName(task.status),
+                details.past_runs.len,
             },
         ) catch "");
 

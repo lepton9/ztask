@@ -320,6 +320,19 @@ pub const DataStore = struct {
         };
     }
 
+    /// Get all the past runs for a task
+    /// Load the runs if not already loaded
+    pub fn getTaskRuns(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !std.StringHashMapUnmanaged(TaskRunMetadata) {
+        return self.task_runs.get(task_id) orelse {
+            try self.loadTaskRuns(gpa, task_id);
+            return self.task_runs.get(task_id) orelse unreachable;
+        };
+    }
+
     /// Get task metadata with ID
     pub fn getTaskMetadata(self: *DataStore, task_id: []const u8) ?*TaskMetadata {
         return self.tasks.getPtr(task_id);
