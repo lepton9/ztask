@@ -341,7 +341,7 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         task_id: []const u8,
     ) !?*task.Task {
-        const meta = self.tasks.getPtr(task_id) orelse return null;
+        const meta = self.tasks.get(task_id) orelse return null;
         return parse.loadTask(gpa, meta.file_path);
     }
 
@@ -371,14 +371,17 @@ pub const DataStore = struct {
         return &meta;
     }
 
+    /// Update the task metafile in disk and the datastore hashmap
     pub fn updateTaskMeta(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
         updated_meta: TaskMetadata,
     ) !void {
-        var meta = self.getTaskMetadata(task_id) orelse return error.TaskNotFound;
+        const entry = self.tasks.getEntry(task_id) orelse return error.TaskNotFound;
+        var meta = entry.value_ptr;
         try meta.update(gpa, updated_meta);
+        entry.key_ptr.* = meta.id;
         try self.writeTaskMeta(gpa, meta);
     }
 
