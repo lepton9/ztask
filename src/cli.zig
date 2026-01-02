@@ -1,4 +1,5 @@
 pub const zcli = @import("zcli");
+pub const std = @import("std");
 const options = @import("build_options");
 
 /// Cli configuration
@@ -51,14 +52,24 @@ const commands = &[_]zcli.Cmd{
                 .long_name = "address",
                 .short_name = "a",
                 .desc = "Address of the main runner server",
-                .arg = .{ .name = "ADDR", .type = .Text },
-                .required = true,
+                .arg = .{
+                    .name = "ADDR",
+                    .default = @import("remote/remote_manager.zig").DEFAULT_ADDR,
+                    .type = .Text,
+                },
             },
             .{
                 .long_name = "port",
                 .short_name = "p",
                 .desc = "Port of the main server",
-                .arg = .{ .name = "PORT", .default = "5555", .type = .Int },
+                .arg = .{
+                    .name = "PORT",
+                    .default = std.fmt.comptimePrint(
+                        "{d}",
+                        .{@import("remote/remote_manager.zig").DEFAULT_PORT},
+                    ),
+                    .type = .Int,
+                },
             },
             runner_n_option,
         },

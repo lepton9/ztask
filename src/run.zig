@@ -7,6 +7,7 @@ const vxfw = vaxis.vxfw;
 const Model = @import("tui/model.zig").Model;
 
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
+pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
 pub const MAX_RUNNERS_N = 100;
 
@@ -31,7 +32,7 @@ pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
 
 pub const AgentOptions = struct {
     name: []const u8,
-    addr: []const u8,
+    addr: []const u8 = DEFAULT_ADDR,
     port: u16 = DEFAULT_PORT,
     runners_n: u8 = BASE_RUNNERS_N,
 };

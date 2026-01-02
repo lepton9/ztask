@@ -54,7 +54,7 @@ fn handleArgs(
         return run.runTask(gpa, opts);
     } else if (std.mem.eql(u8, cmd.name, "runner")) {
         const name = cli.find_opt("name") orelse unreachable;
-        const addr = cli.find_opt("address") orelse unreachable;
+        const addr = cli.find_opt("address");
         const port: ?u16 = blk: {
             if (cli.find_opt("port")) |p| {
                 const port = p.value.?.int;
@@ -64,8 +64,8 @@ fn handleArgs(
         };
         var opts: run.AgentOptions = .{
             .name = name.value.?.string,
-            .addr = addr.value.?.string,
         };
+        if (addr) |a| opts.addr = a.value.?.string;
         if (port) |p| opts.port = p;
         if (cli.find_opt("runners")) |opt| {
             const n = opt.value.?.int;
