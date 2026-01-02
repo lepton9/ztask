@@ -159,7 +159,6 @@ pub const Model = struct {
 
         // Update selected task
         if (self.task_split.selectedTask()) |t| {
-            if (!self.taskmanager.taskRunning(t.meta.id)) return modified;
             _ = self.arena.reset(.retain_capacity);
             const arena = self.arena.allocator();
             const selected_task = try self.taskmanager.buildTaskState(
@@ -195,6 +194,19 @@ pub const Model = struct {
     /// Return the current snapshot of the UI state
     fn getSnapshot(self: *const Model) UiSnapshot {
         return self.snapshot;
+    }
+
+    /// Begin task run
+    fn dispatchTask(self: *Model, task_id: []const u8) !void {
+        return self.taskmanager.beginTask(task_id) catch |err| {
+            // TODO: display status message
+            std.log.info("error {}", .{err});
+        };
+    }
+
+    /// Stop task from running
+    fn stopTask(self: *Model, task_id: []const u8) void {
+        return self.taskmanager.stopTask(task_id);
     }
 };
 
@@ -243,12 +255,24 @@ const TaskSplit = struct {
         switch (event) {
             .init => {},
             .key_press => |key| {
-                if (key.matches('j', .{})) {
+                if (key.matches('j', .{})) { // List down
                     self.task_list_view.nextItem(ctx);
                     try self.updateSelected();
-                } else if (key.matches('k', .{})) {
+                } else if (key.matches('k', .{})) { // List up
                     self.task_list_view.prevItem(ctx);
                     try self.updateSelected();
+                }
+                // Run selected task
+                else if (key.matches('r', .{})) {
+                    const selected = self.selectedTask() orelse return;
+                    self.model.dispatchTask(selected.meta.id) catch {
+                        // TODO: handle error
+                    };
+                }
+                // Stop selected task if running
+                else if (key.matches('s', .{})) {
+                    const selected = self.selectedTask() orelse return;
+                    self.model.stopTask(selected.meta.id);
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     try ctx.requestFocus(self.selected_task_view.widget());
                 } else if (key.matches(vaxis.Key.escape, .{})) {
@@ -459,6 +483,8 @@ const TaskView = struct {
                         std.fmt.bufPrint(&buf,
                             \\Run {s}: {s}
                             \\Start time {d}
+                            \\
+                            \\
                         , .{ run.run_id, @tagName(run.status), run.start_time }) catch "",
                     );
                 },
@@ -468,7 +494,7 @@ const TaskView = struct {
                 // TODO: make an interactive dropdown or something
                 try task_buf.appendSlice(
                     ctx.arena,
-                    std.fmt.bufPrint(&buf, "{s} {s}\n", .{
+                    std.fmt.bufPrint(&buf, "{s:<10} {s}\n", .{
                         job.job_name,
                         @tagName(job.status),
                     }) catch "",

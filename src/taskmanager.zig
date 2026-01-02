@@ -113,7 +113,7 @@ pub const TaskManager = struct {
     }
 
     /// Set scheduler to inactive
-    pub fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
+    fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
         switch (s.*.status) {
             .running => {
                 s.*.forceStop();
@@ -254,7 +254,10 @@ pub const TaskManager = struct {
         defer self.mutex.unlock();
         const task = try self.loadTask(task_id);
         const task_scheduler = blk: {
-            if (self.schedulers.get(task)) |s| break :blk s;
+            if (self.schedulers.get(task)) |s| switch (s.status) {
+                .running, .waiting => return error.TaskRunning,
+                else => break :blk s,
+            };
             const s = try Scheduler.init(
                 self.gpa,
                 task,
@@ -286,6 +289,15 @@ pub const TaskManager = struct {
         } else try task_scheduler.trigger();
     }
 
+    /// Stop task
+    /// Interrupts the task if currently running
+    pub fn stopTask(self: *TaskManager, task_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const sched = self.getScheduler(task_id) orelse return;
+        self.stopScheduler(sched);
+    }
+
     /// Load a task from file path or create the meta file
     pub fn loadOrCreateWithPath(self: *TaskManager, file_path: []const u8) !*Task {
         self.mutex.lock();
@@ -313,9 +325,8 @@ pub const TaskManager = struct {
             try self.loaded_tasks.put(self.gpa, id, task);
 
             if (task.file_path) |path| {
-                var buf: [64]u8 = undefined;
                 try self.datastore.updateTaskMeta(self.gpa, task_id, .{
-                    .id = try task.id.fmt(&buf),
+                    .id = task_id,
                     .name = task.name,
                     .file_path = path,
                 });
@@ -384,13 +395,6 @@ pub const TaskManager = struct {
         return self.schedulers.get(task) orelse null;
     }
 
-    /// Check if the task is currently running or waiting
-    pub fn taskRunning(self: *TaskManager, task_id: []const u8) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.getScheduler(task_id) != null;
-    }
-
     /// Check if any data has changed
     pub fn tasksModified(self: *const TaskManager) bool {
         return self.tasks_changed.load(.seq_cst);
@@ -422,16 +426,21 @@ pub const TaskManager = struct {
         const active_run: ?snap.UiTaskRunSnap = blk: {
             const sched = self.getScheduler(task_id) orelse break :blk null;
             const run_meta = sched.task_meta;
+            if (run_meta.run_id == null and sched.status != .waiting) break :blk null;
 
             // Get job snapshots
             const jobs: []snap.UiJobSnap = jobs: {
                 const job_nodes = sched.nodes;
                 var jobs = try arena.alloc(snap.UiJobSnap, job_nodes.len);
+
                 for (job_nodes, 0..) |*node, i| {
                     const job_meta = sched.job_metas.get(node) orelse unreachable;
                     jobs[i] = .{
                         .job_name = try arena.dupe(u8, job_meta.job_name),
-                        .status = job_meta.status,
+                        .status = if (sched.status == .waiting)
+                            .pending
+                        else
+                            job_meta.status,
                         .start_time = job_meta.start_time,
                         .end_time = job_meta.end_time,
                         .exit_code = job_meta.exit_code,
@@ -440,7 +449,7 @@ pub const TaskManager = struct {
                 break :jobs jobs;
             };
 
-            if (sched.status == .waiting or run_meta.run_id == null) break :blk .{
+            if (sched.status == .waiting) break :blk .{
                 .state = .{ .wait = void{} },
                 .jobs = jobs,
             };
