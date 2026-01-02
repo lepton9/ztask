@@ -22,12 +22,15 @@ fn isQuit(key: vaxis.Key) bool {
 /// Main TUI state
 pub const Model = struct {
     gpa: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
+    /// Arena for selected task
+    arena_task: std.heap.ArenaAllocator,
+    /// Arena for the task list
+    arena_list: std.heap.ArenaAllocator,
 
     task_split: *TaskSplit,
 
     taskmanager: *tm.TaskManager,
-    snapshot: UiSnapshot,
+    snapshot: UiSnapshot = undefined,
 
     /// Active TUI section
     active: enum { status, task_list, task_view } = .status,
@@ -36,19 +39,18 @@ pub const Model = struct {
         const model = try gpa.create(Model);
         model.* = .{
             .gpa = gpa,
-            .arena = std.heap.ArenaAllocator.init(gpa),
+            .arena_task = std.heap.ArenaAllocator.init(gpa),
+            .arena_list = std.heap.ArenaAllocator.init(gpa),
             .task_split = try .init(gpa, model),
             .taskmanager = manager,
-            .snapshot = .{
-                .tasks = try manager.buildTaskList(gpa),
-                .updated = std.time.timestamp(),
-            },
         };
         return model;
     }
 
     pub fn deinit(self: *Model) void {
-        self.arena.deinit();
+        self.arena_task.deinit();
+        self.arena_list.deinit();
+        self.gpa.destroy(self.task_split);
         self.gpa.destroy(self);
     }
 
@@ -67,7 +69,6 @@ pub const Model = struct {
             .init => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
                 _ = try self.requestSnapshot();
-                try self.task_split.buildTaskList(self.gpa);
                 try ctx.requestFocus(self.task_split.widget());
             },
             .tick => {
@@ -149,18 +150,18 @@ pub const Model = struct {
 
         // Update task list
         if (modified) {
-            for (self.snapshot.tasks) |*ts| ts.meta.deinit(self.gpa);
-            self.gpa.free(self.snapshot.tasks);
-            const tasks = try self.taskmanager.buildTaskList(self.gpa);
+            _ = self.arena_list.reset(.retain_capacity);
+            const arena = self.arena_list.allocator();
+            const tasks = try self.taskmanager.buildTaskList(arena);
             self.snapshot.tasks = tasks;
             self.snapshot.updated = std.time.timestamp();
-            try self.task_split.buildTaskList(self.gpa);
+            try self.task_split.buildTaskList(arena);
         }
 
         // Update selected task
         if (self.task_split.selectedTask()) |t| {
-            _ = self.arena.reset(.retain_capacity);
-            const arena = self.arena.allocator();
+            _ = self.arena_task.reset(.retain_capacity);
+            const arena = self.arena_task.allocator();
             const selected_task = try self.taskmanager.buildTaskState(
                 arena,
                 t.meta.id,
@@ -173,8 +174,8 @@ pub const Model = struct {
     }
 
     fn updateSelectedTask(self: *Model) !?snap.UiTaskDetail {
-        _ = self.arena.reset(.retain_capacity);
-        const arena = self.arena.allocator();
+        _ = self.arena_task.reset(.retain_capacity);
+        const arena = self.arena_task.allocator();
         if (self.task_split.selectedTask()) |t| {
             const selected_task = try self.taskmanager.buildTaskState(
                 arena,
@@ -213,6 +214,7 @@ pub const Model = struct {
 const TaskSplit = struct {
     model: *Model,
 
+    // TODO: is necessary?
     tasks_models: std.ArrayList(TaskListItem),
 
     task_list_view: vxfw.ListView,
@@ -226,7 +228,7 @@ const TaskSplit = struct {
             .task_list_view = .{ .children = .{
                 .builder = .{ .userdata = task_split, .buildFn = taskWidget },
             } },
-            .tasks_models = try std.ArrayList(TaskListItem).initCapacity(gpa, 0),
+            .tasks_models = .empty,
             .selected_task_view = .{ .parent = task_split },
         };
         task_split.task_list_view.item_count = 0;
@@ -348,11 +350,11 @@ const TaskSplit = struct {
     }
 
     /// Update the task list
-    fn buildTaskList(self: *@This(), gpa: std.mem.Allocator) !void {
+    fn buildTaskList(self: *@This(), arena: std.mem.Allocator) !void {
         const snapshot = self.model.getSnapshot();
         const tasks_snap = snapshot.tasks;
         self.tasks_models.clearRetainingCapacity();
-        try self.tasks_models.ensureTotalCapacity(gpa, tasks_snap.len);
+        try self.tasks_models.ensureTotalCapacity(arena, tasks_snap.len);
         for (0..tasks_snap.len) |i| {
             self.tasks_models.appendAssumeCapacity(.{ .task = &tasks_snap[i] });
         }

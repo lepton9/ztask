@@ -40,7 +40,7 @@ pub const TaskManager = struct {
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
     /// Has any tasks been added, removed or modified
-    tasks_changed: std.atomic.Value(bool) = .init(false),
+    tasks_changed: std.atomic.Value(bool) = .init(true),
 
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
@@ -123,6 +123,7 @@ pub const TaskManager = struct {
                 s.*.status = .inactive;
                 self.removeFromWatchList(s);
                 s.update();
+                self.tasks_changed.store(true, .seq_cst);
             },
             else => {},
         }
@@ -211,9 +212,13 @@ pub const TaskManager = struct {
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
+                self.tasks_changed.store(true, .seq_cst);
             },
             .inactive => try self.to_unload.append(self.gpa, s.*.task),
-            .interrupted => s.*.status = .inactive,
+            .interrupted => {
+                s.*.status = .inactive;
+                self.tasks_changed.store(true, .seq_cst);
+            },
             .waiting => {},
         };
 
@@ -475,14 +480,14 @@ pub const TaskManager = struct {
     /// Build a snapshot of the current state for the TUI
     pub fn buildTaskList(
         self: *TaskManager,
-        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
     ) ![]snap.UiTaskSnap {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.tasks_changed.store(false, .seq_cst);
 
         const tasks = blk: {
-            var tasks = try gpa.alloc(
+            var tasks = try arena.alloc(
                 snap.UiTaskSnap,
                 self.datastore.tasks.count(),
             );
@@ -491,7 +496,7 @@ pub const TaskManager = struct {
             while (it.next()) |e| {
                 const task_meta = e.value_ptr.*;
                 tasks[idx] = .{
-                    .meta = try task_meta.copy(gpa),
+                    .meta = try task_meta.copy(arena),
                     .status = status: {
                         const s = self.getScheduler(task_meta.id) orelse
                             break :status .inactive;
