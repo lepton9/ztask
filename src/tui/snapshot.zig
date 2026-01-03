@@ -6,6 +6,13 @@ pub const UiSnapshot = struct {
     updated: i64,
     tasks: []UiTaskSnap, // Allocated with gpa
     selected_task: ?UiTaskDetail = null, // Allocated with arena
+    status: AppStatus,
+};
+
+pub const AppStatus = struct {
+    active_tasks: usize,
+    free_local_runners: usize,
+    connected_remote_runners: usize,
 };
 
 pub const TaskStatus = mergeEnums(

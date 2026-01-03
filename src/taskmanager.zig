@@ -104,10 +104,10 @@ pub const TaskManager = struct {
 
     /// End all running schedulers
     fn stopSchedulers(self: *TaskManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
             self.stopScheduler(s.*);
         }
     }
@@ -516,6 +516,16 @@ pub const TaskManager = struct {
         };
 
         return tasks;
+    }
+
+    pub fn getStatus(self: *TaskManager) snap.AppStatus {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .active_tasks = self.schedulers.count(),
+            .connected_remote_runners = self.remote_manager.agents.count(),
+            .free_local_runners = self.pool.free_idx.items.len,
+        };
     }
 };
 

@@ -68,7 +68,7 @@ pub const Model = struct {
         switch (event) {
             .init => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
-                _ = try self.requestSnapshot();
+                try self.requestSnapshot();
                 try ctx.requestFocus(self.task_split.widget());
             },
             .tick => {
@@ -96,8 +96,19 @@ pub const Model = struct {
         const self: *Model = @ptrCast(@alignCast(ptr));
         const max_size = ctx.max.size();
 
+        var buf: [512]u8 = undefined;
+
         // Status text
-        const status_text = try ctx.arena.dupe(u8, "Test text");
+        const status = self.snapshot.status;
+        const status_text = try ctx.arena.dupe(u8, std.fmt.bufPrint(
+            &buf,
+            "Active tasks: {d} | Free runners: {d} | Remote runners: {d}",
+            .{
+                status.active_tasks,
+                status.free_local_runners,
+                status.connected_remote_runners,
+            },
+        ) catch "");
         const status_widget: vxfw.Text = .{ .text = status_text };
         const status_border: vxfw.Border = .{
             .child = status_widget.widget(),
@@ -108,10 +119,7 @@ pub const Model = struct {
         };
         const status_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try status_border.draw(ctx.withConstraints(
-                .{ .width = 20, .height = 1 },
-                .{ .width = max_size.width, .height = 1 },
-            )),
+            .surface = try status_border.draw(ctx),
         };
 
         const task_split_surf: vxfw.SubSurface = .{
@@ -140,17 +148,17 @@ pub const Model = struct {
     /// Handle tick event
     fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
-        if (try self.requestSnapshot()) {
-            try ctx.queueRefresh();
-        }
+        try self.requestSnapshot();
+        try ctx.queueRefresh();
     }
 
     /// Request a snapshot of the UI from TaskManager
-    fn requestSnapshot(self: *Model) !bool {
-        const modified = self.taskmanager.tasksModified();
+    fn requestSnapshot(self: *Model) !void {
+        // Update status
+        self.snapshot.status = self.taskmanager.getStatus();
 
         // Update task list
-        if (modified) {
+        if (self.taskmanager.tasksModified()) {
             _ = self.arena_list.reset(.retain_capacity);
             const arena = self.arena_list.allocator();
             const tasks = try self.taskmanager.buildTaskList(arena);
@@ -169,9 +177,8 @@ pub const Model = struct {
             );
             self.setSelectedState(selected_task);
             self.task_split.setSelectedState(selected_task);
-            return true;
         }
-        return modified;
+        self.snapshot.updated = std.time.timestamp();
     }
 
     /// Fetch new data for selected task
@@ -192,7 +199,6 @@ pub const Model = struct {
     /// Set the selected task state
     fn setSelectedState(self: *Model, state: snap.UiTaskDetail) void {
         self.snapshot.selected_task = state;
-        self.snapshot.updated = std.time.timestamp();
     }
 
     /// Return the current snapshot of the UI state
