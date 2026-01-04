@@ -11,7 +11,7 @@ const JobNode = localrunner.JobNode;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
-const HEARTBEAT_FREQ_S = 2;
+const HEARTBEAT_FREQ_S = 10;
 
 pub const RemoteAgent = struct {
     gpa: std.mem.Allocator,
@@ -207,17 +207,20 @@ pub const RemoteAgent = struct {
     fn handleResults(self: *RemoteAgent) void {
         while (self.result_queue.pop()) |res| {
             // Release runner
-            const kv = self.active_runners.fetchRemove(res.node) orelse unreachable;
-            const runner = kv.value;
-            runner.joinThread();
-            self.pool.release(runner);
+            if (self.active_runners.fetchRemove(res.node)) |kv| {
+                const runner = kv.value;
+                runner.joinThread();
+                self.pool.release(runner);
+            }
 
             // Free the job
-            var job_kv = self.jobs.fetchRemove(res.node.id) orelse unreachable;
-            job_kv.value.node.deinit(self.gpa);
-            const job = job_kv.value.job;
-            self.gpa.free(job.name);
-            self.gpa.free(job.steps);
+            if (self.jobs.fetchRemove(res.node.id)) |kv| {
+                var value = kv.value;
+                value.node.deinit(self.gpa);
+                const job = value.job;
+                self.gpa.free(job.name);
+                self.gpa.free(job.steps);
+            }
         }
     }
 
