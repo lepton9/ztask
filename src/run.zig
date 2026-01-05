@@ -85,7 +85,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         return error.NoTaskFileGiven;
     };
     try task_manager.start();
-    try task_manager.beginTask(task.id.slice());
+    try task_manager.beginTask(task.id.fmt());
     task_manager.waitUntilIdle();
 }
 

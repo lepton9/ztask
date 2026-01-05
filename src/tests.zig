@@ -25,8 +25,7 @@ test "remote_job" {
     const task_manager = try manager.TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
-    const task_id = try gpa.dupe(u8, task.id.slice());
-    try task_manager.loaded_tasks.put(gpa, task_id, task);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.start();
 
     var agent = try remote_agent.RemoteAgent.init(gpa, "runner1", 5);
@@ -34,7 +33,7 @@ test "remote_job" {
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
 
-    try task_manager.beginTask(task_id);
+    try task_manager.beginTask(task.id.fmt());
     task_manager.waitUntilIdle();
 
     agent.stop();

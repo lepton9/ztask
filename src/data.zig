@@ -366,8 +366,8 @@ pub const DataStore = struct {
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
         if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
-        const id = task.Id.fromStr(path);
-        const id_value = id.slice();
+        var id = task.Id.fromStr(path);
+        const id_value = id.fmt();
         if (self.tasks.getPtr(id_value)) |_| {
             return error.TaskExists;
         }

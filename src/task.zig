@@ -109,19 +109,12 @@ pub const Id = struct {
     /// Make Id from a string value
     pub fn fromStr(str: []const u8) Id {
         const value = std.hash.XxHash64.hash(0, str);
-        var id: Id = .{ .value = value };
-        id.fmt();
-        return id;
-    }
-
-    /// Return the Id value as a slice
-    pub fn slice(self: *const Id) []const u8 {
-        return &self.bytes;
+        return .{ .value = value };
     }
 
     /// Format u64 id to a hex value
-    fn fmt(self: *Id) void {
-        _ = std.fmt.bufPrint(self.bytes[0..], "{x}", .{self.value}) catch
+    pub fn fmt(self: *Id) []const u8 {
+        return std.fmt.bufPrint(self.bytes[0..], "{x}", .{self.value}) catch
             unreachable;
     }
 };

@@ -227,7 +227,7 @@ pub const TaskManager = struct {
     /// Unload a task and its scheduler from memory
     fn unloadTask(self: *TaskManager, t: *Task) !void {
         if (self.schedulers.fetchRemove(t)) |kv| {
-            _ = self.loaded_tasks.swapRemove(t.id.slice());
+            _ = self.loaded_tasks.swapRemove(t.id.fmt());
             var s = kv.value;
             self.removeFromWatchList(s);
             s.deinit(); // Free scheduler
@@ -321,7 +321,7 @@ pub const TaskManager = struct {
         return self.loaded_tasks.get(task_id) orelse blk: {
             const task = try self.datastore.loadTask(self.gpa, task_id) orelse
                 return error.TaskNotFound;
-            const id = task.id.slice();
+            const id = task.id.fmt();
             try self.loaded_tasks.put(self.gpa, id, task);
 
             if (task.file_path) |path| {
@@ -538,11 +538,9 @@ test "manager_simple" {
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    const task1_id = try gpa.dupe(u8, task1.id.slice());
-    const task2_id = try gpa.dupe(u8, task2.id.slice());
 
-    try task_manager.loaded_tasks.put(gpa, task1_id, task1);
-    try task_manager.loaded_tasks.put(gpa, task2_id, task2);
+    try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
+    try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
 
     try std.testing.expect(task_manager.schedulers.count() == 0);
 
@@ -577,9 +575,8 @@ test "force_interrupt" {
     const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
-    const task_id = try gpa.dupe(u8, task.id.slice());
-    try task_manager.loaded_tasks.put(gpa, task_id, task);
-    try task_manager.beginTask(task_id);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.beginTask(task.id.fmt());
     // Interrupt while running
     task_manager.stop();
 
@@ -616,10 +613,8 @@ test "complete_tasks" {
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    const task1_id = try gpa.dupe(u8, task1.id.slice());
-    const task2_id = try gpa.dupe(u8, task2.id.slice());
-    try task_manager.loaded_tasks.put(gpa, task1_id, task1);
-    try task_manager.loaded_tasks.put(gpa, task2_id, task2);
+    try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
+    try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
 
     try task_manager.start();
 
