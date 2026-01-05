@@ -22,11 +22,10 @@ test "remote_job" {
         \\       - command: "ls"
         \\     run_on: remote:runner1
     ;
-    var buf: [64]u8 = undefined;
     const task_manager = try manager.TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
-    const task_id = try gpa.dupe(u8, try task.id.fmt(&buf));
+    const task_id = try gpa.dupe(u8, task.id.slice());
     try task_manager.loaded_tasks.put(gpa, task_id, task);
     try task_manager.start();
 

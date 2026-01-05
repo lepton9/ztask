@@ -57,9 +57,8 @@ pub const Scheduler = struct {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
-        var buf: [64]u8 = undefined;
         const task_meta: data.TaskRunMetadata = .{
-            .task_id = try gpa.dupe(u8, try task.id.fmt(&buf)),
+            .task_id = try gpa.dupe(u8, task.id.slice()),
             .start_time = std.time.timestamp(),
             .jobs_total = node_n,
         };

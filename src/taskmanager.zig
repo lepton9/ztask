@@ -64,10 +64,7 @@ pub const TaskManager = struct {
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         var lt_it = self.loaded_tasks.iterator();
-        while (lt_it.next()) |e| {
-            self.gpa.free(e.key_ptr.*);
-            e.value_ptr.*.deinit(self.gpa);
-        }
+        while (lt_it.next()) |e| e.value_ptr.*.deinit(self.gpa);
         self.loaded_tasks.deinit(self.gpa);
         self.to_unload.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
@@ -230,9 +227,7 @@ pub const TaskManager = struct {
     /// Unload a task and its scheduler from memory
     fn unloadTask(self: *TaskManager, t: *Task) !void {
         if (self.schedulers.fetchRemove(t)) |kv| {
-            var buf: [64]u8 = undefined;
-            const lt = self.loaded_tasks.fetchOrderedRemove(try t.id.fmt(&buf));
-            if (lt) |e| self.gpa.free(e.key);
+            _ = self.loaded_tasks.swapRemove(t.id.slice());
             var s = kv.value;
             self.removeFromWatchList(s);
             s.deinit(); // Free scheduler
@@ -326,12 +321,12 @@ pub const TaskManager = struct {
         return self.loaded_tasks.get(task_id) orelse blk: {
             const task = try self.datastore.loadTask(self.gpa, task_id) orelse
                 return error.TaskNotFound;
-            const id = try self.gpa.dupe(u8, task_id); // TODO: store task id in task
+            const id = task.id.slice();
             try self.loaded_tasks.put(self.gpa, id, task);
 
             if (task.file_path) |path| {
-                try self.datastore.updateTaskMeta(self.gpa, task_id, .{
-                    .id = task_id,
+                try self.datastore.updateTaskMeta(self.gpa, id, .{
+                    .id = id,
                     .name = task.name,
                     .file_path = path,
                 });
@@ -539,13 +534,12 @@ test "manager_simple" {
         \\ name: task2
         \\ id: 2
     ;
-    var buf: [64]u8 = undefined;
     const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    const task1_id = try gpa.dupe(u8, try task1.id.fmt(&buf));
-    const task2_id = try gpa.dupe(u8, try task2.id.fmt(&buf));
+    const task1_id = try gpa.dupe(u8, task1.id.slice());
+    const task2_id = try gpa.dupe(u8, task2.id.slice());
 
     try task_manager.loaded_tasks.put(gpa, task1_id, task1);
     try task_manager.loaded_tasks.put(gpa, task2_id, task2);
@@ -580,11 +574,10 @@ test "force_interrupt" {
         \\     steps:
         \\       - command: "cat README.md"
     ;
-    var task_buf: [64]u8 = undefined;
     const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
-    const task_id = try gpa.dupe(u8, try task.id.fmt(&task_buf));
+    const task_id = try gpa.dupe(u8, task.id.slice());
     try task_manager.loaded_tasks.put(gpa, task_id, task);
     try task_manager.beginTask(task_id);
     // Interrupt while running
@@ -619,13 +612,12 @@ test "complete_tasks" {
         \\     steps:
         \\       - command: "zig help"
     ;
-    var buf: [64]u8 = undefined;
     const task_manager = try TaskManager.init(gpa, 5);
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
-    const task1_id = try gpa.dupe(u8, try task1.id.fmt(&buf));
-    const task2_id = try gpa.dupe(u8, try task2.id.fmt(&buf));
+    const task1_id = try gpa.dupe(u8, task1.id.slice());
+    const task2_id = try gpa.dupe(u8, task2.id.slice());
     try task_manager.loaded_tasks.put(gpa, task1_id, task1);
     try task_manager.loaded_tasks.put(gpa, task2_id, task2);
 

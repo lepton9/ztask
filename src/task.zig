@@ -104,16 +104,24 @@ pub const Step = struct {
 
 pub const Id = struct {
     value: u64 = 0,
+    bytes: [16]u8 = [_]u8{0} ** 16,
 
+    /// Make Id from a string value
     pub fn fromStr(str: []const u8) Id {
-        return .{ .value = std.hash.XxHash64.hash(0, str) };
+        const value = std.hash.XxHash64.hash(0, str);
+        var id: Id = .{ .value = value };
+        id.fmt();
+        return id;
     }
 
-    pub fn fromUUID(bytes: [16]u8) Id {
-        return .{ .value = std.hash.XxHash64.hash(0, bytes) };
+    /// Return the Id value as a slice
+    pub fn slice(self: *const Id) []const u8 {
+        return &self.bytes;
     }
 
-    pub fn fmt(self: Id, buf: []u8) ![]u8 {
-        return std.fmt.bufPrint(buf, "{x}", .{self.value});
+    /// Format u64 id to a hex value
+    fn fmt(self: *Id) void {
+        _ = std.fmt.bufPrint(self.bytes[0..], "{x}", .{self.value}) catch
+            unreachable;
     }
 };
