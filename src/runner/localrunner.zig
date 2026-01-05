@@ -2,6 +2,8 @@ const std = @import("std");
 const queue = @import("../queue.zig");
 const task = @import("task");
 
+const log = std.log.scoped(.runner).info;
+
 const Node = @import("../scheduler/dag.zig").Node;
 pub const JobNode = Node(task.Job);
 
@@ -71,7 +73,7 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
-        std.log.debug("- Start job {s} ({d})", .{ job.ptr.name, job.id });
+        log("Start job {s} ({d})", .{ job.ptr.name, job.id });
 
         logs.append(gpa, .{ .job_started = .{
             .job_node = job,
@@ -87,10 +89,10 @@ pub const LocalRunner = struct {
                 err_msg = "Interrupted";
                 break;
             }
-            std.log.debug("{s}: step: {s}", .{ job.ptr.name, step.value });
+            log("{s}: step: {s}", .{ job.ptr.name, step.value });
             switch (step.kind) {
                 .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| blk: {
-                    std.log.debug("step err: {}", .{err});
+                    log("step err: {}", .{err});
                     break :blk 1;
                 },
                 // else => @panic("TODO"),
@@ -111,7 +113,7 @@ pub const LocalRunner = struct {
             } },
         );
         _ = self.running.swap(false, .seq_cst);
-        std.log.debug("- Finish job {s} ({d})", .{ job.ptr.name, job.id });
+        log("Finish job {s} ({d})", .{ job.ptr.name, job.id });
     }
 
     pub fn joinThread(self: *LocalRunner) void {

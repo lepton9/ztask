@@ -63,7 +63,7 @@ pub const Scheduler = struct {
             .start_time = std.time.timestamp(),
             .jobs_total = node_n,
         };
-        const tasks_path = try datastore.tasksPath(gpa);
+        const tasks_path = try data.DataStore.tasksPath(gpa);
         defer gpa.free(tasks_path);
         scheduler.* = .{
             .gpa = gpa,
@@ -171,7 +171,7 @@ pub const Scheduler = struct {
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try std.fmt.allocPrint(self.gpa, "{d}", .{
-            try self.datastore.nextRunId(self.gpa, self.task_meta.task_id),
+            try data.DataStore.nextRunId(self.gpa, self.task_meta.task_id),
         });
 
         try self.logger.startTask(self.gpa, &self.task_meta, run_id);

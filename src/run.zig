@@ -92,7 +92,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
 
 /// List all the found tasks
 pub fn listTasks(gpa: std.mem.Allocator) !void {
-    var datastore = data.DataStore.init(data.root_dir);
+    var datastore = data.DataStore.init();
     defer datastore.deinit(gpa);
     try datastore.loadTaskMetas(gpa, .{ .load_runs = false });
 
