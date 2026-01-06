@@ -35,6 +35,8 @@ pub const Model = struct {
     /// Active TUI section
     active: enum { status, task_list, task_view } = .status,
 
+    info_text: ?[]const u8 = null,
+
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
         model.* = .{
@@ -109,32 +111,50 @@ pub const Model = struct {
                 status.connected_remote_runners,
             },
         ) catch "");
-        const status_widget: vxfw.Text = .{ .text = status_text };
         const status_border: vxfw.Border = .{
-            .child = status_widget.widget(),
+            .child = (vxfw.Text{ .text = status_text }).widget(),
             .labels = &[_]vxfw.Border.BorderLabel{.{
                 .text = "Status",
                 .alignment = .top_left,
             }},
         };
-        const status_surf: vxfw.SubSurface = .{
+
+        var bar_children =
+            try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
+        bar_children.appendAssumeCapacity(.init(status_border.widget(), 1));
+
+        if (self.info_text) |info| {
+            const info_border: vxfw.Border = .{
+                .child = (vxfw.Text{ .text = info }).widget(),
+                .labels = &[_]vxfw.Border.BorderLabel{.{
+                    .text = "Info",
+                    .alignment = .top_left,
+                }},
+            };
+            bar_children.appendAssumeCapacity(.init(info_border.widget(), 1));
+        }
+
+        const status_bar_flex: vxfw.FlexRow = .{
+            .children = try bar_children.toOwnedSlice(ctx.arena),
+        };
+        const status_bar_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try status_border.draw(ctx),
+            .surface = try status_bar_flex.draw(ctx),
         };
 
         const task_split_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = status_surf.surface.size.height, .col = 0 },
+            .origin = .{ .row = status_bar_surf.surface.size.height, .col = 0 },
             .surface = try self.task_split.draw(ctx.withConstraints(
                 .{ .width = 2, .height = 2 },
                 .{
                     .width = max_size.width,
-                    .height = max_size.height - status_surf.surface.size.height,
+                    .height = max_size.height - status_bar_surf.surface.size.height,
                 },
             )),
         };
 
         const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
-        children[0] = status_surf;
+        children[0] = status_bar_surf;
         children[1] = task_split_surf;
 
         return .{
@@ -343,7 +363,7 @@ const TaskSplit = struct {
             .origin = .{ .row = 0, .col = 0 },
             .surface = try flex.draw(ctx.withConstraints(
                 .{ .width = 2, .height = 2 },
-                .{ .width = max_size.width - 1, .height = max_size.height },
+                .{ .width = max_size.width, .height = max_size.height },
             )),
         };
 
