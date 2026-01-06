@@ -10,6 +10,7 @@ const AllocError = std.mem.Allocator.Error;
 const UiSnapshot = snap.UiSnapshot;
 
 const UPDATE_TICK_MS = 300;
+const INFO_TIME_S = 3;
 const BORDER_COLOR: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
 
 fn isQuit(key: vaxis.Key) bool {
@@ -35,7 +36,10 @@ pub const Model = struct {
     /// Active TUI section
     active: enum { status, task_list, task_view } = .status,
 
-    info_text: ?[]const u8 = null,
+    info: struct {
+        text: ?[]const u8 = null,
+        timestamp: i64 = 0,
+    } = .{},
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
@@ -123,7 +127,7 @@ pub const Model = struct {
             try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
         bar_children.appendAssumeCapacity(.init(status_border.widget(), 1));
 
-        if (self.info_text) |info| {
+        if (self.info.text) |info| {
             const info_border: vxfw.Border = .{
                 .child = (vxfw.Text{ .text = info }).widget(),
                 .labels = &[_]vxfw.Border.BorderLabel{.{
@@ -168,6 +172,7 @@ pub const Model = struct {
     /// Handle tick event
     fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
+        self.checkInfo();
         try self.requestSnapshot();
         try ctx.queueRefresh();
     }
@@ -228,15 +233,29 @@ pub const Model = struct {
 
     /// Begin task run
     fn dispatchTask(self: *Model, task_id: []const u8) !void {
-        return self.taskmanager.beginTask(task_id) catch |err| {
-            // TODO: display status message
-            std.log.info("error {}", .{err});
+        self.taskmanager.beginTask(task_id) catch |err| {
+            try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
         };
+        try self.setInfo("Started task {s}", .{task_id});
     }
 
     /// Stop task from running
     fn stopTask(self: *Model, task_id: []const u8) void {
         return self.taskmanager.stopTask(task_id);
+    }
+
+    /// Set info text and restart the info display time
+    fn setInfo(self: *Model, comptime fmt: []const u8, args: anytype) !void {
+        if (self.info.text) |t| self.gpa.free(t);
+        self.info.text = try std.fmt.allocPrint(self.gpa, fmt, args);
+        self.info.timestamp = std.time.timestamp();
+    }
+
+    /// Reset info text if it has been displayed longer than the threshold time
+    fn checkInfo(self: *Model) void {
+        if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
+        if (self.info.text) |t| self.gpa.free(t);
+        self.info.text = null;
     }
 };
 
@@ -296,9 +315,7 @@ const TaskSplit = struct {
                 // Run selected task
                 else if (key.matches('r', .{})) {
                     const selected = self.selectedTask() orelse return;
-                    self.model.dispatchTask(selected.meta.id) catch {
-                        // TODO: handle error
-                    };
+                    try self.model.dispatchTask(selected.meta.id);
                 }
                 // Stop selected task if running
                 else if (key.matches('s', .{})) {
