@@ -158,11 +158,11 @@ pub const LocalRunner = struct {
 
         var stdout_r = poller.reader(.stdout);
         var stderr_r = poller.reader(.stderr);
-        stdout_r.buffer = try gpa.alloc(u8, 128);
-        stderr_r.buffer = try gpa.alloc(u8, 128);
+        stdout_r.buffer = try gpa.alloc(u8, 4096);
+        stderr_r.buffer = try gpa.alloc(u8, 4096);
 
         // Read output
-        while (try poller.poll()) {
+        while (try poller.pollTimeout(std.time.ns_per_ms * 300)) {
             if (!self.running.load(.seq_cst)) {
                 const term = try child.kill();
                 return switch (term) {
