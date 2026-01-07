@@ -277,8 +277,15 @@ const TaskSplit = struct {
                 .builder = .{ .userdata = task_split, .buildFn = taskWidget },
             } },
             .tasks_models = .empty,
-            .selected_task_view = .{ .parent = task_split },
+            .selected_task_view = .{
+                .parent = task_split,
+                .task_run_list = .{ .children = .{ .builder = .{
+                    .userdata = &task_split.selected_task_view,
+                    .buildFn = TaskView.runListItemWidget,
+                } } },
+            },
         };
+        task_split.selected_task_view.task_run_list.item_count = 0;
         task_split.task_list_view.item_count = 0;
         return task_split;
     }
@@ -437,9 +444,17 @@ const TaskSplit = struct {
 
 const TaskView = struct {
     parent: *TaskSplit,
-
     task: ?*const snap.UiTaskSnap = null,
     task_details: ?snap.UiTaskDetail = null,
+
+    tab: enum { task, run_list } = .task,
+
+    selected_run: ?struct {
+        job_list: vxfw.ListView,
+        run_data: *const data.TaskRunMetadata,
+    } = null,
+
+    task_run_list: vxfw.ListView,
 
     fn widget(self: *@This()) Widget {
         return .{
@@ -472,8 +487,6 @@ const TaskView = struct {
         ctx: *vxfw.EventContext,
         event: vxfw.Event,
     ) anyerror!void {
-        // _ = self;
-        // _ = ctx;
         switch (event) {
             .init => {},
             .key_press => |key| {
@@ -483,6 +496,12 @@ const TaskView = struct {
                     ctx.consumeEvent();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     //
+                } else if (key.matches(vaxis.Key.tab, .{})) {
+                    self.tab = switch (self.tab) {
+                        .task => .run_list,
+                        .run_list => .task,
+                    };
+                    try ctx.queueRefresh();
                 }
             },
             .focus_in => {
@@ -552,17 +571,31 @@ const TaskView = struct {
             }
         }
 
-        var run_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
+        // TODO: display tab
+
+        // Selected run surface
+        const run_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
         const run_surf: vxfw.SubSurface = .{
             .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
             .surface = try run_text.draw(ctx),
         };
 
-        // TODO: display past runs
+        // Past run list surface
+        const run_list_surf: vxfw.SubSurface = .{
+            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
+            .surface = try self.task_run_list.draw(ctx),
+        };
 
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
         children[0] = task_surf;
-        children[1] = run_surf;
+        children[1] = .{
+            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
+            .surface = try self.task_run_list.draw(ctx),
+        };
+        children[2] = switch (self.tab) {
+            .task => run_surf,
+            .run_list => run_list_surf,
+        };
 
         return .{
             .size = ctx.max.size(),
@@ -580,6 +613,25 @@ const TaskView = struct {
     ) void {
         self.task = selected;
         self.task_details = state;
+    }
+
+    fn runListItemWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
+        const self: *const @This() = @ptrCast(@alignCast(ptr));
+        if (self.task == null or self.task_details == null) return null;
+        // const details = self.task_details.?;
+        _ = idx;
+
+        // TODO: allocate a list
+        return null;
+
+        // if (idx == 0 and details.active_run != null) {
+        //     var text: vxfw.Text = .{ .text = "Current" };
+        //     return text.widget();
+        // }
+        //
+        // if (idx >= details.past_runs.len) return null;
+        // var text: vxfw.Text = .{ .text = details.past_runs[idx].run_id orelse "" };
+        // return text.widget();
     }
 };
 
