@@ -571,30 +571,37 @@ const TaskView = struct {
             }
         }
 
-        // TODO: display tab
-
-        // Selected run surface
-        const run_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
-        const run_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
-            .surface = try run_text.draw(ctx),
+        var tabs = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
+        tabs[0] = .{
+            .text = "Task",
+            .style = .{ .fg = if (self.tab == .task) BORDER_COLOR else .default },
+        };
+        tabs[1] = .{ .text = " | " };
+        tabs[2] = .{
+            .text = "Runs",
+            .style = .{ .fg = if (self.tab == .run_list) BORDER_COLOR else .default },
         };
 
-        // Past run list surface
-        const run_list_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
-            .surface = try self.task_run_list.draw(ctx),
+        const tab: vxfw.RichText = .{ .text = tabs };
+        const selected_run_text: vxfw.Text = .{
+            .text = try task_buf.toOwnedSlice(ctx.arena),
         };
 
         const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
         children[0] = task_surf;
         children[1] = .{
             .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
-            .surface = try self.task_run_list.draw(ctx),
+            .surface = try tab.draw(ctx),
         };
-        children[2] = switch (self.tab) {
-            .task => run_surf,
-            .run_list => run_list_surf,
+        children[2] = .{
+            .origin = .{
+                .row = children[1].origin.row + children[1].surface.size.height,
+                .col = 1,
+            },
+            .surface = switch (self.tab) {
+                .task => try selected_run_text.draw(ctx),
+                .run_list => try self.task_run_list.draw(ctx),
+            },
         };
 
         return .{
