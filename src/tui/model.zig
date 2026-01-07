@@ -201,7 +201,7 @@ pub const Model = struct {
                 t.meta.id,
             );
             self.setSelectedState(selected_task);
-            self.task_split.setSelectedState(selected_task);
+            try self.task_split.setSelectedState(arena, selected_task);
         }
         self.snapshot.updated = std.time.timestamp();
     }
@@ -279,13 +279,13 @@ const TaskSplit = struct {
             .tasks_models = .empty,
             .selected_task_view = .{
                 .parent = task_split,
-                .task_run_list = .{ .children = .{ .builder = .{
+                .task_run_list_view = .{ .children = .{ .builder = .{
                     .userdata = &task_split.selected_task_view,
                     .buildFn = TaskView.runListItemWidget,
                 } } },
             },
         };
-        task_split.selected_task_view.task_run_list.item_count = 0;
+        task_split.selected_task_view.task_run_list_view.item_count = 0;
         task_split.task_list_view.item_count = 0;
         return task_split;
     }
@@ -337,11 +337,8 @@ const TaskSplit = struct {
             .focus_in => {
                 self.model.active = .task_list;
                 try self.updateSelected();
-                ctx.consumeAndRedraw();
             },
-            .focus_out => {
-                ctx.consumeAndRedraw();
-            },
+            .focus_out => {},
             else => {},
         }
     }
@@ -417,12 +414,17 @@ const TaskSplit = struct {
     /// Update selected task
     fn updateSelected(self: *@This()) !void {
         const state = try self.model.updateSelectedTask();
-        self.setSelectedState(state);
+        const arena = self.model.arena_task.allocator();
+        try self.setSelectedState(arena, state);
     }
 
     /// Set selected task data state
-    fn setSelectedState(self: *@This(), state_maybe: ?snap.UiTaskDetail) void {
-        self.selected_task_view.setData(self.selectedTask(), state_maybe);
+    fn setSelectedState(
+        self: *@This(),
+        arena: std.mem.Allocator,
+        state_maybe: ?snap.UiTaskDetail,
+    ) !void {
+        return self.selected_task_view.setData(arena, self.selectedTask(), state_maybe);
     }
 
     /// Build the widget for a task at the index
@@ -454,7 +456,8 @@ const TaskView = struct {
         run_data: *const data.TaskRunMetadata,
     } = null,
 
-    task_run_list: vxfw.ListView,
+    task_runs: std.ArrayList(RunListItem) = .empty,
+    task_run_list_view: vxfw.ListView,
 
     fn widget(self: *@This()) Widget {
         return .{
@@ -491,8 +494,12 @@ const TaskView = struct {
             .init => {},
             .key_press => |key| {
                 if (key.matches('j', .{})) {
+                    if (self.tab == .run_list)
+                        self.task_run_list_view.nextItem(ctx);
                     ctx.consumeEvent();
                 } else if (key.matches('k', .{})) {
+                    if (self.tab == .run_list)
+                        self.task_run_list_view.prevItem(ctx);
                     ctx.consumeEvent();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     //
@@ -501,7 +508,7 @@ const TaskView = struct {
                         .task => .run_list,
                         .run_list => .task,
                     };
-                    try ctx.queueRefresh();
+                    ctx.consumeAndRedraw();
                 }
             },
             .focus_in => {
@@ -600,7 +607,7 @@ const TaskView = struct {
             },
             .surface = switch (self.tab) {
                 .task => try selected_run_text.draw(ctx),
-                .run_list => try self.task_run_list.draw(ctx),
+                .run_list => try self.task_run_list_view.draw(ctx),
             },
         };
 
@@ -615,32 +622,45 @@ const TaskView = struct {
     /// Set the data for the selected task
     fn setData(
         self: *@This(),
+        arena: std.mem.Allocator,
         selected: ?*const snap.UiTaskSnap,
         state: ?snap.UiTaskDetail,
-    ) void {
+    ) !void {
         self.task = selected;
         self.task_details = state;
+
+        // Arena memory freed before calling this
+        self.task_runs.items.len = 0;
+        self.task_runs.capacity = 0;
+        const runs_n = if (state) |s| s.past_runs.len else 0;
+        try self.task_runs.ensureTotalCapacity(arena, runs_n);
+
+        if (state) |s| for (s.past_runs) |meta| {
+            self.task_runs.appendAssumeCapacity(.{ .id = meta.run_id orelse "" });
+        };
+        self.task_run_list_view.item_count = @intCast(runs_n);
     }
 
     fn runListItemWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        if (self.task == null or self.task_details == null) return null;
-        // const details = self.task_details.?;
-        _ = idx;
 
-        // TODO: allocate a list
-        return null;
+        if (idx >= self.task_runs.items.len) return null;
+        const item = &self.task_runs.items[idx];
 
-        // if (idx == 0 and details.active_run != null) {
-        //     var text: vxfw.Text = .{ .text = "Current" };
-        //     return text.widget();
-        // }
-        //
-        // if (idx >= details.past_runs.len) return null;
-        // var text: vxfw.Text = .{ .text = details.past_runs[idx].run_id orelse "" };
-        // return text.widget();
+        return .{ .userdata = item, .drawFn = struct {
+            fn draw(
+                opq: *anyopaque,
+                ctx: vxfw.DrawContext,
+            ) AllocError!vxfw.Surface {
+                const run_item: *const RunListItem = @ptrCast(@alignCast(opq));
+                var text: vxfw.Text = .{ .text = run_item.id };
+                return text.draw(ctx);
+            }
+        }.draw };
     }
 };
+
+const RunListItem = struct { id: []const u8 };
 
 const TaskListItem = struct {
     task: *const snap.UiTaskSnap,
