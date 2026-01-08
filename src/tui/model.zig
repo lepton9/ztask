@@ -11,7 +11,7 @@ const UiSnapshot = snap.UiSnapshot;
 
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
-const BORDER_COLOR: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
+const COLOR_SELECTED: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
 
 fn isQuit(key: vaxis.Key) bool {
     if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -201,7 +201,7 @@ pub const Model = struct {
                 t.meta.id,
             );
             self.setSelectedState(selected_task);
-            try self.task_split.setSelectedState(arena, selected_task);
+            try self.task_split.setSelectedState(selected_task);
         }
         self.snapshot.updated = std.time.timestamp();
     }
@@ -356,7 +356,7 @@ const TaskSplit = struct {
                 .alignment = .top_left,
             }},
             .style = .{ .fg = switch (self.model.active) {
-                .task_list => BORDER_COLOR,
+                .task_list => COLOR_SELECTED,
                 else => .default,
             } },
         };
@@ -368,7 +368,7 @@ const TaskSplit = struct {
                 .alignment = .top_left,
             }},
             .style = .{ .fg = switch (self.model.active) {
-                .task_view => BORDER_COLOR,
+                .task_view => COLOR_SELECTED,
                 else => .default,
             } },
         };
@@ -414,17 +414,12 @@ const TaskSplit = struct {
     /// Update selected task
     fn updateSelected(self: *@This()) !void {
         const state = try self.model.updateSelectedTask();
-        const arena = self.model.arena_task.allocator();
-        try self.setSelectedState(arena, state);
+        try self.setSelectedState(state);
     }
 
     /// Set selected task data state
-    fn setSelectedState(
-        self: *@This(),
-        arena: std.mem.Allocator,
-        state_maybe: ?snap.UiTaskDetail,
-    ) !void {
-        return self.selected_task_view.setData(arena, self.selectedTask(), state_maybe);
+    fn setSelectedState(self: *@This(), state_maybe: ?snap.UiTaskDetail) !void {
+        return self.selected_task_view.setData(self.selectedTask(), state_maybe);
     }
 
     /// Build the widget for a task at the index
@@ -456,7 +451,6 @@ const TaskView = struct {
         run_data: *const data.TaskRunMetadata,
     } = null,
 
-    task_runs: std.ArrayList(RunListItem) = .empty,
     task_run_list_view: vxfw.ListView,
 
     fn widget(self: *@This()) Widget {
@@ -581,12 +575,12 @@ const TaskView = struct {
         var tabs = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
         tabs[0] = .{
             .text = "Task",
-            .style = .{ .fg = if (self.tab == .task) BORDER_COLOR else .default },
+            .style = .{ .fg = if (self.tab == .task) COLOR_SELECTED else .default },
         };
         tabs[1] = .{ .text = " | " };
         tabs[2] = .{
             .text = "Runs",
-            .style = .{ .fg = if (self.tab == .run_list) BORDER_COLOR else .default },
+            .style = .{ .fg = if (self.tab == .run_list) COLOR_SELECTED else .default },
         };
 
         const tab: vxfw.RichText = .{ .text = tabs };
@@ -600,14 +594,19 @@ const TaskView = struct {
             .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
             .surface = try tab.draw(ctx),
         };
+
+        const run_area_row: u16 = @as(u16, @intCast(children[1].origin.row)) +
+            children[1].surface.size.height;
+        const size = ctx.max.size();
+        const run_area_ctx = ctx.withConstraints(
+            .{ .width = 1, .height = 1 },
+            .{ .width = size.width, .height = @max(0, size.height - run_area_row) },
+        );
         children[2] = .{
-            .origin = .{
-                .row = children[1].origin.row + children[1].surface.size.height,
-                .col = 1,
-            },
+            .origin = .{ .row = run_area_row, .col = 1 },
             .surface = switch (self.tab) {
-                .task => try selected_run_text.draw(ctx),
-                .run_list => try self.task_run_list_view.draw(ctx),
+                .task => try selected_run_text.draw(run_area_ctx),
+                .run_list => try self.task_run_list_view.draw(run_area_ctx),
             },
         };
 
@@ -622,45 +621,36 @@ const TaskView = struct {
     /// Set the data for the selected task
     fn setData(
         self: *@This(),
-        arena: std.mem.Allocator,
         selected: ?*const snap.UiTaskSnap,
         state: ?snap.UiTaskDetail,
     ) !void {
         self.task = selected;
         self.task_details = state;
 
-        // Arena memory freed before calling this
-        self.task_runs.items.len = 0;
-        self.task_runs.capacity = 0;
         const runs_n = if (state) |s| s.past_runs.len else 0;
-        try self.task_runs.ensureTotalCapacity(arena, runs_n);
-
-        if (state) |s| for (s.past_runs) |meta| {
-            self.task_runs.appendAssumeCapacity(.{ .id = meta.run_id orelse "" });
-        };
         self.task_run_list_view.item_count = @intCast(runs_n);
     }
 
+    /// Build the widget for run list item at the index
     fn runListItemWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
+        const details = self.task_details orelse return null;
+        if (idx >= details.past_runs.len) return null;
 
-        if (idx >= self.task_runs.items.len) return null;
-        const item = &self.task_runs.items[idx];
+        const item = &details.past_runs[idx];
 
         return .{ .userdata = item, .drawFn = struct {
             fn draw(
                 opq: *anyopaque,
                 ctx: vxfw.DrawContext,
             ) AllocError!vxfw.Surface {
-                const run_item: *const RunListItem = @ptrCast(@alignCast(opq));
-                var text: vxfw.Text = .{ .text = run_item.id };
+                const run_item: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
+                var text: vxfw.Text = .{ .text = run_item.run_id orelse "" };
                 return text.draw(ctx);
             }
         }.draw };
     }
 };
-
-const RunListItem = struct { id: []const u8 };
 
 const TaskListItem = struct {
     task: *const snap.UiTaskSnap,
