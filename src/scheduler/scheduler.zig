@@ -169,10 +169,7 @@ pub const Scheduler = struct {
     /// Begin running the task
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
-        const run_id = try std.fmt.allocPrint(self.gpa, "{d}", .{
-            try data.DataStore.nextRunId(self.gpa, self.task_meta.task_id),
-        });
-
+        const run_id = try data.DataStore.nextRunId(self.gpa, self.task_meta.task_id);
         try self.logger.startTask(self.gpa, &self.task_meta, run_id);
 
         // Task has no jobs
@@ -396,10 +393,7 @@ pub const Scheduler = struct {
         try self.logger.endTask(self.gpa, &self.task_meta);
         try self.datastore.addNewTaskRun(self.gpa, self.task_meta);
         // Reset run id
-        if (self.task_meta.run_id) |id| {
-            self.gpa.free(id);
-            self.task_meta.run_id = null;
-        }
+        self.task_meta.run_id = null;
     }
 
     /// Get total number of completed jobs

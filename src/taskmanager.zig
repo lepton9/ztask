@@ -411,12 +411,10 @@ pub const TaskManager = struct {
 
         const runs: []data.TaskRunMetadata = blk: {
             const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
-            var runs = try arena.alloc(data.TaskRunMetadata, task_runs.count());
-            var idx: usize = 0;
-            var it = task_runs.valueIterator();
-            while (it.next()) |r| {
-                runs[idx] = try r.copy(arena);
-                idx += 1;
+            const run_metas = task_runs.values();
+            var runs = try arena.alloc(data.TaskRunMetadata, run_metas.len);
+            for (run_metas, 0..) |*meta, offset| {
+                runs[run_metas.len - 1 - offset] = try meta.copy(arena);
             }
             break :blk runs;
         };
@@ -451,10 +449,14 @@ pub const TaskManager = struct {
                 .state = .{ .wait = void{} },
                 .jobs = jobs,
             };
+
+            var buf: [64]u8 = undefined;
             break :blk .{
                 .state = .{
                     .run = .{
-                        .run_id = run_meta.run_id orelse unreachable,
+                        .run_id = try std.fmt.bufPrint(&buf, "{d}", .{
+                            run_meta.run_id orelse unreachable,
+                        }),
                         .start_time = run_meta.start_time,
                         .status = run_meta.status,
                     },

@@ -629,6 +629,11 @@ const TaskView = struct {
 
         const runs_n = if (state) |s| s.past_runs.len else 0;
         self.task_run_list_view.item_count = @intCast(runs_n);
+        self.task_run_list_view.cursor = @min(
+            self.task_run_list_view.cursor,
+            @max(0, @as(i32, @intCast(runs_n)) - 1),
+        );
+        self.task_run_list_view.ensureScroll();
     }
 
     /// Build the widget for run list item at the index
@@ -645,7 +650,11 @@ const TaskView = struct {
                 ctx: vxfw.DrawContext,
             ) AllocError!vxfw.Surface {
                 const run_item: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
-                var text: vxfw.Text = .{ .text = run_item.run_id orelse "" };
+                var text: vxfw.Text = .{ .text = try std.fmt.allocPrint(
+                    ctx.arena,
+                    "{d}",
+                    .{run_item.run_id orelse 0},
+                ) };
                 return text.draw(ctx);
             }
         }.draw };

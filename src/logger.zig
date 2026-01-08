@@ -60,10 +60,15 @@ pub const RunLogger = struct {
         self: *RunLogger,
         gpa: std.mem.Allocator,
         meta: *TaskRunMetadata,
-        run_id: []const u8,
+        run_id: u64,
     ) !void {
         if (self.run_path) |run| gpa.free(run);
-        self.run_path = try std.fs.path.join(gpa, &.{ self.task_path, run_id });
+
+        var buf: [64]u8 = undefined;
+        self.run_path = try std.fs.path.join(gpa, &.{
+            self.task_path,
+            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
+        });
         try std.fs.cwd().makePath(self.run_path.?);
 
         // Set task metadata
@@ -71,7 +76,6 @@ pub const RunLogger = struct {
         meta.end_time = null;
         meta.status = .running;
         meta.jobs_completed = 0;
-        if (meta.run_id) |id| gpa.free(id);
         meta.run_id = run_id;
 
         try self.logTaskRunMetadata(gpa, meta);

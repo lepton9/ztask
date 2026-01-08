@@ -14,11 +14,7 @@ pub const TaskMetadata = struct {
     name: []const u8,
 
     pub fn init(gpa: std.mem.Allocator, meta: TaskMetadata) !TaskMetadata {
-        return .{
-            .id = try gpa.dupe(u8, meta.id),
-            .file_path = try gpa.dupe(u8, meta.file_path),
-            .name = try gpa.dupe(u8, meta.name),
-        };
+        return meta.copy(gpa);
     }
 
     pub fn deinit(self: *TaskMetadata, gpa: std.mem.Allocator) void {
@@ -43,7 +39,7 @@ pub const TaskMetadata = struct {
 
 pub const TaskRunMetadata = struct {
     task_id: []const u8,
-    run_id: ?[]const u8 = null,
+    run_id: ?u64 = null,
     start_time: i64,
     end_time: ?i64 = null,
     status: TaskRunStatus = .running,
@@ -51,21 +47,17 @@ pub const TaskRunMetadata = struct {
     jobs_completed: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, meta: TaskRunMetadata) !TaskRunMetadata {
-        var self = meta;
-        self.task_id = try gpa.dupe(u8, meta.task_id);
-        if (meta.run_id) |id| self.run_id = try gpa.dupe(u8, id);
-        return self;
+        return meta.copy(gpa);
     }
 
     pub fn deinit(self: *TaskRunMetadata, gpa: std.mem.Allocator) void {
         gpa.free(self.task_id);
-        if (self.run_id) |id| gpa.free(id);
     }
 
     pub fn copy(self: *const TaskRunMetadata, gpa: std.mem.Allocator) !@This() {
         return .{
             .task_id = try gpa.dupe(u8, self.task_id),
-            .run_id = if (self.run_id) |id| try gpa.dupe(u8, id) else null,
+            .run_id = self.run_id,
             .start_time = self.start_time,
             .end_time = self.end_time,
             .status = self.status,
@@ -96,7 +88,7 @@ pub const JobRunMetadata = struct {
 pub const DataStore = struct {
     tasks: std.StringHashMapUnmanaged(TaskMetadata),
     task_runs: std.StringHashMapUnmanaged(
-        std.StringHashMapUnmanaged(TaskRunMetadata),
+        std.AutoArrayHashMapUnmanaged(u64, TaskRunMetadata),
     ),
 
     pub fn init() DataStore {
@@ -231,9 +223,14 @@ pub const DataStore = struct {
     fn loadTaskRunMeta(
         gpa: std.mem.Allocator,
         task_id: []const u8,
-        run_id: []const u8,
+        run_id: u64,
     ) !?TaskRunMetadata {
-        const task_path = try taskRunMetaPath(gpa, task_id, run_id);
+        var buf: [64]u8 = undefined;
+        const task_path = try taskRunMetaPath(
+            gpa,
+            task_id,
+            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
+        );
         defer gpa.free(task_path);
         return parseMetaFile(TaskRunMetadata, gpa, task_path);
     }
@@ -302,20 +299,38 @@ pub const DataStore = struct {
         var it = dir.iterate();
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
-                const run_id = std.fs.path.basename(e.name);
+                const run_id: u64 = blk: {
+                    const run_id = std.fs.path.basename(e.name);
+                    break :blk std.fmt.parseInt(u64, run_id, 10) catch
+                        continue;
+                };
+
                 const run_res = try task_runs.getOrPut(gpa, run_id);
                 if (run_res.found_existing) continue;
 
                 const parsed_meta = loadTaskRunMeta(gpa, task_id, run_id);
                 const meta = parsed_meta catch null orelse {
-                    _ = task_runs.remove(run_id);
+                    _ = task_runs.swapRemove(run_id);
                     continue;
                 };
-                run_res.key_ptr.* = meta.run_id orelse unreachable;
+                run_res.key_ptr.* = meta.run_id orelse run_id;
                 run_res.value_ptr.* = meta;
             },
             else => continue,
         };
+
+        // Sort the runs by the run_id in ascending order
+        const Ctx = struct {
+            keys: []u64,
+
+            pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+                const a = ctx.keys[a_index];
+                const b = ctx.keys[b_index];
+                return a < b;
+            }
+        };
+        const sort_ctx: Ctx = .{ .keys = task_runs.keys() };
+        task_runs.sort(sort_ctx);
     }
 
     /// Get all the past runs for a task
@@ -324,7 +339,7 @@ pub const DataStore = struct {
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-    ) !*std.StringHashMapUnmanaged(TaskRunMetadata) {
+    ) !*std.AutoArrayHashMapUnmanaged(u64, TaskRunMetadata) {
         return self.task_runs.getPtr(task_id) orelse {
             try self.loadTaskRuns(gpa, task_id);
             return self.task_runs.getPtr(task_id) orelse unreachable;
