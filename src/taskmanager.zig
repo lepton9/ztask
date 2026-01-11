@@ -400,21 +400,60 @@ pub const TaskManager = struct {
         return self.tasks_changed.load(.seq_cst);
     }
 
+    /// Get task run jobs
+    pub fn buildTaskRunJobs(
+        allocator: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: u64,
+        // TODO: give a list of job names to get
+    ) ![]snap.UiJobSnap {
+        var buf: [64]u8 = undefined;
+
+        const job_metas = try data.DataStore.getRunJobMetas(
+            allocator,
+            task_id,
+            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
+        );
+        defer allocator.free(job_metas);
+        // TODO: make better
+        var jobs = try allocator.alloc(snap.UiJobSnap, job_metas.len);
+        for (job_metas, 0..) |meta, i| {
+            jobs[i] = .{
+                .job_name = try allocator.dupe(u8, meta.job_name),
+                .status = meta.status,
+                .start_time = meta.start_time,
+                .end_time = meta.end_time,
+                .exit_code = meta.exit_code,
+            };
+        }
+        return jobs;
+    }
+
     /// Build the current state of the task based on ID
     pub fn buildTaskState(
         self: *TaskManager,
         arena: std.mem.Allocator,
         task_id: []const u8,
+        options: snap.TaskStateOptions,
     ) !snap.UiTaskDetail {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const runs: []data.TaskRunMetadata = blk: {
+        const runs: []snap.UiTaskRunSnap = blk: {
             const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
             const run_metas = task_runs.values();
-            var runs = try arena.alloc(data.TaskRunMetadata, run_metas.len);
+            var runs = try arena.alloc(snap.UiTaskRunSnap, run_metas.len);
+
             for (run_metas, 0..) |*meta, offset| {
-                runs[run_metas.len - 1 - offset] = try meta.copy(arena);
+                const idx = run_metas.len - 1 - offset;
+                runs[idx] = .{ .state = .{ .completed = try meta.copy(arena) } };
+
+                // Get data for selected run
+                const selected_run = options.selected_run orelse continue;
+                const selected_id = selected_run.run_id orelse continue;
+                const cur_id = meta.run_id orelse continue;
+                if (selected_id != cur_id) continue;
+                runs[idx].jobs = try buildTaskRunJobs(arena, task_id, selected_id);
             }
             break :blk runs;
         };

@@ -152,6 +152,18 @@ pub const DataStore = struct {
         );
     }
 
+    /// Get and allocate the path for a task run jobs directory
+    pub fn taskRunJobsPath(
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: []const u8,
+    ) ![]u8 {
+        return std.fs.path.join(
+            gpa,
+            &.{ ROOT_DIR, "tasks", task_id, "runs", run_id, "jobs" },
+        );
+    }
+
     /// Get and allocate the path for job run metadata file
     pub fn jobRunMetaPath(
         gpa: std.mem.Allocator,
@@ -235,8 +247,8 @@ pub const DataStore = struct {
         return parseMetaFile(TaskRunMetadata, gpa, task_path);
     }
 
-    /// Load and parse a task run metadata file
-    fn loadJobRunMeta(
+    /// Load and parse a task run job metadata file
+    fn loadJobMeta(
         gpa: std.mem.Allocator,
         task_id: []const u8,
         run_id: []const u8,
@@ -245,6 +257,37 @@ pub const DataStore = struct {
         const job_path = try jobRunMetaPath(gpa, task_id, run_id, job_name);
         defer gpa.free(job_path);
         return parseMetaFile(JobRunMetadata, gpa, job_path);
+    }
+
+    /// Load and parse metafiles for all task run jobs
+    pub fn getRunJobMetas(
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: []const u8,
+    ) ![]JobRunMetadata {
+        const jobs_path = try taskRunJobsPath(gpa, task_id, run_id);
+        defer gpa.free(jobs_path);
+
+        var jobs = try std.ArrayList(JobRunMetadata).initCapacity(gpa, 5);
+        errdefer {
+            for (jobs.items) |*meta| meta.deinit(gpa);
+            jobs.deinit(gpa);
+        }
+
+        // TODO: dont iterate dir
+        var dir = try openDir(jobs_path, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const job_name = std.fs.path.basename(e.name);
+                const meta = loadJobMeta(gpa, task_id, run_id, job_name) catch
+                    null orelse continue;
+                try jobs.append(gpa, meta);
+            },
+            else => continue,
+        };
+        return try jobs.toOwnedSlice(gpa);
     }
 
     /// Load and parse a task metadata file
