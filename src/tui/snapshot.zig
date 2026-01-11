@@ -20,6 +20,10 @@ pub const TaskStatus = mergeEnums(
     data.TaskRunStatus,
 );
 
+pub const TaskStateOptions = struct {
+    selected_run: ?*const data.TaskRunMetadata = null,
+};
+
 pub const UiTaskSnap = struct {
     meta: data.TaskMetadata,
     status: TaskStatus,
@@ -27,7 +31,7 @@ pub const UiTaskSnap = struct {
 
 pub const UiTaskDetail = struct {
     task_id: []const u8,
-    past_runs: []data.TaskRunMetadata,
+    past_runs: []UiTaskRunSnap,
     active_run: ?UiTaskRunSnap = null,
 };
 
@@ -41,8 +45,10 @@ pub const UiTaskRunSnap = struct {
         },
         /// Currently waiting for a trigger
         wait: void,
+        /// Already completed run
+        completed: data.TaskRunMetadata,
     },
-    jobs: []UiJobSnap,
+    jobs: ?[]UiJobSnap = null,
 };
 
 pub const UiJobSnap = struct {
