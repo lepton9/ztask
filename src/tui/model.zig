@@ -91,6 +91,7 @@ pub const Model = struct {
                 } else if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
                     // Prev area
                 }
+                ctx.consumeEvent();
             },
             .focus_in => {},
             else => {},
@@ -330,21 +331,28 @@ const TaskSplit = struct {
                 if (key.matches('j', .{})) { // List down
                     self.task_list_view.nextItem(ctx);
                     try self.updateSelected();
+                    ctx.consumeAndRedraw();
                 } else if (key.matches('k', .{})) { // List up
                     self.task_list_view.prevItem(ctx);
                     try self.updateSelected();
+                    ctx.consumeAndRedraw();
                 }
                 // Run selected task
                 else if (key.matches('r', .{})) {
                     const selected = self.selectedTask() orelse return;
+                    if (selected.status != .inactive) return;
                     try self.model.dispatchTask(selected.meta.id);
+                    ctx.consumeAndRedraw();
                 }
                 // Stop selected task if running
                 else if (key.matches('s', .{})) {
                     const selected = self.selectedTask() orelse return;
+                    if (selected.status == .inactive) return;
                     self.model.stopTask(selected.meta.id);
+                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     try ctx.requestFocus(self.selected_task_view.widget());
+                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
                     try ctx.requestFocus(self.widget());
                 }
@@ -516,19 +524,29 @@ const TaskView = struct {
                 if (key.matches('j', .{})) {
                     if (self.tab == .run_list)
                         self.task_run_list_view.nextItem(ctx);
-                    ctx.consumeEvent();
+                    ctx.consumeAndRedraw();
                 } else if (key.matches('k', .{})) {
                     if (self.tab == .run_list)
                         self.task_run_list_view.prevItem(ctx);
-                    ctx.consumeEvent();
+                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    if (self.tab == .run_list)
-                        self.selectRunFromList();
+                    switch (self.tab) {
+                        .run_list => {
+                            self.selectRunFromList();
+                            self.tab = .task;
+                        },
+                        .task => {},
+                    }
+                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.tab, .{})) {
                     self.tab = switch (self.tab) {
                         .task => .run_list,
                         .run_list => .task,
                     };
+                    ctx.consumeAndRedraw();
+                } else if (key.matches(vaxis.Key.escape, .{})) {
+                    self.selected_run = null;
+                    self.tab = .task;
                     ctx.consumeAndRedraw();
                 }
             },
@@ -727,7 +745,6 @@ const TaskView = struct {
         if (selected.jobs == null) {
             selected.jobs = self.fetchRunSnap(selected);
         }
-        // TODO: go to the run view
     }
 
     /// Get the currently selected run from the list

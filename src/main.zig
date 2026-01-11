@@ -1,5 +1,4 @@
 const std = @import("std");
-const run = @import("run.zig");
 const cli_zig = @import("cli.zig");
 const zcli = cli_zig.zcli;
 

@@ -312,11 +312,11 @@ pub const Scheduler = struct {
     fn handleResults(self: *Scheduler) void {
         while (self.result_queue.pop()) |res| switch (res.result.runner) {
             .local => {
-                const kv = self.active_runners.fetchRemove(res.node) orelse
-                    @panic("Active runners should have the runner entry");
-                const runner = kv.value;
-                runner.joinThread();
-                self.pool.release(runner);
+                if (self.active_runners.fetchRemove(res.node)) |kv| {
+                    const runner = kv.value;
+                    runner.joinThread();
+                    self.pool.release(runner);
+                }
                 self.onJobCompleted(res.node, res.result);
             },
             .remote => {
