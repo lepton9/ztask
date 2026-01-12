@@ -630,24 +630,6 @@ const TaskView = struct {
         };
     }
 
-    /// Set the data for the selected task
-    fn setData(
-        self: *@This(),
-        selected: ?*const snap.UiTaskSnap,
-        state: ?snap.UiTaskDetail,
-    ) !void {
-        self.task = selected;
-        self.task_details = state;
-
-        const runs_n = if (state) |s| s.past_runs.len else 0;
-        self.task_runs_list_view.item_count = @intCast(runs_n);
-        self.task_runs_list_view.cursor = @min(
-            self.task_runs_list_view.cursor,
-            @max(0, @as(i32, @intCast(runs_n)) - 1),
-        );
-        self.task_runs_list_view.ensureScroll();
-    }
-
     /// Draw the surface for showing the currently selected or active run
     fn drawRunSurface(
         self: *TaskView,
@@ -656,9 +638,8 @@ const TaskView = struct {
         // Get the task run to show
         const run_snap: *const snap.UiTaskRunSnap = blk: {
             if (self.selected_run) |selected| break :blk selected;
-            const details = self.task_details orelse unreachable;
-            // TODO: handle orelse
-            const active_run = details.active_run orelse return self.job_list.draw(ctx);
+            const details = self.task_details orelse return .empty(self.widget());
+            const active_run = details.active_run orelse return .empty(self.widget());
             break :blk &active_run;
         };
 
@@ -691,13 +672,24 @@ const TaskView = struct {
                 }) catch "");
             },
         }
+        const run_text: vxfw.Text = .{ .text = try buffer.toOwnedSlice(ctx.arena) };
 
-        // TODO: job list
-
-        const selected_run_text: vxfw.Text = .{
-            .text = try buffer.toOwnedSlice(ctx.arena),
+        var children = try ctx.arena.alloc(vxfw.SubSurface, 2);
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try run_text.draw(ctx),
         };
-        return selected_run_text.draw(ctx);
+        children[1] = .{
+            .origin = .{ .row = children[0].surface.size.height + 1, .col = 0 },
+            .surface = try self.job_list.draw(ctx),
+        };
+
+        return .{
+            .size = ctx.max.size(),
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = children,
+        };
     }
 
     /// Build the widget for run list item at the index
@@ -705,7 +697,6 @@ const TaskView = struct {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
         const details = self.task_details orelse return null;
         if (idx >= details.past_runs.len) return null;
-
         const item = &details.past_runs[idx];
 
         return .{ .userdata = item, .drawFn = struct {
@@ -756,6 +747,24 @@ const TaskView = struct {
                 }
             }.draw,
         };
+    }
+
+    /// Set the data for the selected task
+    fn setData(
+        self: *@This(),
+        selected: ?*const snap.UiTaskSnap,
+        state: ?snap.UiTaskDetail,
+    ) !void {
+        self.task = selected;
+        self.task_details = state;
+
+        const runs_n = if (state) |s| s.past_runs.len else 0;
+        self.task_runs_list_view.item_count = @intCast(runs_n);
+        self.task_runs_list_view.cursor = @min(
+            self.task_runs_list_view.cursor,
+            @max(0, @as(i32, @intCast(runs_n)) - 1),
+        );
+        self.task_runs_list_view.ensureScroll();
     }
 
     /// Fetch details for the selected task run
