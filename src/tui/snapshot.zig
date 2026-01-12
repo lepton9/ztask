@@ -39,7 +39,7 @@ pub const UiTaskRunSnap = struct {
     state: union(enum) {
         /// Currently running
         run: struct {
-            run_id: []const u8,
+            run_id: u64,
             start_time: i64,
             status: data.TaskRunStatus = .running,
         },

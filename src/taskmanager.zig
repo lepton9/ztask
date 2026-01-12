@@ -489,21 +489,12 @@ pub const TaskManager = struct {
                 .jobs = jobs,
             };
 
-            var buf: [64]u8 = undefined;
             break :blk .{
-                .state = .{
-                    .run = .{
-                        // TODO: change to u64?
-                        .run_id = try arena.dupe(
-                            u8,
-                            try std.fmt.bufPrint(&buf, "{d}", .{
-                                run_meta.run_id orelse unreachable,
-                            }),
-                        ),
-                        .start_time = run_meta.start_time,
-                        .status = run_meta.status,
-                    },
-                },
+                .state = .{ .run = .{
+                    .run_id = run_meta.run_id orelse unreachable,
+                    .start_time = run_meta.start_time,
+                    .status = run_meta.status,
+                } },
                 .jobs = jobs,
             };
         };
