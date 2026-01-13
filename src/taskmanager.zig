@@ -408,25 +408,11 @@ pub const TaskManager = struct {
         // TODO: give a list of job names to get
     ) ![]snap.UiJobSnap {
         var buf: [64]u8 = undefined;
-
-        const job_metas = try data.DataStore.getRunJobMetas(
+        return data.DataStore.getRunJobMetas(
             allocator,
             task_id,
             try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
         );
-        defer allocator.free(job_metas);
-        // TODO: make better
-        var jobs = try allocator.alloc(snap.UiJobSnap, job_metas.len);
-        for (job_metas, 0..) |meta, i| {
-            jobs[i] = .{
-                .job_name = try allocator.dupe(u8, meta.job_name),
-                .status = meta.status,
-                .start_time = meta.start_time,
-                .end_time = meta.end_time,
-                .exit_code = meta.exit_code,
-            };
-        }
-        return jobs;
     }
 
     /// Build the current state of the task based on ID

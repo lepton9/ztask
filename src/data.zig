@@ -69,7 +69,7 @@ pub const TaskRunMetadata = struct {
 
 pub const JobRunMetadata = struct {
     job_name: []const u8,
-    start_time: i64,
+    start_time: ?i64 = null,
     end_time: ?i64 = null,
     exit_code: ?i32 = null,
     status: JobRunStatus = .pending,

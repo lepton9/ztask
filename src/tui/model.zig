@@ -680,16 +680,16 @@ const TaskView = struct {
         if (idx >= task.details.past_runs.len) return null;
         const item = &task.details.past_runs[idx];
 
-        return .{ .userdata = item, .drawFn = struct {
+        return .{ .userdata = &item.state.completed, .drawFn = struct {
             fn draw(
                 opq: *anyopaque,
                 ctx: vxfw.DrawContext,
             ) AllocError!vxfw.Surface {
-                const run_item: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
+                const meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
                 var text: vxfw.Text = .{ .text = try std.fmt.allocPrint(
                     ctx.arena,
                     "{d} {s}",
-                    .{ run_item.run_id orelse 0, @tagName(run_item.status) },
+                    .{ meta.run_id orelse 0, @tagName(meta.status) },
                 ) };
                 return text.draw(ctx);
             }

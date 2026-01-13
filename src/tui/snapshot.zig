@@ -52,13 +52,7 @@ pub const UiTaskRunSnap = struct {
     jobs: ?[]UiJobSnap = null,
 };
 
-pub const UiJobSnap = struct {
-    job_name: []const u8,
-    status: data.JobRunStatus = .pending,
-    start_time: ?i64 = null,
-    end_time: ?i64 = null,
-    exit_code: ?i32 = null,
-};
+pub const UiJobSnap = data.JobRunMetadata;
 
 /// Merge two enums into one
 fn mergeEnums(comptime A: type, comptime B: type) type {

@@ -91,7 +91,6 @@ pub const Scheduler = struct {
             node.id = @intFromPtr(node); // Set temporary ID for job node
             scheduler.job_metas.putAssumeCapacity(node, .{
                 .job_name = node.ptr.name,
-                .start_time = std.time.timestamp(),
             });
         }
 
