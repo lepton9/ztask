@@ -456,9 +456,11 @@ const TaskSplit = struct {
 
 const TaskView = struct {
     parent: *TaskSplit,
-    // TODO: combine optional
-    task: ?*const snap.UiTaskSnap = null,
-    task_details: ?*const snap.UiTaskDetail = null,
+
+    task: ?struct {
+        data: *const snap.UiTaskSnap,
+        details: *const snap.UiTaskDetail,
+    } = null,
 
     tab: enum { task, run_list } = .task,
 
@@ -547,7 +549,6 @@ const TaskView = struct {
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const task = self.task orelse return .empty(self.widget());
-        const details = self.task_details orelse return .empty(self.widget());
         var buf: [512]u8 = undefined;
         var task_buf = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
@@ -558,11 +559,11 @@ const TaskView = struct {
             \\Status: {s}
             \\Total runs: {d}
         , .{
-            task.meta.name,
-            task.meta.id,
-            task.meta.file_path,
-            @tagName(task.status),
-            details.past_runs.len,
+            task.data.meta.name,
+            task.data.meta.id,
+            task.data.meta.file_path,
+            @tagName(task.data.status),
+            task.details.past_runs.len,
         }) catch "");
 
         var task_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
@@ -675,9 +676,9 @@ const TaskView = struct {
     /// Build the widget for run list item at the index
     fn runListItemWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
-        const details = self.task_details orelse return null;
-        if (idx >= details.past_runs.len) return null;
-        const item = &details.past_runs[idx];
+        const task = self.task orelse return null;
+        if (idx >= task.details.past_runs.len) return null;
+        const item = &task.details.past_runs[idx];
 
         return .{ .userdata = item, .drawFn = struct {
             fn draw(
@@ -727,17 +728,19 @@ const TaskView = struct {
         selected: ?*const snap.UiTaskSnap,
         task_details: ?*const snap.UiTaskDetail,
     ) void {
-        self.task = selected;
-        self.task_details = task_details;
+        self.task = if (selected != null and task_details != null) .{
+            .data = selected.?,
+            .details = task_details.?,
+        } else null;
 
         self.job_list.item_count = 0;
         self.task_runs_list_view.item_count = 0;
 
-        if (task_details) |details| {
-            const runs_n = details.past_runs.len;
+        if (self.task) |task| {
+            const runs_n = task.details.past_runs.len;
             self.task_runs_list_view.item_count = @intCast(runs_n);
 
-            if (details.selected_run) |selected_run| {
+            if (task.details.selected_run) |selected_run| {
                 const jobs = selected_run.jobs orelse @panic("Should have jobs");
                 self.job_list.item_count = @intCast(jobs.len);
             }
@@ -760,9 +763,9 @@ const TaskView = struct {
     fn resetSelectedRun(self: *@This()) void {
         if (self.selected_run_id == null) return;
         self.selected_run_id = null;
-        const details = self.task_details orelse return;
         self.job_list.item_count = 0;
-        if (details.active_run) |a| {
+        const task = self.task orelse return;
+        if (task.details.active_run) |a| {
             self.job_list.item_count = if (a.jobs) |jobs| @intCast(jobs.len) else 0;
             self.job_list.cursor = 0;
         }
@@ -782,18 +785,18 @@ const TaskView = struct {
 
     /// Get the displayed task run
     fn displayedRun(self: *const TaskView) ?*const snap.UiTaskRunSnap {
-        const details = self.task_details orelse return null;
-        if (details.selected_run) |selected| return selected;
-        if (details.active_run) |*a| return a;
+        const task = self.task orelse return null;
+        if (task.details.selected_run) |selected| return selected;
+        if (task.details.active_run) |*a| return a;
         return null;
     }
 
     /// Get the currently selected run from the list
     fn selectedRunFromList(self: *@This()) ?*snap.UiTaskRunSnap {
+        const task = self.task orelse return null;
         const list_view = self.task_runs_list_view;
-        const details = self.task_details orelse return null;
-        if (list_view.cursor >= details.past_runs.len) return null;
-        return &details.past_runs[list_view.cursor];
+        if (list_view.cursor >= task.details.past_runs.len) return null;
+        return &task.details.past_runs[list_view.cursor];
     }
 };
 
