@@ -439,6 +439,9 @@ pub const TaskManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var selected_run: ?*const snap.UiTaskRunSnap = null;
+
+        // Build past runs for the task
         const runs: []snap.UiTaskRunSnap = blk: {
             const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
             const run_metas = task_runs.values();
@@ -449,15 +452,16 @@ pub const TaskManager = struct {
                 runs[idx] = .{ .state = .{ .completed = try meta.copy(arena) } };
 
                 // Get data for selected run
-                const selected_run = options.selected_run orelse continue;
-                const selected_id = selected_run.run_id orelse continue;
+                const selected_run_id = options.selected_run_id orelse continue;
                 const cur_id = meta.run_id orelse continue;
-                if (selected_id != cur_id) continue;
-                runs[idx].jobs = try buildTaskRunJobs(arena, task_id, selected_id);
+                if (selected_run_id != cur_id) continue;
+                runs[idx].jobs = try buildTaskRunJobs(arena, task_id, selected_run_id);
+                selected_run = &runs[idx];
             }
             break :blk runs;
         };
 
+        // Build the current run if task is running
         const active_run: ?snap.UiTaskRunSnap = blk: {
             const sched = self.getScheduler(task_id) orelse break :blk null;
             const run_meta = sched.task_meta;
@@ -503,6 +507,7 @@ pub const TaskManager = struct {
             .task_id = task_id,
             .past_runs = runs,
             .active_run = active_run,
+            .selected_run = selected_run,
         };
     }
 

@@ -21,7 +21,7 @@ pub const TaskStatus = mergeEnums(
 );
 
 pub const TaskStateOptions = struct {
-    selected_run: ?*const data.TaskRunMetadata = null,
+    selected_run_id: ?u64 = null,
 };
 
 pub const UiTaskSnap = struct {
@@ -33,6 +33,7 @@ pub const UiTaskDetail = struct {
     task_id: []const u8,
     past_runs: []UiTaskRunSnap,
     active_run: ?UiTaskRunSnap = null,
+    selected_run: ?*const UiTaskRunSnap = null,
 };
 
 pub const UiTaskRunSnap = struct {
