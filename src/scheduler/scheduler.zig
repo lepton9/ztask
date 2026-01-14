@@ -176,9 +176,15 @@ pub const Scheduler = struct {
             self.completeTask();
             return;
         }
-
-        for (self.nodes) |*node| node.reset();
         self.status = .running;
+
+        // Reset job nodes
+        for (self.nodes) |*node| {
+            node.reset();
+            const job_meta = self.job_metas.getPtr(node) orelse unreachable;
+            self.logger.initJobMeta(self.gpa, job_meta) catch {};
+        }
+
         // Find nodes without dependencies
         for (self.nodes) |*node| {
             if (node.readyToRun()) {
@@ -207,10 +213,9 @@ pub const Scheduler = struct {
         node.status = .running;
 
         self.active_runners.putAssumeCapacity(node, runner);
-        self.logger.startJob(
-            self.gpa,
-            self.job_metas.getPtr(node) orelse unreachable,
-        ) catch {};
+        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        job_meta.status = .running;
+        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
         runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
     }
 
@@ -219,10 +224,9 @@ pub const Scheduler = struct {
         const node = self.queue.pop() orelse return;
         node.status = .running;
 
-        self.logger.startJob(
-            self.gpa,
-            self.job_metas.getPtr(node) orelse unreachable,
-        ) catch {};
+        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        job_meta.status = .running;
+        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
 
         self.remote_manager.pushDispatch(.{
             .agent_name = node.ptr.run_on.remote,

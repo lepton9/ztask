@@ -93,7 +93,7 @@ pub const RunLogger = struct {
 
     /// Record the initial state of the job in a metadata file
     /// Creates the necessary paths and log files for the job
-    pub fn startJob(
+    pub fn initJobMeta(
         self: *RunLogger,
         gpa: std.mem.Allocator,
         meta: *JobRunMetadata,
@@ -112,7 +112,7 @@ pub const RunLogger = struct {
         defer file.close();
 
         // Reset job metadata
-        meta.status = .running;
+        meta.status = .pending;
         meta.start_time_ms = null;
         meta.end_time_ms = null;
         meta.exit_code = null;
