@@ -481,6 +481,49 @@ pub const DataStore = struct {
         res.value_ptr.* = meta_copy;
     }
 
+    /// Read a part of a job log file
+    pub fn readJobLogWindow(
+        allocator: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: u64,
+        job_name: []const u8,
+        window: struct { offset: ?u64 = null, size: usize },
+    ) ![]u8 {
+        var buf: [64]u8 = undefined;
+        const log_path = try DataStore.jobLogPath(
+            allocator,
+            task_id,
+            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
+            job_name,
+        );
+        defer allocator.free(log_path);
+
+        var file = std.fs.cwd().openFile(
+            log_path,
+            .{ .mode = .read_only },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return try allocator.alloc(u8, 0),
+            else => return err,
+        };
+        defer file.close();
+
+        // TODO: Return file size
+        const stat = try file.stat();
+        // TODO: handle orelse better
+        const offset: u64 = window.offset orelse stat.size - window.size;
+        // TODO: maybe just get whatever is left
+        if (offset >= stat.size) return try allocator.alloc(u8, 0);
+
+        const remaining: u64 = stat.size - offset;
+        const to_read: usize = @min(remaining, window.size);
+
+        try file.seekTo(offset);
+
+        var log_buf = try allocator.alloc(u8, to_read);
+        const n = try file.read(log_buf);
+        return log_buf[0..n];
+    }
+
     /// Update the task metafile in disk and the datastore hashmap
     pub fn updateTaskMeta(
         self: *DataStore,
