@@ -2,7 +2,7 @@ const std = @import("std");
 const queue = @import("../queue.zig");
 const task = @import("task");
 
-const log = std.log.scoped(.runner).info;
+const log = std.log.scoped(.runner).debug;
 
 const Node = @import("../scheduler/dag.zig").Node;
 pub const JobNode = Node(task.Job);
@@ -13,9 +13,9 @@ pub const Result = struct {
 };
 
 pub const LogEvent = union(enum) {
-    job_started: struct { job_node: *JobNode, timestamp: i64 },
+    job_started: struct { job_node: *JobNode, timestamp_ms: i64 },
     job_output: struct { job_node: *JobNode, step: u32, data: []const u8 },
-    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp: i64 },
+    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp_ms: i64 },
 };
 
 pub const ResultQueue = queue.MutexQueue(Result);
@@ -77,7 +77,7 @@ pub const LocalRunner = struct {
 
         logs.append(gpa, .{ .job_started = .{
             .job_node = job,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp_ms = std.time.milliTimestamp(),
         } }) catch {};
 
         var exit_code: i32 = 0;
@@ -104,7 +104,7 @@ pub const LocalRunner = struct {
         logs.append(gpa, .{ .job_finished = .{
             .job_node = job,
             .exit_code = exit_code,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp_ms = std.time.milliTimestamp(),
         } }) catch {};
         results.appendAssumeCapacity(
             .{ .node = job, .result = .{

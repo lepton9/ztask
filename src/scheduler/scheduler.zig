@@ -297,7 +297,7 @@ pub const Scheduler = struct {
         // Log job metadata
         var job_meta = self.job_metas.getPtr(node) orelse unreachable;
         job_meta.status = .interrupted;
-        job_meta.end_time = std.time.timestamp();
+        job_meta.end_time_ms = std.time.timestamp();
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
@@ -329,7 +329,7 @@ pub const Scheduler = struct {
         while (self.log_queue.pop()) |event| switch (event) {
             .job_started => |e| {
                 var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
-                job_meta.start_time = e.timestamp;
+                job_meta.start_time_ms = e.timestamp_ms;
                 self.logger.logJobMetadata(self.gpa, job_meta) catch {};
             },
             .job_output => |e| {
@@ -339,7 +339,7 @@ pub const Scheduler = struct {
             },
             .job_finished => |e| {
                 var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
-                job_meta.end_time = e.timestamp;
+                job_meta.end_time_ms = e.timestamp_ms;
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;
                 self.logger.logJobMetadata(self.gpa, job_meta) catch {};

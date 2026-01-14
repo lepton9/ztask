@@ -160,7 +160,7 @@ pub const RemoteManager = struct {
                     return error.NoDispatchedJob;
                 try req.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
                     .job_node = req.job_node,
-                    .timestamp = m.timestamp,
+                    .timestamp_ms = m.timestamp,
                 } });
             },
             .job_log => |m| {
@@ -179,7 +179,7 @@ pub const RemoteManager = struct {
                 try req.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
                     .job_node = req.job_node,
                     .exit_code = m.exit_code,
-                    .timestamp = m.timestamp,
+                    .timestamp_ms = m.timestamp,
                 } });
                 try req.scheduler.result_queue.append(self.gpa, .{
                     .node = req.job_node,

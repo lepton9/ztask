@@ -230,7 +230,7 @@ pub const RemoteAgent = struct {
             .job_started => |e| {
                 const msg: protocol.JobStartMsg = .{
                     .job_id = e.job_node.id,
-                    .timestamp = e.timestamp,
+                    .timestamp = e.timestamp_ms,
                 };
                 const payload = try self.parser.serialize(self.gpa, .{
                     .job_start = msg,
@@ -254,7 +254,7 @@ pub const RemoteAgent = struct {
             .job_finished => |e| {
                 const msg: protocol.JobEndMsg = .{
                     .job_id = e.job_node.id,
-                    .timestamp = e.timestamp,
+                    .timestamp = e.timestamp_ms,
                     .exit_code = e.exit_code,
                 };
                 const payload = try self.parser.serialize(self.gpa, .{

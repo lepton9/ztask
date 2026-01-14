@@ -733,24 +733,42 @@ const TaskView = struct {
         const run = self.displayedRun() orelse return null;
         const jobs = run.jobs orelse return null;
         if (idx >= jobs.len) return null;
-        const job = &jobs[idx];
+        const job_item = &jobs[idx];
 
-        return .{ .userdata = job, .drawFn = struct {
-            fn draw(
-                opq: *anyopaque,
-                ctx: vxfw.DrawContext,
-            ) AllocError!vxfw.Surface {
-                const job_item: *const snap.UiJobSnap = @ptrCast(@alignCast(opq));
-                var text: vxfw.Text = .{
-                    .text = try std.fmt.allocPrint(ctx.arena, "{s:<10} {s}", .{
-                        job_item.job_name,
-                        @tagName(job_item.status),
-                    }),
-                };
+        return .{
+            .userdata = job_item,
+            .drawFn = struct {
+                fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+                    const job: *const snap.UiJobSnap = @ptrCast(@alignCast(opq));
+                    var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
+                    var text: vxfw.RichText = .{ .text = segments };
 
-                return text.draw(ctx);
-            }
-        }.draw };
+                    segments[0] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{s:<10}", .{
+                            job.job_name,
+                        }),
+                    };
+                    segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
+                        @tagName(job.status),
+                    }) };
+                    // Time taken
+                    segments[2] = if (job.start_time_ms != null and job.end_time_ms != null)
+                        .{
+                            .text = try std.fmt.allocPrint(ctx.arena, " {d}s", .{
+                                @divFloor(
+                                    job.end_time_ms.? - job.start_time_ms.?,
+                                    std.time.ms_per_s,
+                                ),
+                            }),
+                            .style = .{ .dim = true },
+                        }
+                    else
+                        .{ .text = "" };
+
+                    return text.draw(ctx);
+                }
+            }.draw,
+        };
     }
 
     /// Set the data for the selected task

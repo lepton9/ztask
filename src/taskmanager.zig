@@ -466,8 +466,8 @@ pub const TaskManager = struct {
                             .pending
                         else
                             job_meta.status,
-                        .start_time = job_meta.start_time,
-                        .end_time = job_meta.end_time,
+                        .start_time_ms = job_meta.start_time_ms,
+                        .end_time_ms = job_meta.end_time_ms,
                         .exit_code = job_meta.exit_code,
                     };
                 }

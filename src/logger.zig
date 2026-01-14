@@ -113,8 +113,8 @@ pub const RunLogger = struct {
 
         // Reset job metadata
         meta.status = .running;
-        meta.start_time = std.time.timestamp();
-        meta.end_time = null;
+        meta.start_time_ms = null;
+        meta.end_time_ms = null;
         meta.exit_code = null;
 
         try self.logJobMetadata(gpa, meta);
