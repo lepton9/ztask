@@ -533,7 +533,7 @@ const TaskView = struct {
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
                     if (self.selected_run_id == null and self.tab == .task) return;
-                    self.resetSelectedRun();
+                    if (self.tab == .task) self.resetSelectedRun();
                     self.tab = .task;
                     ctx.consumeAndRedraw();
                 }
@@ -679,21 +679,52 @@ const TaskView = struct {
         const task = self.task orelse return null;
         if (idx >= task.details.past_runs.len) return null;
         const item = &task.details.past_runs[idx];
+        const meta = &item.state.completed;
 
-        return .{ .userdata = &item.state.completed, .drawFn = struct {
-            fn draw(
-                opq: *anyopaque,
-                ctx: vxfw.DrawContext,
-            ) AllocError!vxfw.Surface {
-                const meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
-                var text: vxfw.Text = .{ .text = try std.fmt.allocPrint(
-                    ctx.arena,
-                    "{d} {s}",
-                    .{ meta.run_id orelse 0, @tagName(meta.status) },
-                ) };
-                return text.draw(ctx);
-            }
-        }.draw };
+        const drawFn: *const fn (*anyopaque, vxfw.DrawContext) AllocError!vxfw.Surface = blk: {
+            // Selected run
+            if (self.selected_run_id) |id| if (id == meta.run_id orelse unreachable) {
+                break :blk struct {
+                    fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+                        const run_meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
+                        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+                        var text: vxfw.RichText = .{ .text = segments };
+
+                        segments[0] = .{
+                            .text = try std.fmt.allocPrint(ctx.arena, "{d} ", .{
+                                run_meta.run_id orelse 0,
+                            }),
+                            .style = .{ .fg = COLOR_SELECTED },
+                        };
+                        segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
+                            @tagName(run_meta.status),
+                        }) };
+
+                        return text.draw(ctx);
+                    }
+                }.draw;
+            };
+            // Not selected
+            break :blk struct {
+                fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+                    const run_meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
+                    var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+                    var text: vxfw.RichText = .{ .text = segments };
+
+                    segments[0] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{d} ", .{
+                            run_meta.run_id orelse 0,
+                        }),
+                    };
+                    segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
+                        @tagName(run_meta.status),
+                    }) };
+
+                    return text.draw(ctx);
+                }
+            }.draw;
+        };
+        return .{ .userdata = meta, .drawFn = drawFn };
     }
 
     /// Build the widget for job list item at the index
