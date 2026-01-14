@@ -49,7 +49,7 @@ pub const UiTaskRunSnap = struct {
         /// Already completed run
         completed: data.TaskRunMetadata,
     },
-    jobs: ?[]UiJobSnap = null,
+    jobs: []UiJobSnap = &.{},
 };
 
 pub const UiJobSnap = data.JobRunMetadata;

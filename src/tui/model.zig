@@ -731,9 +731,8 @@ const TaskView = struct {
     fn jobListItemWidget(ptr: *const anyopaque, idx: usize, _: usize) ?vxfw.Widget {
         const self: *const @This() = @ptrCast(@alignCast(ptr));
         const run = self.displayedRun() orelse return null;
-        const jobs = run.jobs orelse return null;
-        if (idx >= jobs.len) return null;
-        const job_item = &jobs[idx];
+        if (idx >= run.jobs.len) return null;
+        const job_item = &run.jobs[idx];
 
         return .{
             .userdata = job_item,
@@ -790,7 +789,10 @@ const TaskView = struct {
             self.task_runs_list_view.item_count = @intCast(runs_n);
 
             if (task.details.selected_run) |selected_run| {
-                const jobs = selected_run.jobs orelse @panic("Should have jobs");
+                const jobs = selected_run.jobs;
+                self.job_list.item_count = @intCast(jobs.len);
+            } else if (task.details.active_run) |active| {
+                const jobs = active.jobs;
                 self.job_list.item_count = @intCast(jobs.len);
             }
         }
@@ -815,7 +817,7 @@ const TaskView = struct {
         self.job_list.item_count = 0;
         const task = self.task orelse return;
         if (task.details.active_run) |a| {
-            self.job_list.item_count = if (a.jobs) |jobs| @intCast(jobs.len) else 0;
+            self.job_list.item_count = @intCast(a.jobs.len);
             self.job_list.cursor = 0;
         }
         self.job_list.ensureScroll();
@@ -868,20 +870,21 @@ const TaskListItem = struct {
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var text: vxfw.Text = .{ .text = self.task.meta.name };
+        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+        var text: vxfw.RichText = .{ .text = segments };
 
-        const task_name: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try text.draw(ctx),
+        segments[0] = .{
+            .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
+                self.task.meta.name,
+            }),
         };
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-        children[0] = task_name;
+        segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s:>10}", .{
+            switch (self.task.status) {
+                .inactive => "",
+                else => |status| @tagName(status),
+            },
+        }) };
 
-        return .{
-            .size = ctx.max.size(),
-            .widget = self.widget(),
-            .buffer = &.{},
-            .children = children,
-        };
+        return text.draw(ctx);
     }
 };

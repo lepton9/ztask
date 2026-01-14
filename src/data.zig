@@ -275,7 +275,8 @@ pub const DataStore = struct {
         }
 
         // TODO: dont iterate dir
-        var dir = try openDir(jobs_path, .{ .iterate = true });
+        var dir = openDir(jobs_path, .{ .iterate = true }) catch
+            return try jobs.toOwnedSlice(gpa);
         defer dir.close();
         var it = dir.iterate();
         while (it.next() catch null) |e| switch (e.kind) {
