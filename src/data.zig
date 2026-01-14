@@ -215,7 +215,10 @@ pub const DataStore = struct {
 
         var buf: [8]u8 = undefined;
         const next_id: u64 = blk: {
-            const file = cwd.openFile(counter_file_path, .{}) catch break :blk 1;
+            const file = cwd.openFile(counter_file_path, .{}) catch |err| {
+                if (err != error.FileNotFound) return err;
+                break :blk try findLastRun(gpa, task_id) + 1;
+            };
             defer file.close();
             var reader = file.reader(&.{});
             const read = reader.interface.readSliceShort(&buf) catch break :blk 1;
@@ -229,6 +232,28 @@ pub const DataStore = struct {
             .{ .truncate = true, .make_path = true },
         );
         return next_id;
+    }
+
+    /// Iterate the runs directory and find the last run id
+    inline fn findLastRun(gpa: std.mem.Allocator, task_id: []const u8) !u64 {
+        const runs_path = try DataStore.taskRunsPath(gpa, task_id);
+        defer gpa.free(runs_path);
+
+        var last_id: u64 = 0;
+        var dir = openDir(runs_path, .{ .iterate = true }) catch
+            return last_id;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const run_id = std.fs.path.basename(e.name);
+                const id = std.fmt.parseInt(u64, run_id, 10) catch
+                    continue;
+                if (id >= last_id) last_id = id;
+            },
+            else => continue,
+        };
+        return last_id;
     }
 
     /// Load and parse a task run metadata file
@@ -526,10 +551,12 @@ pub fn writeFile(
             if (std.fs.path.dirname(path)) |dir| try cwd.makePath(dir);
             break :blk try cwd.createFile(path, .{ .truncate = options.truncate });
         };
-
     defer file.close();
-    var writer = file.writer(&.{});
+
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(&buffer);
     try writer.interface.writeAll(content);
+    try writer.interface.flush();
 }
 
 /// Open a directory
