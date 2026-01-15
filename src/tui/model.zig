@@ -463,9 +463,20 @@ const TaskView = struct {
     } = null,
 
     tab: enum { task, run_list } = .task,
+    display_job_log: bool = false,
 
     /// Selected run from the past runs list
     selected_run_id: ?u64 = null,
+    selected_job: ?[]const u8 = null,
+
+    log_view_state: struct {
+        /// Log buffer size
+        window_size: usize = 2048,
+        /// Starting index in the log file
+        offset: u64 = 0,
+        /// Follow if logs are appended
+        follow: bool = true,
+    } = .{},
 
     job_list: vxfw.ListView,
     task_runs_list_view: vxfw.ListView,
@@ -521,7 +532,7 @@ const TaskView = struct {
                             self.tab = .task;
                         },
                         .task => {
-                            // TODO: job selecting
+                            self.selectCurrentJob();
                         },
                     }
                     ctx.consumeAndRedraw();
@@ -660,10 +671,56 @@ const TaskView = struct {
             .origin = .{ .row = 0, .col = 0 },
             .surface = try run_text.draw(ctx),
         };
-        children[1] = .{
-            .origin = .{ .row = children[0].surface.size.height + 1, .col = 0 },
-            .surface = try self.job_list.draw(ctx),
+
+        const job_area_origin: vxfw.RelativePoint = .{
+            .row = children[0].surface.size.height + 1,
+            .col = 0,
         };
+
+        // Display job log
+        const selected_job = self.selectedJobFromList();
+        if (self.display_job_log and selected_job != null) {
+            const job = selected_job orelse unreachable;
+
+            self.log_view_state.window_size = (ctx.max.height.? * ctx.max.width.?) * 2;
+
+            const log = if (self.selected_run_id) |run_id|
+                data.DataStore.readJobLogWindow(
+                    ctx.arena,
+                    self.task.?.data.meta.id,
+                    run_id,
+                    job.job_name,
+                    .{
+                        .offset = if (self.log_view_state.follow)
+                            null
+                        else
+                            self.log_view_state.offset,
+                        .size = self.log_view_state.window_size,
+                    },
+                ) catch .{ &.{}, 0 }
+            else
+                .{ &.{}, 0 }; // TODO: Current run
+
+            const log_text = log.@"0";
+            const file_size = log.@"1";
+
+            // Set offset
+            if (self.log_view_state.follow) {
+                self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
+                    @as(i64, @intCast(self.log_view_state.window_size)), 0);
+            }
+
+            const t: vxfw.Text = .{ .text = log_text };
+            children[1] = .{
+                .origin = job_area_origin,
+                .surface = try t.draw(ctx),
+            };
+        } else {
+            children[1] = .{
+                .origin = job_area_origin,
+                .surface = try self.job_list.draw(ctx),
+            };
+        }
 
         return .{
             .size = ctx.max.size(),
@@ -842,12 +899,33 @@ const TaskView = struct {
         return null;
     }
 
+    /// Select the job under the cursor from the job list
+    fn selectCurrentJob(self: *@This()) void {
+        // TODO:
+        // use vxfw.ScrollView
+        // initial offset, get from the first log fetch
+        // offset = max(file_size - window_size, 0)
+        // update winsize before drawing
+        self.display_job_log = false;
+        _ = self.selectedJobFromList() orelse return;
+        self.display_job_log = true;
+        self.log_view_state.follow = true;
+        self.log_view_state.offset = 0;
+    }
+
     /// Get the currently selected run from the list
     fn selectedRunFromList(self: *@This()) ?*snap.UiTaskRunSnap {
         const task = self.task orelse return null;
         const list_view = self.task_runs_list_view;
         if (list_view.cursor >= task.details.past_runs.len) return null;
         return &task.details.past_runs[list_view.cursor];
+    }
+
+    /// Get the currently selected job from the list
+    fn selectedJobFromList(self: *@This()) ?*snap.UiJobSnap {
+        const run = self.displayedRun() orelse return null;
+        if (self.job_list.cursor >= run.jobs.len) return null;
+        return &run.jobs[self.job_list.cursor];
     }
 };
 

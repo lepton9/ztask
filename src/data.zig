@@ -488,7 +488,7 @@ pub const DataStore = struct {
         run_id: u64,
         job_name: []const u8,
         window: struct { offset: ?u64 = null, size: usize },
-    ) ![]u8 {
+    ) !struct { []u8, u64 } {
         var buf: [64]u8 = undefined;
         const log_path = try DataStore.jobLogPath(
             allocator,
@@ -502,17 +502,15 @@ pub const DataStore = struct {
             log_path,
             .{ .mode = .read_only },
         ) catch |err| switch (err) {
-            error.FileNotFound => return try allocator.alloc(u8, 0),
+            error.FileNotFound => return .{ try allocator.alloc(u8, 0), 0 },
             else => return err,
         };
         defer file.close();
 
-        // TODO: Return file size
         const stat = try file.stat();
-        // TODO: handle orelse better
-        const offset: u64 = window.offset orelse stat.size - window.size;
-        // TODO: maybe just get whatever is left
-        if (offset >= stat.size) return try allocator.alloc(u8, 0);
+        const offset: u64 = window.offset orelse
+            @max(@as(i64, @intCast(stat.size)) - @as(i64, @intCast(window.size)), 0);
+        if (offset >= stat.size) return .{ try allocator.alloc(u8, 0), stat.size };
 
         const remaining: u64 = stat.size - offset;
         const to_read: usize = @min(remaining, window.size);
@@ -521,7 +519,7 @@ pub const DataStore = struct {
 
         var log_buf = try allocator.alloc(u8, to_read);
         const n = try file.read(log_buf);
-        return log_buf[0..n];
+        return .{ log_buf[0..n], stat.size };
     }
 
     /// Update the task metafile in disk and the datastore hashmap
