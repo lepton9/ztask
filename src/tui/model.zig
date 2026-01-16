@@ -356,10 +356,10 @@ const TaskSplit = struct {
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const max_size = ctx.max.size();
 
-        var flex_children =
+        var flex_row_children =
             try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
 
-        const list_bordered: vxfw.Border = .{
+        const tasks_list_bordered: vxfw.Border = .{
             .child = self.task_list_view.widget(),
             .labels = &[_]vxfw.Border.BorderLabel{.{
                 .text = "Tasks",
@@ -371,38 +371,22 @@ const TaskSplit = struct {
             } },
         };
 
-        const task_bordered: vxfw.Border = .{
-            .child = self.selected_task_view.widget(),
-            .labels = &[_]vxfw.Border.BorderLabel{.{
-                .text = "Selected",
-                .alignment = .top_left,
-            }},
-            .style = .{ .fg = switch (self.model.active) {
-                .task_view => COLOR_SELECTED,
-                else => .default,
-            } },
-        };
-
-        flex_children.appendAssumeCapacity(.init(list_bordered.widget(), 1));
-        flex_children.appendAssumeCapacity(.init(task_bordered.widget(), 3));
-
+        flex_row_children.appendAssumeCapacity(.init(tasks_list_bordered.widget(), 1));
+        flex_row_children.appendAssumeCapacity(
+            .init(self.selected_task_view.widget(), 3),
+        );
         const flex: vxfw.FlexRow = .{
-            .children = try flex_children.toOwnedSlice(ctx.arena),
-        };
-
-        const flex_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 0 },
-            .surface = try flex.draw(ctx.withConstraints(
-                .{ .width = 2, .height = 2 },
-                .{ .width = max_size.width, .height = max_size.height },
-            )),
+            .children = try flex_row_children.toOwnedSlice(ctx.arena),
         };
 
         const children = try ctx.arena.alloc(vxfw.SubSurface, 1);
-        children[0] = flex_surf;
+        children[0] = .{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try flex.draw(ctx),
+        };
 
         return .{
-            .size = ctx.max.size(),
+            .size = max_size,
             .widget = self.widget(),
             .buffer = &.{},
             .children = children,
@@ -516,11 +500,13 @@ const TaskView = struct {
             .init => {},
             .key_press => |key| {
                 if (key.matches('j', .{})) {
+                    // TODO: handle when in job log view
                     switch (self.tab) {
                         .task => self.job_list.nextItem(ctx),
                         .run_list => self.task_runs_list_view.nextItem(ctx),
                     }
                 } else if (key.matches('k', .{})) {
+                    // TODO: handle when in job log view
                     switch (self.tab) {
                         .task => self.job_list.prevItem(ctx),
                         .run_list => self.task_runs_list_view.prevItem(ctx),
@@ -543,6 +529,7 @@ const TaskView = struct {
                     };
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
+                    // TODO: handle when in job log view
                     if (self.selected_run_id == null and self.tab == .task) return;
                     if (self.tab == .task) self.resetSelectedRun();
                     self.tab = .task;
@@ -559,9 +546,32 @@ const TaskView = struct {
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+        const max = ctx.max.size();
         const task = self.task orelse return .empty(self.widget());
         var buf: [512]u8 = undefined;
         var task_buf = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
+
+        // const children_task = try ctx.arena.alloc(vxfw.SubSurface, 3);
+        // children_task[0] = task_surf;
+        // children_task[1] = .{
+        //     .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
+        //     .surface = try tab.draw(ctx),
+        // };
+        //
+        // const run_area_row: u16 = @as(u16, @intCast(children_task[1].origin.row)) +
+        //     children_task[1].surface.size.height;
+        // const size = ctx.max.size();
+        // const run_area_ctx = ctx.withConstraints(
+        //     .{ .width = 1, .height = 1 },
+        //     .{ .width = size.width, .height = @max(0, size.height - run_area_row) },
+        // );
+        // children_task[2] = .{
+        //     .origin = .{ .row = run_area_row, .col = 1 },
+        //     .surface = switch (self.tab) {
+        //         .task => try self.drawRunSurface(run_area_ctx),
+        //         .run_list => try self.task_runs_list_view.draw(run_area_ctx),
+        //     },
+        // };
 
         try task_buf.appendSlice(ctx.arena, std.fmt.bufPrint(&buf,
             \\Task: {s}
@@ -578,9 +588,9 @@ const TaskView = struct {
         }) catch "");
 
         var task_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
-        const task_surf: vxfw.SubSurface = .{
-            .origin = .{ .row = 0, .col = 1 },
-            .surface = try task_text.draw(ctx),
+        const task_text_sized: vxfw.SizedBox = .{
+            .child = task_text.widget(),
+            .size = .{ .width = max.width, .height = 6 },
         };
 
         var tabs = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
@@ -596,34 +606,96 @@ const TaskView = struct {
 
         const tab: vxfw.RichText = .{ .text = tabs };
 
-        const children = try ctx.arena.alloc(vxfw.SubSurface, 3);
-        children[0] = task_surf;
-        children[1] = .{
-            .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
-            .surface = try tab.draw(ctx),
+        const selected_job = self.selectedJobFromList();
+
+        // TODO: change scale
+        const areas_h: struct { u16, u16 } =
+            if (self.display_job_log and selected_job != null)
+                .{ @divFloor(max.height, 2), @divFloor(max.height, 2) - 1 }
+            else
+                .{ max.height, 0 };
+
+        const runs_sized: vxfw.SizedBox = .{
+            .child = switch (self.tab) {
+                .task => .{
+                    .userdata = self,
+                    .drawFn = &TaskView.drawRunSurfaceTypeErased,
+                },
+                .run_list => self.task_runs_list_view.widget(),
+            },
+            .size = .{ .width = max.width, .height = areas_h.@"0" - 9 },
         };
 
-        const run_area_row: u16 = @as(u16, @intCast(children[1].origin.row)) +
-            children[1].surface.size.height;
-        const size = ctx.max.size();
-        const run_area_ctx = ctx.withConstraints(
-            .{ .width = 1, .height = 1 },
-            .{ .width = size.width, .height = @max(0, size.height - run_area_row) },
-        );
-        children[2] = .{
-            .origin = .{ .row = run_area_row, .col = 1 },
-            .surface = switch (self.tab) {
-                .task => try self.drawRunSurface(run_area_ctx),
-                .run_list => try self.task_runs_list_view.draw(run_area_ctx),
-            },
+        const children_task = try ctx.arena.alloc(vxfw.FlexItem, 3);
+        var task_flex: vxfw.FlexColumn = .{ .children = children_task };
+        children_task[0] = .init(task_text_sized.widget(), 0);
+        children_task[1] = .init(tab.widget(), 0);
+        children_task[2] = .init(runs_sized.widget(), 0);
+
+        // TODO: flex needs to be drawn with context and size
+        const task_bordered: vxfw.Border = .{
+            .child = task_flex.widget(),
+            .labels = &[_]vxfw.Border.BorderLabel{.{
+                .text = "Selected",
+                .alignment = .top_left,
+            }},
+            .style = .{ .fg = switch (self.parent.model.active) {
+                .task_view => COLOR_SELECTED,
+                else => .default,
+            } },
         };
+
+        var children = try std.ArrayList(vxfw.SubSurface).initCapacity(
+            ctx.arena,
+            2,
+        );
+        children.appendAssumeCapacity(.{
+            .origin = .{ .row = 0, .col = 0 },
+            .surface = try task_bordered.draw(ctx.withConstraints(
+                .{ .width = max.width, .height = areas_h.@"0" },
+                .{ .width = max.width, .height = areas_h.@"0" },
+            )),
+        });
+
+        if (areas_h.@"1" > 0) {
+            // TODO:
+            const temp_log: vxfw.Text = .{ .text = try ctx.arena.alloc(u8, 0) };
+            const job_log_bordered: vxfw.Border = .{
+                .child = temp_log.widget(),
+                .labels = &[_]vxfw.Border.BorderLabel{.{
+                    .text = "Log",
+                    .alignment = .top_left,
+                }},
+                .style = .{ .fg = .default },
+            };
+
+            children.appendAssumeCapacity(.{
+                .origin = .{
+                    .row = children.items[0].origin.row +
+                        children.items[0].surface.size.height,
+                    .col = 0,
+                },
+                .surface = try job_log_bordered.draw(ctx.withConstraints(
+                    .{ .width = max.width, .height = areas_h.@"1" },
+                    .{ .width = max.width, .height = areas_h.@"1" },
+                )),
+            });
+        }
 
         return .{
-            .size = ctx.max.size(),
+            .size = max,
             .widget = self.widget(),
             .buffer = &.{},
-            .children = children,
+            .children = try children.toOwnedSlice(ctx.arena),
         };
+    }
+
+    fn drawRunSurfaceTypeErased(
+        ptr: *anyopaque,
+        ctx: vxfw.DrawContext,
+    ) AllocError!vxfw.Surface {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.drawRunSurface(ctx);
     }
 
     /// Draw the surface for showing the currently selected or active run
@@ -632,22 +704,34 @@ const TaskView = struct {
         ctx: vxfw.DrawContext,
     ) AllocError!vxfw.Surface {
         const run_snap = self.displayedRun() orelse {
-            return .empty(self.widget());
+            // return .empty(self.widget());
+            return .{
+                .size = ctx.max.size(),
+                .widget = self.widget(),
+                .buffer = &.{},
+                .children = &.{},
+            };
         };
 
         var scratch: [512]u8 = undefined;
         var buffer = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
+        var text_height: u16 = 0;
+
         switch (run_snap.state) {
-            .wait => try buffer.appendSlice(
-                ctx.arena,
-                std.fmt.bufPrint(&scratch, "Waiting for trigger...\n", .{}) catch "",
-            ),
+            .wait => {
+                try buffer.appendSlice(
+                    ctx.arena,
+                    std.fmt.bufPrint(&scratch, "Waiting for trigger...\n", .{}) catch "",
+                );
+                text_height = 1;
+            },
             .run => |*run| {
                 try buffer.appendSlice(ctx.arena, std.fmt.bufPrint(&scratch,
                     \\Run {d}: {s}
                     \\Start time {d}
                 , .{ run.run_id, @tagName(run.status), run.start_time }) catch "");
+                text_height = 2;
             },
             .completed => |meta| {
                 try buffer.appendSlice(ctx.arena, std.fmt.bufPrint(&scratch,
@@ -662,6 +746,7 @@ const TaskView = struct {
                     meta.jobs_completed,
                     meta.jobs_total,
                 }) catch "");
+                text_height = 3;
             },
         }
         const run_text: vxfw.Text = .{ .text = try buffer.toOwnedSlice(ctx.arena) };
@@ -673,54 +758,59 @@ const TaskView = struct {
         };
 
         const job_area_origin: vxfw.RelativePoint = .{
-            .row = children[0].surface.size.height + 1,
+            .row = text_height + 1,
             .col = 0,
         };
 
+        children[1] = .{
+            .origin = job_area_origin,
+            .surface = try self.job_list.draw(ctx),
+        };
+
         // Display job log
-        const selected_job = self.selectedJobFromList();
-        if (self.display_job_log and selected_job != null) {
-            const job = selected_job orelse unreachable;
-
-            self.log_view_state.window_size = (ctx.max.height.? * ctx.max.width.?) * 2;
-
-            const log = if (self.selected_run_id) |run_id|
-                data.DataStore.readJobLogWindow(
-                    ctx.arena,
-                    self.task.?.data.meta.id,
-                    run_id,
-                    job.job_name,
-                    .{
-                        .offset = if (self.log_view_state.follow)
-                            null
-                        else
-                            self.log_view_state.offset,
-                        .size = self.log_view_state.window_size,
-                    },
-                ) catch .{ &.{}, 0 }
-            else
-                .{ &.{}, 0 }; // TODO: Current run
-
-            const log_text = log.@"0";
-            const file_size = log.@"1";
-
-            // Set offset
-            if (self.log_view_state.follow) {
-                self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
-                    @as(i64, @intCast(self.log_view_state.window_size)), 0);
-            }
-
-            const t: vxfw.Text = .{ .text = log_text };
-            children[1] = .{
-                .origin = job_area_origin,
-                .surface = try t.draw(ctx),
-            };
-        } else {
-            children[1] = .{
-                .origin = job_area_origin,
-                .surface = try self.job_list.draw(ctx),
-            };
-        }
+        // const selected_job = self.selectedJobFromList();
+        // if (self.display_job_log and selected_job != null) {
+        //     const job = selected_job orelse unreachable;
+        //
+        //     self.log_view_state.window_size = (ctx.max.height.? * ctx.max.width.?) * 2;
+        //
+        //     const log = if (self.selected_run_id) |run_id|
+        //         data.DataStore.readJobLogWindow(
+        //             ctx.arena,
+        //             self.task.?.data.meta.id,
+        //             run_id,
+        //             job.job_name,
+        //             .{
+        //                 .offset = if (self.log_view_state.follow)
+        //                     null
+        //                 else
+        //                     self.log_view_state.offset,
+        //                 .size = self.log_view_state.window_size,
+        //             },
+        //         ) catch .{ &.{}, 0 }
+        //     else
+        //         .{ &.{}, 0 }; // TODO: Current run
+        //
+        //     const log_text = log.@"0";
+        //     const file_size = log.@"1";
+        //
+        //     // Set offset
+        //     if (self.log_view_state.follow) {
+        //         self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
+        //             @as(i64, @intCast(self.log_view_state.window_size)), 0);
+        //     }
+        //
+        //     const t: vxfw.Text = .{ .text = log_text };
+        //     children[1] = .{
+        //         .origin = job_area_origin,
+        //         .surface = try t.draw(ctx),
+        //     };
+        // } else {
+        //     children[1] = .{
+        //         .origin = job_area_origin,
+        //         .surface = try self.job_list.draw(ctx),
+        //     };
+        // }
 
         return .{
             .size = ctx.max.size(),
