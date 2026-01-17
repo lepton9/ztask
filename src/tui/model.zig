@@ -11,7 +11,16 @@ const UiSnapshot = snap.UiSnapshot;
 
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
+
 const COLOR_SELECTED: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
+const COLOR_GREEN: vaxis.Color = .{ .rgb = .{ 0, 255, 0 } };
+const COLOR_RED: vaxis.Color = .{ .rgb = .{ 255, 0, 0 } };
+const COLOR_YELLOW: vaxis.Color = .{ .rgb = .{ 255, 255, 0 } };
+
+const StatusText = struct {
+    text: []const u8 = "",
+    color: vaxis.Color = .default,
+};
 
 fn isQuit(key: vaxis.Key) bool {
     if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
@@ -616,10 +625,10 @@ const TaskView = struct {
         const Areas = struct { task: Area, job_log: Area = .{ .height = 0 } };
         const areas: Areas = switch (self.parent.model.active) {
             .task_view => blk: {
-                // TODO: change scale
+                const task_h = @divFloor(max.height, 4);
                 if (self.display_job_log and selected_job != null) break :blk .{
-                    .task = .{ .height = @divFloor(max.height, 2) },
-                    .job_log = .{ .height = @divFloor(max.height, 2) - 1, .selected = true },
+                    .task = .{ .height = task_h },
+                    .job_log = .{ .height = max.height - task_h - 2, .selected = true },
                 };
                 break :blk .{ .task = .{ .height = max.height, .selected = true } };
             },
@@ -685,6 +694,7 @@ const TaskView = struct {
             const text: vxfw.Text = .{ .text = log_text };
 
             // TODO: use vxfw.ScrollView
+            // or just move the offset
             const job_log_bordered: vxfw.Border = .{
                 .child = text.widget(),
                 .labels = &[_]vxfw.Border.BorderLabel{.{
@@ -728,14 +738,11 @@ const TaskView = struct {
         self: *TaskView,
         ctx: vxfw.DrawContext,
     ) AllocError!vxfw.Surface {
-        const run_snap = self.displayedRun() orelse {
-            // return .empty(self.widget());
-            return .{
-                .size = ctx.max.size(),
-                .widget = self.widget(),
-                .buffer = &.{},
-                .children = &.{},
-            };
+        const run_snap = self.displayedRun() orelse return .{
+            .size = ctx.max.size(),
+            .widget = self.widget(),
+            .buffer = &.{},
+            .children = &.{},
         };
 
         var scratch: [512]u8 = undefined;
@@ -808,29 +815,38 @@ const TaskView = struct {
         const item = &task.details.past_runs[idx];
         const meta = &item.state.completed;
 
-        const drawFn: *const fn (*anyopaque, vxfw.DrawContext) AllocError!vxfw.Surface = blk: {
+        const DrawFnType = *const fn (*anyopaque, vxfw.DrawContext) AllocError!vxfw.Surface;
+        const drawFn: DrawFnType = blk: {
             // Selected run
-            if (self.selected_run_id) |id| if (id == meta.run_id orelse unreachable) {
-                break :blk struct {
-                    fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-                        const run_meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
-                        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
-                        var text: vxfw.RichText = .{ .text = segments };
+            if (self.selected_run_id) |id| if (id == meta.run_id.?) break :blk struct {
+                fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+                    const run_meta: *const data.TaskRunMetadata = @ptrCast(@alignCast(opq));
+                    var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+                    var text: vxfw.RichText = .{ .text = segments };
 
-                        segments[0] = .{
-                            .text = try std.fmt.allocPrint(ctx.arena, "{d} ", .{
-                                run_meta.run_id orelse 0,
-                            }),
-                            .style = .{ .fg = COLOR_SELECTED },
-                        };
-                        segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-                            @tagName(run_meta.status),
-                        }) };
+                    const tag: StatusText = switch (run_meta.status) {
+                        .success => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                        .failed, .interrupted => |s| .{
+                            .text = @tagName(s),
+                            .color = COLOR_RED,
+                        },
+                        else => |s| .{ .text = @tagName(s) },
+                    };
 
-                        return text.draw(ctx);
-                    }
-                }.draw;
-            };
+                    segments[0] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{d} ", .{
+                            run_meta.run_id orelse 0,
+                        }),
+                        .style = .{ .fg = COLOR_SELECTED },
+                    };
+                    segments[1] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{tag.text}),
+                        .style = .{ .fg = tag.color },
+                    };
+
+                    return text.draw(ctx);
+                }
+            }.draw;
             // Not selected
             break :blk struct {
                 fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
@@ -838,14 +854,24 @@ const TaskView = struct {
                     var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
                     var text: vxfw.RichText = .{ .text = segments };
 
+                    const tag: StatusText = switch (run_meta.status) {
+                        .success => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                        .failed, .interrupted => |s| .{
+                            .text = @tagName(s),
+                            .color = COLOR_RED,
+                        },
+                        else => |s| .{ .text = @tagName(s) },
+                    };
+
                     segments[0] = .{
                         .text = try std.fmt.allocPrint(ctx.arena, "{d} ", .{
                             run_meta.run_id orelse 0,
                         }),
                     };
-                    segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-                        @tagName(run_meta.status),
-                    }) };
+                    segments[1] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{tag.text}),
+                        .style = .{ .fg = tag.color },
+                    };
 
                     return text.draw(ctx);
                 }
@@ -869,14 +895,25 @@ const TaskView = struct {
                     var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
                     var text: vxfw.RichText = .{ .text = segments };
 
+                    const tag: StatusText = switch (job.status) {
+                        .success => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                        .failed, .interrupted => |s| .{
+                            .text = @tagName(s),
+                            .color = COLOR_RED,
+                        },
+                        .pending => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
+                        .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                    };
+
                     segments[0] = .{
                         .text = try std.fmt.allocPrint(ctx.arena, "{s:<10}", .{
                             job.job_name,
                         }),
                     };
-                    segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-                        @tagName(job.status),
-                    }) };
+                    segments[1] = .{
+                        .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{tag.text}),
+                        .style = .{ .fg = tag.color },
+                    };
                     // Time taken
                     segments[2] = if (job.start_time_ms != null and job.end_time_ms != null)
                         .{
@@ -904,7 +941,7 @@ const TaskView = struct {
         job: *const snap.UiJobSnap,
         area: struct { height: u16, width: u16 },
     ) struct { []u8, u64 } {
-        self.log_view_state.window_size = (area.width * area.height) * 2;
+        self.log_view_state.window_size = area.width * (area.height);
         return if (self.selected_run_id) |run_id|
             data.DataStore.readJobLogWindow(
                 arena,
@@ -1042,17 +1079,20 @@ const TaskListItem = struct {
         var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
         var text: vxfw.RichText = .{ .text = segments };
 
-        segments[0] = .{
-            .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-                self.task.meta.name,
-            }),
+        const tag: StatusText = switch (self.task.status) {
+            .inactive => .{},
+            .waiting => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
+            .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+            else => |s| .{ .text = @tagName(s) },
         };
-        segments[1] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s:>10}", .{
-            switch (self.task.status) {
-                .inactive => "",
-                else => |status| @tagName(status),
-            },
+
+        segments[0] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
+            self.task.meta.name,
         }) };
+        segments[1] = .{
+            .text = try std.fmt.allocPrint(ctx.arena, "{s:>10}", .{tag.text}),
+            .style = .{ .fg = tag.color },
+        };
 
         return text.draw(ctx);
     }
