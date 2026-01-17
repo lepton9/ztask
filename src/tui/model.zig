@@ -500,17 +500,9 @@ const TaskView = struct {
             .init => {},
             .key_press => |key| {
                 if (key.matches('j', .{})) {
-                    // TODO: handle when in job log view
-                    switch (self.tab) {
-                        .task_run => self.job_list.nextItem(ctx),
-                        .run_list => self.task_runs_list_view.nextItem(ctx),
-                    }
+                    self.handleDown(ctx);
                 } else if (key.matches('k', .{})) {
-                    // TODO: handle when in job log view
-                    switch (self.tab) {
-                        .task_run => self.job_list.prevItem(ctx),
-                        .run_list => self.task_runs_list_view.prevItem(ctx),
-                    }
+                    self.handleUp(ctx);
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     switch (self.tab) {
                         .run_list => {
@@ -523,15 +515,19 @@ const TaskView = struct {
                     }
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.tab, .{})) {
+                    defer ctx.consumeAndRedraw();
+                    if (self.display_job_log) return;
                     self.tab = switch (self.tab) {
                         .task_run => .run_list,
                         .run_list => .task_run,
                     };
-                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
-                    // TODO: handle when in job log view
                     if (self.selected_run_id == null and self.tab == .task_run) return;
-                    if (self.tab == .task_run) self.resetSelectedRun();
+                    if (self.tab == .task_run) {
+                        if (self.display_job_log) {
+                            self.display_job_log = false;
+                        } else self.resetSelectedRun();
+                    }
                     self.tab = .task_run;
                     ctx.consumeAndRedraw();
                 }
@@ -542,6 +538,36 @@ const TaskView = struct {
                 self.job_list.cursor = 0;
             },
             else => {},
+        }
+    }
+
+    /// Handle up key press
+    inline fn handleUp(self: *@This(), ctx: *vxfw.EventContext) void {
+        switch (self.tab) {
+            .task_run => {
+                if (self.display_job_log) {
+                    // TODO: handle
+                    ctx.consumeEvent();
+                    return;
+                }
+                self.job_list.prevItem(ctx);
+            },
+            .run_list => self.task_runs_list_view.prevItem(ctx),
+        }
+    }
+
+    /// Handle down key press
+    inline fn handleDown(self: *@This(), ctx: *vxfw.EventContext) void {
+        switch (self.tab) {
+            .task_run => {
+                if (self.display_job_log) {
+                    // TODO: handle
+                    ctx.consumeEvent();
+                    return;
+                }
+                self.job_list.nextItem(ctx);
+            },
+            .run_list => self.task_runs_list_view.nextItem(ctx),
         }
     }
 
@@ -585,12 +611,20 @@ const TaskView = struct {
 
         const selected_job = self.selectedJobFromList();
 
-        // TODO: change scale
-        const area_heights: struct { u16, u16 } =
-            if (self.display_job_log and selected_job != null)
-                .{ @divFloor(max.height, 2), @divFloor(max.height, 2) - 1 }
-            else
-                .{ max.height, 0 };
+        // Calculate the bordered area sizes and selection
+        const Area = struct { height: u16, selected: bool = false };
+        const Areas = struct { task: Area, job_log: Area = .{ .height = 0 } };
+        const areas: Areas = switch (self.parent.model.active) {
+            .task_view => blk: {
+                // TODO: change scale
+                if (self.display_job_log and selected_job != null) break :blk .{
+                    .task = .{ .height = @divFloor(max.height, 2) },
+                    .job_log = .{ .height = @divFloor(max.height, 2) - 1, .selected = true },
+                };
+                break :blk .{ .task = .{ .height = max.height, .selected = true } };
+            },
+            else => .{ .task = .{ .height = max.height } },
+        };
 
         const list_area: vxfw.SizedBox = .{
             .child = switch (self.tab) {
@@ -600,7 +634,7 @@ const TaskView = struct {
                 },
                 .run_list => self.task_runs_list_view.widget(),
             },
-            .size = .{ .width = max.width, .height = area_heights.@"0" - 9 },
+            .size = .{ .width = max.width, .height = areas.task.height - 9 },
         };
 
         const children_flex = try ctx.arena.alloc(vxfw.FlexItem, 3);
@@ -615,10 +649,7 @@ const TaskView = struct {
                 .text = "Selected",
                 .alignment = .top_left,
             }},
-            .style = .{ .fg = switch (self.parent.model.active) {
-                .task_view => COLOR_SELECTED,
-                else => .default,
-            } },
+            .style = .{ .fg = if (areas.task.selected) COLOR_SELECTED else .default },
         };
 
         var children = try std.ArrayList(vxfw.SubSurface).initCapacity(
@@ -628,18 +659,18 @@ const TaskView = struct {
         children.appendAssumeCapacity(.{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try task_bordered.draw(ctx.withConstraints(
-                .{ .width = max.width, .height = area_heights.@"0" },
-                .{ .width = max.width, .height = area_heights.@"0" },
+                .{ .width = max.width, .height = areas.task.height },
+                .{ .width = max.width, .height = areas.task.height },
             )),
         });
 
         // Display job log
-        if (area_heights.@"1" > 0) {
+        if (areas.job_log.selected) {
             const job = selected_job orelse unreachable;
 
             // Fetch logs
             const job_log = self.getJobLog(ctx.arena, job, .{
-                .height = area_heights.@"1",
+                .height = areas.job_log.height,
                 .width = max.width,
             });
             const log_text = job_log.@"0";
@@ -660,7 +691,7 @@ const TaskView = struct {
                     .text = "Log",
                     .alignment = .top_left,
                 }},
-                .style = .{ .fg = .default },
+                .style = .{ .fg = if (areas.job_log.selected) COLOR_SELECTED else .default },
             };
 
             const prev_child = children.items[0];
@@ -670,8 +701,8 @@ const TaskView = struct {
                     .col = 0,
                 },
                 .surface = try job_log_bordered.draw(ctx.withConstraints(
-                    .{ .width = max.width, .height = area_heights.@"1" },
-                    .{ .width = max.width, .height = area_heights.@"1" },
+                    .{ .width = max.width, .height = areas.job_log.height },
+                    .{ .width = max.width, .height = areas.job_log.height },
                 )),
             });
         }
