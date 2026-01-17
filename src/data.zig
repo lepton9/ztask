@@ -450,15 +450,18 @@ pub const DataStore = struct {
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
         if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
+
+        // Check for existing task
         var id = task.Id.fromStr(path);
         const id_value = id.fmt();
-        if (self.tasks.getPtr(id_value)) |_| {
-            return error.TaskExists;
-        }
+        if (self.tasks.getPtr(id_value)) |_| return error.TaskExists;
+
+        // Add new task
+        const parsed = try parse.loadTask(gpa, path);
         var meta = try TaskMetadata.init(gpa, .{
             .file_path = path,
-            .id = id_value,
-            .name = "Unknown",
+            .id = parsed.id.fmt(),
+            .name = parsed.name,
         });
         try self.tasks.put(gpa, meta.id, meta);
         try writeTaskMeta(gpa, &meta);
