@@ -446,7 +446,7 @@ const TaskView = struct {
         details: *const snap.UiTaskDetail,
     } = null,
 
-    tab: enum { task, run_list } = .task,
+    tab: enum { task_run, run_list } = .task_run,
     display_job_log: bool = false,
 
     /// Selected run from the past runs list
@@ -502,37 +502,37 @@ const TaskView = struct {
                 if (key.matches('j', .{})) {
                     // TODO: handle when in job log view
                     switch (self.tab) {
-                        .task => self.job_list.nextItem(ctx),
+                        .task_run => self.job_list.nextItem(ctx),
                         .run_list => self.task_runs_list_view.nextItem(ctx),
                     }
                 } else if (key.matches('k', .{})) {
                     // TODO: handle when in job log view
                     switch (self.tab) {
-                        .task => self.job_list.prevItem(ctx),
+                        .task_run => self.job_list.prevItem(ctx),
                         .run_list => self.task_runs_list_view.prevItem(ctx),
                     }
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     switch (self.tab) {
                         .run_list => {
                             try self.selectRunFromList();
-                            self.tab = .task;
+                            self.tab = .task_run;
                         },
-                        .task => {
+                        .task_run => {
                             self.selectCurrentJob();
                         },
                     }
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.tab, .{})) {
                     self.tab = switch (self.tab) {
-                        .task => .run_list,
-                        .run_list => .task,
+                        .task_run => .run_list,
+                        .run_list => .task_run,
                     };
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
                     // TODO: handle when in job log view
-                    if (self.selected_run_id == null and self.tab == .task) return;
-                    if (self.tab == .task) self.resetSelectedRun();
-                    self.tab = .task;
+                    if (self.selected_run_id == null and self.tab == .task_run) return;
+                    if (self.tab == .task_run) self.resetSelectedRun();
+                    self.tab = .task_run;
                     ctx.consumeAndRedraw();
                 }
             },
@@ -550,28 +550,6 @@ const TaskView = struct {
         const task = self.task orelse return .empty(self.widget());
         var buf: [512]u8 = undefined;
         var task_buf = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
-
-        // const children_task = try ctx.arena.alloc(vxfw.SubSurface, 3);
-        // children_task[0] = task_surf;
-        // children_task[1] = .{
-        //     .origin = .{ .row = task_surf.surface.size.height + 1, .col = 1 },
-        //     .surface = try tab.draw(ctx),
-        // };
-        //
-        // const run_area_row: u16 = @as(u16, @intCast(children_task[1].origin.row)) +
-        //     children_task[1].surface.size.height;
-        // const size = ctx.max.size();
-        // const run_area_ctx = ctx.withConstraints(
-        //     .{ .width = 1, .height = 1 },
-        //     .{ .width = size.width, .height = @max(0, size.height - run_area_row) },
-        // );
-        // children_task[2] = .{
-        //     .origin = .{ .row = run_area_row, .col = 1 },
-        //     .surface = switch (self.tab) {
-        //         .task => try self.drawRunSurface(run_area_ctx),
-        //         .run_list => try self.task_runs_list_view.draw(run_area_ctx),
-        //     },
-        // };
 
         try task_buf.appendSlice(ctx.arena, std.fmt.bufPrint(&buf,
             \\Task: {s}
@@ -596,43 +574,41 @@ const TaskView = struct {
         var tabs = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
         tabs[0] = .{
             .text = "Task",
-            .style = .{ .fg = if (self.tab == .task) COLOR_SELECTED else .default },
+            .style = .{ .fg = if (self.tab == .task_run) COLOR_SELECTED else .default },
         };
         tabs[1] = .{ .text = " | " };
         tabs[2] = .{
             .text = "Runs",
             .style = .{ .fg = if (self.tab == .run_list) COLOR_SELECTED else .default },
         };
-
         const tab: vxfw.RichText = .{ .text = tabs };
 
         const selected_job = self.selectedJobFromList();
 
         // TODO: change scale
-        const areas_h: struct { u16, u16 } =
+        const area_heights: struct { u16, u16 } =
             if (self.display_job_log and selected_job != null)
                 .{ @divFloor(max.height, 2), @divFloor(max.height, 2) - 1 }
             else
                 .{ max.height, 0 };
 
-        const runs_sized: vxfw.SizedBox = .{
+        const list_area: vxfw.SizedBox = .{
             .child = switch (self.tab) {
-                .task => .{
+                .task_run => .{
                     .userdata = self,
                     .drawFn = &TaskView.drawRunSurfaceTypeErased,
                 },
                 .run_list => self.task_runs_list_view.widget(),
             },
-            .size = .{ .width = max.width, .height = areas_h.@"0" - 9 },
+            .size = .{ .width = max.width, .height = area_heights.@"0" - 9 },
         };
 
-        const children_task = try ctx.arena.alloc(vxfw.FlexItem, 3);
-        var task_flex: vxfw.FlexColumn = .{ .children = children_task };
-        children_task[0] = .init(task_text_sized.widget(), 0);
-        children_task[1] = .init(tab.widget(), 0);
-        children_task[2] = .init(runs_sized.widget(), 0);
+        const children_flex = try ctx.arena.alloc(vxfw.FlexItem, 3);
+        var task_flex: vxfw.FlexColumn = .{ .children = children_flex };
+        children_flex[0] = .init(task_text_sized.widget(), 0);
+        children_flex[1] = .init(tab.widget(), 0);
+        children_flex[2] = .init(list_area.widget(), 0);
 
-        // TODO: flex needs to be drawn with context and size
         const task_bordered: vxfw.Border = .{
             .child = task_flex.widget(),
             .labels = &[_]vxfw.Border.BorderLabel{.{
@@ -652,16 +628,34 @@ const TaskView = struct {
         children.appendAssumeCapacity(.{
             .origin = .{ .row = 0, .col = 0 },
             .surface = try task_bordered.draw(ctx.withConstraints(
-                .{ .width = max.width, .height = areas_h.@"0" },
-                .{ .width = max.width, .height = areas_h.@"0" },
+                .{ .width = max.width, .height = area_heights.@"0" },
+                .{ .width = max.width, .height = area_heights.@"0" },
             )),
         });
 
-        if (areas_h.@"1" > 0) {
-            // TODO:
-            const temp_log: vxfw.Text = .{ .text = try ctx.arena.alloc(u8, 0) };
+        // Display job log
+        if (area_heights.@"1" > 0) {
+            const job = selected_job orelse unreachable;
+
+            // Fetch logs
+            const job_log = self.getJobLog(ctx.arena, job, .{
+                .height = area_heights.@"1",
+                .width = max.width,
+            });
+            const log_text = job_log.@"0";
+            const file_size = job_log.@"1";
+
+            // Set offset
+            if (self.log_view_state.follow) {
+                self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
+                    @as(i64, @intCast(self.log_view_state.window_size)), 0);
+            }
+
+            const text: vxfw.Text = .{ .text = log_text };
+
+            // TODO: use vxfw.ScrollView
             const job_log_bordered: vxfw.Border = .{
-                .child = temp_log.widget(),
+                .child = text.widget(),
                 .labels = &[_]vxfw.Border.BorderLabel{.{
                     .text = "Log",
                     .alignment = .top_left,
@@ -669,15 +663,15 @@ const TaskView = struct {
                 .style = .{ .fg = .default },
             };
 
+            const prev_child = children.items[0];
             children.appendAssumeCapacity(.{
                 .origin = .{
-                    .row = children.items[0].origin.row +
-                        children.items[0].surface.size.height,
+                    .row = prev_child.origin.row + prev_child.surface.size.height,
                     .col = 0,
                 },
                 .surface = try job_log_bordered.draw(ctx.withConstraints(
-                    .{ .width = max.width, .height = areas_h.@"1" },
-                    .{ .width = max.width, .height = areas_h.@"1" },
+                    .{ .width = max.width, .height = area_heights.@"1" },
+                    .{ .width = max.width, .height = area_heights.@"1" },
                 )),
             });
         }
@@ -766,51 +760,6 @@ const TaskView = struct {
             .origin = job_area_origin,
             .surface = try self.job_list.draw(ctx),
         };
-
-        // Display job log
-        // const selected_job = self.selectedJobFromList();
-        // if (self.display_job_log and selected_job != null) {
-        //     const job = selected_job orelse unreachable;
-        //
-        //     self.log_view_state.window_size = (ctx.max.height.? * ctx.max.width.?) * 2;
-        //
-        //     const log = if (self.selected_run_id) |run_id|
-        //         data.DataStore.readJobLogWindow(
-        //             ctx.arena,
-        //             self.task.?.data.meta.id,
-        //             run_id,
-        //             job.job_name,
-        //             .{
-        //                 .offset = if (self.log_view_state.follow)
-        //                     null
-        //                 else
-        //                     self.log_view_state.offset,
-        //                 .size = self.log_view_state.window_size,
-        //             },
-        //         ) catch .{ &.{}, 0 }
-        //     else
-        //         .{ &.{}, 0 }; // TODO: Current run
-        //
-        //     const log_text = log.@"0";
-        //     const file_size = log.@"1";
-        //
-        //     // Set offset
-        //     if (self.log_view_state.follow) {
-        //         self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
-        //             @as(i64, @intCast(self.log_view_state.window_size)), 0);
-        //     }
-        //
-        //     const t: vxfw.Text = .{ .text = log_text };
-        //     children[1] = .{
-        //         .origin = job_area_origin,
-        //         .surface = try t.draw(ctx),
-        //     };
-        // } else {
-        //     children[1] = .{
-        //         .origin = job_area_origin,
-        //         .surface = try self.job_list.draw(ctx),
-        //     };
-        // }
 
         return .{
             .size = ctx.max.size(),
@@ -917,6 +866,32 @@ const TaskView = struct {
         };
     }
 
+    /// Get a log chunk for the job
+    fn getJobLog(
+        self: *@This(),
+        arena: std.mem.Allocator,
+        job: *const snap.UiJobSnap,
+        area: struct { height: u16, width: u16 },
+    ) struct { []u8, u64 } {
+        self.log_view_state.window_size = (area.width * area.height) * 2;
+        return if (self.selected_run_id) |run_id|
+            data.DataStore.readJobLogWindow(
+                arena,
+                self.task.?.data.meta.id,
+                run_id,
+                job.job_name,
+                .{
+                    .offset = if (self.log_view_state.follow)
+                        null
+                    else
+                        self.log_view_state.offset,
+                    .size = self.log_view_state.window_size,
+                },
+            ) catch .{ &.{}, 0 }
+        else
+            .{ &.{}, 0 }; // TODO: Current run
+    }
+
     /// Set the data for the selected task
     fn setData(
         self: *@This(),
@@ -991,11 +966,6 @@ const TaskView = struct {
 
     /// Select the job under the cursor from the job list
     fn selectCurrentJob(self: *@This()) void {
-        // TODO:
-        // use vxfw.ScrollView
-        // initial offset, get from the first log fetch
-        // offset = max(file_size - window_size, 0)
-        // update winsize before drawing
         self.display_job_log = false;
         _ = self.selectedJobFromList() orelse return;
         self.display_job_log = true;
