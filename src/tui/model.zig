@@ -22,13 +22,6 @@ const StatusText = struct {
     color: vaxis.Color = .default,
 };
 
-fn isQuit(key: vaxis.Key) bool {
-    if (key.matches('c', .{ .ctrl = true }) or key.matches('q', .{})) {
-        return true;
-    }
-    return false;
-}
-
 /// Main TUI state
 pub const Model = struct {
     gpa: std.mem.Allocator,
@@ -91,7 +84,7 @@ pub const Model = struct {
                 try onTick(self, ctx);
             },
             .key_press => |key| {
-                if (isQuit(key)) {
+                if (keyQuit(key)) {
                     ctx.quit = true;
                     return;
                 }
@@ -324,11 +317,11 @@ const TaskSplit = struct {
         switch (event) {
             .init => {},
             .key_press => |key| {
-                if (key.matches('j', .{})) { // List down
+                if (keyDown(key)) { // List down
                     self.task_list_view.nextItem(ctx);
                     try self.updateSelected();
                     try ctx.queueRefresh();
-                } else if (key.matches('k', .{})) { // List up
+                } else if (keyUp(key)) { // List up
                     self.task_list_view.prevItem(ctx);
                     try self.updateSelected();
                     try ctx.queueRefresh();
@@ -508,9 +501,9 @@ const TaskView = struct {
         switch (event) {
             .init => {},
             .key_press => |key| {
-                if (key.matches('j', .{})) {
+                if (keyDown(key)) {
                     self.handleDown(ctx);
-                } else if (key.matches('k', .{})) {
+                } else if (keyUp(key)) {
                     self.handleUp(ctx);
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     switch (self.tab) {
@@ -531,7 +524,8 @@ const TaskView = struct {
                         .run_list => .task_run,
                     };
                 } else if (key.matches(vaxis.Key.escape, .{})) {
-                    if (self.selected_run_id == null and self.tab == .task_run) return;
+                    if (self.tab == .task_run and self.selected_run_id == null and
+                        !self.display_job_log) return;
                     if (self.tab == .task_run) {
                         if (self.display_job_log) {
                             self.display_job_log = false;
@@ -543,6 +537,7 @@ const TaskView = struct {
             },
             .focus_in => {
                 self.parent.model.active = .task_view;
+                self.display_job_log = false;
                 self.task_runs_list_view.cursor = 0;
                 self.job_list.cursor = 0;
             },
@@ -887,51 +882,50 @@ const TaskView = struct {
         if (idx >= run.jobs.len) return null;
         const job_item = &run.jobs[idx];
 
-        return .{
-            .userdata = job_item,
-            .drawFn = struct {
-                fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-                    const job: *const snap.UiJobSnap = @ptrCast(@alignCast(opq));
-                    var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
-                    var text: vxfw.RichText = .{ .text = segments };
+        const drawFn = struct {
+            fn draw(opq: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
+                const job: *const snap.UiJobSnap = @ptrCast(@alignCast(opq));
+                var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
+                var text: vxfw.RichText = .{ .text = segments };
 
-                    const tag: StatusText = switch (job.status) {
-                        .success => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
-                        .failed, .interrupted => |s| .{
-                            .text = @tagName(s),
-                            .color = COLOR_RED,
-                        },
-                        .pending => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
-                        .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
-                    };
+                const tag: StatusText = switch (job.status) {
+                    .success => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                    .failed, .interrupted => |s| .{
+                        .text = @tagName(s),
+                        .color = COLOR_RED,
+                    },
+                    .pending => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
+                    .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                };
 
-                    segments[0] = .{
-                        .text = try std.fmt.allocPrint(ctx.arena, "{s:<10}", .{
-                            job.job_name,
+                segments[0] = .{
+                    .text = try std.fmt.allocPrint(ctx.arena, "{s:<10}", .{
+                        job.job_name,
+                    }),
+                };
+                segments[1] = .{
+                    .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{tag.text}),
+                    .style = .{ .fg = tag.color },
+                };
+                // Time taken
+                segments[2] = if (job.start_time_ms != null and job.end_time_ms != null)
+                    .{
+                        .text = try std.fmt.allocPrint(ctx.arena, " {d}s", .{
+                            @divFloor(
+                                job.end_time_ms.? - job.start_time_ms.?,
+                                std.time.ms_per_s,
+                            ),
                         }),
-                    };
-                    segments[1] = .{
-                        .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{tag.text}),
-                        .style = .{ .fg = tag.color },
-                    };
-                    // Time taken
-                    segments[2] = if (job.start_time_ms != null and job.end_time_ms != null)
-                        .{
-                            .text = try std.fmt.allocPrint(ctx.arena, " {d}s", .{
-                                @divFloor(
-                                    job.end_time_ms.? - job.start_time_ms.?,
-                                    std.time.ms_per_s,
-                                ),
-                            }),
-                            .style = .{ .dim = true },
-                        }
-                    else
-                        .{ .text = "" };
+                        .style = .{ .dim = true },
+                    }
+                else
+                    .{ .text = "" };
 
-                    return text.draw(ctx);
-                }
-            }.draw,
-        };
+                return text.draw(ctx);
+            }
+        }.draw;
+
+        return .{ .userdata = job_item, .drawFn = drawFn };
     }
 
     /// Get a log chunk for the job
@@ -1097,3 +1091,18 @@ const TaskListItem = struct {
         return text.draw(ctx);
     }
 };
+
+/// Check if pressed key is exit key
+fn keyQuit(key: vaxis.Key) bool {
+    return key.matches('c', .{ .ctrl = true }) or key.matches('q', .{});
+}
+
+/// Check if pressed key is up
+fn keyUp(key: vaxis.Key) bool {
+    return key.matches('k', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{});
+}
+
+/// Check if pressed key is down
+fn keyDown(key: vaxis.Key) bool {
+    return key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{});
+}
