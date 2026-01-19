@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .yaml = .{
-            .url = "git+https://github.com/lepton9/zig-yaml#1ad73ac461fe81f380c109d6ad8fb500f5bb41df",
+            .url = "git+https://github.com/kubkon/zig-yaml#1ad73ac461fe81f380c109d6ad8fb500f5bb41df",
             .hash = "zig_yaml-0.2.0-C1161pKrAgAwvN-1yN42mPMczz2Vw0ngb2BsbiIxolWS",
         },
         .zcli = .{
-            .url = "git+https://github.com/lepton9/zcli#f0741860d69e4d38ddbe187a51748912fa4a1d59",
-            .hash = "zcli-0.3.3-Of3s8eY7AQA1mYNV8vI4mGMiKQyfROQpnxgoQP830vPG",
+            .url = "git+https://github.com/lepton9/zcli#42477063808a3d35861ed0c369065151ade03183",
+            .hash = "zcli-0.3.4-Of3s8RI7AQC6IDw7pXxt4Y6axccCVx2WpZ5dUI-sCpOS",
         },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#e70ca957a6bc2b62a9afab1091a57cfb00e8111c",

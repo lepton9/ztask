@@ -89,8 +89,16 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     task_manager.waitUntilIdle();
 }
 
+pub const ListOptions = struct {
+    pub const SortBy = enum { id, name, runs };
+    pub const Order = enum { asc, desc };
+    pub const Sort = struct { SortBy, Order };
+
+    sort: []Sort = &.{},
+};
+
 /// List all the found tasks
-pub fn listTasks(gpa: std.mem.Allocator) !void {
+pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
     var datastore = data.DataStore.init();
     defer datastore.deinit(gpa);
     try datastore.loadTaskMetas(gpa, .{ .load_runs = false });
@@ -104,6 +112,8 @@ pub fn listTasks(gpa: std.mem.Allocator) !void {
         .{ "ID", "Name", "Runs", "Path" },
     );
     try stdout.flush();
+
+    _ = options;
 
     var it = datastore.tasks.iterator();
     while (it.next()) |e| {

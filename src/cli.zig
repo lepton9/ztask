@@ -80,7 +80,26 @@ const commands = &[_]zcli.Cmd{
     .{
         .name = "list",
         .desc = "List all the tasks",
-        .options = &[_]zcli.Opt{},
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "sort-id",
+                .short_name = null,
+                .desc = "Sort tasks by id (ASC|DESC)",
+                .arg = .{ .name = "ORDER", .type = .Text },
+            },
+            .{
+                .long_name = "sort-name",
+                .short_name = null,
+                .desc = "Sort tasks by name (ASC|DESC)",
+                .arg = .{ .name = "ORDER", .type = .Text },
+            },
+            .{
+                .long_name = "sort-runs",
+                .short_name = null,
+                .desc = "Sort tasks by run amount (ASC|DESC)",
+                .arg = .{ .name = "ORDER", .type = .Text },
+            },
+        },
         .action = cmdListFn,
     },
     .{
@@ -179,7 +198,39 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
 /// Handle list command
 fn cmdListFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    return try run.listTasks(ctx.gpa);
+    const cli = ctx.cli;
+
+    var sorters: [3]run.ListOptions.Sort = undefined;
+    var sort_count: usize = 0;
+
+    var it = cli.args.iterator();
+    while (it.next()) |e| {
+        const opt = e.value_ptr.*;
+        const sort: run.ListOptions.SortBy = blk: {
+            if (std.mem.eql(u8, opt.name, "sort-id")) break :blk .id;
+            if (std.mem.eql(u8, opt.name, "sort-name")) break :blk .name;
+            if (std.mem.eql(u8, opt.name, "sort-runs")) break :blk .runs;
+            unreachable;
+        };
+
+        var buf: [5]u8 = undefined;
+        const value = opt.value.?.string;
+        const value_upper = std.ascii.upperString(
+            &buf,
+            value[0..@min(value.len, 5)],
+        );
+
+        const order: run.ListOptions.Order = blk: {
+            if (std.mem.eql(u8, value_upper, "ASC"))
+                break :blk .asc;
+            if (std.mem.eql(u8, value_upper, "DESC"))
+                break :blk .desc;
+            @panic("TODO: Undefined order");
+        };
+        sorters[sort_count] = .{ sort, order };
+        sort_count += 1;
+    }
+    return try run.listTasks(ctx.gpa, .{ .sort = &sorters });
 }
 
 /// Handle completion command
