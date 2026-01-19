@@ -122,7 +122,7 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
         switch (sort_by) {
             .id => sortByFieldName(&datastore.tasks, "id", order),
             .name => sortByFieldName(&datastore.tasks, "name", order),
-            .runs => @panic("TODO: sort by runs"),
+            .runs => sortByRuns(&datastore.tasks, &datastore.task_runs, order),
         }
     }
 
@@ -145,6 +145,41 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
         );
         try stdout.flush();
     }
+}
+
+/// Sort tasks by run amount
+fn sortByRuns(
+    tasks: *std.StringArrayHashMapUnmanaged(data.TaskMetadata),
+    task_runs: *const std.StringHashMapUnmanaged(
+        std.AutoArrayHashMapUnmanaged(u64, data.TaskRunMetadata),
+    ),
+    order: ListOptions.Order,
+) void {
+    const Ctx = struct {
+        values: []data.TaskMetadata,
+        runs: *const std.StringHashMapUnmanaged(
+            std.AutoArrayHashMapUnmanaged(u64, data.TaskRunMetadata),
+        ),
+        sort_order: ListOptions.Order,
+
+        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+            const idx_order: struct { usize, usize } = switch (ctx.sort_order) {
+                .asc => .{ a_index, b_index },
+                .desc => .{ b_index, a_index },
+            };
+            const a_meta = ctx.values[idx_order.@"0"];
+            const b_meta = ctx.values[idx_order.@"1"];
+            const a = if (ctx.runs.get(a_meta.id)) |r| r.count() else 0;
+            const b = if (ctx.runs.get(b_meta.id)) |r| r.count() else 0;
+            return a < b;
+        }
+    };
+    const sort_ctx: Ctx = .{
+        .values = tasks.values(),
+        .sort_order = order,
+        .runs = task_runs,
+    };
+    tasks.sort(sort_ctx);
 }
 
 /// Sort the values of the array hashmap by the field in the `TaskMetadata`
