@@ -15,6 +15,11 @@ test {
     _ = scheduler;
 }
 
+pub const BeginTaskOptions = struct {
+    /// Job name to run in attached mode
+    attach_job: ?[]const u8 = null,
+};
+
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
@@ -249,6 +254,7 @@ pub const TaskManager = struct {
     pub fn beginTask(
         self: *TaskManager,
         task_id: []const u8,
+        options: BeginTaskOptions,
     ) (error{ WatcherAddUnsupported, TaskNotFound } || anyerror)!void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -265,6 +271,7 @@ pub const TaskManager = struct {
                 self.remote_manager,
                 &self.datastore,
             );
+            s.attach_job = options.attach_job;
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };
@@ -573,7 +580,7 @@ test "manager_simple" {
 
     // Start tasks
     for (task_manager.loaded_tasks.keys()) |key| {
-        try task_manager.beginTask(key);
+        try task_manager.beginTask(key, .{});
     }
     try std.testing.expect(task_manager.schedulers.count() == 2);
 
@@ -603,7 +610,7 @@ test "force_interrupt" {
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
-    try task_manager.beginTask(task.id.fmt());
+    try task_manager.beginTask(task.id.fmt(), .{});
     // Interrupt while running
     task_manager.stop();
 
@@ -647,7 +654,7 @@ test "complete_tasks" {
 
     // Start tasks
     for (task_manager.loaded_tasks.keys()) |key| {
-        try task_manager.beginTask(key);
+        try task_manager.beginTask(key, .{});
     }
     // Wait for completion
     task_manager.waitUntilIdle();

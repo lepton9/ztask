@@ -13,6 +13,8 @@ const ExecResult = localrunner.ExecResult;
 const Job = task_zig.Job;
 const Task = task_zig.Task;
 const Node = dag.Node;
+const ExecMode = localrunner.LocalRunner.ExecMode;
+
 const ErrorDAG = dag.ErrorDAG;
 
 test {
@@ -35,6 +37,9 @@ pub const Scheduler = struct {
     pool: *RunnerPool,
     remote_manager: *remote.RemoteManager,
     nodes: []JobNode = undefined,
+    /// Job to run in attached mode
+    attach_job: ?[]const u8 = null,
+
     /// Ready queue of jobs that can run
     queue: Queue(*JobNode),
     /// Runners currently running jobs
@@ -216,7 +221,11 @@ pub const Scheduler = struct {
         var job_meta = self.job_metas.getPtr(node) orelse unreachable;
         job_meta.status = .running;
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
-        runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
+        const exec_mode: ExecMode = if (self.attach_job) |attach_name|
+            (if (std.mem.eql(u8, attach_name, node.ptr.name)) .attached else .piped)
+        else
+            .piped;
+        runner.runJobWithMode(self.gpa, node, self.result_queue, self.log_queue, exec_mode);
     }
 
     /// Run the next job in the queue with a remote runner

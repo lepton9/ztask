@@ -234,7 +234,7 @@ pub const Model = struct {
 
     /// Begin task run
     fn dispatchTask(self: *Model, task_id: []const u8) !void {
-        self.taskmanager.beginTask(task_id) catch |err| {
+        self.taskmanager.beginTask(task_id, .{}) catch |err| {
             try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
         };
         try self.setInfo("Started task {s}", .{task_id});
@@ -1099,10 +1099,10 @@ fn keyQuit(key: vaxis.Key) bool {
 
 /// Check if pressed key is up
 fn keyUp(key: vaxis.Key) bool {
-    return key.matches('k', .{ .ctrl = true }) or key.matches(vaxis.Key.up, .{});
+    return key.matches('k', .{ .ctrl = false }) or key.matches(vaxis.Key.up, .{});
 }
 
 /// Check if pressed key is down
 fn keyDown(key: vaxis.Key) bool {
-    return key.matches('j', .{ .ctrl = true }) or key.matches(vaxis.Key.down, .{});
+    return key.matches('j', .{ .ctrl = false }) or key.matches(vaxis.Key.down, .{});
 }

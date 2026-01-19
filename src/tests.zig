@@ -33,7 +33,7 @@ test "remote_job" {
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
 
-    try task_manager.beginTask(task.id.fmt());
+    try task_manager.beginTask(task.id.fmt(), .{});
     task_manager.waitUntilIdle();
 
     agent.stop();

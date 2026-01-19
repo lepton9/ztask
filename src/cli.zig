@@ -35,6 +35,11 @@ const commands = &[_]zcli.Cmd{
                 .desc = "ID of the task",
                 .arg = .{ .name = "ID", .type = .Text },
             },
+            .{
+                .long_name = "attach",
+                .desc = "Run a job in the foreground (inherit stdio)",
+                .arg = .{ .name = "JOB", .type = .Text },
+            },
             runner_n_option,
         },
         .action = cmdRunFn,
@@ -162,6 +167,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     var opts: run.RunOptions = .{
         .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
         .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
+        .attach_job = if (cli.find_opt("attach")) |o| o.value.?.string else null,
     };
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;

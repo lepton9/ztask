@@ -58,6 +58,7 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
 pub const RunOptions = struct {
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
+    attach_job: ?[]const u8 = null,
     runners_n: u8 = BASE_RUNNERS_N,
 };
 
@@ -83,7 +84,9 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         return error.NoTaskFileGiven;
     };
     try task_manager.start();
-    try task_manager.beginTask(task.id.fmt());
+    try task_manager.beginTask(task.id.fmt(), .{
+        .attach_job = options.attach_job,
+    });
     task_manager.waitUntilIdle();
 }
 

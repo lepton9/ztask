@@ -39,6 +39,9 @@ pub const LocalRunner = struct {
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
+    pub const ExecMode = enum { piped, attached };
+
+    /// Run a job in the background
     pub fn runJob(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
@@ -46,16 +49,34 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
+        self.runJobWithMode(gpa, job, results, logs, .piped);
+    }
+
+    /// Run a job with an execution mode
+    ///
+    /// - `.piped` background execution
+    /// - `.attached` runs in the foreground with inherited stdio
+    pub fn runJobWithMode(
+        self: *LocalRunner,
+        gpa: std.mem.Allocator,
+        job: *JobNode,
+        results: *ResultQueue,
+        logs: *LogQueue,
+        mode: ExecMode,
+    ) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         _ = self.running.swap(true, .seq_cst);
+
         self.thread = std.Thread.spawn(.{}, runFn, .{
             self,
             gpa,
             job,
             results,
             logs,
+            mode,
         }) catch {
+            self.mutex.unlock();
             return results.appendAssumeCapacity(.{
                 .node = job,
                 .result = .{
@@ -66,12 +87,14 @@ pub const LocalRunner = struct {
         };
     }
 
+    /// Execute the job node
     fn runFn(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         job: *JobNode,
         results: *ResultQueue,
         logs: *LogQueue,
+        mode: ExecMode,
     ) void {
         log("Start job {s} ({d})", .{ job.ptr.name, job.id });
 
@@ -91,10 +114,11 @@ pub const LocalRunner = struct {
             }
             log("{s}: step: {s}", .{ job.ptr.name, step.value });
             switch (step.kind) {
-                .command => exit_code = self.runCommandStep(gpa, step, job, logs) catch |err| blk: {
-                    log("step err: {}", .{err});
-                    break :blk 1;
-                },
+                .command => exit_code =
+                    self.runCommandStep(gpa, step, job, logs, mode) catch |err| blk: {
+                        log("step {s} error: {}", .{ step.value, err });
+                        break :blk 1;
+                    },
                 // else => @panic("TODO"),
             }
 
@@ -116,22 +140,26 @@ pub const LocalRunner = struct {
         log("Finish job {s} ({d})", .{ job.ptr.name, job.id });
     }
 
+    /// Join the runner thread
     pub fn joinThread(self: *LocalRunner) void {
         if (self.thread) |t| t.join();
         self.thread = null;
     }
 
+    /// Force runner to stop and join the runner thread
     pub fn forceStop(self: *LocalRunner) void {
         _ = self.running.swap(false, .seq_cst);
         self.joinThread();
     }
 
+    /// Run one job node with the given execution mode
     fn runCommandStep(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         step: *task.Step,
         job: *JobNode,
         logs: *LogQueue,
+        mode: ExecMode,
     ) !i32 {
         // Create args
         var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
@@ -146,45 +174,66 @@ pub const LocalRunner = struct {
 
         // Spawn child process
         var child = std.process.Child.init(argv.items, gpa);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        try child.spawn();
+        switch (mode) {
+            .attached => {
+                // In attached mode we inherit stdio so the child process can be
+                // interacted with normally.
+                child.stdin_behavior = .Inherit;
+                child.stdout_behavior = .Inherit;
+                child.stderr_behavior = .Inherit;
+                try child.spawn();
 
-        var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
-            .stdout = child.stdout.?,
-            .stderr = child.stderr.?,
-        });
-        defer poller.deinit();
-
-        var stdout_r = poller.reader(.stdout);
-        var stderr_r = poller.reader(.stderr);
-        stdout_r.buffer = try gpa.alloc(u8, 4096);
-        stderr_r.buffer = try gpa.alloc(u8, 4096);
-
-        // Read output
-        while (try poller.pollTimeout(std.time.ns_per_ms * 300)) {
-            if (!self.running.load(.seq_cst)) {
-                const term = try child.kill();
+                const term = try child.wait();
                 return switch (term) {
                     .Exited => |code| @intCast(code),
                     .Signal => |sig| @intCast(sig),
                     else => 1,
                 };
-            }
+            },
+            .piped => {
+                child.stdout_behavior = .Pipe;
+                child.stderr_behavior = .Pipe;
+                try child.spawn();
 
-            readLogs(gpa, stdout_r, step_index, job, logs);
-            readLogs(gpa, stderr_r, step_index, job, logs);
+                var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
+                    .stdout = child.stdout.?,
+                    .stderr = child.stderr.?,
+                });
+                defer poller.deinit();
+
+                var stdout_r = poller.reader(.stdout);
+                var stderr_r = poller.reader(.stderr);
+                stdout_r.buffer = try gpa.alloc(u8, 4096);
+                stderr_r.buffer = try gpa.alloc(u8, 4096);
+
+                // Read output
+                while (try poller.pollTimeout(std.time.ns_per_ms * 300)) {
+                    if (!self.running.load(.seq_cst)) {
+                        const term = try child.kill();
+                        return switch (term) {
+                            .Exited => |code| @intCast(code),
+                            .Signal => |sig| @intCast(sig),
+                            else => 1,
+                        };
+                    }
+
+                    readLogs(gpa, stdout_r, step_index, job, logs);
+                    readLogs(gpa, stderr_r, step_index, job, logs);
+                }
+
+                const term = try child.wait();
+                return switch (term) {
+                    .Exited => |code| @intCast(code),
+                    .Signal => |sig| @intCast(sig),
+                    else => 1,
+                };
+            },
         }
-
-        const term = try child.wait();
-        return switch (term) {
-            .Exited => |code| @intCast(code),
-            .Signal => |sig| @intCast(sig),
-            else => 1,
-        };
     }
 };
 
+/// Read the logs from the reader
+/// Appends the data to the back of the `LogQueue`
 fn readLogs(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
