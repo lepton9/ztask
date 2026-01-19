@@ -83,19 +83,16 @@ const commands = &[_]zcli.Cmd{
         .options = &[_]zcli.Opt{
             .{
                 .long_name = "sort-id",
-                .short_name = null,
                 .desc = "Sort tasks by id (ASC|DESC)",
                 .arg = .{ .name = "ORDER", .type = .Text },
             },
             .{
                 .long_name = "sort-name",
-                .short_name = null,
                 .desc = "Sort tasks by name (ASC|DESC)",
                 .arg = .{ .name = "ORDER", .type = .Text },
             },
             .{
                 .long_name = "sort-runs",
-                .short_name = null,
                 .desc = "Sort tasks by run amount (ASC|DESC)",
                 .arg = .{ .name = "ORDER", .type = .Text },
             },
@@ -126,6 +123,12 @@ fn write_to_stdout(data: []const u8) !void {
     const stdout = &writer.interface;
     try stdout.writeAll(data);
     try stdout.flush();
+}
+
+/// Write error message and exit the program
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.log.err(fmt, args);
+    std.process.exit(1);
 }
 
 /// Generate shell completions
@@ -162,10 +165,29 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     };
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;
-        if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
+        if (n < 0 or n > run.MAX_RUNNERS_N) fatal(
+            "Invalid amount of runners '{d}'. (0 < n < {d})",
+            .{ n, run.MAX_RUNNERS_N + 1 },
+        );
         opts.runners_n = @intCast(n);
     }
-    return run.runTask(ctx.gpa, opts);
+    return run.runTask(ctx.gpa, opts) catch |err| switch (err) {
+        error.TaskNotFoundId => fatal(
+            "Task not found with ID: {s}",
+            .{opts.id orelse ""},
+        ),
+        error.FileNotFound => fatal(
+            "Task file not found: '{s}'",
+            .{opts.path orelse ""},
+        ),
+        error.ErrorOpenFilePath => fatal(
+            "Error opening file: '{s}'",
+            .{opts.path orelse ""},
+        ),
+        error.InvalidTaskFile => fatal("Invalid task file format", .{}),
+        error.NoTaskFileGiven => fatal("No task file given", .{}),
+        else => return err,
+    };
 }
 
 /// Handle runner command
@@ -173,7 +195,11 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
 
-    const name = cli.find_opt("name") orelse unreachable;
+    const name_opt = cli.find_opt("name") orelse unreachable;
+    const name = name_opt.value.?.string;
+    const trimmed = std.mem.trim(u8, name, " \t");
+    if (std.mem.eql(u8, trimmed, "")) fatal("Invalid runner name '{s}'", .{name});
+
     const addr = cli.find_opt("address");
     const port: ?u16 = blk: {
         if (cli.find_opt("port")) |p| {
@@ -182,9 +208,8 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
             break :blk @truncate(@as(u64, @intCast(port)));
         } else break :blk null;
     };
-    var opts: run.AgentOptions = .{
-        .name = name.value.?.string,
-    };
+    var opts: run.AgentOptions = .{ .name = name };
+
     if (addr) |a| opts.addr = a.value.?.string;
     if (port) |p| opts.port = p;
     if (cli.find_opt("runners")) |opt| {
@@ -226,7 +251,7 @@ fn cmdListFn(ptr: *anyopaque) !void {
                 break :blk .asc;
             if (std.mem.eql(u8, value_upper, "DESC"))
                 break :blk .desc;
-            @panic("TODO: Undefined order");
+            fatal("Invalid sort order '{s}'", .{value});
         };
         sorters[sort_count] = .{ sort, order };
         sort_count += 1;

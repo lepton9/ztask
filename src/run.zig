@@ -68,19 +68,17 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     const task = blk: {
         if (options.path) |p| {
             break :blk task_manager.loadOrCreateWithPath(p) catch |err| {
-                switch (err) {
-                    error.ErrorOpenFile => std.log.info("File not found", .{}),
-                    error.InvalidTaskFile => std.log.info("Invalid file format", .{}),
-                    else => std.log.info("{}", .{err}),
-                }
-                return;
+                return switch (err) {
+                    error.ErrorOpenFile => error.ErrorOpenFilePath,
+                    else => err,
+                };
             };
         }
         if (options.id) |i| break :blk task_manager.loadTaskWithId(i) catch |err| {
-            if (err == error.TaskNotFound) {
-                std.log.info("Task not found with ID: {s}", .{i});
-            }
-            return;
+            return switch (err) {
+                error.TaskNotFound => error.TaskNotFoundId,
+                else => err,
+            };
         };
         return error.NoTaskFileGiven;
     };

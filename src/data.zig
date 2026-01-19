@@ -86,7 +86,7 @@ pub const JobRunMetadata = struct {
 };
 
 pub const DataStore = struct {
-    tasks: std.StringHashMapUnmanaged(TaskMetadata),
+    tasks: std.StringArrayHashMapUnmanaged(TaskMetadata),
     task_runs: std.StringHashMapUnmanaged(
         std.AutoArrayHashMapUnmanaged(u64, TaskRunMetadata),
     ),
