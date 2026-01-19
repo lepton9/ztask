@@ -101,7 +101,9 @@ pub const ListOptions = struct {
 pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
     var datastore = data.DataStore.init();
     defer datastore.deinit(gpa);
-    try datastore.loadTaskMetas(gpa, .{ .load_runs = false });
+
+    const pre_load_runs = options.sort.len > 0;
+    try datastore.loadTaskMetas(gpa, .{ .load_runs = pre_load_runs });
 
     var write_buffer: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&write_buffer);
@@ -113,13 +115,24 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
     );
     try stdout.flush();
 
-    _ = options;
+    // Sort tasks
+    for (options.sort) |sorter| {
+        const sort_by: ListOptions.SortBy = sorter.@"0";
+        const order = sorter.@"1";
+        switch (sort_by) {
+            .id => sortByFieldName(&datastore.tasks, "id", order),
+            .name => sortByFieldName(&datastore.tasks, "name", order),
+            .runs => @panic("TODO: sort by runs"),
+        }
+    }
 
+    // Print all the tasks
     var it = datastore.tasks.iterator();
     while (it.next()) |e| {
         const meta = e.value_ptr.*;
         const task_id = e.key_ptr.*;
-        try datastore.loadTaskRuns(gpa, task_id);
+        if (!pre_load_runs) try datastore.loadTaskRuns(gpa, task_id);
+
         const runs = datastore.task_runs.get(task_id) orelse unreachable;
         try stdout.print(
             "{s:<20}{s:<15}{d:<10}{s}\n",
@@ -132,4 +145,34 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
         );
         try stdout.flush();
     }
+}
+
+/// Sort the values of the array hashmap by the field in the `TaskMetadata`
+fn sortByFieldName(
+    tasks: *std.StringArrayHashMapUnmanaged(data.TaskMetadata),
+    comptime field_name: []const u8,
+    order: ListOptions.Order,
+) void {
+    const FieldType = @FieldType(data.TaskMetadata, field_name);
+
+    const Ctx = struct {
+        values: []data.TaskMetadata,
+        sort_order: ListOptions.Order,
+
+        pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+            const idx_order: struct { usize, usize } = switch (ctx.sort_order) {
+                .asc => .{ a_index, b_index },
+                .desc => .{ b_index, a_index },
+            };
+            const a = @field(ctx.values[idx_order.@"0"], field_name);
+            const b = @field(ctx.values[idx_order.@"1"], field_name);
+            return switch (@typeInfo(FieldType)) {
+                .int, .float, .bool => a < b,
+                .pointer => |p| std.mem.lessThan(p.child, a, b),
+                else => |t| @panic("Sorting not implemented for type " ++ t),
+            };
+        }
+    };
+    const sort_ctx: Ctx = .{ .values = tasks.values(), .sort_order = order };
+    tasks.sort(sort_ctx);
 }

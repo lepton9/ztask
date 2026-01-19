@@ -203,6 +203,7 @@ fn cmdListFn(ptr: *anyopaque) !void {
     var sorters: [3]run.ListOptions.Sort = undefined;
     var sort_count: usize = 0;
 
+    // Add sorters
     var it = cli.args.iterator();
     while (it.next()) |e| {
         const opt = e.value_ptr.*;
@@ -230,7 +231,7 @@ fn cmdListFn(ptr: *anyopaque) !void {
         sorters[sort_count] = .{ sort, order };
         sort_count += 1;
     }
-    return try run.listTasks(ctx.gpa, .{ .sort = &sorters });
+    return try run.listTasks(ctx.gpa, .{ .sort = sorters[0..sort_count] });
 }
 
 /// Handle completion command
