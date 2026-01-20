@@ -39,6 +39,8 @@ pub const Scheduler = struct {
     nodes: []JobNode = undefined,
     /// Job to run in attached mode
     attach_job: ?[]const u8 = null,
+    /// Option to retrigger while running
+    retrigger: bool = false,
 
     /// Ready queue of jobs that can run
     queue: Queue(*JobNode),

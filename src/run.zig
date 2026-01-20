@@ -59,6 +59,7 @@ pub const RunOptions = struct {
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
     attach_job: ?[]const u8 = null,
+    retrigger: bool = false,
     runners_n: u8 = BASE_RUNNERS_N,
 };
 
@@ -86,6 +87,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     try task_manager.start();
     try task_manager.beginTask(task.id.fmt(), .{
         .attach_job = options.attach_job,
+        .retrigger = options.retrigger,
     });
     task_manager.waitUntilIdle();
 }

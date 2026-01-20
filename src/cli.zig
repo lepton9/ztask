@@ -40,6 +40,11 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Run a job in the foreground (inherit stdio)",
                 .arg = .{ .name = "JOB", .type = .Text },
             },
+            .{
+                .long_name = "retrigger",
+                .short_name = "t",
+                .desc = "Restart task if a trigger occurs while running",
+            },
             runner_n_option,
         },
         .action = cmdRunFn,
@@ -168,6 +173,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
         .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
         .attach_job = if (cli.find_opt("attach")) |o| o.value.?.string else null,
+        .retrigger = cli.find_opt("retrigger") != null,
     };
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;

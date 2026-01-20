@@ -18,6 +18,7 @@ test {
 pub const BeginTaskOptions = struct {
     /// Job name to run in attached mode
     attach_job: ?[]const u8 = null,
+    retrigger: bool = false,
 };
 
 /// Manages all tasks and triggers
@@ -185,10 +186,19 @@ pub const TaskManager = struct {
     fn checkWatcher(self: *TaskManager) !void {
         while (self.watcher.getEvent()) |event| switch (event) {
             .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
-                for (l.items) |s| if (s.status == .waiting) {
-                    self.mutex.lock();
-                    defer self.mutex.unlock();
-                    try s.trigger();
+                for (l.items) |s| switch (s.status) {
+                    .waiting => {
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+                        try s.trigger();
+                    },
+                    else => {
+                        if (!s.retrigger) continue;
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+                        s.forceStop();
+                        try s.trigger();
+                    },
                 };
             },
             else => {},
@@ -272,6 +282,7 @@ pub const TaskManager = struct {
                 &self.datastore,
             );
             s.attach_job = options.attach_job;
+            s.retrigger = options.retrigger;
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };

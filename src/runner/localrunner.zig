@@ -150,7 +150,7 @@ pub const LocalRunner = struct {
 
     /// Join the runner thread
     pub fn finishJob(self: *LocalRunner) void {
-        if (self.thread) |t| t.join();
+        if (self.thread) |t| t.detach();
         self.thread = null;
         self.job = null;
     }
