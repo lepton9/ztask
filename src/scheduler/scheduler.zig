@@ -326,7 +326,7 @@ pub const Scheduler = struct {
             .local => {
                 if (self.active_runners.fetchRemove(res.node)) |kv| {
                     const runner = kv.value;
-                    runner.joinThread();
+                    runner.finishJob();
                     self.pool.release(runner);
                 }
                 self.onJobCompleted(res.node, res.result);

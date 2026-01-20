@@ -31,7 +31,6 @@ pub const RunnerPool = struct {
     }
 
     pub fn deinit(self: *RunnerPool) void {
-        // for (self.runners) |*runner| runner.deinit();
         self.gpa.free(self.runners);
         self.free_idx.deinit(self.gpa);
         self.waiters.deinit(self.gpa);

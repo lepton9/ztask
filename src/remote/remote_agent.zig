@@ -209,7 +209,7 @@ pub const RemoteAgent = struct {
             // Release runner
             if (self.active_runners.fetchRemove(res.node)) |kv| {
                 const runner = kv.value;
-                runner.joinThread();
+                runner.finishJob();
                 self.pool.release(runner);
             }
 
