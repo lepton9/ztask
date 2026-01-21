@@ -84,6 +84,11 @@ pub fn Queue(comptime T: type) type {
             self.free.append(&node.link);
         }
 
+        /// Clear all the remaining items from the queue
+        pub fn clear(self: *@This()) void {
+            while (self.pop()) |_| {}
+        }
+
         /// Get an iterator for the queue
         /// Starts iterating from the first node
         pub fn iterator(self: *const @This()) Iterator {
@@ -208,6 +213,20 @@ test "iterator" {
     try std.testing.expect(count == N);
 }
 
+test "clear" {
+    const gpa = std.testing.allocator;
+    const N = 5;
+    var q = try Queue(i64).initCapacity(gpa, N);
+    defer q.deinit(gpa);
+    q.clear();
+    try std.testing.expect(q.empty());
+    const arr: [N]i64 = .{ 1, 2, 3, 4, 5 };
+    for (arr) |i| q.appendAssumeCapacity(i);
+    try std.testing.expect(!q.empty());
+    q.clear();
+    try std.testing.expect(q.empty());
+}
+
 /// Thread safe queue
 pub fn MutexQueue(comptime T: type) type {
     return struct {
@@ -276,6 +295,13 @@ pub fn MutexQueue(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             return self.queue.list.first == null;
+        }
+
+        /// Clear all the remaining items from the queue
+        pub fn clear(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.queue.clear();
         }
     };
 }

@@ -278,6 +278,7 @@ pub const Scheduler = struct {
             self.pool.release(runner);
             self.skipJob(node);
         }
+        self.result_queue.clear();
         self.active_runners.clearRetainingCapacity();
 
         self.skipRemainingJobs();

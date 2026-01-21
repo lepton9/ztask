@@ -39,13 +39,12 @@ pub const LocalRunner = struct {
     running: std.atomic.Value(bool) = .init(false),
     /// Thread for running the job run function
     thread: ?std.Thread = null,
-    /// Handle for the current running job
-    job: ?struct {
-        /// Current job node being executed
-        node: *JobNode,
-        /// Running child processes of the job
-        process: ?*std.process.Child = null,
-    } = null,
+    /// Current running job node
+    job: ?*JobNode = null,
+    /// Child process for the job commands
+    process: ?*std.process.Child = null,
+    /// Execution mode of the job
+    mode: ExecMode = .piped,
 
     /// Map job nodes to their child processes
     pub const ExecMode = enum { piped, attached };
@@ -73,10 +72,9 @@ pub const LocalRunner = struct {
         logs: *LogQueue,
         mode: ExecMode,
     ) void {
-        _ = self.running.swap(true, .seq_cst);
-        self.mutex.lock();
-        self.job = .{ .node = job };
-        self.mutex.unlock();
+        self.running.store(true, .seq_cst);
+        self.job = job;
+        self.mode = mode;
 
         self.thread = std.Thread.spawn(.{}, runFn, .{
             self,
@@ -103,7 +101,8 @@ pub const LocalRunner = struct {
         logs: *LogQueue,
         mode: ExecMode,
     ) void {
-        const job = if (self.job) |j| j.node else return;
+        defer self.running.store(false, .seq_cst);
+        const job = self.job orelse return;
         log("Start job {s} ({d})", .{ job.ptr.name, job.id });
 
         logs.append(gpa, .{ .job_started = .{
@@ -133,6 +132,11 @@ pub const LocalRunner = struct {
             if (exit_code != 0) break;
         }
 
+        log("Finish job {s} ({d})", .{ job.ptr.name, job.id });
+
+        // Already force interrupted
+        if (!self.running.load(.seq_cst)) return;
+
         logs.append(gpa, .{ .job_finished = .{
             .job_node = job,
             .exit_code = exit_code,
@@ -144,42 +148,34 @@ pub const LocalRunner = struct {
                 .msg = err_msg,
             } },
         );
-        _ = self.running.swap(false, .seq_cst);
-        log("Finish job {s} ({d})", .{ job.ptr.name, job.id });
     }
 
     /// Join the runner thread
     pub fn finishJob(self: *LocalRunner) void {
-        if (self.thread) |t| t.detach();
+        self.running.store(false, .seq_cst);
+        if (self.thread) |t| t.join();
         self.thread = null;
+        self.process = null;
         self.job = null;
     }
 
-    /// Force runner to stop and join the runner thread
+    /// Force runner to stop executing the job if running
     pub fn forceStop(self: *LocalRunner) void {
-        _ = self.running.swap(false, .seq_cst);
-        _ = self.killJobProcess();
-        self.finishJob();
-    }
-
-    /// Force kill the job child process if running
-    pub fn killJobProcess(self: *LocalRunner) i32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        var job = self.job orelse return 0;
-        defer job.process = null;
-        if (job.process) |child| {
-            const term = child.kill() catch |err| switch (err) {
-                error.AlreadyTerminated => return 0,
-                else => return 1,
-            };
-            return switch (term) {
-                .Exited => |code| @intCast(code),
-                .Signal => |sig| @intCast(sig),
-                else => 1,
-            };
+        switch (self.mode) {
+            .piped => self.finishJob(),
+            .attached => {
+                self.running.store(false, .seq_cst);
+                self.mutex.lock();
+                if (self.process) |child| {
+                    _ = std.posix.kill(child.id, std.posix.SIG.INT) catch {};
+                }
+                self.process = null;
+                self.mutex.unlock();
+                if (self.thread) |t| t.detach();
+                self.thread = null;
+                self.job = null;
+            },
         }
-        return 0;
     }
 
     /// Run one job node with the given execution mode
@@ -190,8 +186,7 @@ pub const LocalRunner = struct {
         logs: *LogQueue,
         mode: ExecMode,
     ) !i32 {
-        var job_handle = self.job orelse return error.NoJobRunning;
-        const job = job_handle.node;
+        const job = self.job orelse return error.NoJobRunning;
         // Create args for child process
         var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
         defer argv.deinit(gpa);
@@ -203,17 +198,9 @@ pub const LocalRunner = struct {
             @sizeOf(task.Step),
         );
 
-        // Spawn child process
+        // Create child process
         var child = std.process.Child.init(argv.items, gpa);
-
-        self.mutex.lock();
-        job_handle.process = &child;
-        self.mutex.unlock();
-        defer {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            job_handle.process = null;
-        }
+        self.process = &child;
 
         switch (mode) {
             .attached => {
@@ -223,6 +210,9 @@ pub const LocalRunner = struct {
                 try child.spawn();
 
                 const term = try child.wait();
+                self.mutex.lock();
+                self.process = null;
+                self.mutex.unlock();
                 return switch (term) {
                     .Exited => |code| @intCast(code),
                     .Signal => |sig| @intCast(sig),
@@ -250,6 +240,7 @@ pub const LocalRunner = struct {
                     if (!self.running.load(.seq_cst)) {
                         self.mutex.lock();
                         const term = try child.kill();
+                        self.process = null;
                         self.mutex.unlock();
                         return switch (term) {
                             .Exited => |code| @intCast(code),
