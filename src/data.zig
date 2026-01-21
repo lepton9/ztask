@@ -484,61 +484,24 @@ pub const DataStore = struct {
         res.value_ptr.* = meta_copy;
     }
 
-    /// Read a part of a job log file
+    pub const LogReadOptions = struct {
+        /// Number of lines to skip from the end
+        skip_lines_from_end: usize = 0,
+        /// Max lines to return
+        max_lines: usize,
+        /// Max bytes to read from the end
+        max_bytes: usize = 256 * 1024,
+    };
+
+    /// Read the desired log window from a job log file
+    ///
+    /// Returns full lines
     pub fn readJobLogWindow(
         allocator: std.mem.Allocator,
         task_id: []const u8,
         run_id: u64,
         job_name: []const u8,
-        window: struct { offset: ?u64 = null, size: usize },
-    ) !struct { []u8, u64 } {
-        var buf: [64]u8 = undefined;
-        const log_path = try DataStore.jobLogPath(
-            allocator,
-            task_id,
-            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
-            job_name,
-        );
-        defer allocator.free(log_path);
-
-        var file = std.fs.cwd().openFile(
-            log_path,
-            .{ .mode = .read_only },
-        ) catch |err| switch (err) {
-            error.FileNotFound => return .{ try allocator.alloc(u8, 0), 0 },
-            else => return err,
-        };
-        defer file.close();
-
-        const stat = try file.stat();
-        const offset: u64 = window.offset orelse
-            @max(@as(i64, @intCast(stat.size)) - @as(i64, @intCast(window.size)), 0);
-        if (offset >= stat.size) return .{ try allocator.alloc(u8, 0), stat.size };
-
-        const remaining: u64 = stat.size - offset;
-        const to_read: usize = @min(remaining, window.size);
-
-        try file.seekTo(offset);
-
-        var log_buf = try allocator.alloc(u8, to_read);
-        const n = try file.read(log_buf);
-        return .{ log_buf[0..n], stat.size };
-    }
-
-    /// Read the last N lines from a job log
-    pub fn readJobLogTailLines(
-        allocator: std.mem.Allocator,
-        task_id: []const u8,
-        run_id: u64,
-        job_name: []const u8,
-        opts: struct {
-            /// Number of lines to skip from the end
-            skip_lines_from_end: usize = 0,
-            /// Max lines to return
-            max_lines: usize,
-            /// Max bytes to read from the end
-            max_bytes: usize = 256 * 1024,
-        },
+        opts: LogReadOptions,
     ) !struct { []u8, u64, usize } {
         var buf: [64]u8 = undefined;
         const log_path = try DataStore.jobLogPath(
@@ -562,51 +525,50 @@ pub const DataStore = struct {
         if (stat.size == 0) return .{ try allocator.alloc(u8, 0), 0, 0 };
         const want_lines: usize = opts.skip_lines_from_end + opts.max_lines;
 
-        var chunks: std.ArrayList([]u8) = .empty;
-        defer {
-            for (chunks.items) |c| allocator.free(c);
-            chunks.deinit(allocator);
-        }
-
         var scratch: [8192]u8 = undefined;
         var pos: u64 = stat.size;
-        var bytes_read: usize = 0;
+        var read: usize = 0;
         var newlines: usize = 0;
 
-        // Read the wanted amount of bytes from the log file
-        while (pos > 0 and bytes_read < opts.max_bytes and newlines <= want_lines) {
+        // Find the start position of the log file to read from
+        while (pos > 0 and read < opts.max_bytes and newlines <= want_lines) {
             const remaining: usize = @intCast(pos);
             var to_read: usize = @min(remaining, scratch.len);
-            const budget = opts.max_bytes - bytes_read;
-            to_read = @min(to_read, budget);
+            to_read = @min(to_read, opts.max_bytes - read);
             if (to_read == 0) break;
 
-            pos -= @intCast(to_read);
+            pos -= @as(u64, @intCast(to_read));
             try file.seekTo(pos);
-            const n = try file.read(scratch[0..to_read]);
+
+            var nread: usize = 0;
+            while (nread < to_read) {
+                const n = try file.read(scratch[nread..to_read]);
+                if (n == 0) break;
+                nread += n;
+            }
+            if (nread == 0) break;
+
+            read += nread;
+            newlines += std.mem.count(u8, scratch[0..nread], "\n");
+        }
+
+        const read_len: usize = @intCast(stat.size - pos);
+        if (read_len == 0) return .{ try allocator.alloc(u8, 0), stat.size, 0 };
+
+        // Read the file to the buffer
+        var bytes_all = try allocator.alloc(u8, read_len);
+        defer allocator.free(bytes_all);
+
+        try file.seekTo(pos);
+        var filled: usize = 0;
+        while (filled < read_len) {
+            const n = try file.read(bytes_all[filled..]);
             if (n == 0) break;
-
-            const chunk = try allocator.alloc(u8, n);
-            @memcpy(chunk, scratch[0..n]);
-            try chunks.append(allocator, chunk);
-
-            bytes_read += n;
-            newlines += std.mem.count(u8, chunk, "\n");
+            filled += n;
         }
+        const bytes = bytes_all[0..filled];
 
-        var collected: std.ArrayList(u8) = try .initCapacity(allocator, bytes_read);
-        defer collected.deinit(allocator);
-
-        // Reverse the read slices
-        var i: usize = chunks.items.len;
-        while (i > 0) {
-            i -= 1;
-            collected.appendSliceAssumeCapacity(chunks.items[i]);
-        }
-
-        const bytes = collected.items;
-
-        // Remove newlines from the end
+        // Trim trailing newlines
         var bytes_end: usize = bytes.len;
         while (bytes_end > 0 and bytes[bytes_end - 1] == '\n') {
             bytes_end -= 1;
@@ -614,7 +576,6 @@ pub const DataStore = struct {
         }
         if (bytes_end == 0) return .{ try allocator.alloc(u8, 0), stat.size, 0 };
 
-        // Calculate the lines to leave from the end
         const total_lines: usize = newlines + 1;
         const max_skip: usize = if (total_lines > opts.max_lines)
             total_lines - opts.max_lines
@@ -622,33 +583,31 @@ pub const DataStore = struct {
             0;
         const skip_from_end: usize = @min(opts.skip_lines_from_end, max_skip);
 
-        // Skip lines from the end
-        var slice_end: usize = bytes_end;
-        var to_skip: usize = skip_from_end;
-        while (to_skip > 0 and slice_end > 0) : (to_skip -= 1) {
-            const slice = bytes[0..slice_end];
-            const idx = std.mem.lastIndexOfScalar(u8, slice, '\n') orelse {
-                slice_end = 0;
-                break;
-            };
-            slice_end = idx;
-        }
-
-        // Take `max_lines` amount of lines from the end
+        var end_pos: usize = bytes_end;
         var start_pos: usize = 0;
-        var last_newline: usize = slice_end;
-        var lines: usize = @max(opts.max_lines, 1);
-        while (lines > 0 and last_newline > 0) : (lines -= 1) {
-            const slice = bytes[0..last_newline];
-            last_newline = std.mem.lastIndexOfScalar(u8, slice, '\n') orelse {
-                start_pos = 0;
+        var newlines_seen: usize = 0;
+        const max_lines: usize = @max(opts.max_lines, 1);
+        const end_line_offset: usize = skip_from_end;
+        const start_line_offset: usize = skip_from_end + max_lines;
+
+        // Take `max_lines` amount of lines
+        var idx: usize = bytes_end;
+        while (idx > 0) {
+            idx -= 1;
+            if (bytes[idx] != '\n') continue;
+            newlines_seen += 1;
+
+            if (end_line_offset != 0 and newlines_seen == end_line_offset) {
+                end_pos = idx;
+            }
+            if (newlines_seen == start_line_offset) {
+                start_pos = idx + 1;
                 break;
-            };
-            start_pos = last_newline + 1;
+            }
         }
 
-        const out_slice = bytes[start_pos..slice_end];
-        return .{ try allocator.dupe(u8, out_slice), stat.size, max_skip };
+        const out = try allocator.dupe(u8, bytes[start_pos..end_pos]);
+        return .{ out, stat.size, max_skip };
     }
 
     /// Update the task metafile in disk and the datastore hashmap
