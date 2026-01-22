@@ -626,6 +626,11 @@ const TaskView = struct {
         if (lines == 0) return;
 
         var vstate = &self.log_view_state;
+        if (vstate.file_size == 0) {
+            vstate.* = .{};
+            ctx.consumeEvent();
+            return;
+        }
         const prev_follow = vstate.follow;
         const prev_skip = vstate.skip_lines_from_end;
         const prev_pending = vstate.anchor_advance_lines;
@@ -793,12 +798,24 @@ const TaskView = struct {
                 .overflow = .clip,
                 .width_basis = .parent,
             };
+
+            const log_label: vxfw.Border.BorderLabel = .{
+                .text = "Log",
+                .alignment = .top_left,
+            };
+            const labels = if (!self.log_view_state.follow) blk: {
+                const labels = try ctx.arena.alloc(vxfw.Border.BorderLabel, 2);
+                labels[0] = log_label;
+                labels[1] = .{
+                    .text = "Paused (press 'c' to follow)",
+                    .alignment = .bottom_left,
+                };
+                break :blk labels;
+            } else &[_]vxfw.Border.BorderLabel{log_label};
+
             const job_log_bordered: vxfw.Border = .{
                 .child = text.widget(),
-                .labels = &[_]vxfw.Border.BorderLabel{.{
-                    .text = "Log",
-                    .alignment = .top_left,
-                }},
+                .labels = labels,
                 .style = .{
                     .fg = if (areas.job_log.selected) COLOR_SELECTED else .default,
                 },
