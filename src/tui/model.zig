@@ -461,14 +461,18 @@ const TaskView = struct {
         follow: bool = true,
         /// Offset from the end in lines
         skip_lines_from_end: usize = 0,
+        /// File size in bytes, up to the end of the viewed log
+        anchor_file_end_offset: ?u64 = null,
+        /// Pending request to advance the anchor by N lines
+        anchor_advance_lines: usize = 0,
         /// Last known log file size
-        last_file_size: u64 = 0,
+        file_size: u64 = 0,
         /// Last known area width
         last_view_width: u16 = 0,
         /// Last known area height
         last_view_height: u16 = 0,
         /// Maximum allowed skip for the window
-        last_max_skip_lines: usize = 0,
+        max_skip_lines: usize = 0,
     } = .{},
 
     job_list: vxfw.ListView,
@@ -601,10 +605,15 @@ const TaskView = struct {
                 @max(@divFloor(self.log_view_state.last_view_height, 2), 1),
             );
             self.scrollLogByLines(ctx, half);
+        } else if (key.matches('c', .{})) {
+            // Reset log view state and set back to follow mode
+            self.log_view_state = .{};
+            ctx.consumeAndRedraw();
         } else if (key.matches(vaxis.Key.escape, .{})) {
             self.display_job_log = false;
             self.job_list.cursor = 0;
             self.tab = .task_run;
+            self.log_view_state = .{};
             ctx.consumeAndRedraw();
         }
     }
@@ -618,6 +627,7 @@ const TaskView = struct {
         var vstate = &self.log_view_state;
         const prev_follow = vstate.follow;
         const prev_skip = vstate.skip_lines_from_end;
+        const prev_pending = vstate.anchor_advance_lines;
 
         // Scroll up
         if (lines < 0) {
@@ -625,32 +635,49 @@ const TaskView = struct {
             if (vstate.follow) {
                 vstate.follow = false;
                 vstate.skip_lines_from_end = 0;
+                vstate.anchor_advance_lines = 0;
+                if (vstate.anchor_file_end_offset == null and vstate.file_size != 0)
+                    vstate.anchor_file_end_offset = vstate.file_size;
             }
 
-            if (vstate.skip_lines_from_end >= vstate.last_max_skip_lines) {
+            if (vstate.skip_lines_from_end >= vstate.max_skip_lines) {
                 ctx.consumeEvent();
                 return;
             }
 
             vstate.skip_lines_from_end = @min(
                 vstate.skip_lines_from_end + up,
-                vstate.last_max_skip_lines,
+                vstate.max_skip_lines,
             );
         } else { // Scroll down
             const down: usize = @intCast(lines);
             if (!vstate.follow) {
-                vstate.skip_lines_from_end -|= down;
-                if (vstate.skip_lines_from_end == 0)
-                    vstate.follow = true;
+                if (vstate.skip_lines_from_end == 0) {
+                    // Request to advance the anchor when reading the next log
+                    vstate.anchor_advance_lines += down;
+                } else {
+                    vstate.skip_lines_from_end -|= down;
+                }
             }
         }
 
         // Nothing changed
-        if (vstate.follow == prev_follow and vstate.skip_lines_from_end == prev_skip) {
+        if (vstate.follow == prev_follow and
+            vstate.skip_lines_from_end == prev_skip and
+            vstate.anchor_advance_lines == prev_pending)
+        {
             ctx.consumeEvent();
             return;
         }
 
+        if (vstate.follow) {
+            vstate.anchor_file_end_offset = null;
+        } else if (vstate.anchor_file_end_offset == null and
+            vstate.file_size != 0)
+        {
+            // Set anchor so appending the log file won't move the log view
+            vstate.anchor_file_end_offset = vstate.file_size;
+        }
         ctx.consumeAndRedraw();
     }
 
@@ -754,13 +781,10 @@ const TaskView = struct {
             const inner_h: u16 = areas.job_log.height;
 
             // Fetch logs
-            const job_log = self.getJobLog(ctx.arena, job, .{
+            const log_text = self.getJobLog(ctx.arena, job, .{
                 .height = inner_h,
                 .width = inner_w,
             });
-            const log_text = job_log.@"0";
-            const file_size = job_log.@"1";
-            self.log_view_state.last_file_size = file_size;
 
             const text: vxfw.Text = .{
                 .text = log_text,
@@ -1025,39 +1049,101 @@ const TaskView = struct {
         arena: std.mem.Allocator,
         job: *const snap.UiJobSnap,
         area: struct { height: u16, width: u16 },
-    ) struct { []const u8, u64 } {
-        self.log_view_state.last_view_width = area.width;
-        self.log_view_state.last_view_height = area.height;
-        return if (self.selected_run_id) |run_id| blk: {
-            const lines_to_skip: usize = if (self.log_view_state.follow)
-                0
-            else
-                self.log_view_state.skip_lines_from_end;
-            const max_bytes: usize = @max(
-                @as(usize, 16 * 1024),
-                @as(usize, @intCast(area.width)) * @as(usize, @intCast(area.height)) * 32,
+    ) []const u8 {
+        var vstate = &self.log_view_state;
+        vstate.last_view_width = area.width;
+        vstate.last_view_height = area.height;
+
+        const prev_file_size = vstate.file_size;
+        vstate.file_size = 0;
+
+        const run_id: u64 = blk: {
+            if (self.selected_run_id) |id| break :blk id;
+            const run = self.displayedRun() orelse return &.{};
+            break :blk switch (run.state) {
+                .run => |r| r.run_id,
+                .completed => |meta| meta.run_id orelse return &.{},
+                .wait => return &.{},
+            };
+        };
+
+        const max_bytes: usize = @max(
+            16 * 1024,
+            @as(usize, area.width) * @as(usize, area.height) * 32,
+        );
+        const max_lines: usize = @intCast(@max(area.height, 1));
+
+        // Set anchor if not set and not following
+        if (!vstate.follow and
+            vstate.anchor_file_end_offset == null and prev_file_size != 0)
+        {
+            vstate.anchor_file_end_offset = prev_file_size;
+        }
+
+        const read_options: data.DataStore.LogReadOptions = blk: {
+            if (vstate.follow) break :blk .{
+                .skip_lines_from_end = 0,
+                .end_offset = null,
+                .advance_end_by_lines = 0,
+                .max_lines = max_lines,
+                .max_bytes = max_bytes,
+            };
+            break :blk .{
+                .skip_lines_from_end = vstate.skip_lines_from_end,
+                .end_offset = vstate.anchor_file_end_offset,
+                .advance_end_by_lines = vstate.anchor_advance_lines,
+                .max_lines = max_lines,
+                .max_bytes = max_bytes,
+            };
+        };
+
+        // Read logs
+        const res = data.DataStore.readJobLogWindow(
+            arena,
+            self.task.?.data.meta.id,
+            run_id,
+            job.job_name,
+            read_options,
+        ) catch .{ &.{}, 0, 0, 0 };
+
+        const log_text = res.@"0";
+        const file_size = res.@"1";
+        const max_skip = res.@"2";
+        const file_end_pos = res.@"3";
+
+        vstate.max_skip_lines = max_skip;
+        vstate.file_size = file_size;
+
+        if (vstate.follow) {
+            vstate.skip_lines_from_end = 0;
+            vstate.anchor_file_end_offset = null;
+            vstate.anchor_advance_lines = 0;
+        } else {
+            if (vstate.anchor_file_end_offset == null and file_size != 0)
+                vstate.anchor_file_end_offset = file_size;
+
+            // Update anchor
+            if (vstate.anchor_file_end_offset) |*a| {
+                a.* = @min(file_end_pos, file_size);
+            }
+            vstate.anchor_advance_lines = 0;
+
+            vstate.skip_lines_from_end = @min(
+                vstate.skip_lines_from_end,
+                vstate.max_skip_lines,
             );
 
-            const res = data.DataStore.readJobLogWindow(
-                arena,
-                self.task.?.data.meta.id,
-                run_id,
-                job.job_name,
-                .{
-                    .skip_lines_from_end = lines_to_skip,
-                    .max_lines = @max(@as(usize, @intCast(area.height)), 1),
-                    .max_bytes = max_bytes,
-                },
-            ) catch .{ &.{}, 0, 0 };
+            // Continue following if at the end of the currenly read log file
+            if (vstate.skip_lines_from_end == 0 and
+                vstate.anchor_file_end_offset != null and
+                vstate.anchor_file_end_offset.? == file_size)
+            {
+                vstate.follow = true;
+                vstate.anchor_file_end_offset = null;
+            }
+        }
 
-            self.log_view_state.last_max_skip_lines = res.@"2";
-            self.log_view_state.skip_lines_from_end = @min(
-                self.log_view_state.skip_lines_from_end,
-                self.log_view_state.last_max_skip_lines,
-            );
-
-            break :blk .{ res.@"0", res.@"1" };
-        } else .{ &.{}, 0 }; // TODO: Current run
+        return log_text;
     }
 
     /// Set the data for the selected task
@@ -1138,6 +1224,8 @@ const TaskView = struct {
         self.display_job_log = true;
         self.log_view_state.follow = true;
         self.log_view_state.skip_lines_from_end = 0;
+        self.log_view_state.anchor_file_end_offset = null;
+        self.log_view_state.anchor_advance_lines = 0;
     }
 
     /// Get the currently selected run from the list

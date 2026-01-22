@@ -489,7 +489,8 @@ pub const DataStore = struct {
         skip_lines_from_end: usize = 0,
         /// Virtual end of file position
         end_offset: ?u64 = null,
-        /// Advance the end offset by lines
+        /// Advance the end offset by lines.
+        /// Only if `end_offset` is not null.
         advance_end_by_lines: usize = 0,
         /// Max lines to return
         max_lines: usize,
