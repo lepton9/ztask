@@ -487,6 +487,10 @@ pub const DataStore = struct {
     pub const LogReadOptions = struct {
         /// Number of lines to skip from the end
         skip_lines_from_end: usize = 0,
+        /// Virtual end of file position
+        end_offset: ?u64 = null,
+        /// Advance the end offset by lines
+        advance_end_by_lines: usize = 0,
         /// Max lines to return
         max_lines: usize,
         /// Max bytes to read from the end
@@ -502,7 +506,7 @@ pub const DataStore = struct {
         run_id: u64,
         job_name: []const u8,
         opts: LogReadOptions,
-    ) !struct { []u8, u64, usize } {
+    ) !struct { []u8, u64, usize, u64 } {
         var buf: [64]u8 = undefined;
         const log_path = try DataStore.jobLogPath(
             allocator,
@@ -516,17 +520,55 @@ pub const DataStore = struct {
             log_path,
             .{ .mode = .read_only },
         ) catch |err| switch (err) {
-            error.FileNotFound => return .{ try allocator.alloc(u8, 0), 0, 0 },
+            error.FileNotFound => return .{ &.{}, 0, 0, 0 },
             else => return err,
         };
         defer file.close();
 
         const stat = try file.stat();
-        if (stat.size == 0) return .{ try allocator.alloc(u8, 0), 0, 0 };
-        const want_lines: usize = opts.skip_lines_from_end + opts.max_lines;
+        if (stat.size == 0) return .{ &.{}, stat.size, 0, 0 };
+
+        // Set EOF position
+        var file_end: u64 = if (opts.end_offset) |end|
+            @min(end, stat.size)
+        else
+            stat.size;
+        if (file_end == 0) return .{ &.{}, stat.size, 0, 0 };
 
         var scratch: [8192]u8 = undefined;
-        var pos: u64 = stat.size;
+
+        // Advance the end offset forward
+        if (opts.end_offset != null and opts.advance_end_by_lines != 0 and
+            file_end < stat.size)
+        {
+            var remaining_lines: usize = opts.advance_end_by_lines;
+
+            try file.seekTo(file_end);
+            var pos_fwd: u64 = file_end;
+            while (pos_fwd < stat.size) {
+                const max_read: usize = @intCast(
+                    @min(@as(u64, scratch.len), stat.size - pos_fwd),
+                );
+                const nread = try file.read(scratch[0..max_read]);
+                if (nread == 0) break;
+
+                var i: usize = 0;
+                while (i < nread) : (i += 1) {
+                    if (scratch[i] != '\n') continue;
+                    remaining_lines -= 1;
+                    if (remaining_lines == 0) {
+                        file_end = pos_fwd + @as(u64, @intCast(i + 1));
+                        break;
+                    }
+                }
+                if (remaining_lines == 0) break;
+                pos_fwd += @as(u64, @intCast(nread));
+            }
+            if (remaining_lines != 0) file_end = stat.size;
+        }
+
+        const want_lines: usize = opts.skip_lines_from_end + opts.max_lines;
+        var pos: u64 = file_end;
         var read: usize = 0;
         var newlines: usize = 0;
 
@@ -552,8 +594,8 @@ pub const DataStore = struct {
             newlines += std.mem.count(u8, scratch[0..nread], "\n");
         }
 
-        const read_len: usize = @intCast(stat.size - pos);
-        if (read_len == 0) return .{ try allocator.alloc(u8, 0), stat.size, 0 };
+        const read_len: usize = @intCast(file_end - pos);
+        if (read_len == 0) return .{ &.{}, stat.size, 0, file_end };
 
         // Read the file to the buffer
         var bytes_all = try allocator.alloc(u8, read_len);
@@ -574,7 +616,7 @@ pub const DataStore = struct {
             bytes_end -= 1;
             newlines -= 1;
         }
-        if (bytes_end == 0) return .{ try allocator.alloc(u8, 0), stat.size, 0 };
+        if (bytes_end == 0) return .{ &.{}, stat.size, 0, file_end };
 
         const total_lines: usize = newlines + 1;
         const max_skip: usize = if (total_lines > opts.max_lines)
@@ -607,7 +649,7 @@ pub const DataStore = struct {
         }
 
         const out = try allocator.dupe(u8, bytes[start_pos..end_pos]);
-        return .{ out, stat.size, max_skip };
+        return .{ out, stat.size, max_skip, file_end };
     }
 
     /// Update the task metafile in disk and the datastore hashmap
