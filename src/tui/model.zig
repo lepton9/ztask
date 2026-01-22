@@ -456,12 +456,18 @@ const TaskView = struct {
     selected_job: ?[]const u8 = null,
 
     log_view_state: struct {
-        /// Log buffer size
-        window_size: usize = 2048,
-        /// Starting index in the log file
-        offset: u64 = 0,
         /// Follow if logs are appended
         follow: bool = true,
+        /// Offset from the end in lines
+        skip_lines_from_end: usize = 0,
+        /// Last known log file size
+        last_file_size: u64 = 0,
+        /// Last known area width
+        last_view_width: u16 = 0,
+        /// Last known area height
+        last_view_height: u16 = 0,
+        /// Maximum allowed skip for the window
+        last_max_skip_lines: usize = 0,
     } = .{},
 
     job_list: vxfw.ListView,
@@ -500,7 +506,20 @@ const TaskView = struct {
     ) anyerror!void {
         switch (event) {
             .init => {},
+            .mouse => |mouse| {
+                if (!self.display_job_log) return;
+                // Scroll job logs
+                if (mouse.button == .wheel_up) {
+                    self.scrollLogByLines(ctx, -3);
+                } else if (mouse.button == .wheel_down) {
+                    self.scrollLogByLines(ctx, 3);
+                }
+            },
             .key_press => |key| {
+                if (self.display_job_log) {
+                    self.handleJobLogKey(ctx, key);
+                    return;
+                }
                 if (keyDown(key)) {
                     self.handleDown(ctx);
                 } else if (keyUp(key)) {
@@ -517,20 +536,14 @@ const TaskView = struct {
                     }
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.tab, .{})) {
-                    defer ctx.consumeAndRedraw();
-                    if (self.display_job_log) return;
                     self.tab = switch (self.tab) {
                         .task_run => .run_list,
                         .run_list => .task_run,
                     };
+                    ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
-                    if (self.tab == .task_run and self.selected_run_id == null and
-                        !self.display_job_log) return;
-                    if (self.tab == .task_run) {
-                        if (self.display_job_log) {
-                            self.display_job_log = false;
-                        } else self.resetSelectedRun();
-                    }
+                    if (self.tab == .task_run and self.selected_run_id == null) return;
+                    if (self.tab == .task_run) self.resetSelectedRun();
                     self.tab = .task_run;
                     ctx.consumeAndRedraw();
                 }
@@ -548,14 +561,7 @@ const TaskView = struct {
     /// Handle up key press
     inline fn handleUp(self: *@This(), ctx: *vxfw.EventContext) void {
         switch (self.tab) {
-            .task_run => {
-                if (self.display_job_log) {
-                    // TODO: handle
-                    ctx.consumeEvent();
-                    return;
-                }
-                self.job_list.prevItem(ctx);
-            },
+            .task_run => self.job_list.prevItem(ctx),
             .run_list => self.task_runs_list_view.prevItem(ctx),
         }
     }
@@ -563,16 +569,87 @@ const TaskView = struct {
     /// Handle down key press
     inline fn handleDown(self: *@This(), ctx: *vxfw.EventContext) void {
         switch (self.tab) {
-            .task_run => {
-                if (self.display_job_log) {
-                    // TODO: handle
-                    ctx.consumeEvent();
-                    return;
-                }
-                self.job_list.nextItem(ctx);
-            },
+            .task_run => self.job_list.nextItem(ctx),
             .run_list => self.task_runs_list_view.nextItem(ctx),
         }
+    }
+
+    /// Handle key presses in the job log view
+    inline fn handleJobLogKey(self: *@This(), ctx: *vxfw.EventContext, key: vaxis.Key) void {
+        if (keyDown(key)) {
+            self.scrollLogByLines(ctx, 1);
+        } else if (keyUp(key)) {
+            self.scrollLogByLines(ctx, -1);
+        } else if ((key.matches(vaxis.Key.page_up, .{}) or
+            key.matches(vaxis.Key.kp_page_up, .{})))
+        {
+            const page: i32 = @intCast(@max(self.log_view_state.last_view_height, 1));
+            self.scrollLogByLines(ctx, -page);
+        } else if ((key.matches(vaxis.Key.page_down, .{}) or
+            key.matches(vaxis.Key.kp_page_down, .{})))
+        {
+            const page: i32 = @intCast(@max(self.log_view_state.last_view_height, 1));
+            self.scrollLogByLines(ctx, page);
+        } else if (key.matches('u', .{ .ctrl = true })) {
+            const half: i32 = @intCast(
+                @max(@divFloor(self.log_view_state.last_view_height, 2), 1),
+            );
+            self.scrollLogByLines(ctx, -half);
+        } else if (key.matches('d', .{ .ctrl = true })) {
+            const half: i32 = @intCast(
+                @max(@divFloor(self.log_view_state.last_view_height, 2), 1),
+            );
+            self.scrollLogByLines(ctx, half);
+        } else if (key.matches(vaxis.Key.escape, .{})) {
+            self.display_job_log = false;
+            self.tab = .task_run;
+            ctx.consumeAndRedraw();
+        }
+    }
+
+    /// Scroll the job log text by lines
+    /// Prevent scrolling if already at the edge of the log
+    fn scrollLogByLines(self: *TaskView, ctx: *vxfw.EventContext, lines: i32) void {
+        if (!self.display_job_log) return;
+        if (lines == 0) return;
+
+        var vstate = &self.log_view_state;
+        const prev_follow = vstate.follow;
+        const prev_skip = vstate.skip_lines_from_end;
+
+        // Scroll up
+        if (lines < 0) {
+            const up: usize = @intCast(-lines);
+            if (vstate.follow) {
+                vstate.follow = false;
+                vstate.skip_lines_from_end = 0;
+            }
+
+            if (vstate.skip_lines_from_end >= vstate.last_max_skip_lines) {
+                ctx.consumeEvent();
+                return;
+            }
+
+            vstate.skip_lines_from_end = @min(
+                vstate.skip_lines_from_end + up,
+                vstate.last_max_skip_lines,
+            );
+        } else { // Scroll down
+            const down: usize = @intCast(lines);
+            if (!vstate.follow) {
+                vstate.skip_lines_from_end -|= down;
+                if (vstate.skip_lines_from_end == 0)
+                    vstate.follow = true;
+            }
+        }
+
+        // Nothing changed
+        if (vstate.follow == prev_follow and vstate.skip_lines_from_end == prev_skip) {
+            ctx.consumeEvent();
+            return;
+        }
+
+        ctx.consumeAndRedraw();
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
@@ -671,32 +748,33 @@ const TaskView = struct {
         // Display job log
         if (areas.job_log.selected) {
             const job = selected_job orelse unreachable;
+            const inner_w: u16 = max.width;
+            const inner_h: u16 = areas.job_log.height;
 
             // Fetch logs
             const job_log = self.getJobLog(ctx.arena, job, .{
-                .height = areas.job_log.height,
-                .width = max.width,
+                .height = inner_h,
+                .width = inner_w,
             });
             const log_text = job_log.@"0";
             const file_size = job_log.@"1";
+            self.log_view_state.last_file_size = file_size;
 
-            // Set offset
-            if (self.log_view_state.follow) {
-                self.log_view_state.offset = @max(@as(i64, @intCast(file_size)) -
-                    @as(i64, @intCast(self.log_view_state.window_size)), 0);
-            }
-
-            const text: vxfw.Text = .{ .text = log_text };
-
-            // TODO: use vxfw.ScrollView
-            // or just move the offset
+            const text: vxfw.Text = .{
+                .text = log_text,
+                .softwrap = false,
+                .overflow = .clip,
+                .width_basis = .parent,
+            };
             const job_log_bordered: vxfw.Border = .{
                 .child = text.widget(),
                 .labels = &[_]vxfw.Border.BorderLabel{.{
                     .text = "Log",
                     .alignment = .top_left,
                 }},
-                .style = .{ .fg = if (areas.job_log.selected) COLOR_SELECTED else .default },
+                .style = .{
+                    .fg = if (areas.job_log.selected) COLOR_SELECTED else .default,
+                },
             };
 
             const prev_child = children.items[0];
@@ -934,24 +1012,39 @@ const TaskView = struct {
         arena: std.mem.Allocator,
         job: *const snap.UiJobSnap,
         area: struct { height: u16, width: u16 },
-    ) struct { []u8, u64 } {
-        self.log_view_state.window_size = area.width * (area.height);
-        return if (self.selected_run_id) |run_id|
-            data.DataStore.readJobLogWindow(
+    ) struct { []const u8, u64 } {
+        self.log_view_state.last_view_width = area.width;
+        self.log_view_state.last_view_height = area.height;
+        return if (self.selected_run_id) |run_id| blk: {
+            const lines_to_skip: usize = if (self.log_view_state.follow)
+                0
+            else
+                self.log_view_state.skip_lines_from_end;
+            const max_bytes: usize = @max(
+                @as(usize, 16 * 1024),
+                @as(usize, @intCast(area.width)) * @as(usize, @intCast(area.height)) * 32,
+            );
+
+            const res = data.DataStore.readJobLogWindow(
                 arena,
                 self.task.?.data.meta.id,
                 run_id,
                 job.job_name,
                 .{
-                    .offset = if (self.log_view_state.follow)
-                        null
-                    else
-                        self.log_view_state.offset,
-                    .size = self.log_view_state.window_size,
+                    .skip_lines_from_end = lines_to_skip,
+                    .max_lines = @max(@as(usize, @intCast(area.height)), 1),
+                    .max_bytes = max_bytes,
                 },
-            ) catch .{ &.{}, 0 }
-        else
-            .{ &.{}, 0 }; // TODO: Current run
+            ) catch .{ &.{}, 0, 0 };
+
+            self.log_view_state.last_max_skip_lines = res.@"2";
+            self.log_view_state.skip_lines_from_end = @min(
+                self.log_view_state.skip_lines_from_end,
+                self.log_view_state.last_max_skip_lines,
+            );
+
+            break :blk .{ res.@"0", res.@"1" };
+        } else .{ &.{}, 0 }; // TODO: Current run
     }
 
     /// Set the data for the selected task
@@ -1032,7 +1125,7 @@ const TaskView = struct {
         _ = self.selectedJobFromList() orelse return;
         self.display_job_log = true;
         self.log_view_state.follow = true;
-        self.log_view_state.offset = 0;
+        self.log_view_state.skip_lines_from_end = 0;
     }
 
     /// Get the currently selected run from the list
