@@ -1,6 +1,7 @@
 const std = @import("std");
 const tm = @import("../taskmanager.zig");
 const data = @import("../data.zig");
+const date = @import("../date.zig");
 const snap = @import("snapshot.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -820,6 +821,7 @@ const TaskView = struct {
         };
 
         var scratch: [512]u8 = undefined;
+        var buf: [64]u8 = undefined;
         var buffer = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
         var text_height: u16 = 0;
@@ -833,22 +835,32 @@ const TaskView = struct {
                 text_height = 1;
             },
             .run => |*run| {
+                const start_d = date.timestampToDateTime(@intCast(run.start_time));
                 try buffer.appendSlice(ctx.arena, std.fmt.bufPrint(&scratch,
                     \\Run {d}: {s}
-                    \\Start time {d}
-                , .{ run.run_id, @tagName(run.status), run.start_time }) catch "");
+                    \\Started: {s}
+                , .{
+                    run.run_id,
+                    @tagName(run.status),
+                    start_d.fmt(&buf) catch "",
+                }) catch "");
                 text_height = 2;
             },
             .completed => |meta| {
+                const start_d = date.timestampToDateTime(@intCast(meta.start_time));
+                const end_d = if (meta.end_time) |e|
+                    date.timestampToDateTime(@intCast(e))
+                else
+                    null;
                 try buffer.appendSlice(ctx.arena, std.fmt.bufPrint(&scratch,
                     \\Run {d}: {s}
-                    \\Time {d} - {d}
+                    \\Time: {s} - {s}
                     \\Completed jobs: {d}/{d}
                 , .{
                     meta.run_id orelse 0,
                     @tagName(meta.status),
-                    meta.start_time,
-                    meta.end_time orelse 0,
+                    start_d.fmt(&buf) catch "",
+                    if (end_d) |e| e.fmt(&buf) catch "" else "",
                     meta.jobs_completed,
                     meta.jobs_total,
                 }) catch "");
@@ -991,7 +1003,7 @@ const TaskView = struct {
                     .{
                         .text = try std.fmt.allocPrint(ctx.arena, " {d}s", .{
                             @divFloor(
-                                job.end_time_ms.? - job.start_time_ms.?,
+                                @max(0, job.end_time_ms.? - job.start_time_ms.?),
                                 std.time.ms_per_s,
                             ),
                         }),

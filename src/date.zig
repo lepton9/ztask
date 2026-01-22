@@ -7,10 +7,9 @@ pub const DateTime = struct {
     pub fn fmt(self: DateTime, buf: []u8) ![]u8 {
         const d = self.date;
         const t = self.time;
-        // 2026-01-22 13:30:00Z
         return try std.fmt.bufPrint(
             buf,
-            "{d}-{d}-{d} {d}:{d}:{d}",
+            "{d}-{d:0>2}-{d} {d}:{d}:{d}",
             .{ d.year, d.month, d.day, t.h, t.min, t.sec },
         );
     }
@@ -29,10 +28,13 @@ pub const Time = struct {
     ms: u30 = 0,
 };
 
+/// Check if the year is a leap year
 fn isLeapYear(year: u32) bool {
     return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
 }
 
+/// Calculate the amount of days in the month
+/// Counts for leap years
 fn daysInMonth(month: u8, year: u32) u5 {
     const days_in_month = [_]u5{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
     const max_days = days_in_month[month - 1];
@@ -42,20 +44,22 @@ fn daysInMonth(month: u8, year: u32) u5 {
     };
 }
 
-pub fn timestampToDateTime(timestamp: u64) DateTime {
-    // TODO:
-    return milliTsToDateTime(timestamp);
+/// Convert timestamp in seconds to datetime
+pub fn timestampToDateTime(timestamp_s: u64) DateTime {
+    const timestamp_ms = timestamp_s * std.time.ms_per_s;
+    return milliTsToDateTime(timestamp_ms);
 }
 
-pub fn milliTsToDateTime(timestamp: u64) DateTime {
-    const seconds = @divTrunc(timestamp, std.time.ms_per_s);
+/// Convert timestamp in milliseconds to datetime
+pub fn milliTsToDateTime(timestamp_ms: u64) DateTime {
+    const seconds = @divTrunc(timestamp_ms, std.time.ms_per_s);
 
     // Calculate time
     const time: Time = .{
         .h = @intCast(@divTrunc(@rem(seconds, std.time.s_per_day), std.time.s_per_hour)),
         .min = @intCast(@divTrunc(@rem(seconds, std.time.s_per_hour), std.time.s_per_min)),
         .sec = @intCast(@rem(seconds, std.time.s_per_min)),
-        .ms = @intCast(@rem(timestamp, std.time.ms_per_s)),
+        .ms = @intCast(@rem(timestamp_ms, std.time.ms_per_s)),
     };
 
     var days = @divTrunc(seconds, std.time.s_per_day);
