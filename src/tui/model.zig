@@ -602,6 +602,7 @@ const TaskView = struct {
             self.scrollLogByLines(ctx, half);
         } else if (key.matches(vaxis.Key.escape, .{})) {
             self.display_job_log = false;
+            self.job_list.cursor = 0;
             self.tab = .task_run;
             ctx.consumeAndRedraw();
         }
@@ -1064,7 +1065,6 @@ const TaskView = struct {
         if (self.task) |task| {
             const runs_n = task.details.past_runs.len;
             self.task_runs_list_view.item_count = @intCast(runs_n);
-
             if (task.details.selected_run) |selected_run| {
                 const jobs = selected_run.jobs;
                 self.job_list.item_count = @intCast(jobs.len);
@@ -1077,11 +1077,11 @@ const TaskView = struct {
         // Set list cursors in bounds
         self.task_runs_list_view.cursor = @min(
             self.task_runs_list_view.cursor,
-            @max(0, @as(i32, @intCast(self.task_runs_list_view.item_count.?)) - 1),
+            self.task_runs_list_view.item_count.? -| 1,
         );
         self.job_list.cursor = @min(
             self.job_list.cursor,
-            @max(0, @as(i32, @intCast(self.job_list.item_count.?)) - 1),
+            self.job_list.item_count.? -| 1,
         );
         self.task_runs_list_view.ensureScroll();
         self.job_list.ensureScroll();
