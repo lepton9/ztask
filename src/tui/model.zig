@@ -237,6 +237,7 @@ pub const Model = struct {
     fn dispatchTask(self: *Model, task_id: []const u8) !void {
         self.taskmanager.beginTask(task_id, .{}) catch |err| {
             try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
+            return;
         };
         try self.setInfo("Started task {s}", .{task_id});
     }
@@ -1222,10 +1223,7 @@ const TaskView = struct {
         self.display_job_log = false;
         _ = self.selectedJobFromList() orelse return;
         self.display_job_log = true;
-        self.log_view_state.follow = true;
-        self.log_view_state.skip_lines_from_end = 0;
-        self.log_view_state.anchor_file_end_offset = null;
-        self.log_view_state.anchor_advance_lines = 0;
+        self.log_view_state = .{};
     }
 
     /// Get the currently selected run from the list
@@ -1238,7 +1236,10 @@ const TaskView = struct {
 
     /// Get the currently selected job from the list
     fn selectedJobFromList(self: *@This()) ?*snap.UiJobSnap {
-        const run = self.displayedRun() orelse return null;
+        const run = self.displayedRun() orelse {
+            self.display_job_log = false;
+            return null;
+        };
         if (self.job_list.cursor >= run.jobs.len) return null;
         return &run.jobs[self.job_list.cursor];
     }
