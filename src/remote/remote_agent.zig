@@ -1,11 +1,11 @@
 const std = @import("std");
-const task = @import("task");
+const task = @import("../types/task.zig");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 
-const Queue = @import("../queue.zig").Queue;
+const Queue = @import("../types/queue.zig").Queue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
 const ResultQueue = localrunner.ResultQueue;

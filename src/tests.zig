@@ -1,5 +1,5 @@
 const std = @import("std");
-const parse = @import("parse");
+const parse = @import("parse.zig");
 const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 

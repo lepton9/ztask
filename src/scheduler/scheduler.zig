@@ -1,12 +1,13 @@
 const std = @import("std");
 const data = @import("../data.zig");
-const task_zig = @import("task");
+const task_zig = @import("../types/task.zig");
 const dag = @import("dag.zig");
 const log = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const remote = @import("../remote/remote_manager.zig");
+const queue_zig = @import("../types/queue.zig");
 
-const Queue = @import("../queue.zig").Queue;
+const Queue = queue_zig.Queue;
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
 const LocalRunner = localrunner.LocalRunner;
 const ExecResult = localrunner.ExecResult;
@@ -19,7 +20,7 @@ const ErrorDAG = dag.ErrorDAG;
 
 test {
     _ = dag;
-    _ = @import("../queue.zig");
+    _ = queue_zig;
 }
 
 const JobNode = localrunner.JobNode;

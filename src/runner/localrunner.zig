@@ -1,6 +1,6 @@
 const std = @import("std");
-const queue = @import("../queue.zig");
-const task = @import("task");
+const queue = @import("../types/queue.zig");
+const task = @import("../types/task.zig");
 
 const log = std.log.scoped(.runner).debug;
 

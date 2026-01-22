@@ -1,5 +1,5 @@
 const std = @import("std");
-const task = @import("task");
+const task = @import("types/task.zig");
 const yaml = @import("yaml");
 
 const Task = task.Task;

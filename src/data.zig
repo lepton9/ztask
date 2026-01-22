@@ -1,6 +1,6 @@
 const std = @import("std");
-const parse = @import("parse");
-const task = @import("task");
+const parse = @import("parse.zig");
+const task = @import("types/task.zig");
 
 pub const ROOT_DIR: []const u8 = "./.ztask/"; // TODO: change
 const RUN_COUNTER_FILE: []const u8 = "run_counter";

@@ -1,7 +1,7 @@
 const std = @import("std");
-const queue_zig = @import("../queue.zig");
+const queue_zig = @import("../types/queue.zig");
 const builtin = @import("builtin");
-const task = @import("task");
+const task = @import("../types/task.zig");
 
 pub const EventType = enum { modified, created, deleted };
 pub const WatchEvent = union(enum) {

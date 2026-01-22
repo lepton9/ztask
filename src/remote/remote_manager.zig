@@ -5,7 +5,7 @@ const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 
-const Queue = @import("../queue.zig").Queue;
+const Queue = @import("../types/queue.zig").Queue;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
