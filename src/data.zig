@@ -422,10 +422,15 @@ pub const DataStore = struct {
 
     /// Find task metadata with task file path
     pub fn findTaskMetaPath(self: *DataStore, file_path: []const u8) ?*TaskMetadata {
-        // TODO: check with id from the path
-        var it = self.tasks.valueIterator();
-        while (it.next()) |meta| {
-            if (std.mem.eql(u8, file_path, meta.file_path)) return meta;
+        // Try to find with id
+        var id = task.Id.fromStr(file_path);
+        if (self.tasks.getPtr(id.fmt())) |meta| return meta;
+
+        // Find by iterating
+        var it = self.tasks.iterator();
+        while (it.next()) |e| {
+            const m = e.value_ptr;
+            if (std.mem.eql(u8, m.file_path, file_path)) return m;
         }
         return null;
     }
