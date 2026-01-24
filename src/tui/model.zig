@@ -264,10 +264,7 @@ pub const Model = struct {
 
 const TaskSplit = struct {
     model: *Model,
-
-    // TODO: is necessary?
     tasks_models: std.ArrayList(TaskListItem),
-
     task_list_view: vxfw.ListView,
     selected_task_view: TaskView,
 
@@ -401,7 +398,8 @@ const TaskSplit = struct {
     fn buildTaskList(self: *@This(), arena: std.mem.Allocator) !void {
         const snapshot = self.model.getSnapshot();
         const tasks_snap = snapshot.tasks;
-        self.tasks_models.clearRetainingCapacity();
+        self.tasks_models.items.len = 0;
+        self.tasks_models.capacity = 0;
         try self.tasks_models.ensureTotalCapacity(arena, tasks_snap.len);
         for (0..tasks_snap.len) |i| {
             self.tasks_models.appendAssumeCapacity(.{ .task = &tasks_snap[i] });
@@ -548,6 +546,7 @@ const TaskView = struct {
                     };
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
+                    self.job_list.cursor = 0;
                     if (self.tab == .task_run and self.selected_run_id == null) return;
                     if (self.tab == .task_run) self.resetSelectedRun();
                     self.tab = .task_run;
@@ -612,7 +611,6 @@ const TaskView = struct {
             ctx.consumeAndRedraw();
         } else if (key.matches(vaxis.Key.escape, .{})) {
             self.display_job_log = false;
-            self.job_list.cursor = 0;
             self.tab = .task_run;
             self.log_view_state = .{};
             ctx.consumeAndRedraw();
@@ -750,6 +748,7 @@ const TaskView = struct {
                 },
                 .run_list => self.task_runs_list_view.widget(),
             },
+            // TODO: fix size int overflow on small screen
             .size = .{ .width = max.width, .height = areas.task.height - 9 },
         };
 
