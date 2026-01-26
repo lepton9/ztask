@@ -236,12 +236,12 @@ pub const TaskManager = struct {
         };
 
         // Unload any tasks
-        for (self.to_unload.items) |task| try self.unloadTask(task);
+        for (self.to_unload.items) |task| self.unloadTask(task);
         self.to_unload.clearRetainingCapacity();
     }
 
     /// Unload a task and its scheduler from memory
-    fn unloadTask(self: *TaskManager, t: *Task) !void {
+    fn unloadTask(self: *TaskManager, t: *Task) void {
         if (self.schedulers.fetchRemove(t)) |kv| {
             _ = self.loaded_tasks.swapRemove(t.id.fmt());
             var s = kv.value;
@@ -287,6 +287,8 @@ pub const TaskManager = struct {
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };
+        errdefer self.unloadTask(task);
+
         // Add trigger
         if (task.trigger) |t| {
             task_scheduler.status = .waiting;
