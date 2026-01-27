@@ -3,17 +3,16 @@ const queue_zig = @import("../types/queue.zig");
 const builtin = @import("builtin");
 const task = @import("../types/task.zig");
 
+const FileWatcher = @import("filewatcher/FileWatcher.zig");
+
 pub const EventType = enum { modified, created, deleted };
 pub const WatchEvent = union(enum) {
-    fileEvent: struct {
-        path: []const u8,
-        kind: EventType,
-    },
+    fileEvent: FileWatcher.FileEvent,
     interval: @TypeOf(task.Trigger.interval),
     time: @TypeOf(task.Trigger.time),
 };
 
-pub const EventQueue = queue_zig.MutexQueue(WatchEvent);
+const EventQueue = queue_zig.MutexQueue(WatchEvent);
 
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
@@ -68,7 +67,7 @@ pub const Watcher = struct {
 
             // Poll watchers for events
             if (self.file_watcher) |fw| {
-                fw.pollEvents(self.gpa, self.queue) catch |err| {
+                fw.pollEvents(self.gpa, self.queue, addFileEvent) catch |err| {
                     if (err == error.WouldBlock) continue;
                     std.log.scoped(.Watcher).err("watcher: {}", .{err});
                 };
@@ -107,81 +106,12 @@ pub const Watcher = struct {
     }
 };
 
-pub const FileWatcher = struct {
-    ptr: *anyopaque,
-    vtable: struct {
-        deinit: *const fn (opq: *anyopaque, gpa: std.mem.Allocator) void,
-        addWatch: *const fn (
-            opq: *anyopaque,
-            gpa: std.mem.Allocator,
-            path: []const u8,
-        ) anyerror!void,
-        removeWatch: *const fn (opq: *anyopaque, path: []const u8) void,
-        watchCount: *const fn (opq: *anyopaque) u32,
-        pollEvents: *const fn (
-            opq: *anyopaque,
-            gpa: std.mem.Allocator,
-            out: *EventQueue,
-        ) anyerror!void,
-    },
-
-    fn init(gpa: std.mem.Allocator) !*FileWatcher {
-        const w = try gpa.create(FileWatcher);
-        errdefer gpa.destroy(w);
-        w.* = try loadWatcherBackend(gpa);
-        return w;
-    }
-
-    fn deinit(self: *FileWatcher, gpa: std.mem.Allocator) void {
-        self.vtable.deinit(self.ptr, gpa);
-        gpa.destroy(self);
-    }
-
-    /// Add a file path to watch list
-    fn addWatch(self: *FileWatcher, gpa: std.mem.Allocator, path: []const u8) !void {
-        return self.vtable.addWatch(self.ptr, gpa, path);
-    }
-
-    /// Remove a file from the watch list
-    fn removeWatch(self: *FileWatcher, path: []const u8) void {
-        return self.vtable.removeWatch(self.ptr, path);
-    }
-
-    /// Get the amount of paths to watch
-    fn watchCount(self: *FileWatcher) u32 {
-        return self.vtable.watchCount(self.ptr);
-    }
-
-    /// Check if any files in the watch list have changed
-    fn pollEvents(
-        self: *FileWatcher,
-        gpa: std.mem.Allocator,
-        out: *EventQueue,
-    ) !void {
-        return self.vtable.pollEvents(self.ptr, gpa, out);
-    }
-
-    /// Get a platform-specific implementation for `FileWatcher`
-    fn loadWatcherBackend(gpa: std.mem.Allocator) !@This() {
-        return switch (builtin.os.tag) {
-            .linux => try @import(
-                "filewatcher/watcherlinux.zig",
-            ).FileWatcherLinux.fileWatcher(gpa),
-            .windows => try @import(
-                "filewatcher/watcherwindows.zig",
-            ).FileWatcherWindows.fileWatcher(gpa),
-            else => error.UnsupportedPlatform,
-        };
-    }
-};
-
-/// Split path string to a directory name and a file basename
-pub fn splitPath(path: []const u8) !struct { dirname: []const u8, basename: ?[]const u8 } {
-    if (std.mem.eql(u8, path, "")) return .{ .dirname = ".", .basename = null };
-    const stat = try std.fs.cwd().statFile(path);
-    if (stat.kind == .directory) return .{ .dirname = path, .basename = null };
-    return .{
-        .dirname = std.fs.path.dirname(path) orelse if (path[0] == '/') "/" else ".",
-        .basename = std.fs.path.basename(path),
-    };
+/// Add a file event to the event queue
+pub fn addFileEvent(
+    gpa: std.mem.Allocator,
+    queue_ptr: *anyopaque,
+    ev: FileWatcher.FileEvent,
+) !void {
+    var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
+    try queue.append(gpa, .{ .fileEvent = ev });
 }
