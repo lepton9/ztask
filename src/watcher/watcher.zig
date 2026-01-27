@@ -166,7 +166,10 @@ pub const FileWatcher = struct {
         return switch (builtin.os.tag) {
             .linux => try @import(
                 "filewatcher/watcherlinux.zig",
-            ).FileWatcherLinux.filewatcher(gpa),
+            ).FileWatcherLinux.fileWatcher(gpa),
+            .windows => try @import(
+                "filewatcher/watcherwindows.zig",
+            ).FileWatcherWindows.fileWatcher(gpa),
             else => error.UnsupportedPlatform,
         };
     }

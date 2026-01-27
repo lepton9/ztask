@@ -7,12 +7,6 @@ const EventQueue = watcher.EventQueue;
 const EventType = watcher.EventType;
 const splitPath = watcher.splitPath;
 
-const Dir = struct {
-    dirname: []const u8,
-    watch_self: bool = false,
-    file_table: std.StringHashMapUnmanaged([]const u8),
-};
-
 pub const FileWatcherLinux = struct {
     fd: i32,
     wd_map: std.AutoHashMapUnmanaged(i32, Dir),
@@ -20,7 +14,13 @@ pub const FileWatcherLinux = struct {
     watch_count: u32 = 0,
     buffer: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined,
 
-    pub fn filewatcher(gpa: std.mem.Allocator) !FileWatcher {
+    const Dir = struct {
+        dirname: []const u8,
+        watch_self: bool = false,
+        file_table: std.StringHashMapUnmanaged([]const u8),
+    };
+
+    pub fn fileWatcher(gpa: std.mem.Allocator) !FileWatcher {
         return .{
             .ptr = try FileWatcherLinux.init(gpa),
             .vtable = .{
@@ -109,6 +109,7 @@ pub const FileWatcherLinux = struct {
         return self.watch_count;
     }
 
+    /// Poll for any file events
     fn pollEvents(
         opq: *anyopaque,
         gpa: std.mem.Allocator,

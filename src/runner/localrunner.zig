@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const queue = @import("../types/queue.zig");
 const task = @import("../types/task.zig");
 
@@ -167,7 +168,11 @@ pub const LocalRunner = struct {
                 self.running.store(false, .seq_cst);
                 self.mutex.lock();
                 if (self.process) |child| {
-                    _ = std.posix.kill(child.id, std.posix.SIG.INT) catch {};
+                    if (builtin.os.tag == .windows) {
+                        std.os.windows.TerminateProcess(child.id, 1) catch {};
+                    } else {
+                        _ = std.posix.kill(child.id, std.posix.SIG.INT) catch {};
+                    }
                 }
                 self.process = null;
                 self.mutex.unlock();
