@@ -75,10 +75,10 @@ pub fn pollEvents(
 fn loadWatcherBackend(gpa: std.mem.Allocator) !@This() {
     return switch (builtin.os.tag) {
         .linux => try @import(
-            "WatcherLinux.zig",
+            "FileWatcherLinux.zig",
         ).fileWatcher(gpa),
         .windows => try @import(
-            "WatcherWindows.zig",
+            "FileWatcherWindows.zig",
         ).fileWatcher(gpa),
         else => error.UnsupportedPlatform,
     };
