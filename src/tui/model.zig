@@ -707,7 +707,7 @@ const TaskView = struct {
             task.details.past_runs.len,
         }) catch "");
 
-        const text_segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 4);
+        const text_segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 5);
         text_segments[0] = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
         text_segments[1] = .{
             .text = "Task",
@@ -718,12 +718,7 @@ const TaskView = struct {
             .text = "Runs",
             .style = .{ .fg = if (self.tab == .run_list) COLOR_SELECTED else .default },
         };
-
-        var task_text: vxfw.RichText = .{ .text = text_segments };
-        const task_text_sized: vxfw.SizedBox = .{
-            .child = task_text.widget(),
-            .size = .{ .width = max.width, .height = @min(7, max.height -| 2) },
-        };
+        text_segments[4] = .{ .text = "\n" };
 
         const selected_job = self.selectedJobFromList();
 
@@ -740,6 +735,12 @@ const TaskView = struct {
                 break :blk .{ .task = .{ .height = max.height, .selected = true } };
             },
             else => .{ .task = .{ .height = max.height } },
+        };
+
+        var task_text: vxfw.RichText = .{ .text = text_segments };
+        const task_text_sized: vxfw.SizedBox = .{
+            .child = task_text.widget(),
+            .size = .{ .width = max.width, .height = @min(8, areas.task.height -| 2) },
         };
 
         const list_area_start: u16 = task_text_sized.size.height + 2;
@@ -926,9 +927,14 @@ const TaskView = struct {
             .col = 0,
         };
 
+        const max = ctx.max.size();
+        const list_height = max.height -| @as(u16, @intCast(job_area_origin.row));
         children[1] = .{
             .origin = job_area_origin,
-            .surface = try self.job_list.draw(ctx),
+            .surface = try self.job_list.draw(ctx.withConstraints(
+                .{ .width = 1, .height = 1 },
+                .{ .width = max.width, .height = list_height },
+            )),
         };
 
         return .{
