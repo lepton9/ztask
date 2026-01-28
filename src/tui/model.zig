@@ -697,6 +697,8 @@ const TaskView = struct {
             \\File: {s}
             \\Status: {s}
             \\Total runs: {d}
+            \\
+            \\
         , .{
             task.data.meta.name,
             task.data.meta.id,
@@ -705,23 +707,23 @@ const TaskView = struct {
             task.details.past_runs.len,
         }) catch "");
 
-        var task_text: vxfw.Text = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
-        const task_text_sized: vxfw.SizedBox = .{
-            .child = task_text.widget(),
-            .size = .{ .width = max.width, .height = 6 },
-        };
-
-        var tabs = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
-        tabs[0] = .{
+        const text_segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 4);
+        text_segments[0] = .{ .text = try task_buf.toOwnedSlice(ctx.arena) };
+        text_segments[1] = .{
             .text = "Task",
             .style = .{ .fg = if (self.tab == .task_run) COLOR_SELECTED else .default },
         };
-        tabs[1] = .{ .text = " | " };
-        tabs[2] = .{
+        text_segments[2] = .{ .text = " | " };
+        text_segments[3] = .{
             .text = "Runs",
             .style = .{ .fg = if (self.tab == .run_list) COLOR_SELECTED else .default },
         };
-        const tab: vxfw.RichText = .{ .text = tabs };
+
+        var task_text: vxfw.RichText = .{ .text = text_segments };
+        const task_text_sized: vxfw.SizedBox = .{
+            .child = task_text.widget(),
+            .size = .{ .width = max.width, .height = @min(7, max.height -| 2) },
+        };
 
         const selected_job = self.selectedJobFromList();
 
@@ -730,15 +732,17 @@ const TaskView = struct {
         const Areas = struct { task: Area, job_log: Area = .{ .height = 0 } };
         const areas: Areas = switch (self.parent.model.active) {
             .task_view => blk: {
-                const task_h = @divFloor(max.height, 4);
+                const task_h: u16 = @divFloor(max.height, 4);
                 if (self.display_job_log and selected_job != null) break :blk .{
                     .task = .{ .height = task_h },
-                    .job_log = .{ .height = max.height - task_h - 2, .selected = true },
+                    .job_log = .{ .height = max.height -| task_h -| 2, .selected = true },
                 };
                 break :blk .{ .task = .{ .height = max.height, .selected = true } };
             },
             else => .{ .task = .{ .height = max.height } },
         };
+
+        const list_area_start: u16 = task_text_sized.size.height + 2;
 
         const list_area: vxfw.SizedBox = .{
             .child = switch (self.tab) {
@@ -748,15 +752,16 @@ const TaskView = struct {
                 },
                 .run_list => self.task_runs_list_view.widget(),
             },
-            // TODO: fix size int overflow on small screen
-            .size = .{ .width = max.width, .height = areas.task.height - 9 },
+            .size = .{
+                .width = max.width,
+                .height = areas.task.height -| list_area_start,
+            },
         };
 
-        const children_flex = try ctx.arena.alloc(vxfw.FlexItem, 3);
+        const children_flex = try ctx.arena.alloc(vxfw.FlexItem, 2);
         var task_flex: vxfw.FlexColumn = .{ .children = children_flex };
         children_flex[0] = .init(task_text_sized.widget(), 0);
-        children_flex[1] = .init(tab.widget(), 0);
-        children_flex[2] = .init(list_area.widget(), 0);
+        children_flex[1] = .init(list_area.widget(), 0);
 
         const task_bordered: vxfw.Border = .{
             .child = task_flex.widget(),
