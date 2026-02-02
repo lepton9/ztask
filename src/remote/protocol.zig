@@ -191,6 +191,7 @@ pub fn deserialize(comptime T: type, msg: []const u8) !T {
     return out;
 }
 
+/// Serialize a `field` of type `T` and append it to `msg`
 fn serializeField(
     gpa: std.mem.Allocator,
     comptime T: type,
@@ -199,6 +200,13 @@ fn serializeField(
 ) !void {
     var buf: [64]u8 = undefined;
     switch (@typeInfo(T)) {
+        .@"enum" => |e| {
+            const Tag = e.tag_type;
+            const raw: Tag = @intFromEnum(field);
+            const bytes = @divExact(@typeInfo(Tag).int.bits, 8);
+            std.mem.writeInt(Tag, buf[0..bytes], raw, .little);
+            try msg.appendSlice(gpa, buf[0..bytes]);
+        },
         .int => |i| {
             const bytes = @divExact(i.bits, 8);
             std.mem.writeInt(T, buf[0..bytes], field, .little);
@@ -222,12 +230,21 @@ fn serializeField(
     }
 }
 
+/// Deserialize an item of type `T` from the buffer,
+/// starting from index `pos`.
+///
+/// Increments the `pos` by the amount of bytes read.
 fn deserializeField(
     comptime T: type,
     buffer: []const u8,
     pos: *usize,
 ) !T {
     switch (@typeInfo(T)) {
+        .@"enum" => |e| {
+            const Tag = e.tag_type;
+            const raw: Tag = try deserializeField(Tag, buffer, pos);
+            return std.enums.fromInt(T, raw) orelse error.InvalidEnumValue;
+        },
         .int => |i| {
             const bytes = @divExact(i.bits, 8);
             if (pos.* + bytes > buffer.len) return error.InvalidMsg;
