@@ -117,10 +117,28 @@ pub const RemoteManager = struct {
         if (self.polls.items.len < 2) return;
 
         // Agents
-        for (self.polls.items[1..]) |p| {
-            if (p.revents == 0) continue;
-            const agent = self.agents.getPtr(p.fd) orelse unreachable;
-            try self.updateAgent(agent);
+        var i: usize = 1;
+        while (i < self.polls.items.len) {
+            const p = self.polls.items[i];
+            if (p.revents == 0) {
+                i += 1;
+                continue;
+            }
+
+            // Remove the socket if not connected
+            if ((p.revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) {
+                self.removeAgentByFd(p.fd);
+                continue;
+            }
+
+            self.updateAgentByFd(p.fd) catch |err| switch (err) {
+                error.ConnectionError => {
+                    self.removeAgentByFd(p.fd);
+                    continue;
+                },
+                else => return err,
+            };
+            i += 1;
         }
     }
 
@@ -138,11 +156,17 @@ pub const RemoteManager = struct {
     }
 
     /// Update the agent and handle incoming messages
-    fn updateAgent(self: *RemoteManager, agent: *AgentHandle) !void {
-        while (agent.connection.readNextFrame(self.gpa) catch null) |msg| {
-            const parsed = try self.parser.parse(msg);
+    fn updateAgentByFd(self: *RemoteManager, fd: posix.socket_t) !void {
+        const agent = self.agents.getPtr(fd) orelse return;
+        while (true) {
+            const msg = agent.connection.readNextFrame(self.gpa) catch {
+                return error.ConnectionError;
+            };
+            const frame = msg orelse break;
+            const parsed = try self.parser.parse(frame);
             try self.handleMessage(agent, parsed);
         }
+        if (agent.connection.closed) return error.ConnectionError;
     }
 
     /// Handle a parsed message sent to the manager
@@ -151,7 +175,6 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         msg: protocol.Msg,
     ) !void {
-        std.log.debug("parsed: {any}", .{msg});
         switch (msg) {
             .register => |m| try agent.setName(self.gpa, m.hostname),
             .heartbeat => agent.last_heartbeat = std.time.timestamp(),
@@ -271,7 +294,7 @@ pub const RemoteManager = struct {
             .cancel_job = msg,
         });
         defer self.gpa.free(payload);
-        self.sendMessage(agent, payload) catch {};
+        try self.sendMessage(agent, payload);
     }
 
     /// Send a message to the agent
@@ -282,10 +305,7 @@ pub const RemoteManager = struct {
         message: []const u8,
     ) !void {
         agent.connection.sendFrame(message) catch {
-            var kv = self.agents.fetchRemove(
-                agent.connection.conn.stream.handle,
-            );
-            if (kv) |*e| e.value.deinit(self.gpa);
+            self.removeAgentByFd(agent.connection.conn.stream.handle);
             return error.NotConnected;
         };
     }
@@ -312,10 +332,7 @@ pub const RemoteManager = struct {
             posix.SOCK.NONBLOCK,
         ) catch |err| switch (err) {
             error.WouldBlock => return,
-            else => {
-                std.log.err("remote manager err: {}", .{err});
-                return;
-            },
+            else => return err,
         };
         try self.newAgent(.{
             .address = address,
@@ -339,8 +356,21 @@ pub const RemoteManager = struct {
         }
     }
 
+    /// Remove a connected agent using the socket
+    fn removeAgentByFd(self: *RemoteManager, fd: posix.socket_t) void {
+        var kv = self.agents.fetchRemove(fd);
+        if (kv) |*e| e.value.deinit(self.gpa);
+
+        if (self.polls.items.len < 2) return;
+        for (self.polls.items[1..], 1..) |pfd, i| {
+            if (pfd.fd != fd) continue;
+            _ = self.polls.swapRemove(i);
+            break;
+        }
+    }
+
     /// Remove a connected agent based on the name
-    fn removeAgent(self: *RemoteManager, name: []const u8) !void {
+    fn removeAgentByName(self: *RemoteManager, name: []const u8) !void {
         if (self.polls.items.len < 2) return error.NoConnectedAgents;
         for (self.polls.items[1..], 1..) |pfd, i| {
             const agent = self.agents.get(pfd.fd) orelse continue;
