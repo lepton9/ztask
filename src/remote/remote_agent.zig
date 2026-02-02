@@ -103,11 +103,12 @@ pub const RemoteAgent = struct {
     /// Retry connecting
     fn tryReconnect(self: *RemoteAgent) void {
         while (true) {
+            if (!self.running.load(.seq_cst)) break;
             std.log.info("Reconnecting..", .{});
             self.connect(self.connection.conn.address) catch |err| switch (err) {
                 error.AlreadyConnected => break,
                 else => {
-                    std.Thread.sleep(std.time.ns_per_s); // Sleep for 1 second
+                    std.Thread.sleep(std.time.ns_per_s);
                     continue;
                 },
             };
@@ -128,6 +129,16 @@ pub const RemoteAgent = struct {
         switch (msg) {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
+            .error_msg => |m| {
+                std.log.err(
+                    "Remote manager error ({s}/{d}): {s}",
+                    .{ @tagName(m.code), @intFromEnum(m.code), m.message },
+                );
+                if (m.code == protocol.ErrorCode.NameTaken) {
+                    self.connection.close();
+                    self.stop();
+                }
+            },
             else => {}, // Not relevant for agent
         }
     }
@@ -149,17 +160,18 @@ pub const RemoteAgent = struct {
         try self.queue.append(self.gpa, &res.value_ptr.node);
     }
 
+    /// Send a message to the server
     fn sendMessage(self: *RemoteAgent, message: []const u8) void {
         self.connection.sendFrame(message) catch {
-            self.tryReconnect();
+            if (self.running.load(.seq_cst)) {
+                self.tryReconnect();
+            }
         };
     }
 
-    /// Cancel a job from running
-    /// Force stop the runner if active
-    /// Otherwise remove from the queue
+    /// Cancel a job from running.
+    /// Force stop the runner if active, otherwise remove from the queue.
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
-        // TODO: send message if not found
         const e = self.jobs.getPtr(msg.job_id) orelse return;
         if (self.active_runners.get(&e.node)) |runner| {
             runner.forceStop();

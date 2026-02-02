@@ -176,7 +176,24 @@ pub const RemoteManager = struct {
         msg: protocol.Msg,
     ) !void {
         switch (msg) {
-            .register => |m| try agent.setName(self.gpa, m.hostname),
+            .register => |m| {
+                if (self.isNameTaken(agent, m.hostname)) {
+                    // Send error to agent and disconnect
+                    const err_msg: protocol.ErrorMsg = .{
+                        .code = protocol.ErrorCode.NameTaken,
+                        .message = "Agent name already taken",
+                    };
+                    const payload = try self.parser.serialize(self.gpa, .{
+                        .error_msg = err_msg,
+                    });
+                    defer self.gpa.free(payload);
+
+                    agent.connection.sendFrame(payload) catch {};
+                    agent.connection.close();
+                    return error.ConnectionError;
+                }
+                try agent.setName(self.gpa, m.hostname);
+            },
             .heartbeat => agent.last_heartbeat = std.time.timestamp(),
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
@@ -214,6 +231,22 @@ pub const RemoteManager = struct {
             },
             else => {},
         }
+    }
+
+    /// Find if a connected and registered agent exists with the name
+    fn isNameTaken(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        name: []const u8,
+    ) bool {
+        var it = self.agents.valueIterator();
+        while (it.next()) |a| {
+            if (@intFromPtr(a) == @intFromPtr(agent)) continue;
+            if (a.connection.closed) continue;
+            if (std.mem.eql(u8, a.name orelse continue, name))
+                return true;
+        }
+        return false;
     }
 
     /// Dispatch all jobs in the queue to agents

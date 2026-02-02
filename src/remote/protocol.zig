@@ -11,6 +11,7 @@ pub const Msg = union(enum) {
     job_finish: JobEndMsg,
     run_job: RunJobMsg,
     cancel_job: CancelJobMsg,
+    error_msg: ErrorMsg,
 
     const Tag = std.meta.Tag(Msg);
 };
@@ -117,6 +118,15 @@ pub const RunJobMsg = struct {
         const steps = json.value;
         return try gpa.dupe(task.Step, steps);
     }
+};
+
+pub const ErrorCode = enum(u32) {
+    NameTaken = 1,
+};
+
+pub const ErrorMsg = struct {
+    code: ErrorCode,
+    message: []const u8,
 };
 
 pub const CancelJobMsg = struct {
@@ -430,6 +440,17 @@ test "cancel_job" {
     defer alloc.free(serialized);
     const parsed = try parser.parse(serialized);
     try std.testing.expect(msg.job_id == parsed.cancel_job.job_id);
+}
+
+test "error_message" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: ErrorMsg = .{ .code = ErrorCode.NameTaken, .message = "taken" };
+    const serialized = try parser.serialize(alloc, .{ .error_msg = msg });
+    defer alloc.free(serialized);
+    const parsed = try parser.parse(serialized);
+    try std.testing.expect(msg.code == parsed.error_msg.code);
+    try std.testing.expect(std.mem.eql(u8, msg.message, parsed.error_msg.message));
 }
 
 test "heartbeat" {
