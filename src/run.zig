@@ -49,25 +49,35 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
     defer agent.deinit();
     const address: std.net.Address = try .parseIp4(options.addr, options.port);
 
-    const agentStart = struct {
-        fn start(a: *RemoteAgent, addr: std.net.Address) void {
-            a.running.store(true, .seq_cst);
-            a.connectUntil(addr);
-            if (!a.running.load(.seq_cst)) return;
-            a.run();
-        }
-    }.start;
-    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address });
+    const Event = union(enum) {
+        key_press: vaxis.Key,
+        exit,
+    };
 
     // Initialize event loop to handle input
     var tty = try vaxis.Tty.init(&.{});
     defer tty.deinit();
     var vx = try vaxis.init(gpa, .{});
     defer vx.deinit(null, tty.writer());
-    var loop: vaxis.Loop(vaxis.Event) = .{ .tty = &tty, .vaxis = &vx };
+    var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
     try loop.init();
     try loop.start();
     defer loop.stop();
+
+    const agentStart = struct {
+        fn start(
+            a: *RemoteAgent,
+            addr: std.net.Address,
+            event_loop: *vaxis.Loop(Event),
+        ) void {
+            defer event_loop.postEvent(.exit);
+            a.running.store(true, .seq_cst);
+            a.connectUntil(addr);
+            if (!a.running.load(.seq_cst)) return;
+            a.run();
+        }
+    }.start;
+    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address, &loop });
 
     while (true) {
         const event = loop.nextEvent();
@@ -75,12 +85,13 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
             },
-            else => {},
+            .exit => break,
         }
     }
 
     agent.stop();
     agent_thread.join();
+    if (agent.exit_error) |err| return err;
 }
 
 pub const RunOptions = struct {

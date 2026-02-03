@@ -11,6 +11,8 @@ const JobNode = localrunner.JobNode;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
+const log = std.log.scoped(.agent);
+
 const HEARTBEAT_FREQ_S = 10;
 
 pub const RemoteAgent = struct {
@@ -32,6 +34,11 @@ pub const RemoteAgent = struct {
 
     parser: protocol.MsgParser = .init(),
     connection: connection.Connection,
+
+    /// Error for exiting
+    exit_error: ?ExitError = null,
+
+    const ExitError = error{NameTaken};
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -58,7 +65,6 @@ pub const RemoteAgent = struct {
         var it = self.jobs.iterator();
         while (it.next()) |e| {
             e.value_ptr.node.deinit(self.gpa);
-            // e.value_ptr.job.deinit(self.gpa);
             const job = e.value_ptr.job;
             self.gpa.free(job.name);
             self.gpa.free(job.steps);
@@ -105,7 +111,7 @@ pub const RemoteAgent = struct {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
             const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            std.log.info(
+            log.info(
                 "Connecting to {d}.{d}.{d}.{d}:{d}",
                 .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
             );
@@ -139,13 +145,14 @@ pub const RemoteAgent = struct {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
             .error_msg => |m| {
-                std.log.err(
-                    "Remote manager error ({s}/{d}): {s}",
+                log.info(
+                    "Error message: ({s}/{d}): {s}",
                     .{ @tagName(m.code), @intFromEnum(m.code), m.message },
                 );
                 if (m.code == protocol.ErrorCode.NameTaken) {
                     self.connection.close();
                     self.stop();
+                    self.exit_error = ExitError.NameTaken;
                 }
             },
             else => {}, // Not relevant for agent
@@ -206,7 +213,6 @@ pub const RemoteAgent = struct {
         const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         self.sendMessage(payload);
-        std.log.debug("Sent {s}", .{payload});
     }
 
     /// Send a heartbeat packet
@@ -215,7 +221,6 @@ pub const RemoteAgent = struct {
         self.connection.setLastAccessed();
         var buf: [1]u8 = .{@intFromEnum(protocol.Msg.heartbeat)};
         self.sendMessage(&buf);
-        std.log.info("Sent heartbeat", .{});
     }
 
     /// Return true if last message was long ago

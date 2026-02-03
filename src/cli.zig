@@ -126,18 +126,23 @@ const runner_n_option: zcli.Opt = .{
     .arg = .{ .name = "INT", .type = .Int },
 };
 
-/// Write all the data to stdout
-fn write_to_stdout(data: []const u8) !void {
+/// Write to stdout with format
+fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
     var buffer: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buffer);
     const stdout = &writer.interface;
-    try stdout.writeAll(data);
+    try stdout.print(fmt, args);
     try stdout.flush();
+}
+
+/// Write all the data to stdout
+fn write(data: []const u8) !void {
+    return fmtWrite("{s}", .{data});
 }
 
 /// Write error message and exit the program
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    std.log.err(fmt, args);
+    fmtWrite(fmt, args) catch {};
     std.process.exit(1);
 }
 
@@ -154,7 +159,7 @@ fn generate_completion(
         spec.config.name.?,
         shell.value,
     );
-    try write_to_stdout(script);
+    try write(script);
     std.process.exit(0);
 }
 
@@ -232,7 +237,15 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
         if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
         opts.runners_n = @intCast(n);
     }
-    return try run.runAgent(ctx.gpa, opts);
+    return run.runAgent(ctx.gpa, opts) catch |err| switch (err) {
+        error.NameTaken => fatal(
+            "Another remote runner with name '{s}' already connected to {s}:{d}",
+            .{
+                opts.name, opts.addr, opts.port,
+            },
+        ),
+        else => {},
+    };
 }
 
 /// Handle list command
