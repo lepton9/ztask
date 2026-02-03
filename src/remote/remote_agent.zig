@@ -100,12 +100,16 @@ pub const RemoteAgent = struct {
         try self.register();
     }
 
-    /// Retry connecting
-    fn tryReconnect(self: *RemoteAgent) void {
+    /// Try connecting until success
+    pub fn connectUntil(self: *RemoteAgent, addr: std.net.Address) void {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
-            std.log.info("Reconnecting..", .{});
-            self.connect(self.connection.conn.address) catch |err| switch (err) {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            std.log.info(
+                "Connecting to {d}.{d}.{d}.{d}:{d}",
+                .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
+            );
+            self.connect(addr) catch |err| switch (err) {
                 error.AlreadyConnected => break,
                 else => {
                     std.Thread.sleep(std.time.ns_per_s);
@@ -114,6 +118,11 @@ pub const RemoteAgent = struct {
             };
             break;
         }
+    }
+
+    /// Try connecting until success
+    fn tryReconnect(self: *RemoteAgent) void {
+        self.connectUntil(self.connection.conn.address);
     }
 
     /// Listen for incoming messages

@@ -127,14 +127,11 @@ pub const Connection = struct {
         var header: [4]u8 = undefined;
         std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
 
-        sendAllNonBlocking(self.conn.stream.handle, &header) catch {
-            self.close();
+        errdefer self.close();
+        sendAllNonBlocking(self.conn.stream.handle, &header) catch
             return error.NotConnected;
-        };
-        sendAllNonBlocking(self.conn.stream.handle, msg) catch {
-            self.close();
+        sendAllNonBlocking(self.conn.stream.handle, msg) catch
             return error.NotConnected;
-        };
         self.setLastAccessed();
     }
 

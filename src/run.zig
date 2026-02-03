@@ -4,7 +4,9 @@ const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+
 const Model = @import("tui/model.zig").Model;
+const RemoteAgent = remote_agent.RemoteAgent;
 
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
@@ -39,20 +41,46 @@ pub const AgentOptions = struct {
 
 /// Run the remote runner
 pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
-    // TODO: run on thread and take input
-    var agent = try remote_agent.RemoteAgent.init(
+    var agent: *RemoteAgent = try .init(
         gpa,
         options.name,
         options.runners_n,
     );
     defer agent.deinit();
     const address: std.net.Address = try .parseIp4(options.addr, options.port);
-    while (agent.connection.closed) {
-        std.log.info("Connecting..", .{});
-        agent.connect(address) catch {};
-        std.Thread.sleep(std.time.ns_per_s);
+
+    const agentStart = struct {
+        fn start(a: *RemoteAgent, addr: std.net.Address) void {
+            a.running.store(true, .seq_cst);
+            a.connectUntil(addr);
+            if (!a.running.load(.seq_cst)) return;
+            a.run();
+        }
+    }.start;
+    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address });
+
+    // Initialize event loop to handle input
+    var tty = try vaxis.Tty.init(&.{});
+    defer tty.deinit();
+    var vx = try vaxis.init(gpa, .{});
+    defer vx.deinit(null, tty.writer());
+    var loop: vaxis.Loop(vaxis.Event) = .{ .tty = &tty, .vaxis = &vx };
+    try loop.init();
+    try loop.start();
+    defer loop.stop();
+
+    while (true) {
+        const event = loop.nextEvent();
+        switch (event) {
+            .key_press => |key| {
+                if (key.matches('c', .{ .ctrl = true })) break;
+            },
+            else => {},
+        }
     }
-    agent.run();
+
+    agent.stop();
+    agent_thread.join();
 }
 
 pub const RunOptions = struct {
