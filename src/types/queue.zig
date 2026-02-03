@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub fn Queue(comptime T: type) type {
     const QueueNode = struct {
@@ -89,6 +90,14 @@ pub fn Queue(comptime T: type) type {
             while (self.pop()) |_| {}
         }
 
+        /// Iterate over all nodes, returning the count.
+        /// This operation is O(N).
+        pub fn len(self: *@This()) usize {
+            if (builtin.mode != .Debug)
+                @panic("Don't use `len` outside of debug build");
+            return self.list.len();
+        }
+
         /// Get an iterator for the queue
         /// Starts iterating from the first node
         pub fn iterator(self: *const @This()) Iterator {
@@ -117,6 +126,7 @@ test "queue_simple" {
     try q.append(gpa, 1);
     try q.append(gpa, 2);
     try std.testing.expect(!q.empty());
+    try std.testing.expect(q.len() == 2);
     try std.testing.expect(q.pop().? == 1);
     try std.testing.expect(q.pop().? == 2);
 }
@@ -128,6 +138,7 @@ test "assume_capacity" {
     defer q.deinit(gpa);
     const arr: [N]i64 = .{ -1, 123, 999, 21, 0 };
     for (arr) |i| q.appendAssumeCapacity(i);
+    try std.testing.expect(q.len() == N);
     for (arr) |i| try std.testing.expect(q.pop().? == i);
 }
 
@@ -222,7 +233,7 @@ test "clear" {
     try std.testing.expect(q.empty());
     const arr: [N]i64 = .{ 1, 2, 3, 4, 5 };
     for (arr) |i| q.appendAssumeCapacity(i);
-    try std.testing.expect(!q.empty());
+    try std.testing.expect(q.len() == N);
     q.clear();
     try std.testing.expect(q.empty());
 }
@@ -302,6 +313,14 @@ pub fn MutexQueue(comptime T: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             self.queue.clear();
+        }
+
+        /// Iterate over all nodes, returning the count.
+        /// This operation is O(N).
+        pub fn len(self: *@This()) usize {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return self.queue.len();
         }
     };
 }

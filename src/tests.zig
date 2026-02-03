@@ -67,6 +67,9 @@ test "force_interrupt" {
 
     var it = task_manager.schedulers.valueIterator();
     while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
+    if (task_manager.events.pop()) |event| switch (event) {
+        .run_finished => |e| try std.testing.expect(e.status == .interrupted),
+    };
 }
 
 test "complete_tasks" {
@@ -101,6 +104,8 @@ test "complete_tasks" {
     try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
     try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
 
+    try std.testing.expect(task_manager.events.empty());
+
     try task_manager.start();
 
     // Start tasks
@@ -112,6 +117,16 @@ test "complete_tasks" {
 
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
     try std.testing.expect(task_manager.schedulers.count() == 0);
+
+    try std.testing.expect(task_manager.events.len() == 2);
+    while (task_manager.events.pop()) |event| switch (event) {
+        .run_finished => |e| {
+            try std.testing.expect(e.status == .success);
+            try std.testing.expect(
+                e.task_id == task1.id.value or e.task_id == task2.id.value,
+            );
+        },
+    };
 }
 
 test "remote_job" {
@@ -150,4 +165,5 @@ test "remote_job" {
     try std.testing.expect(agent.result_queue.empty());
     try std.testing.expect(agent.log_queue.empty());
     try std.testing.expect(agent.active_runners.count() == 0);
+    try std.testing.expect(task_manager.events.len() == 1);
 }
