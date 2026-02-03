@@ -184,6 +184,9 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         opts.runners_n = @intCast(n);
     }
     return run.runTask(ctx.gpa, opts) catch |err| switch (err) {
+        error.Interrupted => {
+            std.log.info("Interrupted", .{});
+        },
         error.TaskNotFoundId => fatal(
             "Task not found with ID: {s}",
             .{opts.id orelse ""},

@@ -6,6 +6,7 @@ const remotemanager = @import("remote/remote_manager.zig");
 const parse = @import("parse.zig");
 const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("types/task.zig");
+const MutexQueue = @import("types/queue.zig").MutexQueue;
 const Task = task_zig.Task;
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
@@ -22,6 +23,13 @@ pub const BeginTaskOptions = struct {
     retrigger: bool = false,
 };
 
+pub const TaskEvent = union(enum) {
+    run_finished: struct {
+        task_id: u64,
+        status: data.TaskRunStatus,
+    },
+};
+
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
@@ -30,6 +38,9 @@ pub const TaskManager = struct {
     running: std.atomic.Value(bool) = .init(false),
     /// Condition for tasks currently running
     idle_cond: std.Thread.Condition = .{},
+
+    /// Queue of task events (single-consumer)
+    events: *MutexQueue(TaskEvent),
     datastore: data.DataStore,
     pool: *RunnerPool,
 
@@ -53,6 +64,7 @@ pub const TaskManager = struct {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
+            .events = try MutexQueue(TaskEvent).initCapacity(gpa, 64),
             .datastore = .init(),
             .pool = try RunnerPool.init(gpa, runners_n),
             .schedulers = .{},
@@ -68,6 +80,7 @@ pub const TaskManager = struct {
 
     pub fn deinit(self: *TaskManager) void {
         self.stop();
+        self.events.deinit(self.gpa);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         var lt_it = self.loaded_tasks.iterator();
@@ -81,6 +94,16 @@ pub const TaskManager = struct {
         self.watch_map.deinit(self.gpa);
         self.datastore.deinit(self.gpa);
         self.gpa.destroy(self);
+    }
+
+    /// Pop the next task event if available (non-blocking)
+    pub fn tryPopEvent(self: *TaskManager) ?TaskEvent {
+        return self.events.pop();
+    }
+
+    /// Pop the next task event (blocking)
+    pub fn nextEvent(self: *TaskManager) ?TaskEvent {
+        return self.events.popBlocking();
     }
 
     /// Start task manager thread
@@ -225,11 +248,21 @@ pub const TaskManager = struct {
                 if (s.*.task.trigger) |_| {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
+
+                try self.events.append(self.gpa, .{ .run_finished = .{
+                    .task_id = s.*.task.id.value,
+                    .status = s.*.task_meta.status,
+                } });
                 self.tasks_changed.store(true, .seq_cst);
             },
             .inactive => try self.to_unload.append(self.gpa, s.*.task),
             .interrupted => {
                 s.*.status = .inactive;
+
+                try self.events.append(self.gpa, .{ .run_finished = .{
+                    .task_id = s.*.task.id.value,
+                    .status = .interrupted,
+                } });
                 self.tasks_changed.store(true, .seq_cst);
             },
             .waiting => {},

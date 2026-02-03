@@ -84,12 +84,49 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         };
         return error.NoTaskFileGiven;
     };
+    const task_id = task.id.fmt();
+    const task_id_value = task.id.value;
+    const task_has_trigger = task.trigger != null;
+
+    // Initialize event loop to handle input
+    var tty = try vaxis.Tty.init(&.{});
+    defer tty.deinit();
+    var vx = try vaxis.init(gpa, .{});
+    defer vx.deinit(null, tty.writer());
+    var loop: vaxis.Loop(vaxis.Event) = .{ .tty = &tty, .vaxis = &vx };
+    try loop.init();
+    try loop.start();
+    defer loop.stop();
+
+    // Start task run
     try task_manager.start();
-    try task_manager.beginTask(task.id.fmt(), .{
+    try task_manager.beginTask(task_id, .{
         .attach_job = options.attach_job,
         .retrigger = options.retrigger,
     });
-    task_manager.waitUntilIdle();
+
+    while (true) {
+        while (loop.tryEvent()) |event| switch (event) {
+            .key_press => |key| {
+                if (key.matches('c', .{ .ctrl = true })) {
+                    task_manager.stopTask(task_id);
+                    task_manager.waitUntilIdle();
+                    return error.Interrupted;
+                }
+            },
+            else => {},
+        };
+
+        // Drain task events
+        while (task_manager.tryPopEvent()) |ev| switch (ev) {
+            .run_finished => |e| {
+                if (e.task_id != task_id_value) continue;
+                if (!task_has_trigger) return;
+            },
+        };
+
+        std.Thread.sleep(std.time.ns_per_ms * 25);
+    }
 }
 
 pub const ListOptions = struct {
