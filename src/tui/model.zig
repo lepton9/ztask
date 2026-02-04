@@ -25,6 +25,8 @@ const StatusText = struct {
 
 /// Main TUI state
 pub const Model = struct {
+    const ActiveArea = enum { status, info, task_list, task_view };
+
     gpa: std.mem.Allocator,
     /// Arena for selected task
     arena_task: std.heap.ArenaAllocator,
@@ -37,7 +39,8 @@ pub const Model = struct {
     snapshot: UiSnapshot = undefined,
 
     /// Active TUI section
-    active: enum { status, task_list, task_view } = .status,
+    active: ActiveArea = .status,
+    last_active: ActiveArea = .status,
 
     info: struct {
         text: ?[]const u8 = null,
@@ -88,6 +91,12 @@ pub const Model = struct {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
                 try onTick(self, ctx);
             },
+            .mouse => {
+                if (self.quit_confirm) {
+                    ctx.consumeEvent();
+                    return;
+                }
+            },
             .key_press => |key| {
                 // Handle exit prompt
                 if (self.quit_confirm) {
@@ -97,11 +106,14 @@ pub const Model = struct {
                         return;
                     }
                     if (key.matches('n', .{}) or key.matches('N', .{}) or
-                        key.matches(vaxis.Key.escape, .{}))
+                        key.matches(vaxis.Key.escape, .{}) or
+                        key.matches(vaxis.Key.enter, .{}))
                     {
                         self.quit_confirm = false;
+                        self.active = self.last_active;
                         if (self.info.text) |t| self.gpa.free(t);
                         self.info.text = null;
+                        try self.restoreFocusForActive(ctx);
                         ctx.consumeAndRedraw();
                         return;
                     }
@@ -110,13 +122,17 @@ pub const Model = struct {
                 }
 
                 if (keyQuit(key)) {
-                    const active_tasks = self.taskmanager.tasksRunning();
-                    if (active_tasks > 0) {
+                    const status = self.taskmanager.getStatus();
+                    // Ask for confirmation if there are tasks running
+                    if (status.active_tasks > 0) {
                         self.quit_confirm = true;
+                        self.last_active = self.active;
+                        self.active = .info;
                         try self.setInfo(
                             "{d} task(s) running. Quit and stop them? (y/N)",
-                            .{active_tasks},
+                            .{status.active_tasks},
                         );
+                        try ctx.requestFocus(self.widget());
                         ctx.consumeAndRedraw();
                         return;
                     }
@@ -132,6 +148,15 @@ pub const Model = struct {
             },
             .focus_in => {},
             else => {},
+        }
+    }
+
+    /// Request focus for the active area
+    fn restoreFocusForActive(self: *Model, ctx: *vxfw.EventContext) !void {
+        switch (self.active) {
+            .task_view => try ctx.requestFocus(self.task_split.selected_task_view.widget()),
+            .task_list => try ctx.requestFocus(self.task_split.widget()),
+            .status, .info => try ctx.requestFocus(self.widget()),
         }
     }
 
@@ -177,6 +202,7 @@ pub const Model = struct {
                     .text = "Info",
                     .alignment = .top_left,
                 }},
+                .style = .{ .fg = if (self.active == .info) COLOR_SELECTED else .default },
             };
             bar_children.appendAssumeCapacity(.init(info_border.widget(), 1));
         }
