@@ -106,6 +106,13 @@ pub const TaskManager = struct {
         return self.events.popBlocking();
     }
 
+    /// Amount of tasks currently running
+    pub fn tasksRunning(self: *TaskManager) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.schedulers.count();
+    }
+
     /// Start task manager thread
     pub fn start(self: *TaskManager) !void {
         _ = self.running.swap(true, .seq_cst);
@@ -343,13 +350,18 @@ pub const TaskManager = struct {
         } else try task_scheduler.trigger();
     }
 
-    /// Stop task
-    /// Interrupts the task if currently running
+    /// Stop task.
+    /// Interrupts the task if currently running.
     pub fn stopTask(self: *TaskManager, task_id: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sched = self.getScheduler(task_id) orelse return;
         self.stopScheduler(sched);
+    }
+
+    /// Force stop all active tasks
+    pub fn stopAllTasks(self: *TaskManager) void {
+        self.stopSchedulers();
     }
 
     /// Load a task from file path or create the meta file

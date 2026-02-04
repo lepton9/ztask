@@ -44,6 +44,9 @@ pub const Model = struct {
         timestamp: i64 = 0,
     } = .{},
 
+    /// If true, the next quit key press is awaiting confirmation
+    quit_confirm: bool = false,
+
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
         model.* = .{
@@ -57,6 +60,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.info.text) |t| self.gpa.free(t);
         self.arena_task.deinit();
         self.arena_list.deinit();
         self.gpa.destroy(self.task_split);
@@ -85,7 +89,37 @@ pub const Model = struct {
                 try onTick(self, ctx);
             },
             .key_press => |key| {
+                // Handle exit prompt
+                if (self.quit_confirm) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        self.forceStopRunningTasks();
+                        ctx.quit = true;
+                        return;
+                    }
+                    if (key.matches('n', .{}) or key.matches('N', .{}) or
+                        key.matches(vaxis.Key.escape, .{}))
+                    {
+                        self.quit_confirm = false;
+                        if (self.info.text) |t| self.gpa.free(t);
+                        self.info.text = null;
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    ctx.consumeEvent();
+                    return;
+                }
+
                 if (keyQuit(key)) {
+                    const active_tasks = self.taskmanager.tasksRunning();
+                    if (active_tasks > 0) {
+                        self.quit_confirm = true;
+                        try self.setInfo(
+                            "{d} task(s) running. Quit and stop them? (y/N)",
+                            .{active_tasks},
+                        );
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
                     ctx.quit = true;
                     return;
                 }
@@ -99,6 +133,11 @@ pub const Model = struct {
             .focus_in => {},
             else => {},
         }
+    }
+
+    /// Stop all running tasks
+    fn forceStopRunningTasks(self: *Model) void {
+        self.taskmanager.stopAllTasks();
     }
 
     /// Draw function callback for the Model
@@ -256,6 +295,7 @@ pub const Model = struct {
 
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
+        if (self.quit_confirm) return;
         if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = null;
