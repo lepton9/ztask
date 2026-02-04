@@ -25,8 +25,6 @@ const StatusText = struct {
 
 /// Main TUI state
 pub const Model = struct {
-    const ActiveArea = enum { status, info, task_list, task_view };
-
     gpa: std.mem.Allocator,
     /// Arena for selected task
     arena_task: std.heap.ArenaAllocator,
@@ -40,20 +38,26 @@ pub const Model = struct {
 
     /// Active TUI section
     active: ActiveArea = .status,
-    last_active: ActiveArea = .status,
 
     info: struct {
         text: ?[]const u8 = null,
         timestamp: i64 = 0,
     } = .{},
 
-    /// If true, the next quit key press is awaiting confirmation
-    quit_confirm: bool = false,
+    /// Confirmation state
+    confirm: ?ConfirmState = null,
 
-    /// If true, a task delete is awaiting confirmation
-    delete_confirm: bool = false,
-    delete_task_id: ?[]u8 = null,
-    delete_task_name: ?[]u8 = null,
+    const ActiveArea = enum { status, info, task_list, task_view };
+
+    const ConfirmAction = union(enum) {
+        quit_running_tasks: usize,
+        delete_task: struct { id: []u8, name: []u8 },
+    };
+
+    const ConfirmState = struct {
+        last_active: ActiveArea,
+        action: ConfirmAction,
+    };
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
@@ -69,8 +73,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         if (self.info.text) |t| self.gpa.free(t);
-        if (self.delete_task_id) |t| self.gpa.free(t);
-        if (self.delete_task_name) |t| self.gpa.free(t);
+        self.deinitConfirm();
         self.arena_task.deinit();
         self.arena_list.deinit();
         self.gpa.destroy(self.task_split);
@@ -99,83 +102,15 @@ pub const Model = struct {
                 try onTick(self, ctx);
             },
             .mouse => {
-                if (self.quit_confirm or self.delete_confirm) {
+                if (self.confirm != null) {
                     ctx.consumeEvent();
                     return;
                 }
             },
             .key_press => |key| {
-                // Handle delete prompt
-                if (self.delete_confirm) {
-                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
-                        const task_id = self.delete_task_id orelse {
-                            self.delete_confirm = false;
-                            ctx.consumeAndRedraw();
-                            return;
-                        };
-                        const task_name = self.delete_task_name orelse task_id;
-
-                        self.taskmanager.deleteTask(task_id) catch |err| {
-                            try self.setInfo(
-                                "Failed to delete task \"{s}\": {}",
-                                .{ task_name, err },
-                            );
-                            self.delete_confirm = false;
-                            self.active = self.last_active;
-                            self.clearDeletePending();
-                            self.active = .task_list;
-                            try self.restoreFocusForActive(ctx);
-                            ctx.consumeAndRedraw();
-                            return;
-                        };
-
-                        try self.setInfo("Deleted task \"{s}\"", .{task_name});
-                        self.delete_confirm = false;
-                        self.active = self.last_active;
-                        self.clearDeletePending();
-
-                        try self.requestSnapshot();
-                        try self.restoreFocusForActive(ctx);
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    if (key.matches('n', .{}) or key.matches('N', .{}) or
-                        key.matches(vaxis.Key.escape, .{}) or
-                        key.matches(vaxis.Key.enter, .{}))
-                    {
-                        self.delete_confirm = false;
-                        self.active = self.last_active;
-                        self.clearDeletePending();
-                        if (self.info.text) |t| self.gpa.free(t);
-                        self.info.text = null;
-                        try self.restoreFocusForActive(ctx);
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    ctx.consumeEvent();
-                    return;
-                }
-
-                // Handle exit prompt
-                if (self.quit_confirm) {
-                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
-                        self.forceStopRunningTasks();
-                        ctx.quit = true;
-                        return;
-                    }
-                    if (key.matches('n', .{}) or key.matches('N', .{}) or
-                        key.matches(vaxis.Key.escape, .{}) or
-                        key.matches(vaxis.Key.enter, .{}))
-                    {
-                        self.quit_confirm = false;
-                        self.active = self.last_active;
-                        if (self.info.text) |t| self.gpa.free(t);
-                        self.info.text = null;
-                        try self.restoreFocusForActive(ctx);
-                        ctx.consumeAndRedraw();
-                        return;
-                    }
-                    ctx.consumeEvent();
+                // Handle confirmation prompt
+                if (self.confirm != null) {
+                    try self.handleConfirmKey(ctx, key);
                     return;
                 }
 
@@ -183,15 +118,12 @@ pub const Model = struct {
                     const status = self.taskmanager.getStatus();
                     // Ask for confirmation if there are tasks running
                     if (status.active_tasks > 0) {
-                        self.quit_confirm = true;
-                        self.last_active = self.active;
-                        self.active = .info;
-                        try self.setInfo(
+                        try self.beginConfirm(
+                            ctx,
+                            .{ .quit_running_tasks = status.active_tasks },
                             "{d} task(s) running. Quit and stop them? (y/N)",
                             .{status.active_tasks},
                         );
-                        try ctx.requestFocus(self.widget());
-                        ctx.consumeAndRedraw();
                         return;
                     }
                     ctx.quit = true;
@@ -210,7 +142,7 @@ pub const Model = struct {
     }
 
     /// Request focus for the active area
-    fn restoreFocusForActive(self: *Model, ctx: *vxfw.EventContext) !void {
+    fn restoreFocusActive(self: *Model, ctx: *vxfw.EventContext) !void {
         switch (self.active) {
             .task_view => try ctx.requestFocus(self.task_split.selected_task_view.widget()),
             .task_list => try ctx.requestFocus(self.task_split.widget()),
@@ -336,6 +268,22 @@ pub const Model = struct {
         self.snapshot.updated = std.time.timestamp();
     }
 
+    /// Initialize a confirmation state and change active area
+    fn beginConfirm(
+        self: *Model,
+        ctx: *vxfw.EventContext,
+        action: ConfirmAction,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        self.deinitConfirm();
+        self.confirm = .{ .last_active = self.active, .action = action };
+        self.active = .info;
+        try self.setInfo(fmt, args);
+        try ctx.requestFocus(self.widget());
+        ctx.consumeAndRedraw();
+    }
+
     /// Make a task delete confirmation request
     fn requestDeleteTask(
         self: *Model,
@@ -343,25 +291,92 @@ pub const Model = struct {
         task_id: []const u8,
         task_name: []const u8,
     ) !void {
-        if (self.delete_task_id) |t| self.gpa.free(t);
-        if (self.delete_task_name) |t| self.gpa.free(t);
+        const id = try self.gpa.dupe(u8, task_id);
+        errdefer self.gpa.free(id);
+        const name = try self.gpa.dupe(u8, task_name);
+        errdefer self.gpa.free(name);
 
-        self.delete_task_id = try self.gpa.dupe(u8, task_id);
-        self.delete_task_name = try self.gpa.dupe(u8, task_name);
-        self.delete_confirm = true;
-        self.last_active = self.active;
-        self.active = .info;
-        try self.setInfo("Delete task \"{s}\"? (y/N)", .{task_name});
-        try ctx.requestFocus(self.widget());
+        try self.beginConfirm(
+            ctx,
+            .{ .delete_task = .{ .id = id, .name = name } },
+            "Delete task \"{s}\"? (y/N)",
+            .{task_name},
+        );
+    }
+
+    /// Handle the confirm key
+    fn handleConfirmKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !void {
+        if (key.matches('y', .{}) or key.matches('Y', .{})) {
+            try self.acceptConfirm(ctx);
+            return;
+        }
+        if (key.matches('n', .{}) or key.matches('N', .{}) or
+            key.matches(vaxis.Key.escape, .{}) or
+            key.matches(vaxis.Key.enter, .{}))
+        {
+            try self.cancelConfirm(ctx);
+            return;
+        }
+        ctx.consumeEvent();
+    }
+
+    /// Accept the current confirm state
+    fn acceptConfirm(self: *Model, ctx: *vxfw.EventContext) !void {
+        const c = self.confirm orelse return;
+
+        switch (c.action) {
+            .quit_running_tasks => {
+                self.deinitConfirm();
+                self.forceStopRunningTasks();
+                ctx.quit = true;
+                return;
+            },
+            .delete_task => |p| {
+                self.active = c.last_active;
+                const id = p.id;
+                const name = p.name;
+                defer self.deinitConfirm();
+
+                outer: {
+                    self.taskmanager.deleteTask(id) catch |err| {
+                        try self.setInfo("Failed to delete task \"{s}\": {}", .{ name, err });
+                        break :outer;
+                    };
+                    try self.setInfo("Deleted task \"{s}\"", .{name});
+                }
+
+                try self.requestSnapshot();
+                try self.restoreFocusActive(ctx);
+                ctx.consumeAndRedraw();
+                return;
+            },
+        }
+    }
+
+    /// Cancel and free the confirmation state.
+    /// Restore last focused area as active.
+    fn cancelConfirm(self: *Model, ctx: *vxfw.EventContext) !void {
+        const c = self.confirm orelse return;
+        const last_active = c.last_active;
+        self.deinitConfirm();
+        self.active = last_active;
+        if (self.info.text) |t| self.gpa.free(t);
+        self.info.text = null;
+        try self.restoreFocusActive(ctx);
         ctx.consumeAndRedraw();
     }
 
-    /// Free any pending delete request
-    fn clearDeletePending(self: *Model) void {
-        if (self.delete_task_id) |t| self.gpa.free(t);
-        if (self.delete_task_name) |t| self.gpa.free(t);
-        self.delete_task_id = null;
-        self.delete_task_name = null;
+    /// Free the confirmation state
+    fn deinitConfirm(self: *Model) void {
+        const c = self.confirm orelse return;
+        switch (c.action) {
+            .quit_running_tasks => {},
+            .delete_task => |p| {
+                self.gpa.free(p.id);
+                self.gpa.free(p.name);
+            },
+        }
+        self.confirm = null;
     }
 
     /// Fetch new data for selected task
@@ -410,7 +425,7 @@ pub const Model = struct {
 
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
-        if (self.quit_confirm or self.delete_confirm) return;
+        if (self.confirm != null) return;
         if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = null;
@@ -791,8 +806,8 @@ const TaskView = struct {
         }
     }
 
-    /// Scroll the job log text by lines
-    /// Prevent scrolling if already at the edge of the log
+    /// Scroll the job log text by lines.
+    /// Prevent scrolling if already at the edge of the log.
     fn scrollLogByLines(self: *TaskView, ctx: *vxfw.EventContext, lines: i32) void {
         if (!self.display_job_log) return;
         if (lines == 0) return;
