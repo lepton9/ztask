@@ -50,6 +50,11 @@ pub const Model = struct {
     /// If true, the next quit key press is awaiting confirmation
     quit_confirm: bool = false,
 
+    /// If true, a task delete is awaiting confirmation
+    delete_confirm: bool = false,
+    delete_task_id: ?[]u8 = null,
+    delete_task_name: ?[]u8 = null,
+
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
         const model = try gpa.create(Model);
         model.* = .{
@@ -64,6 +69,8 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         if (self.info.text) |t| self.gpa.free(t);
+        if (self.delete_task_id) |t| self.gpa.free(t);
+        if (self.delete_task_name) |t| self.gpa.free(t);
         self.arena_task.deinit();
         self.arena_list.deinit();
         self.gpa.destroy(self.task_split);
@@ -92,12 +99,63 @@ pub const Model = struct {
                 try onTick(self, ctx);
             },
             .mouse => {
-                if (self.quit_confirm) {
+                if (self.quit_confirm or self.delete_confirm) {
                     ctx.consumeEvent();
                     return;
                 }
             },
             .key_press => |key| {
+                // Handle delete prompt
+                if (self.delete_confirm) {
+                    if (key.matches('y', .{}) or key.matches('Y', .{})) {
+                        const task_id = self.delete_task_id orelse {
+                            self.delete_confirm = false;
+                            ctx.consumeAndRedraw();
+                            return;
+                        };
+                        const task_name = self.delete_task_name orelse task_id;
+
+                        self.taskmanager.deleteTask(task_id) catch |err| {
+                            try self.setInfo(
+                                "Failed to delete task \"{s}\": {}",
+                                .{ task_name, err },
+                            );
+                            self.delete_confirm = false;
+                            self.active = self.last_active;
+                            self.clearDeletePending();
+                            self.active = .task_list;
+                            try self.restoreFocusForActive(ctx);
+                            ctx.consumeAndRedraw();
+                            return;
+                        };
+
+                        try self.setInfo("Deleted task \"{s}\"", .{task_name});
+                        self.delete_confirm = false;
+                        self.active = self.last_active;
+                        self.clearDeletePending();
+
+                        try self.requestSnapshot();
+                        try self.restoreFocusForActive(ctx);
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    if (key.matches('n', .{}) or key.matches('N', .{}) or
+                        key.matches(vaxis.Key.escape, .{}) or
+                        key.matches(vaxis.Key.enter, .{}))
+                    {
+                        self.delete_confirm = false;
+                        self.active = self.last_active;
+                        self.clearDeletePending();
+                        if (self.info.text) |t| self.gpa.free(t);
+                        self.info.text = null;
+                        try self.restoreFocusForActive(ctx);
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    ctx.consumeEvent();
+                    return;
+                }
+
                 // Handle exit prompt
                 if (self.quit_confirm) {
                     if (key.matches('y', .{}) or key.matches('Y', .{})) {
@@ -271,8 +329,39 @@ pub const Model = struct {
                 self.task_split.getState(),
             );
             self.task_split.setSelectedState(&self.snapshot.selected_task.?);
+        } else {
+            self.snapshot.selected_task = null;
+            self.task_split.setSelectedState(null);
         }
         self.snapshot.updated = std.time.timestamp();
+    }
+
+    /// Make a task delete confirmation request
+    fn requestDeleteTask(
+        self: *Model,
+        ctx: *vxfw.EventContext,
+        task_id: []const u8,
+        task_name: []const u8,
+    ) !void {
+        if (self.delete_task_id) |t| self.gpa.free(t);
+        if (self.delete_task_name) |t| self.gpa.free(t);
+
+        self.delete_task_id = try self.gpa.dupe(u8, task_id);
+        self.delete_task_name = try self.gpa.dupe(u8, task_name);
+        self.delete_confirm = true;
+        self.last_active = self.active;
+        self.active = .info;
+        try self.setInfo("Delete task \"{s}\"? (y/N)", .{task_name});
+        try ctx.requestFocus(self.widget());
+        ctx.consumeAndRedraw();
+    }
+
+    /// Free any pending delete request
+    fn clearDeletePending(self: *Model) void {
+        if (self.delete_task_id) |t| self.gpa.free(t);
+        if (self.delete_task_name) |t| self.gpa.free(t);
+        self.delete_task_id = null;
+        self.delete_task_name = null;
     }
 
     /// Fetch new data for selected task
@@ -321,7 +410,7 @@ pub const Model = struct {
 
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
-        if (self.quit_confirm) return;
+        if (self.quit_confirm or self.delete_confirm) return;
         if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = null;
@@ -404,6 +493,20 @@ const TaskSplit = struct {
                     if (selected.status == .inactive) return;
                     self.model.stopTask(selected.meta.id);
                     ctx.consumeAndRedraw();
+                }
+                // Delete selected task (with confirmation)
+                else if (key.matches('d', .{})) {
+                    const selected = self.selectedTask() orelse return;
+                    if (selected.status != .inactive) {
+                        try self.model.setInfo(
+                            "Task must be inactive to delete (press 's' to stop)",
+                            .{},
+                        );
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    try self.model.requestDeleteTask(ctx, selected.meta.id, selected.meta.name);
+                    return;
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     try ctx.requestFocus(self.selected_task_view.widget());
                     ctx.consumeAndRedraw();
@@ -471,6 +574,11 @@ const TaskSplit = struct {
             self.tasks_models.appendAssumeCapacity(.{ .task = &tasks_snap[i] });
         }
         self.task_list_view.item_count = @intCast(self.tasks_models.items.len);
+        self.task_list_view.cursor = @min(
+            self.task_list_view.cursor,
+            self.task_list_view.item_count.? -| 1,
+        );
+        self.task_list_view.ensureScroll();
     }
 
     /// Update selected task

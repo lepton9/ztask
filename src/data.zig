@@ -473,6 +473,26 @@ pub const DataStore = struct {
         return &meta;
     }
 
+    /// Delete a task with the given `task_id`.
+    ///
+    /// Deletes the metafile belonging to the task.
+    pub fn deleteTask(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !void {
+        const kv = self.tasks.fetchOrderedRemove(task_id) orelse return;
+        var meta = kv.value;
+        defer meta.deinit(gpa);
+
+        const meta_path = try taskMetaPath(gpa, task_id);
+        defer gpa.free(meta_path);
+        std.fs.cwd().deleteFile(meta_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
     /// Add a new task run to the task runs hashmap
     pub fn addNewTaskRun(
         self: *DataStore,

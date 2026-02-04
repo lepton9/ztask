@@ -282,8 +282,8 @@ pub const TaskManager = struct {
 
     /// Unload a task and its scheduler from memory
     fn unloadTask(self: *TaskManager, t: *Task) void {
+        _ = self.loaded_tasks.swapRemove(t.id.fmt());
         if (self.schedulers.fetchRemove(t)) |kv| {
-            _ = self.loaded_tasks.swapRemove(t.id.fmt());
             var s = kv.value;
             self.removeFromWatchList(s);
             s.deinit(); // Free scheduler
@@ -452,6 +452,24 @@ pub const TaskManager = struct {
             },
             else => continue,
         };
+    }
+
+    /// Delete a task with the given `task_id`.
+    pub fn deleteTask(self: *TaskManager, task_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Prevent deleting if task is active
+        if (self.loaded_tasks.get(task_id)) |task| {
+            if (self.schedulers.get(task)) |s| switch (s.status) {
+                .running, .waiting => return error.TaskActive,
+                else => {},
+            };
+            self.unloadTask(task);
+        }
+
+        try self.datastore.deleteTask(self.gpa, task_id);
+        self.tasks_changed.store(true, .seq_cst);
     }
 
     /// Get a scheduler for a task based on task id if loaded
