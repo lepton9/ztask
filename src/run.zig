@@ -230,14 +230,14 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
 fn sortByRuns(
     tasks: *std.StringArrayHashMapUnmanaged(data.TaskMetadata),
     task_runs: *const std.StringHashMapUnmanaged(
-        std.AutoArrayHashMapUnmanaged(u64, data.TaskRunMetadata),
+        std.AutoArrayHashMapUnmanaged(u64, data.DataStore.TaskRunEntry),
     ),
     order: ListOptions.Order,
 ) void {
     const Ctx = struct {
         values: []data.TaskMetadata,
         runs: *const std.StringHashMapUnmanaged(
-            std.AutoArrayHashMapUnmanaged(u64, data.TaskRunMetadata),
+            std.AutoArrayHashMapUnmanaged(u64, data.DataStore.TaskRunEntry),
         ),
         sort_order: ListOptions.Order,
 

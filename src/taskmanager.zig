@@ -484,21 +484,6 @@ pub const TaskManager = struct {
         return self.tasks_changed.load(.seq_cst);
     }
 
-    /// Get task run jobs
-    pub fn buildTaskRunJobs(
-        allocator: std.mem.Allocator,
-        task_id: []const u8,
-        run_id: u64,
-        // TODO: give a list of job names to get
-    ) ![]snap.UiJobSnap {
-        var buf: [64]u8 = undefined;
-        return data.DataStore.getRunJobMetas(
-            allocator,
-            task_id,
-            try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
-        );
-    }
-
     /// Build the current state of the task based on ID
     pub fn buildTaskState(
         self: *TaskManager,
@@ -514,18 +499,23 @@ pub const TaskManager = struct {
         // Build past runs for the task
         const runs: []snap.UiTaskRunSnap = blk: {
             const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
-            const run_metas = task_runs.values();
-            var runs = try arena.alloc(snap.UiTaskRunSnap, run_metas.len);
+            const run_entries = task_runs.values();
+            var runs = try arena.alloc(snap.UiTaskRunSnap, run_entries.len);
 
-            for (run_metas, 0..) |*meta, offset| {
-                const idx = run_metas.len - 1 - offset;
+            for (run_entries, 0..) |*entry, offset| {
+                const meta = &entry.meta;
+                const idx = run_entries.len - 1 - offset;
                 runs[idx] = .{ .state = .{ .completed = try meta.copy(arena) } };
 
                 // Get data for selected run
                 const selected_run_id = options.selected_run_id orelse continue;
                 const cur_id = meta.run_id orelse continue;
                 if (selected_run_id != cur_id) continue;
-                runs[idx].jobs = try buildTaskRunJobs(arena, task_id, selected_run_id);
+                runs[idx].jobs = try self.datastore.getRunJobMetas(
+                    self.gpa,
+                    task_id,
+                    selected_run_id,
+                );
                 selected_run = &runs[idx];
             }
             break :blk runs;

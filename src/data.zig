@@ -87,9 +87,16 @@ pub const JobRunMetadata = struct {
 
 pub const DataStore = struct {
     tasks: std.StringArrayHashMapUnmanaged(TaskMetadata),
+    /// Map of task_id -> map of run_id -> task run entry
     task_runs: std.StringHashMapUnmanaged(
-        std.AutoArrayHashMapUnmanaged(u64, TaskRunMetadata),
+        std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry),
     ),
+
+    pub const TaskRunEntry = struct {
+        meta: TaskRunMetadata,
+        /// Lazily loaded job run metadatas for this run
+        jobs: ?[]JobRunMetadata = null,
+    };
 
     pub fn init() DataStore {
         return .{ .tasks = .{}, .task_runs = .{} };
@@ -102,7 +109,8 @@ pub const DataStore = struct {
             var runs = e.value_ptr;
             var runs_it = runs.iterator();
             while (runs_it.next()) |re| {
-                re.value_ptr.deinit(gpa);
+                re.value_ptr.meta.deinit(gpa);
+                if (re.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
             }
             gpa.free(e.key_ptr.*);
             runs.deinit(gpa);
@@ -115,6 +123,12 @@ pub const DataStore = struct {
             e.value_ptr.deinit(gpa);
         }
         self.tasks.deinit(gpa);
+    }
+
+    /// Deinitialize a slice of `JobRunMetadata`
+    fn deinitJobMetaSlice(gpa: std.mem.Allocator, metas: []JobRunMetadata) void {
+        for (metas) |*m| m.deinit(gpa);
+        gpa.free(metas);
     }
 
     /// Get and allocate the tasks directory path
@@ -284,13 +298,33 @@ pub const DataStore = struct {
         return parseMetaFile(JobRunMetadata, gpa, job_path);
     }
 
-    /// Load and parse metafiles for all task run jobs
+    /// Get metafiles for all task run jobs.
+    /// Lazy load jobs if not in memory.
     pub fn getRunJobMetas(
+        self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-        run_id: []const u8,
+        run_id: u64,
     ) ![]JobRunMetadata {
-        const jobs_path = try taskRunJobsPath(gpa, task_id, run_id);
+        const runs = try self.getTaskRuns(gpa, task_id);
+        const entry = runs.getPtr(run_id) orelse return &.{};
+        if (entry.jobs) |cached_jobs| return cached_jobs;
+
+        const jobs = try loadJobRunMetasFromDisk(gpa, task_id, run_id);
+        entry.jobs = jobs;
+        return jobs;
+    }
+
+    /// Load and parse metafiles for all task run jobs
+    fn loadJobRunMetasFromDisk(
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: u64,
+    ) ![]JobRunMetadata {
+        var id_buf: [64]u8 = undefined;
+        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{run_id});
+
+        const jobs_path = try taskRunJobsPath(gpa, task_id, run_id_str);
         defer gpa.free(jobs_path);
 
         var jobs = try std.ArrayList(JobRunMetadata).initCapacity(gpa, 5);
@@ -299,7 +333,6 @@ pub const DataStore = struct {
             jobs.deinit(gpa);
         }
 
-        // TODO: dont iterate dir
         var dir = openDir(jobs_path, .{ .iterate = true }) catch
             return try jobs.toOwnedSlice(gpa);
         defer dir.close();
@@ -307,7 +340,7 @@ pub const DataStore = struct {
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
                 const job_name = std.fs.path.basename(e.name);
-                const meta = loadJobMeta(gpa, task_id, run_id, job_name) catch
+                const meta = loadJobMeta(gpa, task_id, run_id_str, job_name) catch
                     null orelse continue;
                 try jobs.append(gpa, meta);
             },
@@ -383,7 +416,7 @@ pub const DataStore = struct {
                     continue;
                 };
                 run_res.key_ptr.* = meta.run_id orelse run_id;
-                run_res.value_ptr.* = meta;
+                run_res.value_ptr.* = .{ .meta = meta };
             },
             else => continue,
         };
@@ -402,13 +435,13 @@ pub const DataStore = struct {
         task_runs.sort(sort_ctx);
     }
 
-    /// Get all the past runs for a task
-    /// Load the runs if not already loaded
+    /// Get all the past runs for a task.
+    /// Load the runs if not already loaded.
     pub fn getTaskRuns(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-    ) !*std.AutoArrayHashMapUnmanaged(u64, TaskRunMetadata) {
+    ) !*std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry) {
         return self.task_runs.getPtr(task_id) orelse {
             try self.loadTaskRuns(gpa, task_id);
             return self.task_runs.getPtr(task_id) orelse unreachable;
@@ -485,6 +518,18 @@ pub const DataStore = struct {
         var meta = kv.value;
         defer meta.deinit(gpa);
 
+        // Drop cached runs in memory
+        if (self.task_runs.fetchRemove(task_id)) |rkv| {
+            var runs = rkv.value;
+            var runs_it = runs.iterator();
+            while (runs_it.next()) |re| {
+                re.value_ptr.meta.deinit(gpa);
+                if (re.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
+            }
+            gpa.free(rkv.key);
+            runs.deinit(gpa);
+        }
+
         const meta_path = try taskMetaPath(gpa, task_id);
         defer gpa.free(meta_path);
         std.fs.cwd().deleteFile(meta_path) catch |err| switch (err) {
@@ -504,9 +549,10 @@ pub const DataStore = struct {
         const runs = try self.getTaskRuns(gpa, meta.task_id);
         const res = try runs.getOrPut(gpa, run_id);
         if (res.found_existing) {
-            res.value_ptr.deinit(gpa);
+            res.value_ptr.meta.deinit(gpa);
+            if (res.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
         }
-        res.value_ptr.* = meta_copy;
+        res.value_ptr.* = .{ .meta = meta_copy };
     }
 
     pub const LogReadOptions = struct {
@@ -711,7 +757,7 @@ fn parseMetaFile(
     const file = std.fs.cwd().openFile(path, .{}) catch return null;
     defer file.close();
     var reader = file.reader(&.{});
-    var buffer: [512]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     const read = try reader.interface.readSliceShort(&buffer);
     const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{}) catch
         return error.InvalidMetaDataFile;
