@@ -485,25 +485,70 @@ pub const DataStore = struct {
         path: []const u8,
     ) !*TaskMetadata {
         const cwd = std.fs.cwd();
-        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
+
+        // Convert to absolute path
+        const path_alloc: struct { []const u8, bool } = blk: {
+            if (!std.fs.path.isAbsolute(path)) {
+                const real_path = try std.fs.cwd().realpathAlloc(gpa, path);
+                break :blk .{ real_path, true };
+            }
+            break :blk .{ path, false };
+        };
+        defer if (path_alloc.@"1") gpa.free(path_alloc.@"0");
+        const real_path = path_alloc.@"0";
+
+        var file = cwd.openFile(real_path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
-        if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
+        if (!parse.isTaskFile(real_path)) return error.InvalidTaskFile;
 
         // Check for existing task
-        var id = task.Id.fromStr(path);
+        var id = task.Id.fromStr(real_path);
         const id_value = id.fmt();
         if (self.tasks.getPtr(id_value)) |_| return error.TaskExists;
 
         // Add new task
-        const parsed = try parse.loadTask(gpa, path);
+        const parsed = try parse.loadTask(gpa, real_path);
         var meta = try TaskMetadata.init(gpa, .{
-            .file_path = path,
+            .file_path = real_path,
             .id = parsed.id.fmt(),
             .name = parsed.name,
         });
         try self.tasks.put(gpa, meta.id, meta);
         try writeTaskMeta(gpa, &meta);
         return &meta;
+    }
+
+    /// Add all task files from a given directory.
+    /// Recurse all sub directories if the `recursive` flag is `true`.
+    pub fn addTasksInDir(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        dir_path: []const u8,
+        recursive: bool,
+    ) !void {
+        const cwd = std.fs.cwd();
+        var dir = cwd.openDir(dir_path, .{ .iterate = true }) catch
+            return error.ErrorOpenDir;
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| switch (entry.kind) {
+            .file => {
+                const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+                defer gpa.free(path);
+                _ = self.addTask(gpa, path) catch |err| switch (err) {
+                    error.TaskExists => continue,
+                    else => return err,
+                };
+            },
+            .directory => {
+                if (!recursive) continue;
+                const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
+                defer gpa.free(path);
+                try self.addTasksInDir(gpa, path, recursive);
+            },
+            else => continue,
+        };
     }
 
     /// Delete a task with the given `task_id`.

@@ -300,15 +300,17 @@ pub const AddOptions = struct {
 
 /// Add one task or a directory
 pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
-    const task_manager = try manager.TaskManager.init(gpa, 0);
-    defer task_manager.deinit();
+    var datastore = data.DataStore.init();
+    defer datastore.deinit(gpa);
+    try datastore.loadTaskMetas(gpa, .{});
+
     const cwd = std.fs.cwd();
     const stat = try cwd.statFile(options.path);
-    try switch (stat.kind) {
-        .directory => task_manager.addTasksInDir(options.path, options.recursive),
-        .file => task_manager.addTask(options.path),
+    switch (stat.kind) {
+        .directory => try datastore.addTasksInDir(gpa, options.path, options.recursive),
+        .file => _ = try datastore.addTask(gpa, options.path),
         else => return error.NotFileOrDir,
-    };
+    }
 }
 
 pub const DeleteOptions = struct {

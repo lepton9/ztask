@@ -402,58 +402,6 @@ pub const TaskManager = struct {
         };
     }
 
-    /// Create metadata for a task from file path
-    pub fn addTask(self: *TaskManager, file_path: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (!std.fs.path.isAbsolute(file_path)) {
-            const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
-            defer self.gpa.free(real_path);
-            _ = try self.datastore.addTask(self.gpa, real_path);
-            self.tasks_changed.store(true, .seq_cst);
-            return;
-        }
-        _ = try self.datastore.addTask(self.gpa, file_path);
-        self.tasks_changed.store(true, .seq_cst);
-    }
-
-    /// Add all task files from a given directory
-    /// Recurse all sub directories if the `recursive` flag is `true`
-    pub fn addTasksInDir(
-        self: *TaskManager,
-        dir_path: []const u8,
-        recursive: bool,
-    ) !void {
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(dir_path, .{ .iterate = true }) catch
-            return error.ErrorOpenDir;
-        defer dir.close();
-
-        var it = dir.iterate();
-        while (it.next() catch null) |entry| switch (entry.kind) {
-            .file => {
-                const path = try std.fs.path.join(self.gpa, &.{ dir_path, entry.name });
-                defer self.gpa.free(path);
-                const real_path = try cwd.realpathAlloc(self.gpa, path);
-                defer self.gpa.free(real_path);
-                self.addTask(real_path) catch |err| switch (err) {
-                    error.TaskExists => continue,
-                    else => return err,
-                };
-            },
-            .directory => {
-                if (!recursive) continue;
-                const path = try std.fs.path.join(
-                    self.gpa,
-                    &.{ dir_path, entry.name },
-                );
-                defer self.gpa.free(path);
-                try self.addTasksInDir(path, recursive);
-            },
-            else => continue,
-        };
-    }
-
     /// Delete a task with the given `task_id`.
     pub fn deleteTask(self: *TaskManager, task_id: []const u8) !void {
         self.mutex.lock();
