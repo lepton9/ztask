@@ -117,6 +117,25 @@ const commands = &[_]zcli.Cmd{
         },
         .action = cmdCompletionFn,
     },
+    .{
+        .name = "add",
+        .desc = "Add a task file or a directory of task files",
+        .positionals = &[_]zcli.PosArg{
+            .{
+                .name = "path",
+                .desc = "Path for a file or directory",
+                .required = true,
+            },
+        },
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "recursive",
+                .short_name = "r",
+                .desc = "Add task files recursively in a directory",
+            },
+        },
+        .action = cmdAddFn,
+    },
 };
 
 const runner_n_option: zcli.Opt = .{
@@ -291,6 +310,19 @@ fn cmdListFn(ptr: *anyopaque) !void {
 fn cmdCompletionFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     return try generate_completion(ctx.cli, &cli_spec);
+}
+
+/// Handle add command
+fn cmdAddFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    const cli = ctx.cli;
+    const path = cli.find_positional("path") orelse unreachable;
+    const recursive = cli.find_opt("recursive") != null;
+    // TODO: handle errors
+    return try run.addTasks(ctx.gpa, .{
+        .path = path.value,
+        .recursive = recursive,
+    });
 }
 
 /// Handle parsed cli and call the command function

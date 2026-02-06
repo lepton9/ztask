@@ -290,3 +290,23 @@ fn sortByFieldName(
     const sort_ctx: Ctx = .{ .values = tasks.values(), .sort_order = order };
     tasks.sort(sort_ctx);
 }
+
+pub const AddOptions = struct {
+    /// A task file path or a directory
+    path: []const u8,
+    /// Only when path is a directory
+    recursive: bool = false,
+};
+
+/// Add one task or a directory
+pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
+    const task_manager = try manager.TaskManager.init(gpa, 0);
+    defer task_manager.deinit();
+    const cwd = std.fs.cwd();
+    const stat = try cwd.statFile(options.path);
+    try switch (stat.kind) {
+        .directory => task_manager.addTasksInDir(options.path, options.recursive),
+        .file => task_manager.addTask(options.path),
+        else => return error.NotFileOrDir,
+    };
+}
