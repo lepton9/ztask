@@ -124,10 +124,15 @@ const commands = &[_]zcli.Cmd{
             .{
                 .name = "path",
                 .desc = "Path for a file or directory",
-                .required = true,
+                .required = false,
             },
         },
         .options = &[_]zcli.Opt{
+            .{
+                .long_name = "path",
+                .desc = "Path of the task file",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
             .{
                 .long_name = "recursive",
                 .short_name = "r",
@@ -334,16 +339,28 @@ fn cmdCompletionFn(ptr: *anyopaque) !void {
 fn cmdAddFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
-    const path = cli.find_positional("path") orelse unreachable;
+
+    const path: []const u8 = if (cli.find_positional("path")) |p|
+        p.value
+    else if (cli.find_opt("path")) |o|
+        o.value.?.string
+    else
+        fatal("No path argument given", .{});
+
     const recursive = cli.find_opt("recursive") != null;
-    // TODO: handle errors
-    return try run.addTasks(ctx.gpa, .{
-        .path = path.value,
+    return run.addTasks(ctx.gpa, .{
+        .path = path,
         .recursive = recursive,
-    });
+    }) catch |err| switch (err) {
+        error.ErrorOpenFile => fatal("Failed to open file: {s}", .{path}),
+        error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
+        error.InvalidTaskFile => fatal("Not a task file", .{}),
+        error.TaskExists => fatal("Task already exists", .{}),
+        else => fatal("Error {any}", .{err}),
+    };
 }
 
-/// Handle add command
+/// Handle delete command
 fn cmdDeleteFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
@@ -353,10 +370,18 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
     else if (cli.find_opt("id")) |id|
         .{ .task = .{ .id = id.value.?.string } }
     else
-        fatal("No task given", .{});
+        fatal("No task given to delete", .{});
 
-    // TODO: handle errors
-    return try run.deleteTask(ctx.gpa, opts);
+    return run.deleteTask(ctx.gpa, opts) catch |err| switch (err) {
+        error.TaskNotFound => {
+            switch (opts.task) {
+                .path => |path| fatal("Task not found with path: '{s}'", .{path}),
+                .id => |id| fatal("Task not found with ID: '{s}'", .{id}),
+            }
+        },
+        error.FileNotFound => fatal("File not found: '{s}'", .{opts.task.path}),
+        else => fatal("Error {any}", .{err}),
+    };
 }
 
 /// Handle parsed cli and call the command function
