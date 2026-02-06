@@ -514,7 +514,8 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         task_id: []const u8,
     ) !void {
-        const kv = self.tasks.fetchOrderedRemove(task_id) orelse return;
+        const kv = self.tasks.fetchOrderedRemove(task_id) orelse
+            return error.TaskNotFound;
         var meta = kv.value;
         defer meta.deinit(gpa);
 

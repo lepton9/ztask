@@ -310,3 +310,28 @@ pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
         else => return error.NotFileOrDir,
     };
 }
+
+pub const DeleteOptions = struct {
+    task: union(enum) {
+        path: []const u8,
+        id: []const u8,
+    },
+};
+
+/// Delete a task with the given path or ID
+pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
+    var datastore = data.DataStore.init();
+    defer datastore.deinit(gpa);
+    try datastore.loadTaskMetas(gpa, .{});
+    const id = blk: switch (options.task) {
+        .path => |path| {
+            const real_path = try std.fs.cwd().realpathAlloc(gpa, path);
+            defer gpa.free(real_path);
+            const meta = datastore.findTaskMetaPath(real_path) orelse
+                return error.TaskNotFound;
+            break :blk meta.id;
+        },
+        .id => |id| break :blk id,
+    };
+    try datastore.deleteTask(gpa, id);
+}

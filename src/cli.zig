@@ -119,7 +119,7 @@ const commands = &[_]zcli.Cmd{
     },
     .{
         .name = "add",
-        .desc = "Add a task file or a directory of task files",
+        .desc = "Add a task or a directory of tasks",
         .positionals = &[_]zcli.PosArg{
             .{
                 .name = "path",
@@ -135,6 +135,24 @@ const commands = &[_]zcli.Cmd{
             },
         },
         .action = cmdAddFn,
+    },
+
+    .{
+        .name = "delete",
+        .desc = "Delete a task",
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "path",
+                .desc = "Path of the task file",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
+            .{
+                .long_name = "id",
+                .desc = "ID of the task",
+                .arg = .{ .name = "ID", .type = .Text },
+            },
+        },
+        .action = cmdDeleteFn,
     },
 };
 
@@ -323,6 +341,22 @@ fn cmdAddFn(ptr: *anyopaque) !void {
         .path = path.value,
         .recursive = recursive,
     });
+}
+
+/// Handle add command
+fn cmdDeleteFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    const cli = ctx.cli;
+
+    const opts: run.DeleteOptions = if (cli.find_opt("path")) |path|
+        .{ .task = .{ .path = path.value.?.string } }
+    else if (cli.find_opt("id")) |id|
+        .{ .task = .{ .id = id.value.?.string } }
+    else
+        fatal("No task given", .{});
+
+    // TODO: handle errors
+    return try run.deleteTask(ctx.gpa, opts);
 }
 
 /// Handle parsed cli and call the command function
