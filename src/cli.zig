@@ -232,7 +232,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     }
     return run.runTask(ctx.gpa, opts) catch |err| switch (err) {
         error.Interrupted => {
-            std.log.info("Interrupted", .{});
+            std.log.debug("Interrupted", .{});
         },
         error.TaskNotFoundId => fatal(
             "Task not found with ID: {s}",

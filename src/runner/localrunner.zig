@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const queue = @import("../types/queue.zig");
 const task = @import("../types/task.zig");
 
-const log = std.log.scoped(.runner).debug;
+const log = std.log.scoped(.runner);
 
 const Node = @import("../scheduler/dag.zig").Node;
 pub const JobNode = Node(task.Job);
@@ -104,7 +104,7 @@ pub const LocalRunner = struct {
     ) void {
         defer self.running.store(false, .seq_cst);
         const job = self.job orelse return;
-        log("Start job {s} ({d})", .{ job.ptr.name, job.id });
+        log.debug("Start job: {s} ({d})", .{ job.ptr.name, job.id });
 
         logs.append(gpa, .{ .job_started = .{
             .job_node = job,
@@ -120,11 +120,15 @@ pub const LocalRunner = struct {
                 err_msg = "Interrupted";
                 break;
             }
-            log("{s}: step: {s}", .{ job.ptr.name, step.value });
+            log.debug("{s}: step {s}", .{ job.ptr.name, step.value });
             switch (step.kind) {
                 .command => exit_code =
                     self.runCommandStep(gpa, step, logs, mode) catch |err| blk: {
-                        log("step {s} error: {}", .{ step.value, err });
+                        log.debug("{s}: step {s}: error: {}", .{
+                            job.ptr.name,
+                            step.value,
+                            err,
+                        });
                         break :blk 1;
                     },
                 // else => @panic("TODO"),
@@ -133,7 +137,7 @@ pub const LocalRunner = struct {
             if (exit_code != 0) break;
         }
 
-        log("Finish job {s} ({d})", .{ job.ptr.name, job.id });
+        log.debug("Finish job: {s} ({d})", .{ job.ptr.name, job.id });
 
         // Already force interrupted
         if (!self.running.load(.seq_cst)) return;
@@ -212,9 +216,8 @@ pub const LocalRunner = struct {
                 child.stdin_behavior = .Inherit;
                 child.stdout_behavior = .Inherit;
                 child.stderr_behavior = .Inherit;
-                try child.spawn();
 
-                const term = try child.wait();
+                const term = try child.spawnAndWait();
                 self.mutex.lock();
                 self.process = null;
                 self.mutex.unlock();

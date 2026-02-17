@@ -2,7 +2,7 @@ const std = @import("std");
 const data = @import("../data.zig");
 const task_zig = @import("../types/task.zig");
 const dag = @import("dag.zig");
-const log = @import("../logger.zig");
+const logger = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const remote = @import("../remote/remote_manager.zig");
 const queue_zig = @import("../types/queue.zig");
@@ -17,6 +17,8 @@ const Node = dag.Node;
 const ExecMode = localrunner.LocalRunner.ExecMode;
 
 const ErrorDAG = dag.ErrorDAG;
+
+const log = std.log.scoped(.scheduler);
 
 test {
     _ = dag;
@@ -51,7 +53,7 @@ pub const Scheduler = struct {
     result_queue: *ResultQueue,
     log_queue: *LogQueue,
 
-    logger: log.RunLogger,
+    logger: logger.RunLogger,
     task_meta: data.TaskRunMetadata,
     job_metas: std.AutoHashMapUnmanaged(*JobNode, data.JobRunMetadata),
 
@@ -368,8 +370,7 @@ pub const Scheduler = struct {
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
         node.status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |err| {
-            // TODO: handle error
-            std.log.err("{}", .{err});
+            log.debug("{}", .{err});
             node.status = .failed;
         }
         if (node.status == .failed) self.skipRemainingJobs();

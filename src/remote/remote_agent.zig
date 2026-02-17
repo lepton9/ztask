@@ -111,7 +111,7 @@ pub const RemoteAgent = struct {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
             const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            log.info(
+            log.debug(
                 "Connecting to {d}.{d}.{d}.{d}:{d}",
                 .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
             );
@@ -145,7 +145,7 @@ pub const RemoteAgent = struct {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
             .error_msg => |m| {
-                log.info(
+                log.debug(
                     "Error message: ({s}/{d}): {s}",
                     .{ @tagName(m.code), @intFromEnum(m.code), m.message },
                 );

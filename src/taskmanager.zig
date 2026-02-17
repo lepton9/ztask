@@ -12,6 +12,8 @@ const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 const Watcher = watcher_zig.Watcher;
 
+const log = std.log.scoped(.taskmanager);
+
 test {
     _ = scheduler;
 }
@@ -194,13 +196,13 @@ pub const TaskManager = struct {
         while (self.running.load(.seq_cst)) {
             // TODO: handle errors
             self.checkWatcher() catch |err| {
-                std.log.err("watcher: {}", .{err});
+                log.debug("Watcher err: {}", .{err});
             };
             self.updateRemoteManager() catch |err| {
-                std.log.err("remote manager: {}", .{err});
+                log.debug("Remote manager err: {}", .{err});
             };
             self.updateSchedulers() catch |err| {
-                std.log.err("scheduler: {}", .{err});
+                log.debug("Scheduler err: {}", .{err});
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }

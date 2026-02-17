@@ -14,6 +14,8 @@ pub const WatchEvent = union(enum) {
 
 const EventQueue = queue_zig.MutexQueue(WatchEvent);
 
+const log = std.log.scoped(.watcher);
+
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
     gpa: std.mem.Allocator,
@@ -69,7 +71,7 @@ pub const Watcher = struct {
             if (self.file_watcher) |fw| {
                 fw.pollEvents(self.gpa, self.queue, addFileEvent) catch |err| {
                     if (err == error.WouldBlock) continue;
-                    std.log.scoped(.Watcher).err("watcher: {}", .{err});
+                    log.debug("{}", .{err});
                 };
             }
         }
