@@ -143,8 +143,9 @@ fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
     }
 
     if (p.basename) |base| {
-        try res.value_ptr.*.file_table.put(gpa, base, path);
-        self.watch_count += 1;
+        const ft = try res.value_ptr.*.file_table.getOrPut(gpa, base);
+        if (!ft.found_existing) self.watch_count += 1;
+        ft.value_ptr.* = path;
     } else if (!res.value_ptr.watch_self) {
         res.value_ptr.watch_self = true;
         self.watch_count += 1;
@@ -156,21 +157,23 @@ fn removeWatch(opq: *anyopaque, path: []const u8) void {
     const self: *@This() = @ptrCast(@alignCast(opq));
     const p = splitPath(path) catch return;
 
-    if (self.dir_map.getPtr(p.dirname)) |dir| {
-        if (p.basename) |base| {
-            _ = dir.file_table.remove(base);
-        } else {
-            dir.watch_self = false;
-        }
+    const dir = self.dir_map.getPtr(p.dirname) orelse return;
 
-        if (!dir.watch_self and dir.file_table.count() == 0) {
-            if (self.dir_map.fetchRemove(p.dirname)) |kv| {
-                var removed_dir = kv.value;
-                closeDir(self.gpa, &removed_dir);
-            }
-        }
-    } else return;
+    var removed: bool = false;
+    if (p.basename) |base| {
+        removed = dir.file_table.remove(base);
+    } else if (dir.watch_self) {
+        dir.watch_self = false;
+        removed = true;
+    }
+    if (!removed) return;
 
+    if (!dir.watch_self and dir.file_table.count() == 0) {
+        if (self.dir_map.fetchRemove(p.dirname)) |kv| {
+            var removed_dir = kv.value;
+            closeDir(self.gpa, &removed_dir);
+        }
+    }
     self.watch_count -= 1;
 }
 

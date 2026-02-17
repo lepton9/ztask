@@ -110,6 +110,31 @@ pub const Watcher = struct {
             fw.removeWatch(path);
         }
     }
+
+    /// Drain all the remaining events.
+    fn drainEvents(self: *Watcher) void {
+        while (self.getEvent()) |_| {}
+    }
+
+    /// Wait for a file event on a path.
+    fn waitForFileEvent(
+        w: *Watcher,
+        expected_path: []const u8,
+        timeout_ns: u64,
+    ) !FileWatcher.FileEvent {
+        var timer = try std.time.Timer.start();
+        while (timer.read() < timeout_ns) {
+            if (w.getEvent()) |ev| switch (ev) {
+                .fileEvent => |fe| {
+                    if (!std.mem.eql(u8, fe.path, expected_path)) continue;
+                    return fe;
+                },
+                else => {},
+            };
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+        return error.Timeout;
+    }
 };
 
 /// Add a file event to the event queue
@@ -122,10 +147,21 @@ pub fn addFileEvent(
     try queue.append(gpa, .{ .fileEvent = ev });
 }
 
+const test_timeout = 2 * std.time.ns_per_s;
+
+test "watcher_stop_no_work" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    try watcher.start();
+    watcher.stop();
+}
+
 test "file_watch_add" {
     const gpa = std.testing.allocator;
     const watcher = try Watcher.init(gpa);
     defer watcher.deinit();
+    if (watcher.file_watcher == null) return error.SkipZigTest;
     try watcher.start();
     defer watcher.stop();
 
@@ -141,5 +177,105 @@ test "file_watch_add" {
     watcher.removeFileWatch(".");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
     watcher.removeFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
+}
+
+test "file_watch_add_duplicate" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    if (watcher.file_watcher == null) return error.SkipZigTest;
+    try watcher.start();
+    defer watcher.stop();
+
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
+    try watcher.addFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
+    try watcher.addFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
+    watcher.removeFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
+}
+
+test "file_events_modify_and_delete" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    if (watcher.file_watcher == null) return error.SkipZigTest;
+
+    // Create test dir and file
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var f = try tmp.dir.createFile("watch.txt", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("hello");
+    }
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+    const file_path = try std.fs.path.join(gpa, &.{ dir_path, "watch.txt" });
+    defer gpa.free(file_path);
+
+    try watcher.start();
+    defer watcher.stop();
+
+    try watcher.addFileWatch(file_path);
+
+    // Modify test file
+    {
+        var f = try tmp.dir.createFile("watch.txt", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("world");
+    }
+    const fe = try watcher.waitForFileEvent(file_path, test_timeout);
+    try std.testing.expect(fe.kind == .modified);
+    watcher.drainEvents();
+
+    // Delete file
+    try tmp.dir.deleteFile("watch.txt");
+    const fe_del = blk: while (true) {
+        const fe_del = try watcher.waitForFileEvent(file_path, test_timeout);
+        if (fe_del.kind == .deleted) break :blk fe_del;
+    };
+    try std.testing.expect(fe_del.kind == .deleted);
+}
+
+test "file_events_create_in_dir" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    if (watcher.file_watcher == null) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(dir_path);
+
+    try watcher.start();
+    defer watcher.stop();
+
+    try watcher.addFileWatch(dir_path);
+
+    {
+        var f = try tmp.dir.createFile("new.txt", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("test");
+    }
+
+    const fe = try watcher.waitForFileEvent(dir_path, test_timeout);
+    try std.testing.expect(fe.kind == .created);
+}
+
+test "file_watch_remove_not_existing" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    if (watcher.file_watcher == null) return error.SkipZigTest;
+
+    try watcher.start();
+    defer watcher.stop();
+
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
+    watcher.removeFileWatch("file_not_existing.txt");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
 }

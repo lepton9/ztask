@@ -13,7 +13,7 @@ fd: i32,
 wd_map: std.AutoHashMapUnmanaged(i32, Dir),
 dir_to_wd: std.StringHashMapUnmanaged(i32),
 watch_count: u32 = 0,
-buffer: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined,
+buffer: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined,
 
 const Dir = struct {
     dirname: []const u8,
@@ -63,23 +63,27 @@ fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
 
     const p = try splitPath(path);
 
-    const wd = std.posix.inotify_add_watch(
-        self.fd,
-        p.dirname,
-        linux.IN.CLOSE_WRITE | linux.IN.ONLYDIR | linux.IN.DELETE | linux.IN.EXCL_UNLINK,
-    ) catch |err| blk: {
-        break :blk self.dir_to_wd.get(p.dirname) orelse return err;
-    };
+    const IN = linux.IN;
+    const mask = IN.CLOSE_WRITE | IN.MODIFY | IN.CREATE | IN.DELETE |
+        IN.MOVED_FROM | IN.MOVED_TO | IN.ONLYDIR | IN.EXCL_UNLINK;
 
-    try self.dir_to_wd.put(gpa, p.dirname, wd);
+    const wd = std.posix.inotify_add_watch(self.fd, p.dirname, mask) catch |err|
+        blk: {
+            break :blk self.dir_to_wd.get(p.dirname) orelse return err;
+        };
+
+    if (!self.dir_to_wd.contains(p.dirname)) {
+        try self.dir_to_wd.put(gpa, p.dirname, wd);
+    }
     const res = try self.wd_map.getOrPut(gpa, wd);
     if (!res.found_existing) {
         res.value_ptr.* = .{ .dirname = p.dirname, .file_table = .{} };
     }
 
     if (p.basename) |base| {
-        try res.value_ptr.*.file_table.put(gpa, base, path);
-        self.watch_count += 1;
+        const ft = try res.value_ptr.*.file_table.getOrPut(gpa, base);
+        if (!ft.found_existing) self.watch_count += 1;
+        ft.value_ptr.* = path;
     } else if (!res.value_ptr.watch_self) {
         res.value_ptr.watch_self = true;
         self.watch_count += 1;
@@ -92,14 +96,22 @@ fn removeWatch(opq: *anyopaque, path: []const u8) void {
     const p = splitPath(path) catch return;
     const wd = self.dir_to_wd.get(p.dirname) orelse return;
 
-    var dir = self.wd_map.get(wd) orelse return;
+    const dir = self.wd_map.getPtr(wd) orelse return;
+
+    var removed: bool = false;
     if (p.basename) |base| {
-        _ = dir.file_table.remove(base);
-    } else dir.watch_self = false;
+        removed = dir.file_table.remove(base);
+    } else if (dir.watch_self) {
+        dir.watch_self = false;
+        removed = true;
+    }
+    if (!removed) return;
 
     if (!dir.watch_self and dir.file_table.count() == 0) {
+        const dirname = dir.dirname;
         _ = self.wd_map.remove(wd);
-        _ = self.dir_to_wd.remove(dir.dirname);
+        _ = self.dir_to_wd.remove(dirname);
+        std.posix.inotify_rm_watch(self.fd, wd);
     }
     self.watch_count -= 1;
 }
@@ -130,12 +142,12 @@ fn pollEvents(
         // const basename_ptr = ptr + @sizeOf(linux.inotify_event);
         // const basename = std.mem.span(@as([*:0]u8, @ptrCast(basename_ptr)));
 
-        const kind: EventType = if (ev.mask & std.os.linux.IN.MODIFY != 0)
-            .modified
-        else if (ev.mask & std.os.linux.IN.CREATE != 0)
+        const kind: EventType = if (ev.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0)
             .created
+        else if (ev.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0)
+            .deleted
         else
-            .deleted;
+            .modified;
 
         const path = if (ev.getName()) |name|
             dir.file_table.get(name) orelse dir.dirname
