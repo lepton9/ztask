@@ -4,6 +4,7 @@ const manager = @import("taskmanager.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
+const builtin = @import("builtin");
 
 const Model = @import("tui/model.zig").Model;
 const RemoteAgent = remote_agent.RemoteAgent;
@@ -57,6 +58,7 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
     // Initialize event loop to handle input
     var tty = try vaxis.Tty.init(&.{});
     defer tty.deinit();
+    try setupInputTty(&tty);
     var vx = try vaxis.init(gpa, .{});
     defer vx.deinit(null, tty.writer());
     var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
@@ -130,6 +132,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     // Initialize event loop to handle input
     var tty = try vaxis.Tty.init(&.{});
     defer tty.deinit();
+    try setupInputTty(&tty);
     var vx = try vaxis.init(gpa, .{});
     defer vx.deinit(null, tty.writer());
     var loop: vaxis.Loop(vaxis.Event) = .{ .tty = &tty, .vaxis = &vx };
@@ -337,4 +340,18 @@ pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
         .id => |id| break :blk id,
     };
     try datastore.deleteTask(gpa, id);
+}
+
+/// Restore normal output behavior.
+fn setupInputTty(tty: *vaxis.Tty) !void {
+    if (builtin.os.tag == .windows) {
+        var mode = vaxis.tty.WindowsTty.getConsoleMode(tty.stdout);
+        mode.DISABLE_NEWLINE_AUTO_RETURN = 0;
+        vaxis.tty.WindowsTty.setConsoleMode(tty.stdout, mode);
+        return;
+    }
+
+    var tio = try std.posix.tcgetattr(tty.fd);
+    tio.oflag.OPOST = true;
+    try std.posix.tcsetattr(tty.fd, .FLUSH, tio);
 }
