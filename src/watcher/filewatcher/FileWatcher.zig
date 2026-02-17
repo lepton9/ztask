@@ -28,7 +28,6 @@ vtable: struct {
     pollEvents: *const fn (
         opq: *anyopaque,
         gpa: std.mem.Allocator,
-        // out: *EventQueue,
         queue: *anyopaque,
         addEvent: *const fn (std.mem.Allocator, *anyopaque, FileEvent) anyerror!void,
     ) anyerror!void,

@@ -44,28 +44,32 @@ pub const Watcher = struct {
 
     /// Start the event watcher and run it on a separate thread
     pub fn start(self: *Watcher) !void {
-        _ = self.running.swap(true, .seq_cst);
+        self.running.store(true, .seq_cst);
         self.thread = try std.Thread.spawn(.{}, runWatcher, .{self});
     }
 
     /// Stop event watcher thread from running
     pub fn stop(self: *Watcher) void {
         if (!self.running.load(.seq_cst)) return;
-        _ = self.running.swap(false, .seq_cst);
-        self.cond.broadcast(); // Wake up if waiting
+        self.mutex.lock();
+        self.running.store(false, .seq_cst);
+        // Wake the watcher thread if it's waiting
+        self.cond.broadcast();
+        self.mutex.unlock();
         self.thread.join();
     }
 
     /// Run watcher and poll for events
     fn runWatcher(self: *Watcher) void {
-        while (self.running.load(.seq_cst)) {
-            // Wait for work
-            if (self.running.load(.seq_cst) and !self.hasWork()) {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+        while (true) {
+            self.mutex.lock();
+            while (self.running.load(.seq_cst) and !self.hasWork()) {
                 self.cond.wait(&self.mutex);
             }
-            if (!self.running.load(.seq_cst)) break;
+            const still_running = self.running.load(.seq_cst);
+            self.mutex.unlock();
+
+            if (!still_running) break;
 
             // Poll watchers for events
             if (self.file_watcher) |fw| {
@@ -116,4 +120,26 @@ pub fn addFileEvent(
 ) !void {
     var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
     try queue.append(gpa, .{ .fileEvent = ev });
+}
+
+test "file_watch_add" {
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(gpa);
+    defer watcher.deinit();
+    try watcher.start();
+    defer watcher.stop();
+
+    // Add a path to watch
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
+    try watcher.addFileWatch(".");
+    try std.testing.expect(watcher.hasWork());
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
+    try watcher.addFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 2);
+
+    // Remove from watched
+    watcher.removeFileWatch(".");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
+    watcher.removeFileWatch("src");
+    try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
 }
