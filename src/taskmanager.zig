@@ -25,13 +25,6 @@ pub const BeginTaskOptions = struct {
     retrigger: bool = false,
 };
 
-pub const TaskEvent = union(enum) {
-    run_finished: struct {
-        task_id: u64,
-        status: data.TaskRunStatus,
-    },
-};
-
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     gpa: std.mem.Allocator,
@@ -42,7 +35,7 @@ pub const TaskManager = struct {
     idle_cond: std.Thread.Condition = .{},
 
     /// Queue of task events (single-consumer)
-    events: *MutexQueue(TaskEvent),
+    events: *MutexQueue(Event),
     datastore: data.DataStore,
     pool: *RunnerPool,
 
@@ -62,11 +55,24 @@ pub const TaskManager = struct {
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
 
+    pub const Event = union(enum) {
+        run_finished: struct {
+            task_id: u64,
+            status: data.TaskRunStatus,
+        },
+        err: struct {
+            scope: ErrorScope,
+            msg: []const u8,
+        },
+
+        const ErrorScope = enum { watcher, remote_manager, scheduler };
+    };
+
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         const self = try gpa.create(TaskManager);
         self.* = .{
             .gpa = gpa,
-            .events = try MutexQueue(TaskEvent).initCapacity(gpa, 64),
+            .events = try MutexQueue(Event).initCapacity(gpa, 64),
             .datastore = .init(),
             .pool = try RunnerPool.init(gpa, runners_n),
             .schedulers = .{},
@@ -99,13 +105,26 @@ pub const TaskManager = struct {
     }
 
     /// Pop the next task event if available (non-blocking)
-    pub fn tryPopEvent(self: *TaskManager) ?TaskEvent {
+    pub fn tryPopEvent(self: *TaskManager) ?Event {
         return self.events.pop();
     }
 
     /// Pop the next task event (blocking)
-    pub fn nextEvent(self: *TaskManager) ?TaskEvent {
+    pub fn nextEvent(self: *TaskManager) ?Event {
         return self.events.popBlocking();
+    }
+
+    /// Handle error and push it to the event queue
+    fn handleError(
+        self: *TaskManager,
+        scope: Event.ErrorScope,
+        err: anyerror,
+    ) void {
+        log.debug("{}: error: {}", .{ scope, err });
+        self.events.append(self.gpa, .{ .err = .{
+            .scope = scope,
+            .msg = @errorName(err),
+        } }) catch {};
     }
 
     /// Amount of tasks currently running
@@ -194,15 +213,14 @@ pub const TaskManager = struct {
     /// Main run loop
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
-            // TODO: handle errors
             self.checkWatcher() catch |err| {
-                log.debug("Watcher err: {}", .{err});
+                self.handleError(.watcher, err);
             };
             self.updateRemoteManager() catch |err| {
-                log.debug("Remote manager err: {}", .{err});
+                self.handleError(.remote_manager, err);
             };
             self.updateSchedulers() catch |err| {
-                log.debug("Scheduler err: {}", .{err});
+                self.handleError(.scheduler, err);
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }

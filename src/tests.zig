@@ -67,8 +67,9 @@ test "force_interrupt" {
 
     var it = task_manager.schedulers.valueIterator();
     while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
-    if (task_manager.events.pop()) |event| switch (event) {
+    if (task_manager.tryPopEvent()) |event| switch (event) {
         .run_finished => |e| try std.testing.expect(e.status == .interrupted),
+        else => {},
     };
 }
 
@@ -119,13 +120,14 @@ test "complete_tasks" {
     try std.testing.expect(task_manager.schedulers.count() == 0);
 
     try std.testing.expect(task_manager.events.len() == 2);
-    while (task_manager.events.pop()) |event| switch (event) {
+    while (task_manager.tryPopEvent()) |event| switch (event) {
         .run_finished => |e| {
             try std.testing.expect(e.status == .success);
             try std.testing.expect(
                 e.task_id == task1.id.value or e.task_id == task2.id.value,
             );
         },
+        else => {},
     };
 }
 

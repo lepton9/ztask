@@ -162,6 +162,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                 if (e.task_id != task_id_value) continue;
                 if (!task_has_trigger) return;
             },
+            .err => {},
         };
 
         std.Thread.sleep(std.time.ns_per_ms * 25);
