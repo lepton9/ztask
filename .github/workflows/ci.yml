@@ -1,11 +1,9 @@
 name: CI
 on:
   push:
-    branches:
-      - main
+    branches: ['main']
   pull_request:
-    branches:
-      - main
+    branches: ['main']
   workflow_dispatch:
 
 jobs:
@@ -24,5 +22,5 @@ jobs:
 
       - name: Check format
         run: zig fmt --check ./*.zig src/*.zig
-      - name: Run tests
-        run: zig build test
+      - name: Build and run tests
+        run: zig build ci

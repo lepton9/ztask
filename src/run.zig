@@ -345,9 +345,12 @@ pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
 /// Restore normal output behavior.
 fn setupInputTty(tty: *vaxis.Tty) !void {
     if (builtin.os.tag == .windows) {
-        var mode = vaxis.tty.WindowsTty.getConsoleMode(tty.stdout);
+        var mode = try vaxis.tty.WindowsTty.getConsoleMode(
+            vaxis.tty.WindowsTty.CONSOLE_MODE_OUTPUT,
+            tty.stdout,
+        );
         mode.DISABLE_NEWLINE_AUTO_RETURN = 0;
-        vaxis.tty.WindowsTty.setConsoleMode(tty.stdout, mode);
+        try vaxis.tty.WindowsTty.setConsoleMode(tty.stdout, mode);
         return;
     }
 
