@@ -1,7 +1,11 @@
 pub const std = @import("std");
 pub const zcli = @import("zcli");
 const run = @import("run.zig");
+const data = @import("data.zig");
 const options = @import("build_options");
+
+const fmtWrite = run.fmtWrite;
+const write = run.write;
 
 /// Cli configuration
 pub const cli_spec: zcli.CliApp = .{
@@ -21,6 +25,52 @@ pub const cli_spec: zcli.CliApp = .{
 
 /// Cli commands
 const commands = &[_]zcli.Cmd{
+    .{
+        .name = "init",
+        .desc = "Initialize a project-local .ztask directory",
+        .action = cmdInitFn,
+    },
+    .{
+        .name = "add",
+        .desc = "Add a task or a directory of tasks",
+        .positionals = &[_]zcli.PosArg{
+            .{
+                .name = "path",
+                .desc = "Path for a file or directory",
+                .required = false,
+            },
+        },
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "path",
+                .desc = "Path of the task file",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
+            .{
+                .long_name = "recursive",
+                .short_name = "r",
+                .desc = "Add task files recursively in a directory",
+            },
+        },
+        .action = cmdAddFn,
+    },
+    .{
+        .name = "delete",
+        .desc = "Delete a task",
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "path",
+                .desc = "Path of the task file",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
+            .{
+                .long_name = "id",
+                .desc = "ID of the task",
+                .arg = .{ .name = "ID", .type = .Text },
+            },
+        },
+        .action = cmdDeleteFn,
+    },
     .{
         .name = "run",
         .desc = "Run a single task",
@@ -117,48 +167,6 @@ const commands = &[_]zcli.Cmd{
         },
         .action = cmdCompletionFn,
     },
-    .{
-        .name = "add",
-        .desc = "Add a task or a directory of tasks",
-        .positionals = &[_]zcli.PosArg{
-            .{
-                .name = "path",
-                .desc = "Path for a file or directory",
-                .required = false,
-            },
-        },
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "path",
-                .desc = "Path of the task file",
-                .arg = .{ .name = "PATH", .type = .Path },
-            },
-            .{
-                .long_name = "recursive",
-                .short_name = "r",
-                .desc = "Add task files recursively in a directory",
-            },
-        },
-        .action = cmdAddFn,
-    },
-
-    .{
-        .name = "delete",
-        .desc = "Delete a task",
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "path",
-                .desc = "Path of the task file",
-                .arg = .{ .name = "PATH", .type = .Path },
-            },
-            .{
-                .long_name = "id",
-                .desc = "ID of the task",
-                .arg = .{ .name = "ID", .type = .Text },
-            },
-        },
-        .action = cmdDeleteFn,
-    },
 };
 
 const runner_n_option: zcli.Opt = .{
@@ -167,20 +175,6 @@ const runner_n_option: zcli.Opt = .{
     .desc = "Maximum amount of runners active",
     .arg = .{ .name = "INT", .type = .Int },
 };
-
-/// Write to stdout with format
-fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
-    var buffer: [1024]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buffer);
-    const stdout = &writer.interface;
-    try stdout.print(fmt, args);
-    try stdout.flush();
-}
-
-/// Write all the data to stdout
-fn write(data: []const u8) !void {
-    return fmtWrite("{s}", .{data});
-}
 
 /// Write error message and exit the program
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
@@ -210,6 +204,14 @@ const Ctx = struct {
     gpa: std.mem.Allocator,
     cli: *zcli.Cli,
 };
+
+/// Handle init command
+fn cmdInitFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    run.initProjectDataDir(ctx.gpa) catch |err| switch (err) {
+        else => {},
+    };
+}
 
 /// Handle run command
 fn cmdRunFn(ptr: *anyopaque) !void {

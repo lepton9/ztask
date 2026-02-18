@@ -182,21 +182,16 @@ pub const ListOptions = struct {
 
 /// List all the found tasks
 pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
-    var datastore = data.DataStore.init();
+    var datastore = try data.DataStore.init(gpa, .{});
     defer datastore.deinit(gpa);
 
     const pre_load_runs = options.sort.len > 0;
     try datastore.loadTaskMetas(gpa, .{ .load_runs = pre_load_runs });
 
-    var write_buffer: [1024]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&write_buffer);
-    const stdout = &writer.interface;
-
-    try stdout.print(
+    try fmtWrite(
         "{s:<20}{s:<15}{s:<10}{s}\n\n",
         .{ "ID", "Name", "Runs", "Path" },
     );
-    try stdout.flush();
 
     // Sort tasks
     for (options.sort) |sorter| {
@@ -217,7 +212,7 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
         if (!pre_load_runs) try datastore.loadTaskRuns(gpa, task_id);
 
         const runs = datastore.task_runs.get(task_id) orelse unreachable;
-        try stdout.print(
+        try fmtWrite(
             "{s:<20}{s:<15}{d:<10}{s}\n",
             .{
                 meta.id,
@@ -226,7 +221,6 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
                 meta.file_path,
             },
         );
-        try stdout.flush();
     }
 }
 
@@ -304,7 +298,7 @@ pub const AddOptions = struct {
 
 /// Add one task or a directory
 pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
-    var datastore = data.DataStore.init();
+    var datastore = try data.DataStore.init(gpa, .{});
     defer datastore.deinit(gpa);
     try datastore.loadTaskMetas(gpa, .{});
 
@@ -326,7 +320,7 @@ pub const DeleteOptions = struct {
 
 /// Delete a task with the given path or ID
 pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
-    var datastore = data.DataStore.init();
+    var datastore = try data.DataStore.init(gpa, .{});
     defer datastore.deinit(gpa);
     try datastore.loadTaskMetas(gpa, .{});
     const id = blk: switch (options.task) {
@@ -340,6 +334,21 @@ pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
         .id => |id| break :blk id,
     };
     try datastore.deleteTask(gpa, id);
+}
+
+/// Initialize a project-local data directory in the current working directory.
+pub fn initProjectDataDir(gpa: std.mem.Allocator) !void {
+    const cwd = std.fs.cwd();
+
+    // TODO: check for existing
+    const marker_path = data.PROJECT_MARKER_DIR;
+    const tasks_dir = try std.fs.path.join(gpa, &.{ marker_path, "tasks" });
+    defer gpa.free(tasks_dir);
+    try cwd.makePath(tasks_dir);
+
+    const wd = try std.process.getCwdAlloc(gpa);
+    defer gpa.free(wd);
+    try fmtWrite("Initialized {s} in {s}\n", .{ marker_path, wd });
 }
 
 /// Restore normal output behavior.
@@ -357,4 +366,18 @@ fn setupInputTty(tty: *vaxis.Tty) !void {
     var tio = try std.posix.tcgetattr(tty.fd);
     tio.oflag.OPOST = true;
     try std.posix.tcsetattr(tty.fd, .FLUSH, tio);
+}
+
+/// Write to stdout with format
+pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &writer.interface;
+    try stdout.print(fmt, args);
+    try stdout.flush();
+}
+
+/// Write all the data to stdout
+pub fn write(bytes: []const u8) !void {
+    return fmtWrite("{s}", .{bytes});
 }
