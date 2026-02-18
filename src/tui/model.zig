@@ -1001,7 +1001,7 @@ const TaskView = struct {
                 const labels = try ctx.arena.alloc(vxfw.Border.BorderLabel, 2);
                 labels[0] = log_label;
                 labels[1] = .{
-                    .text = "Paused (press 'c' to follow)",
+                    .text = "Detached (press 'c' to follow)",
                     .alignment = .bottom_left,
                 };
                 break :blk labels;
@@ -1314,8 +1314,10 @@ const TaskView = struct {
             };
         };
 
+        const datastore = self.parent.model.taskmanager.datastore;
+
         // Read logs
-        const res = data.DataStore.readJobLogWindow(
+        const res = datastore.readJobLogWindow(
             arena,
             self.task.?.data.meta.id,
             run_id,

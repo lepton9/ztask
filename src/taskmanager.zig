@@ -68,20 +68,53 @@ pub const TaskManager = struct {
         const ErrorScope = enum { watcher, remote_manager, scheduler };
     };
 
+    pub const InitOptions = struct {
+        data: data.DataStore.InitOptions = .{},
+    };
+
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
+        return initWithOptions(gpa, runners_n, .{});
+    }
+
+    /// Initialize `TaskManager` with init options.
+    pub fn initWithOptions(
+        gpa: std.mem.Allocator,
+        runners_n: u16,
+        options: InitOptions,
+    ) !*TaskManager {
+        var datastore = try data.DataStore.init(gpa, options.data);
+        errdefer datastore.deinit(gpa);
+
+        var events = try MutexQueue(Event).initCapacity(gpa, 64);
+        errdefer events.deinit(gpa);
+
+        const pool = try RunnerPool.init(gpa, runners_n);
+        errdefer pool.deinit();
+
+        var to_unload = try std.ArrayList(*Task).initCapacity(gpa, 1);
+        errdefer to_unload.deinit(gpa);
+
+        const remote_manager = try remotemanager.RemoteManager.init(gpa);
+        errdefer remote_manager.deinit();
+
+        const watcher = try Watcher.init(gpa);
+        errdefer watcher.deinit();
+
         const self = try gpa.create(TaskManager);
+        errdefer gpa.destroy(self);
         self.* = .{
             .gpa = gpa,
-            .events = try MutexQueue(Event).initCapacity(gpa, 64),
-            .datastore = .init(),
-            .pool = try RunnerPool.init(gpa, runners_n),
+            .events = events,
+            .datastore = datastore,
+            .pool = pool,
             .schedulers = .{},
             .loaded_tasks = .{},
-            .to_unload = try .initCapacity(gpa, 1),
+            .to_unload = to_unload,
             .watch_map = .{},
-            .remote_manager = try remotemanager.RemoteManager.init(gpa),
-            .watcher = try Watcher.init(gpa),
+            .remote_manager = remote_manager,
+            .watcher = watcher,
         };
+
         try self.datastore.loadTaskMetas(gpa, .{ .load_runs = false });
         return self;
     }
