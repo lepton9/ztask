@@ -9,8 +9,34 @@ test {
     _ = manager;
 }
 
+/// Only used for testing.
+const TestEnv = struct {
+    dir: std.testing.TmpDir,
+    path: []u8,
+    data_dir: []u8,
+
+    fn init(gpa: std.mem.Allocator) !TestEnv {
+        var tmp = std.testing.tmpDir(.{});
+        const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+        return .{
+            .dir = tmp,
+            .path = dir_path,
+            .data_dir = try std.fs.path.join(gpa, &.{ dir_path, "ztask-data" }),
+        };
+    }
+
+    fn deinit(self: *TestEnv, gpa: std.mem.Allocator) void {
+        self.dir.cleanup();
+        gpa.free(self.path);
+        gpa.free(self.data_dir);
+    }
+};
+
 test "manager_simple" {
     const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
     const task1_file =
         \\ name: task1
         \\ id: 1
@@ -19,7 +45,9 @@ test "manager_simple" {
         \\ name: task2
         \\ id: 2
     ;
-    const task_manager = try TaskManager.init(gpa, 5);
+    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
+    });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
@@ -45,6 +73,9 @@ test "manager_simple" {
 
 test "force_interrupt" {
     const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
     const task_file =
         \\ name: task
         \\ id: 3
@@ -57,7 +88,9 @@ test "force_interrupt" {
         \\     steps:
         \\       - command: "cat README.md"
     ;
-    const task_manager = try TaskManager.init(gpa, 5);
+    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
+    });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
@@ -75,6 +108,9 @@ test "force_interrupt" {
 
 test "complete_tasks" {
     const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
     const task1_file =
         \\ name: task1
         \\ id: 4
@@ -98,7 +134,9 @@ test "complete_tasks" {
         \\     steps:
         \\       - command: "zig help"
     ;
-    const task_manager = try TaskManager.init(gpa, 5);
+    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
+    });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
@@ -133,6 +171,9 @@ test "complete_tasks" {
 
 test "remote_job" {
     const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
     const task_file =
         \\ name: task6
         \\ id: 6
@@ -146,7 +187,9 @@ test "remote_job" {
         \\       - command: "ls"
         \\     run_on: remote:runner1
     ;
-    const task_manager = try manager.TaskManager.init(gpa, 5);
+    const task_manager = try manager.TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
+    });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
