@@ -99,7 +99,7 @@ pub const Model = struct {
             },
             .tick => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
-                try onTick(self, ctx);
+                try self.onTick(ctx);
             },
             .mouse => {
                 if (self.confirm != null) {
@@ -229,11 +229,22 @@ pub const Model = struct {
     }
 
     /// Handle tick event
-    fn onTick(ptr: *anyopaque, ctx: *vxfw.EventContext) anyerror!void {
-        const self: *Model = @ptrCast(@alignCast(ptr));
+    fn onTick(self: *Model, ctx: *vxfw.EventContext) anyerror!void {
         self.checkInfo();
         try self.requestSnapshot();
+        try self.handleTaskManagerEvents();
         try ctx.queueRefresh();
+    }
+
+    /// Pop and show all the events in the task manager event queue.
+    fn handleTaskManagerEvents(self: *Model) !void {
+        while (self.taskmanager.tryPopEvent()) |ev| switch (ev) {
+            .run_finished => |r| try self.setInfo(
+                "Finished task {x} ({s})",
+                .{ r.task_id, @tagName(r.status) },
+            ),
+            .err => |e| try self.setInfo("Error {s}: '{s}'", .{ @tagName(e.scope), e.msg }),
+        };
     }
 
     /// Request a snapshot of the UI from TaskManager
@@ -523,7 +534,9 @@ const TaskSplit = struct {
                     try self.model.requestDeleteTask(ctx, selected.meta.id, selected.meta.name);
                     return;
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    try ctx.requestFocus(self.selected_task_view.widget());
+                    if (self.tasks_models.items.len > 0) {
+                        try ctx.requestFocus(self.selected_task_view.widget());
+                    }
                     ctx.consumeAndRedraw();
                 } else if (key.matches(vaxis.Key.escape, .{})) {
                     try ctx.requestFocus(self.widget());
