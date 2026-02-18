@@ -168,7 +168,7 @@ pub const DataStore = struct {
     }
 
     /// Get the root directory to use for saving and fetching data.
-    fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
+    pub fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
         if (options.data_dir) |explicit| return try gpa.dupe(u8, explicit);
 
         // Try to find project-local data directory

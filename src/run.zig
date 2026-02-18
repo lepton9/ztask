@@ -339,16 +339,33 @@ pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
 /// Initialize a project-local data directory in the current working directory.
 pub fn initProjectDataDir(gpa: std.mem.Allocator) !void {
     const cwd = std.fs.cwd();
-
-    // TODO: check for existing
     const marker_path = data.PROJECT_MARKER_DIR;
-    const tasks_dir = try std.fs.path.join(gpa, &.{ marker_path, "tasks" });
-    defer gpa.free(tasks_dir);
-    try cwd.makePath(tasks_dir);
 
     const wd = try std.process.getCwdAlloc(gpa);
     defer gpa.free(wd);
+
+    const exists: bool = blk: {
+        cwd.access(marker_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => break :blk false,
+            else => return err,
+        };
+        break :blk true;
+    };
+    if (exists) {
+        const project_dir = try std.fs.path.join(gpa, &.{ wd, marker_path });
+        defer gpa.free(project_dir);
+        try fmtWrite("Project already exists in {s}\n", .{project_dir});
+        return;
+    }
+
+    try cwd.makePath(marker_path);
     try fmtWrite("Initialized {s} in {s}\n", .{ marker_path, wd });
+}
+
+/// Show the currently used directory path for saving and fetching data.
+pub fn showCurDataDir(gpa: std.mem.Allocator) !void {
+    const path = try data.DataStore.resolveRootDir(gpa, .{});
+    try fmtWrite("Current data directory is {s}\n", .{path});
 }
 
 /// Restore normal output behavior.

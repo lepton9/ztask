@@ -1,7 +1,6 @@
 pub const std = @import("std");
 pub const zcli = @import("zcli");
 const run = @import("run.zig");
-const data = @import("data.zig");
 const options = @import("build_options");
 
 const fmtWrite = run.fmtWrite;
@@ -29,6 +28,11 @@ const commands = &[_]zcli.Cmd{
         .name = "init",
         .desc = "Initialize a project-local .ztask directory",
         .action = cmdInitFn,
+    },
+    .{
+        .name = "data",
+        .desc = "Print the current data directory",
+        .action = cmdDataFn,
     },
     .{
         .name = "add",
@@ -208,9 +212,13 @@ const Ctx = struct {
 /// Handle init command
 fn cmdInitFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    run.initProjectDataDir(ctx.gpa) catch |err| switch (err) {
-        else => {},
-    };
+    try run.initProjectDataDir(ctx.gpa);
+}
+
+/// Handle init command
+fn cmdDataFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    try run.showCurDataDir(ctx.gpa);
 }
 
 /// Handle run command
