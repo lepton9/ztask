@@ -182,11 +182,11 @@ pub const ListOptions = struct {
 
 /// List all the found tasks
 pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
-    var datastore = try data.DataStore.init(gpa, .{});
-    defer datastore.deinit(gpa);
-
     const pre_load_runs = options.sort.len > 0;
-    try datastore.loadTaskMetas(gpa, .{ .load_runs = pre_load_runs });
+    var datastore = try data.DataStore.init(gpa, .{
+        .load = .{ .tasks = true, .runs = pre_load_runs },
+    });
+    defer datastore.deinit(gpa);
 
     try fmtWrite(
         "{s:<20}{s:<15}{s:<10}{s}\n\n",
@@ -298,9 +298,8 @@ pub const AddOptions = struct {
 
 /// Add one task or a directory
 pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
-    var datastore = try data.DataStore.init(gpa, .{});
+    var datastore = try data.DataStore.init(gpa, .{ .load = .{ .tasks = true } });
     defer datastore.deinit(gpa);
-    try datastore.loadTaskMetas(gpa, .{});
 
     const cwd = std.fs.cwd();
     const stat = try cwd.statFile(options.path);
@@ -320,9 +319,8 @@ pub const DeleteOptions = struct {
 
 /// Delete a task with the given path or ID
 pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
-    var datastore = try data.DataStore.init(gpa, .{});
+    var datastore = try data.DataStore.init(gpa, .{ .load = .{ .tasks = true } });
     defer datastore.deinit(gpa);
-    try datastore.loadTaskMetas(gpa, .{});
     const id = blk: switch (options.task) {
         .path => |path| {
             const real_path = try std.fs.cwd().realpathAlloc(gpa, path);

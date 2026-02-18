@@ -82,7 +82,10 @@ pub const TaskManager = struct {
         runners_n: u16,
         options: InitOptions,
     ) !*TaskManager {
-        var datastore = try data.DataStore.init(gpa, options.data);
+        var data_opts = options.data;
+        data_opts.load.tasks = true;
+
+        var datastore = try data.DataStore.init(gpa, data_opts);
         errdefer datastore.deinit(gpa);
 
         var events = try MutexQueue(Event).initCapacity(gpa, 64);
@@ -114,8 +117,6 @@ pub const TaskManager = struct {
             .remote_manager = remote_manager,
             .watcher = watcher,
         };
-
-        try self.datastore.loadTaskMetas(gpa, .{ .load_runs = false });
         return self;
     }
 

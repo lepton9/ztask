@@ -110,13 +110,24 @@ pub const DataStore = struct {
         /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
         /// Defaults to current working directory.
         start_dir: ?[]const u8 = null,
+        /// Options to load metadata on init.
+        load: LoadOptions = .{},
+    };
+
+    const LoadOptions = struct {
+        tasks: bool = false,
+        runs: bool = false,
     };
 
     pub fn init(gpa: std.mem.Allocator, options: InitOptions) !DataStore {
         const root_dir = try resolveRootDir(gpa, options);
         errdefer gpa.free(root_dir);
         try std.fs.cwd().makePath(root_dir);
-        return .{ .root_dir = root_dir, .tasks = .{}, .task_runs = .{} };
+        var datastore: DataStore = .{ .root_dir = root_dir, .tasks = .{}, .task_runs = .{} };
+        if (options.load.tasks) {
+            try datastore.loadTaskMetas(gpa, .{ .load_runs = options.load.runs });
+        }
+        return datastore;
     }
 
     pub fn deinit(self: *DataStore, gpa: std.mem.Allocator) void {

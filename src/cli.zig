@@ -148,17 +148,32 @@ const commands = &[_]zcli.Cmd{
             .{
                 .long_name = "sort-id",
                 .desc = "Sort tasks by id (ASC|DESC)",
-                .arg = .{ .name = "ORDER", .type = .Text },
+                .arg = .{
+                    .name = "ORDER",
+                    .type = .Text,
+                    .required = false,
+                    .default = "ASC",
+                },
             },
             .{
                 .long_name = "sort-name",
                 .desc = "Sort tasks by name (ASC|DESC)",
-                .arg = .{ .name = "ORDER", .type = .Text },
+                .arg = .{
+                    .name = "ORDER",
+                    .type = .Text,
+                    .required = false,
+                    .default = "ASC",
+                },
             },
             .{
                 .long_name = "sort-runs",
                 .desc = "Sort tasks by run amount (ASC|DESC)",
-                .arg = .{ .name = "ORDER", .type = .Text },
+                .arg = .{
+                    .name = "ORDER",
+                    .type = .Text,
+                    .required = false,
+                    .default = "ASC",
+                },
             },
         },
         .action = cmdListFn,
