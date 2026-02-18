@@ -5,7 +5,8 @@ const task = @import("types/task.zig");
 pub const PROJECT_MARKER_DIR: []const u8 = ".ztask";
 pub const APP_DATA_SUBDIR: []const u8 = "ztask";
 const RUN_COUNTER_FILE: []const u8 = "run_counter";
-// TODO: have consts for the data directory names under the project dir
+const DATA_DIR_NAME: []const u8 = "data";
+const TASKS_DIR_NAME: []const u8 = "tasks";
 
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
 pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
@@ -189,17 +190,17 @@ pub const DataStore = struct {
     }
 
     /// Get and allocate the tasks directory path
-    pub fn tasksPath(self: *const DataStore, gpa: std.mem.Allocator) ![]u8 {
-        return std.fs.path.join(gpa, &.{ self.root_dir, "tasks" });
+    pub fn tasksDataPath(self: *const DataStore, gpa: std.mem.Allocator) ![]u8 {
+        return std.fs.path.join(gpa, &.{ self.root_dir, DATA_DIR_NAME });
     }
 
     /// Get and allocate the directory path for a task
-    pub fn taskPath(
+    pub fn taskDataPath(
         self: *const DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
     ) ![]u8 {
-        return std.fs.path.join(gpa, &.{ self.root_dir, "tasks", task_id });
+        return std.fs.path.join(gpa, &.{ self.root_dir, DATA_DIR_NAME, task_id });
     }
 
     /// Get and allocate the path for task metadata file
@@ -210,7 +211,7 @@ pub const DataStore = struct {
     ) ![]u8 {
         return std.fs.path.join(
             gpa,
-            &.{ self.root_dir, "tasks", task_id, "meta.json" },
+            &.{ self.root_dir, DATA_DIR_NAME, task_id, "meta.json" },
         );
     }
 
@@ -220,7 +221,10 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         task_id: []const u8,
     ) ![]u8 {
-        return std.fs.path.join(gpa, &.{ self.root_dir, "tasks", task_id, "runs" });
+        return std.fs.path.join(
+            gpa,
+            &.{ self.root_dir, DATA_DIR_NAME, task_id, "runs" },
+        );
     }
 
     /// Get and allocate the path for task run metadata file
@@ -232,7 +236,7 @@ pub const DataStore = struct {
     ) ![]u8 {
         return std.fs.path.join(
             gpa,
-            &.{ self.root_dir, "tasks", task_id, "runs", run_id, "meta.json" },
+            &.{ self.root_dir, DATA_DIR_NAME, task_id, "runs", run_id, "meta.json" },
         );
     }
 
@@ -245,7 +249,7 @@ pub const DataStore = struct {
     ) ![]u8 {
         return std.fs.path.join(
             gpa,
-            &.{ self.root_dir, "tasks", task_id, "runs", run_id, "jobs" },
+            &.{ self.root_dir, DATA_DIR_NAME, task_id, "runs", run_id, "jobs" },
         );
     }
 
@@ -259,7 +263,7 @@ pub const DataStore = struct {
     ) ![]u8 {
         return std.fs.path.join(gpa, &.{
             self.root_dir,
-            "tasks",
+            DATA_DIR_NAME,
             task_id,
             "runs",
             run_id,
@@ -279,7 +283,7 @@ pub const DataStore = struct {
     ) ![]u8 {
         return std.fs.path.join(gpa, &.{
             self.root_dir,
-            "tasks",
+            DATA_DIR_NAME,
             task_id,
             "runs",
             run_id,
@@ -296,7 +300,7 @@ pub const DataStore = struct {
         task_id: []const u8,
     ) !u64 {
         const cwd = std.fs.cwd();
-        const task_dir = try self.taskPath(gpa, task_id);
+        const task_dir = try self.taskDataPath(gpa, task_id);
         defer gpa.free(task_dir);
         const counter_file_path = try std.fs.path.join(gpa, &.{
             task_dir,
@@ -450,7 +454,7 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         options: struct { load_runs: bool = false },
     ) !void {
-        const tasks_path = try self.tasksPath(gpa);
+        const tasks_path = try self.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.fs.cwd();
         try cwd.makePath(tasks_path);

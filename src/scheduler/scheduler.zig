@@ -72,7 +72,7 @@ pub const Scheduler = struct {
             .start_time = std.time.timestamp(),
             .jobs_total = node_n,
         };
-        const tasks_path = try datastore.tasksPath(gpa);
+        const tasks_path = try datastore.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
         scheduler.* = .{
             .gpa = gpa,

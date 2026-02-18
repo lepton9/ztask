@@ -111,7 +111,7 @@ pub const RemoteAgent = struct {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
             const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            log.debug(
+            log.info(
                 "Connecting to {d}.{d}.{d}.{d}:{d}",
                 .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
             );
@@ -145,7 +145,7 @@ pub const RemoteAgent = struct {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
             .error_msg => |m| {
-                log.debug(
+                log.info(
                     "Error message: ({s}/{d}): {s}",
                     .{ @tagName(m.code), @intFromEnum(m.code), m.message },
                 );
@@ -213,6 +213,7 @@ pub const RemoteAgent = struct {
         const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         self.sendMessage(payload);
+        log.info("Connected as {s}", .{reg.hostname});
     }
 
     /// Send a heartbeat packet
@@ -263,6 +264,7 @@ pub const RemoteAgent = struct {
                 });
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
+                log.info("Starting job {s}", .{e.job_node.ptr.name});
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
@@ -288,6 +290,7 @@ pub const RemoteAgent = struct {
                 });
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
+                log.info("Finished job {s}", .{e.job_node.ptr.name});
             },
         };
     }
