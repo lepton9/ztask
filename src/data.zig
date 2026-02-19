@@ -205,6 +205,19 @@ pub const DataStore = struct {
         defer gpa.free(start_dir_alloc);
         if (try findProjectDataDir(gpa, start_dir_alloc)) |proj| return proj;
 
+        // Override global path with env variable
+        const env_data_dir = std.process.getEnvVarOwned(
+            gpa,
+            "ZTASK_DATA_DIR",
+        ) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => null,
+            else => return err,
+        };
+        if (env_data_dir) |p| {
+            if (p.len != 0) return p;
+            gpa.free(p);
+        }
+
         return try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR);
     }
 
