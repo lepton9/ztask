@@ -707,12 +707,109 @@ pub const DataStore = struct {
     }
 
     /// Move a task file to a new directory
+    ///
+    /// Also moves all associated data linked to the task.
     pub fn moveTask(
         self: *DataStore,
         gpa: std.mem.Allocator,
         from: []const u8,
         to: []const u8,
     ) !void {
+        const cwd = std.fs.cwd();
+        if (to.len == 0) return error.InvalidTaskFile;
+
+        const real_path_from = try cwd.realpathAlloc(gpa, from);
+        defer gpa.free(real_path_from);
+
+        const to_stat = cwd.statFile(to) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        const to_is_dir: bool = blk: {
+            if (to_stat) |st| break :blk st.kind == .directory;
+            if (to[to.len - 1] == std.fs.path.sep) break :blk true;
+            break :blk false;
+        };
+        if (!to_is_dir and !parse.isTaskFile(to)) return error.InvalidTaskFile;
+
+        // Create the destination path
+        var dest_path_alloc: ?[]u8 = null;
+        const dest_path: []const u8 = blk: {
+            if (!to_is_dir) break :blk to;
+            const base = std.fs.path.basename(real_path_from);
+            const joined = try std.fs.path.join(gpa, &.{ to, base });
+            dest_path_alloc = joined;
+            break :blk joined;
+        };
+        defer if (dest_path_alloc) |p| gpa.free(p);
+        if (std.fs.path.dirname(dest_path)) |dir| try cwd.makePath(dir);
+        const real_path_to = blk: {
+            const parent = std.fs.path.dirname(dest_path) orelse ".";
+            const parent_real = try cwd.realpathAlloc(gpa, parent);
+            defer gpa.free(parent_real);
+            const base = std.fs.path.basename(dest_path);
+            break :blk try std.fs.path.join(gpa, &.{ parent_real, base });
+        };
+        defer gpa.free(real_path_to);
+
+        const meta_old = self.findTaskMetaPath(real_path_from) orelse
+            return error.TaskNotFound;
+        var old_id_from_path = task.Id.fromStr(real_path_from);
+        const old_id_from_path_str = old_id_from_path.fmt();
+
+        // If the task id is derived from path, make sure the new id won't collide
+        const not_custom_id = std.mem.eql(u8, meta_old.id, old_id_from_path_str);
+        if (not_custom_id) {
+            var new_id_pred = task.Id.fromStr(real_path_to);
+            const new_id_pred_str = new_id_pred.fmt();
+            if (!std.mem.eql(u8, new_id_pred_str, meta_old.id)) {
+                if (self.tasks.get(new_id_pred_str)) |_| return error.TaskExists;
+            }
+        }
+
+        try std.fs.renameAbsolute(real_path_from, real_path_to);
+
+        const meta_new: *TaskMetadata = blk: {
+            if (!not_custom_id) break :blk meta_old; // Is user set ID
+
+            var new_id = task.Id.fromStr(real_path_to);
+            const new_id_str = new_id.fmt();
+            if (std.mem.eql(u8, new_id_str, meta_old.id)) break :blk meta_old;
+            if (self.tasks.get(new_id_str)) |_| return error.TaskExists;
+
+            const kv = self.tasks.fetchSwapRemove(meta_old.id) orelse unreachable;
+            var meta = kv.value;
+
+            // Rename the old task data dir to have the new id
+            const old_data_dir = try self.taskDataPath(gpa, meta.id);
+            defer gpa.free(old_data_dir);
+            const new_data_dir = try self.taskDataPath(gpa, new_id_str);
+            defer gpa.free(new_data_dir);
+            std.fs.renameAbsolute(old_data_dir, new_data_dir) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+
+            // Move cached runs map key if loaded
+            if (self.task_runs.fetchRemove(meta.id)) |rkv| {
+                const runs = rkv.value;
+                gpa.free(rkv.key);
+                const gop = try self.task_runs.getOrPut(gpa, new_id_str);
+                if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, new_id_str);
+                gop.value_ptr.* = runs;
+            }
+
+            // Set the new id
+            gpa.free(meta.id);
+            meta.id = try gpa.dupe(u8, new_id_str);
+            const gop = try self.tasks.getOrPut(gpa, meta.id);
+            gop.value_ptr.* = meta;
+            break :blk gop.value_ptr;
+        };
+        gpa.free(meta_new.file_path);
+        meta_new.file_path = try gpa.dupe(u8, real_path_to);
+
+        try self.writeTaskMeta(gpa, meta_new);
     }
 
     /// Add a new task run to the task runs hashmap
