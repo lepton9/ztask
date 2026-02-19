@@ -16,6 +16,17 @@ pub const cli_spec: zcli.CliApp = .{
     },
     .commands = commands,
     .options = &[_]zcli.Opt{
+        .{
+            .long_name = "data-dir",
+            .short_name = "d",
+            .desc = "Set used data directory",
+            .arg = .{ .name = "PATH", .type = .Path },
+        },
+        .{
+            .long_name = "global",
+            .short_name = "g",
+            .desc = "Force global data dir (ignore project + env)",
+        },
         .{ .long_name = "version", .short_name = "V", .desc = "Print version" },
         .{ .long_name = "help", .short_name = "h", .desc = "Print help" },
     },
@@ -233,6 +244,16 @@ const Ctx = struct {
     cli: *zcli.Cli,
 };
 
+/// Get the path value for used data directory.
+fn getDataDirOpt(cli: *zcli.Cli) ?[]const u8 {
+    const opt = cli.find_opt("data-dir") orelse return null;
+    return opt.value.?.string;
+}
+
+fn getForceGlobalOpt(cli: *zcli.Cli) bool {
+    return cli.find_opt("global") != null;
+}
+
 /// Handle init command
 fn cmdInitFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
@@ -242,7 +263,11 @@ fn cmdInitFn(ptr: *anyopaque) !void {
 /// Handle data command
 fn cmdDataFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    try run.showCurDataDir(ctx.gpa);
+    try run.showCurDataDir(
+        ctx.gpa,
+        getDataDirOpt(ctx.cli),
+        getForceGlobalOpt(ctx.cli),
+    );
 }
 
 /// Handle move command
@@ -253,7 +278,13 @@ fn cmdMoveFn(ptr: *anyopaque) !void {
     const to_arg = cli.find_positional("TO") orelse unreachable;
     const from = from_arg.value;
     const to = to_arg.value;
-    run.moveTask(ctx.gpa, from, to) catch |err| switch (err) {
+    run.moveTask(
+        ctx.gpa,
+        from,
+        to,
+        getDataDirOpt(ctx.cli),
+        getForceGlobalOpt(ctx.cli),
+    ) catch |err| switch (err) {
         error.FileNotFound => fatal("File not found: '{s}'", .{from}),
         error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
         error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
@@ -272,6 +303,8 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
         .attach_job = if (cli.find_opt("attach")) |o| o.value.?.string else null,
         .retrigger = cli.find_opt("retrigger") != null,
+        .data_dir = getDataDirOpt(cli),
+        .force_global = getForceGlobalOpt(cli),
     };
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;
@@ -357,7 +390,7 @@ fn cmdListFn(ptr: *anyopaque) !void {
             if (std.mem.eql(u8, opt.name, "sort-id")) break :blk .id;
             if (std.mem.eql(u8, opt.name, "sort-name")) break :blk .name;
             if (std.mem.eql(u8, opt.name, "sort-runs")) break :blk .runs;
-            unreachable;
+            continue;
         };
 
         var buf: [5]u8 = undefined;
@@ -377,7 +410,11 @@ fn cmdListFn(ptr: *anyopaque) !void {
         sorters[sort_count] = .{ sort, order };
         sort_count += 1;
     }
-    return try run.listTasks(ctx.gpa, .{ .sort = sorters[0..sort_count] });
+    return try run.listTasks(ctx.gpa, .{
+        .sort = sorters[0..sort_count],
+        .data_dir = getDataDirOpt(ctx.cli),
+        .force_global = getForceGlobalOpt(ctx.cli),
+    });
 }
 
 /// Handle completion command
@@ -402,6 +439,8 @@ fn cmdAddFn(ptr: *anyopaque) !void {
     return run.addTasks(ctx.gpa, .{
         .path = path,
         .recursive = recursive,
+        .data_dir = getDataDirOpt(ctx.cli),
+        .force_global = getForceGlobalOpt(ctx.cli),
     }) catch |err| switch (err) {
         error.ErrorOpenFile => fatal("Failed to open file: {s}", .{path}),
         error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
@@ -416,12 +455,15 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
 
-    const opts: run.DeleteOptions = if (cli.find_opt("path")) |path|
+    var opts: run.DeleteOptions = if (cli.find_opt("path")) |path|
         .{ .task = .{ .path = path.value.?.string } }
     else if (cli.find_opt("id")) |id|
         .{ .task = .{ .id = id.value.?.string } }
     else
         fatal("No task given to delete", .{});
+
+    opts.data_dir = getDataDirOpt(ctx.cli);
+    opts.force_global = getForceGlobalOpt(ctx.cli);
 
     return run.deleteTask(ctx.gpa, opts) catch |err| switch (err) {
         error.TaskNotFound => {
@@ -437,7 +479,17 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
 
 /// Handle parsed cli and call the command function
 pub fn handleArgs(gpa: std.mem.Allocator, cli: *zcli.Cli) !void {
-    const cmd = cli.cmd orelse return try run.runTui(gpa, .{});
+    const data_dir = getDataDirOpt(cli);
+    const force_global = getForceGlobalOpt(cli);
+    if (force_global and data_dir != null) fatal(
+        "Options '--global' and '--data-dir' are mutually exclusive",
+        .{},
+    );
+
+    const cmd = cli.cmd orelse return try run.runTui(gpa, .{
+        .data_dir = data_dir,
+        .force_global = force_global,
+    });
     const cmdFn = cmd.exec orelse return;
     var ctx: Ctx = .{ .gpa = gpa, .cli = cli };
     try cmdFn(&ctx);
