@@ -46,7 +46,7 @@ test "manager_simple" {
         \\ id: 2
     ;
     const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
@@ -89,7 +89,7 @@ test "force_interrupt" {
         \\       - command: "cat README.md"
     ;
     const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
@@ -135,7 +135,7 @@ test "complete_tasks" {
         \\       - command: "zig help"
     ;
     const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
@@ -188,7 +188,7 @@ test "remote_job" {
         \\     run_on: remote:runner1
     ;
     const task_manager = try manager.TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);

@@ -16,8 +16,7 @@ pub const MAX_RUNNERS_N = 100;
 
 pub const TuiOptions = struct {
     runners_n: u8 = BASE_RUNNERS_N,
-    data_dir: ?[]const u8 = null,
-    force_global: bool = false,
+    data_dir: data.DataStore.DataDirMode = .auto,
 };
 
 pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
@@ -27,7 +26,7 @@ pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
     const task_manager = try manager.TaskManager.initWithOptions(
         gpa,
         options.runners_n,
-        .{ .data = .{ .data_dir = options.data_dir, .force_global = options.force_global } },
+        .{ .data = .{ .data_dir = options.data_dir } },
     );
     defer task_manager.deinit();
     try task_manager.start();
@@ -108,13 +107,16 @@ pub const RunOptions = struct {
     attach_job: ?[]const u8 = null,
     retrigger: bool = false,
     runners_n: u8 = BASE_RUNNERS_N,
-    data_dir: ?[]const u8 = null,
-    force_global: bool = false,
+    data_dir: data.DataStore.DataDirMode = .auto,
 };
 
 /// Run a single task either with path or ID
 pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
-    const task_manager = try manager.TaskManager.init(gpa, options.runners_n);
+    const task_manager = try manager.TaskManager.initWithOptions(
+        gpa,
+        options.runners_n,
+        .{ .data = .{ .data_dir = options.data_dir } },
+    );
     defer task_manager.deinit();
     const task = blk: {
         if (options.path) |p| {
@@ -186,8 +188,7 @@ pub const ListOptions = struct {
     pub const Sort = struct { SortBy, Order };
 
     sort: []Sort = &.{},
-    data_dir: ?[]const u8 = null,
-    force_global: bool = false,
+    data_dir: data.DataStore.DataDirMode = .auto,
 };
 
 /// List all the found tasks
@@ -195,7 +196,6 @@ pub fn listTasks(gpa: std.mem.Allocator, options: ListOptions) !void {
     const pre_load_runs = options.sort.len > 0;
     var datastore = try data.DataStore.init(gpa, .{
         .data_dir = options.data_dir,
-        .force_global = options.force_global,
         .load = .{ .tasks = true, .runs = pre_load_runs },
     });
     defer datastore.deinit(gpa);
@@ -306,15 +306,13 @@ pub const AddOptions = struct {
     path: []const u8,
     /// Only when path is a directory
     recursive: bool = false,
-    data_dir: ?[]const u8 = null,
-    force_global: bool = false,
+    data_dir: data.DataStore.DataDirMode = .auto,
 };
 
 /// Add one task or a directory
 pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
     var datastore = try data.DataStore.init(gpa, .{
         .data_dir = options.data_dir,
-        .force_global = options.force_global,
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
@@ -333,15 +331,13 @@ pub const DeleteOptions = struct {
         path: []const u8,
         id: []const u8,
     },
-    data_dir: ?[]const u8 = null,
-    force_global: bool = false,
+    data_dir: data.DataStore.DataDirMode = .auto,
 };
 
 /// Delete a task with the given path or ID
 pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
     var datastore = try data.DataStore.init(gpa, .{
         .data_dir = options.data_dir,
-        .force_global = options.force_global,
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
@@ -387,12 +383,10 @@ pub fn initProjectDataDir(gpa: std.mem.Allocator) !void {
 /// Show the currently used directory path for saving and fetching data.
 pub fn showCurDataDir(
     gpa: std.mem.Allocator,
-    data_dir: ?[]const u8,
-    force_global: bool,
+    data_dir: data.DataStore.DataDirMode,
 ) !void {
     const path = try data.DataStore.resolveRootDir(gpa, .{
         .data_dir = data_dir,
-        .force_global = force_global,
     });
     defer gpa.free(path);
     try fmtWrite("Current data directory is {s}\n", .{path});
@@ -403,12 +397,10 @@ pub fn moveTask(
     gpa: std.mem.Allocator,
     from: []const u8,
     to: []const u8,
-    data_dir: ?[]const u8,
-    force_global: bool,
+    data_dir: data.DataStore.DataDirMode,
 ) !void {
     var datastore = try data.DataStore.init(gpa, .{
         .data_dir = data_dir,
-        .force_global = force_global,
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);

@@ -104,12 +104,18 @@ pub const DataStore = struct {
         jobs: ?[]JobRunMetadata = null,
     };
 
-    pub const InitOptions = struct {
-        /// Explicit data directory.
-        data_dir: ?[]const u8 = null,
+    pub const DataDirMode = union(enum) {
+        /// Resolve data dir using project dir -> env var -> global.
+        auto,
         /// Force using the global app data dir.
-        /// Ignores project-local dir and env var.
-        force_global: bool = false,
+        global,
+        /// Explicit data directory.
+        path: []const u8,
+    };
+
+    pub const InitOptions = struct {
+        /// Data directory selection.
+        data_dir: DataDirMode = .auto,
         /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
         /// Defaults to current working directory.
         start_dir: ?[]const u8 = null,
@@ -198,15 +204,16 @@ pub const DataStore = struct {
 
     /// Get the root directory to use for saving and fetching data.
     pub fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
-        if (options.data_dir) |explicit| {
-            if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
-            const cwd = try std.process.getCwdAlloc(gpa);
-            defer gpa.free(cwd);
-            return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
-        }
-
-        if (options.force_global) {
-            return try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR);
+        // Check the data dir mode
+        switch (options.data_dir) {
+            .path => |explicit| {
+                if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
+                const cwd = try std.process.getCwdAlloc(gpa);
+                defer gpa.free(cwd);
+                return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
+            },
+            .global => return try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR),
+            .auto => {},
         }
 
         // Try to find project-local data directory
