@@ -76,6 +76,15 @@ const commands = &[_]zcli.Cmd{
         .action = cmdDeleteFn,
     },
     .{
+        .name = "move",
+        .desc = "Move a task file to a new directory",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "FROM", .desc = "Path to move from", .required = true },
+            .{ .name = "TO", .desc = "Path to move to", .required = true },
+        },
+        .action = cmdMoveFn,
+    },
+    .{
         .name = "run",
         .desc = "Run a single task",
         .options = &[_]zcli.Opt{
@@ -230,10 +239,27 @@ fn cmdInitFn(ptr: *anyopaque) !void {
     try run.initProjectDataDir(ctx.gpa);
 }
 
-/// Handle init command
+/// Handle data command
 fn cmdDataFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     try run.showCurDataDir(ctx.gpa);
+}
+
+/// Handle move command
+fn cmdMoveFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    var cli = ctx.cli;
+    const from_arg = cli.find_positional("FROM") orelse unreachable;
+    const to_arg = cli.find_positional("TO") orelse unreachable;
+    const from = from_arg.value;
+    const to = to_arg.value;
+    run.moveTask(ctx.gpa, from, to) catch |err| switch (err) {
+        error.FileNotFound => fatal("File not found: '{s}'", .{from}),
+        error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
+        error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
+        error.InvalidTaskFile => fatal("Moved file is not a task file: '{s}'", .{to}),
+        else => fatal("Error {any}", .{err}),
+    };
 }
 
 /// Handle run command

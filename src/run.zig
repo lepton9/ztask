@@ -366,6 +366,13 @@ pub fn showCurDataDir(gpa: std.mem.Allocator) !void {
     try fmtWrite("Current data directory is {s}\n", .{path});
 }
 
+/// Move a task file to a new directory
+pub fn moveTask(gpa: std.mem.Allocator, from: []const u8, to: []const u8) !void {
+    var datastore = try data.DataStore.init(gpa, .{ .load = .{ .tasks = true } });
+    defer datastore.deinit(gpa);
+    try datastore.moveTask(gpa, from, to);
+}
+
 /// Restore normal output behavior.
 fn setupInputTty(tty: *vaxis.Tty) !void {
     if (builtin.os.tag == .windows) {

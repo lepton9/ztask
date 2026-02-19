@@ -122,8 +122,22 @@ pub const DataStore = struct {
     pub fn init(gpa: std.mem.Allocator, options: InitOptions) !DataStore {
         const root_dir = try resolveRootDir(gpa, options);
         errdefer gpa.free(root_dir);
-        try std.fs.cwd().makePath(root_dir);
-        var datastore: DataStore = .{ .root_dir = root_dir, .tasks = .{}, .task_runs = .{} };
+
+        var datastore: DataStore = .{
+            .root_dir = root_dir,
+            .tasks = .{},
+            .task_runs = .{},
+        };
+
+        const cwd = std.fs.cwd();
+        const data_path = try datastore.tasksDataPath(gpa);
+        defer gpa.free(data_path);
+        const tasks_path = try datastore.tasksPath(gpa);
+        defer gpa.free(tasks_path);
+        try cwd.makePath(root_dir);
+        try cwd.makePath(data_path);
+        try cwd.makePath(tasks_path);
+
         if (options.load.tasks) {
             try datastore.loadTaskMetas(gpa, .{ .load_runs = options.load.runs });
         }
@@ -200,12 +214,17 @@ pub const DataStore = struct {
         gpa.free(metas);
     }
 
-    /// Get and allocate the tasks directory path
+    /// Get and allocate the tasks data directory path
     pub fn tasksDataPath(self: *const DataStore, gpa: std.mem.Allocator) ![]u8 {
         return std.fs.path.join(gpa, &.{ self.root_dir, DATA_DIR_NAME });
     }
 
-    /// Get and allocate the directory path for a task
+    /// Get and allocate the directory path for task files
+    pub fn tasksPath(self: *const DataStore, gpa: std.mem.Allocator) ![]u8 {
+        return std.fs.path.join(gpa, &.{ self.root_dir, TASKS_DIR_NAME });
+    }
+
+    /// Get and allocate the directory path for a task data
     pub fn taskDataPath(
         self: *const DataStore,
         gpa: std.mem.Allocator,
@@ -685,6 +704,15 @@ pub const DataStore = struct {
             error.FileNotFound => {},
             else => return err,
         };
+    }
+
+    /// Move a task file to a new directory
+    pub fn moveTask(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        from: []const u8,
+        to: []const u8,
+    ) !void {
     }
 
     /// Add a new task run to the task runs hashmap
