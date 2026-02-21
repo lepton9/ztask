@@ -1,10 +1,12 @@
 const std = @import("std");
 const task = @import("types/task.zig");
+const date = @import("types/date.zig");
 const yaml = @import("yaml");
+const expectEqual = std.testing.expectEqual;
 
 const Task = task.Task;
 
-const max_size = 8192;
+const max_size = 8192 * 128;
 
 pub const ParseError = error{
     InvalidFileFormat,
@@ -15,8 +17,12 @@ pub const ParseError = error{
     DuplicateKey,
     InvalidStep,
     InvalidStepKind,
-    InvalidTrigger,
     InvalidFieldType,
+    InvalidTrigger,
+    InvalidTriggerHour,
+    InvalidTriggerMin,
+    InvalidTriggerSec,
+    InvalidTriggerMs,
 };
 
 fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
@@ -41,6 +47,18 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
                 .watch = .{ .path = try gpa.dupe(u8, path), .type = .file },
             };
         }
+        if (on.get("time")) |time_val| {
+            const time_str = time_val.asScalar() orelse
+                return ParseError.InvalidFieldType;
+            const t = try parseTime(time_str);
+            break :blk .{ .time = t };
+        }
+        if (on.get("interval")) |interval_val| {
+            const interval_str = interval_val.asScalar() orelse
+                return ParseError.InvalidFieldType;
+            const t = try parseTime(interval_str);
+            break :blk .{ .interval = t };
+        }
         return ParseError.InvalidTrigger;
     };
     errdefer if (trigger) |t| t.deinit(gpa);
@@ -58,6 +76,59 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     t.trigger = trigger;
     t.jobs = jobs;
     return t;
+}
+
+/// Parse a time from a string.
+///
+/// Formats:
+/// - HH:MM
+/// - HH:MM:SS
+/// - HH:MM:SS.mmm
+fn parseTime(str: []const u8) ParseError!date.Time {
+    var it = std.mem.splitScalar(u8, str, ':');
+    const h_str = it.next() orelse return ParseError.InvalidTriggerHour;
+    const m_str = it.next() orelse return ParseError.InvalidTriggerMin;
+    const s_str_opt = it.next();
+    if (it.next() != null) return ParseError.InvalidTrigger;
+
+    const h_u32 = blk: {
+        const h = std.fmt.parseInt(u32, h_str, 10) catch
+            return ParseError.InvalidTriggerHour;
+        if (h >= 24) return ParseError.InvalidTriggerHour;
+        break :blk h;
+    };
+    const m_u32 = blk: {
+        const min = std.fmt.parseInt(u32, m_str, 10) catch
+            return ParseError.InvalidTriggerMin;
+        if (min >= 60) return ParseError.InvalidTriggerMin;
+        break :blk min;
+    };
+
+    var s_u32: u32 = 0;
+    var ms_u32: u32 = 0;
+    if (s_str_opt) |s_str| {
+        var sit = std.mem.splitScalar(u8, s_str, '.');
+        const sec_str = sit.next() orelse return ParseError.InvalidTrigger;
+        const ms_str_opt = sit.next();
+        if (sit.next() != null) return ParseError.InvalidTrigger;
+
+        s_u32 = std.fmt.parseInt(u32, sec_str, 10) catch
+            return ParseError.InvalidTriggerSec;
+        if (s_u32 >= 60) return ParseError.InvalidTriggerSec;
+
+        if (ms_str_opt) |ms_str| {
+            ms_u32 = std.fmt.parseInt(u32, ms_str, 10) catch
+                return ParseError.InvalidTriggerMs;
+            if (ms_u32 >= 1000) return ParseError.InvalidTriggerMs;
+        }
+    }
+
+    return .{
+        .h = @intCast(h_u32),
+        .min = @intCast(m_u32),
+        .sec = @intCast(s_u32),
+        .ms = @intCast(ms_u32),
+    };
 }
 
 fn parseJobs(
@@ -180,7 +251,7 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     defer gpa.free(yaml_file);
     const t = try parseTaskBuffer(gpa, yaml_file);
     t.file_path = try std.fs.cwd().realpathAlloc(gpa, path);
-    if (t.id.value == 0) t.id = task.Id.fromStr(t.file_path.?);
+    if (t.id.value == 0) t.id = task.Id.fromStr(t.file_path orelse unreachable);
     return t;
 }
 
@@ -275,4 +346,62 @@ test "parse_task" {
     try std.testing.expect(test_job.run_on == .remote);
     try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote, "runner1"));
     try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
+}
+
+test "parse_trigger_time" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: time_trigger
+        \\ on:
+        \\   time: "17:38"
+    ;
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.trigger.? == .time);
+    const time = t.trigger.?.time;
+    try std.testing.expectEqual(@as(u5, 17), time.h);
+    try std.testing.expectEqual(@as(u6, 38), time.min);
+    try std.testing.expectEqual(@as(u6, 0), time.sec);
+    try std.testing.expectEqual(@as(u6, 0), time.ms);
+}
+
+test "parse_trigger_interval" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: interval_trigger
+        \\ on:
+        \\   interval: "00:01:15.001"
+    ;
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.trigger.? == .interval);
+    const interval = t.trigger.?.interval;
+    try std.testing.expectEqual(@as(u5, 0), interval.h);
+    try std.testing.expectEqual(@as(u6, 1), interval.min);
+    try std.testing.expectEqual(@as(u6, 15), interval.sec);
+    try std.testing.expectEqual(@as(u6, 1), interval.ms);
+}
+
+test "time_error_hour" {
+    try expectEqual(parseTime("25:00"), ParseError.InvalidTriggerHour);
+    try expectEqual(parseTime("asd:00"), ParseError.InvalidTriggerHour);
+    try expectEqual(parseTime(":00"), ParseError.InvalidTriggerHour);
+}
+
+test "time_error_min" {
+    try expectEqual(parseTime("00:60"), ParseError.InvalidTriggerMin);
+    try expectEqual(parseTime("00:asd"), ParseError.InvalidTriggerMin);
+    try expectEqual(parseTime("00:"), ParseError.InvalidTriggerMin);
+}
+
+test "time_error_sec" {
+    try expectEqual(parseTime("00:00:60"), ParseError.InvalidTriggerSec);
+    try expectEqual(parseTime("00:00:a"), ParseError.InvalidTriggerSec);
+    try expectEqual(parseTime("00:00:"), ParseError.InvalidTriggerSec);
+}
+
+test "time_error_ms" {
+    try expectEqual(parseTime("00:00:00.1000"), ParseError.InvalidTriggerMs);
+    try expectEqual(parseTime("00:00:00.zig"), ParseError.InvalidTriggerMs);
+    try expectEqual(parseTime("00:00:00."), ParseError.InvalidTriggerMs);
 }

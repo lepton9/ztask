@@ -44,24 +44,28 @@ fn daysInMonth(month: u8, year: u32) u5 {
     };
 }
 
-/// Convert timestamp in seconds to datetime
+/// Convert timestamp in seconds to `DateTime`
 pub fn timestampToDateTime(timestamp_s: u64) DateTime {
     const timestamp_ms = timestamp_s * std.time.ms_per_s;
     return milliTsToDateTime(timestamp_ms);
 }
 
-/// Convert timestamp in milliseconds to datetime
-pub fn milliTsToDateTime(timestamp_ms: u64) DateTime {
+/// Convert timestamp in milliseconds to `Time`
+pub fn milliTsToTime(timestamp_ms: u64) Time {
     const seconds = @divTrunc(timestamp_ms, std.time.ms_per_s);
-
-    // Calculate time
-    const time: Time = .{
+    return .{
         .h = @intCast(@divTrunc(@rem(seconds, std.time.s_per_day), std.time.s_per_hour)),
         .min = @intCast(@divTrunc(@rem(seconds, std.time.s_per_hour), std.time.s_per_min)),
         .sec = @intCast(@rem(seconds, std.time.s_per_min)),
         .ms = @intCast(@rem(timestamp_ms, std.time.ms_per_s)),
     };
+}
 
+/// Convert timestamp in milliseconds to `DateTime`
+pub fn milliTsToDateTime(timestamp_ms: u64) DateTime {
+    // Calculate time
+    const time = milliTsToTime(timestamp_ms);
+    const seconds = @divTrunc(timestamp_ms, std.time.ms_per_s);
     var days = @divTrunc(seconds, std.time.s_per_day);
 
     // Calculate year
@@ -91,4 +95,12 @@ pub fn milliTsToDateTime(timestamp_ms: u64) DateTime {
         .day = day,
     };
     return DateTime{ .date = date, .time = time };
+}
+
+/// Convert Time to milliseconds
+pub fn timeToMs(time: Time) i64 {
+    const total_s: i64 = @as(i64, time.h) * std.time.s_per_hour +
+        @as(i64, time.min) * std.time.s_per_min +
+        @as(i64, time.sec);
+    return total_s * std.time.ms_per_s + @as(i64, time.ms);
 }
