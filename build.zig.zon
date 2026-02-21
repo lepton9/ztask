@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml#1ad73ac461fe81f380c109d6ad8fb500f5bb41df",
-            .hash = "zig_yaml-0.2.0-C1161pKrAgAwvN-1yN42mPMczz2Vw0ngb2BsbiIxolWS",
+            .url = "git+https://github.com/kubkon/zig-yaml.git#2e2bd0c0aabbca27497501f904715b87facc54fb",
+            .hash = "zig_yaml-0.2.0-C1161kqsAgAlnJFIEkGCMXUSq-QvDKF3vpqeg1XRKW-w",
         },
         .zcli = .{
             .url = "git+https://github.com/lepton9/zcli#42477063808a3d35861ed0c369065151ade03183",
