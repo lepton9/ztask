@@ -2,14 +2,15 @@ const std = @import("std");
 const queue_zig = @import("../types/queue.zig");
 const builtin = @import("builtin");
 const task = @import("../types/task.zig");
+const date = @import("../types/date.zig");
 
 const FileWatcher = @import("filewatcher/FileWatcher.zig");
+const TimeWatcher = @import("TimeWatcher.zig");
 
 pub const EventType = enum { modified, created, deleted };
 pub const WatchEvent = union(enum) {
     fileEvent: FileWatcher.FileEvent,
-    interval: @TypeOf(task.Trigger.interval),
-    time: @TypeOf(task.Trigger.time),
+    timeEvent: TimeWatcher.TimeEvent,
 };
 
 const EventQueue = queue_zig.MutexQueue(WatchEvent);
@@ -25,6 +26,9 @@ pub const Watcher = struct {
     running: std.atomic.Value(bool) = .init(false),
     queue: *EventQueue,
     file_watcher: ?*FileWatcher,
+    time_watcher: *TimeWatcher,
+
+    const file_poll_ns = 25 * std.time.ns_per_ms;
 
     pub fn init(gpa: std.mem.Allocator) !*Watcher {
         const watcher = try gpa.create(Watcher);
@@ -32,6 +36,7 @@ pub const Watcher = struct {
             .gpa = gpa,
             .queue = try EventQueue.init(gpa),
             .file_watcher = FileWatcher.init(gpa) catch null,
+            .time_watcher = try TimeWatcher.init(gpa),
         };
         return watcher;
     }
@@ -39,6 +44,7 @@ pub const Watcher = struct {
     pub fn deinit(self: *Watcher) void {
         self.queue.deinit(self.gpa);
         if (self.file_watcher) |fw| fw.deinit(self.gpa);
+        self.time_watcher.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -63,28 +69,50 @@ pub const Watcher = struct {
     fn runWatcher(self: *Watcher) void {
         while (true) {
             self.mutex.lock();
+            defer self.mutex.unlock();
+
+            // Wait until there are triggers to watch for
             while (self.running.load(.seq_cst) and !self.hasWork()) {
                 self.cond.wait(&self.mutex);
             }
-            const still_running = self.running.load(.seq_cst);
-            self.mutex.unlock();
+            if (!self.running.load(.seq_cst)) break;
 
-            if (!still_running) break;
+            const wait_ns = self.nextWaitNsLocked();
+            if (wait_ns > 0) {
+                self.cond.timedWait(&self.mutex, wait_ns) catch {};
+            }
+
+            if (!self.running.load(.seq_cst)) break;
 
             // Poll watchers for events
             if (self.file_watcher) |fw| {
                 fw.pollEvents(self.gpa, self.queue, addFileEvent) catch |err| {
-                    if (err == error.WouldBlock) continue;
-                    log.debug("{}", .{err});
+                    if (err != error.WouldBlock) log.debug("{}", .{err});
                 };
             }
+            const tw = self.time_watcher;
+            tw.pollEvents(self.gpa, self.queue, addTimeEvent) catch |err| {
+                log.debug("{}", .{err});
+            };
         }
     }
 
     /// Determine if the watcher has anything to watch
     fn hasWork(self: *Watcher) bool {
         const fw_work = if (self.file_watcher) |fw| fw.watchCount() > 0 else false;
-        return fw_work;
+        return fw_work or self.time_watcher.watchCount() > 0;
+    }
+
+    /// Sleep for a bit while holding the mutex.
+    fn nextWaitNsLocked(self: *Watcher) u64 {
+        var best: ?u64 = null;
+        if (self.file_watcher) |fw| {
+            if (fw.watchCount() > 0) best = file_poll_ns;
+        }
+        if (self.time_watcher.nextDueInNs()) |t_ns| {
+            best = if (best) |b| @min(b, t_ns) else t_ns;
+        }
+        return best orelse file_poll_ns;
     }
 
     /// Pop an event from the event queue if there is one
@@ -135,6 +163,35 @@ pub const Watcher = struct {
         }
         return error.Timeout;
     }
+
+    /// Add an interval time watch for `TimeWatcher` to watch for.
+    pub fn addIntervalWatch(
+        self: *Watcher,
+        task_id: []const u8,
+        interval: date.Time,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ms_i64 = date.timeToMs(interval);
+        if (ms_i64 <= 0) return error.InvalidInterval;
+        try self.time_watcher.addIntervalWatch(self.gpa, task_id, @intCast(ms_i64));
+        self.cond.signal();
+    }
+
+    /// Add a time of day watch for `TimeWatcher` to watch for.
+    pub fn addTimeWatch(self: *Watcher, task_id: []const u8, time: date.Time) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.time_watcher.addTimeOfDayWatch(self.gpa, task_id, time);
+        self.cond.signal();
+    }
+
+    /// Remove a time watch for a task.
+    pub fn removeTimeWatch(self: *Watcher, task_id: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.time_watcher.removeWatch(self.gpa, task_id);
+    }
 };
 
 /// Add a file event to the event queue
@@ -145,6 +202,16 @@ pub fn addFileEvent(
 ) !void {
     var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
     try queue.append(gpa, .{ .fileEvent = ev });
+}
+
+/// Add a time event to the event queue
+fn addTimeEvent(
+    gpa: std.mem.Allocator,
+    queue_ptr: *anyopaque,
+    ev: TimeWatcher.TimeEvent,
+) !void {
+    var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
+    try queue.append(gpa, .{ .timeEvent = ev });
 }
 
 const test_timeout = 2 * std.time.ns_per_s;

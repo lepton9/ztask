@@ -14,7 +14,7 @@ const WatchType = union(enum) {
     },
     time: struct {
         time: date.Time,
-        last_triggered: i64,
+        last_triggered_day: i64,
     },
 };
 
@@ -93,7 +93,7 @@ pub fn addTimeOfDayWatch(
     }
     return self.addWatch(gpa, task_id, .{ .time = .{
         .time = time,
-        .last_triggered = last_triggered,
+        .last_triggered_day = last_triggered,
     } });
 }
 
@@ -132,12 +132,51 @@ pub fn pollEvents(
 
             const target_ms: i64 = date.timeToMs(t.time);
             if (ms_since_midnight < target_ms) continue;
-            if (t.last_triggered == today) continue;
+            if (t.last_triggered_day == today) continue;
 
-            t.last_triggered = today;
+            t.last_triggered_day = today;
             try addEvent(gpa, queue, .{ .task_id = e.key_ptr.* });
         },
     };
+}
+
+/// Returns nanoseconds until the next scheduled trigger.
+/// Returns null if there are no triggers.
+pub fn nextDueInNs(self: *TimeWatcher) ?u64 {
+    if (self.watch_list.count() == 0) return null;
+
+    const now = std.time.milliTimestamp();
+    const wall_ok = now >= 0;
+
+    const ms_per_day: i64 = @intCast(std.time.ms_per_day);
+    const today: i64 = if (wall_ok) @divTrunc(now, ms_per_day) else 0;
+    const ms_since_midnight: i64 = if (wall_ok) @rem(now, ms_per_day) else 0;
+
+    var best_ms: ?u64 = null;
+    var it = self.watch_list.iterator();
+    while (it.next()) |e| switch (e.value_ptr.*) {
+        .interval => |i| {
+            const delta_ms: u64 = @max(i.next_due_ms - now, 0);
+            best_ms = if (best_ms) |b| @min(b, delta_ms) else delta_ms;
+        },
+        .time => |t| {
+            if (!wall_ok) continue;
+
+            const target_ms: i64 = date.timeToMs(t.time);
+            const due_ms: i64 = if (ms_since_midnight < target_ms)
+                target_ms - ms_since_midnight
+            else if (t.last_triggered_day != today)
+                0
+            else
+                (ms_per_day - ms_since_midnight) + target_ms;
+
+            const delta_ms: u64 = if (due_ms <= 0) 0 else @intCast(due_ms);
+            best_ms = if (best_ms) |b| @min(b, delta_ms) else delta_ms;
+        },
+    };
+
+    const ms = best_ms orelse return null;
+    return ms * std.time.ns_per_ms;
 }
 
 test "interval_watch" {

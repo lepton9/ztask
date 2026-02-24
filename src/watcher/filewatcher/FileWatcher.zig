@@ -29,7 +29,7 @@ vtable: struct {
         opq: *anyopaque,
         gpa: std.mem.Allocator,
         queue: *anyopaque,
-        addEvent: *const fn (std.mem.Allocator, *anyopaque, FileEvent) anyerror!void,
+        addEvent: addEventFn,
     ) anyerror!void,
 },
 
