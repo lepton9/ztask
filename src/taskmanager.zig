@@ -220,27 +220,29 @@ pub const TaskManager = struct {
 
     /// Remove scheduler from watch list if the task trigger is being watched
     fn removeFromWatchList(self: *TaskManager, s: *Scheduler) void {
-        const path = blk: {
-            if (s.task.trigger) |t| switch (t) {
-                .watch => |w| break :blk w.path,
-                else => {},
-            };
-            return;
-        };
-        if (self.watch_map.getEntry(path)) |e| {
-            var list = e.value_ptr.*;
-            for (0..list.items.len) |i| {
-                if (@intFromPtr(list.items[i]) == @intFromPtr(s)) {
-                    _ = list.orderedRemove(i);
-                    break;
+        const t = s.task.trigger orelse return;
+        switch (t) {
+            .watch => |w| {
+                const path = w.path;
+                if (self.watch_map.getEntry(path)) |e| {
+                    var list = e.value_ptr.*;
+                    for (0..list.items.len) |i| {
+                        if (@intFromPtr(list.items[i]) == @intFromPtr(s)) {
+                            _ = list.orderedRemove(i);
+                            break;
+                        }
+                    }
+                    // No more schedulers that have the same watch path
+                    if (list.items.len == 0) {
+                        _ = self.watch_map.remove(path);
+                        list.deinit(self.gpa);
+                        self.watcher.removeFileWatch(path);
+                    }
                 }
-            }
-            // No more schedulers that have the same watch path
-            if (list.items.len == 0) {
-                _ = self.watch_map.remove(path);
-                list.deinit(self.gpa);
-                self.watcher.removeFileWatch(path);
-            }
+            },
+            .interval, .time => {
+                self.watcher.removeTimeWatch(s.task.id.fmt());
+            },
         }
     }
 
@@ -267,26 +269,31 @@ pub const TaskManager = struct {
         return self.remote_manager.update();
     }
 
-    /// Handle watcher events and trigger corresponding schedulers
+    /// Handle a watcher event for a scheduler.
+    fn handleTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (s.status) {
+            .waiting => {
+                try s.trigger();
+            },
+            else => {
+                if (!s.retrigger) return;
+                s.forceStop();
+                try s.trigger();
+            },
+        }
+    }
+
+    /// Handle watcher events and trigger corresponding schedulers.
     fn checkWatcher(self: *TaskManager) !void {
         while (self.watcher.getEvent()) |event| switch (event) {
             .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
-                for (l.items) |s| switch (s.status) {
-                    .waiting => {
-                        self.mutex.lock();
-                        defer self.mutex.unlock();
-                        try s.trigger();
-                    },
-                    else => {
-                        if (!s.retrigger) continue;
-                        self.mutex.lock();
-                        defer self.mutex.unlock();
-                        s.forceStop();
-                        try s.trigger();
-                    },
-                };
+                for (l.items) |s| try self.handleTriggerEvent(s);
             },
-            else => {},
+            .timeEvent => |te| if (self.getScheduler(te.task_id)) |s| {
+                try self.handleTriggerEvent(s);
+            },
         };
     }
 
@@ -399,7 +406,12 @@ pub const TaskManager = struct {
                         res.value_ptr.*.appendAssumeCapacity(task_scheduler);
                     } else try res.value_ptr.*.append(self.gpa, task_scheduler);
                 },
-                else => {},
+                .interval => |interval| {
+                    try self.watcher.addIntervalWatch(task.id.fmt(), interval);
+                },
+                .time => |time| {
+                    try self.watcher.addTimeWatch(task.id.fmt(), time);
+                },
             }
         } else try task_scheduler.trigger();
     }
