@@ -113,8 +113,9 @@ const commands = &[_]zcli.Cmd{
             },
             .{
                 .long_name = "attach",
-                .desc = "Run a job in the foreground (inherit stdio)",
-                .arg = .{ .name = "JOB", .type = .Text },
+                .short_name = "a",
+                .desc = "Run a job in the foreground [default: first job]",
+                .arg = .{ .name = "JOB", .type = .Text, .required = false },
             },
             .{
                 .long_name = "retrigger",
@@ -284,7 +285,11 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     var opts: run.RunOptions = .{
         .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
         .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
-        .attach_job = if (cli.find_opt("attach")) |o| o.value.?.string else null,
+        .attach_job = blk: {
+            const o = cli.find_opt("attach") orelse break :blk null;
+            const value = o.value orelse break :blk .first;
+            break :blk .{ .name = value.string };
+        },
         .retrigger = cli.find_opt("retrigger") != null,
         .data_dir = ctx.data_dir,
     };

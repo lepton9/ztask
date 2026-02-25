@@ -18,9 +18,11 @@ test {
     _ = scheduler;
 }
 
+pub const AttachJob = union(enum) { first, name: []const u8 };
+
 pub const BeginTaskOptions = struct {
     /// Job name to run in attached mode
-    attach_job: ?[]const u8 = null,
+    attach_job: ?AttachJob = null,
     /// Retrigger the task if trigger event occurs while the task is running
     retrigger: bool = false,
 };
@@ -383,7 +385,16 @@ pub const TaskManager = struct {
                 self.remote_manager,
                 &self.datastore,
             );
-            s.attach_job = options.attach_job;
+            s.attach_job = attach: {
+                const a = options.attach_job orelse break :attach null;
+                switch (a) {
+                    .first => {
+                        if (task.jobs.count() == 0) break :attach null;
+                        break :attach task.jobs.values()[0].name;
+                    },
+                    .name => |n| break :attach n,
+                }
+            };
             s.retrigger = options.retrigger;
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;

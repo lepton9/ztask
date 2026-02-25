@@ -104,7 +104,7 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
 pub const RunOptions = struct {
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
-    attach_job: ?[]const u8 = null,
+    attach_job: ?manager.AttachJob = null,
     retrigger: bool = false,
     runners_n: u8 = BASE_RUNNERS_N,
     data_dir: data.DataStore.DataDirMode = .auto,
