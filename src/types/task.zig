@@ -49,19 +49,69 @@ pub const Trigger = union(enum) {
     }
 };
 
+pub const RemoteRunSpec = struct {
+    /// Registered agent name.
+    name: []const u8,
+    /// Optional address of the runner agent (IPv4).
+    addr: ?[]const u8 = null,
+};
+
 pub const RunLocation = union(enum) {
     local,
-    remote: []const u8,
+    remote: RemoteRunSpec,
 
+    /// Allocate the needed fields.
+    pub fn dupe(rl: RunLocation, gpa: std.mem.Allocator) !RunLocation {
+        return switch (rl) {
+            .local => .local,
+            .remote => |r| .{ .remote = .{
+                .name = try gpa.dupe(u8, r.name),
+                .addr = if (r.addr) |a| try gpa.dupe(u8, a) else null,
+            } },
+        };
+    }
+
+    pub fn deinit(rl: RunLocation, gpa: std.mem.Allocator) void {
+        switch (rl) {
+            .remote => |r| {
+                gpa.free(r.name);
+                if (r.addr) |a| gpa.free(a);
+            },
+            else => {},
+        }
+    }
+
+    /// Parse a run location from a string.
+    ///
+    /// Syntax:
+    /// - local
+    /// - remote:<name>
+    /// - remote:<name>@<addr>
     pub fn parse(l: []const u8) !RunLocation {
         if (std.mem.eql(u8, l, "local")) return .local;
         const colon_idx = std.mem.indexOfScalar(u8, l, ':') orelse
             return error.InvalidRemoteRunner;
+
+        if (!std.mem.eql(u8, l[0..colon_idx], "remote"))
+            return error.InvalidRunnerType;
         if (colon_idx == l.len) return error.InvalidRunnerName;
-        if (std.mem.eql(u8, l[0..colon_idx], "remote")) {
-            return .{ .remote = l[colon_idx + 1 ..] };
-        }
-        return error.InvalidRemoteRunner;
+
+        const rest = l[colon_idx + 1 ..];
+        if (rest.len == 0) return error.InvalidRunnerName;
+
+        const at_idx = std.mem.indexOfScalar(u8, rest, '@') orelse
+            return .{ .remote = .{ .name = rest } };
+
+        // Parse address
+        const name = rest[0..at_idx];
+        const addr_port = rest[at_idx + 1 ..];
+        if (name.len == 0) return error.InvalidRunnerName;
+        if (addr_port.len == 0) return error.InvalidRunnerAddr;
+
+        // Validate address (IPv4)
+        _ = std.net.Address.parseIp4(addr_port, 0) catch
+            return error.InvalidRunnerAddr;
+        return .{ .remote = .{ .name = name, .addr = addr_port } };
     }
 };
 
@@ -73,10 +123,7 @@ pub const Job = struct {
 
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
-        switch (self.run_on) {
-            .remote => |r| gpa.free(r),
-            else => {},
-        }
+        self.run_on.deinit(gpa);
         if (self.deps) |deps| {
             for (deps) |dep| gpa.free(dep);
             gpa.free(deps);

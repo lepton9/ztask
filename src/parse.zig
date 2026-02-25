@@ -18,6 +18,7 @@ pub const ParseError = error{
     InvalidStep,
     InvalidStepKind,
     InvalidFieldType,
+    InvalidFieldName,
     InvalidTrigger,
     InvalidTriggerHour,
     InvalidTriggerMin,
@@ -131,6 +132,7 @@ fn parseTime(str: []const u8) ParseError!date.Time {
     };
 }
 
+/// Parse all the jobs to a hashmap.
 fn parseJobs(
     gpa: std.mem.Allocator,
     map: yaml.Yaml.Map,
@@ -161,6 +163,7 @@ fn parseJobs(
     return jobs;
 }
 
+/// Parse one job.
 fn parseJob(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -171,12 +174,17 @@ fn parseJob(
         break :blk steps_value.asList() orelse
             return ParseError.InvalidFieldType;
     };
-    const run_on = blk: {
-        const run_field: ?[]const u8 = if (map.get("run_on")) |on|
-            on.asScalar() orelse return ParseError.InvalidFieldType
-        else
-            null;
-        break :blk if (run_field) |on| try task.RunLocation.parse(on) else .local;
+
+    // Parse run location
+    const run_on: task.RunLocation = blk: {
+        const on_val = map.get("run_on") orelse break :blk .local;
+        if (on_val.asScalar()) |on_str| {
+            break :blk try task.RunLocation.parse(on_str);
+        }
+        if (on_val.asMap()) |on_map| {
+            break :blk try parseRunLocationMap(on_map);
+        }
+        return ParseError.InvalidFieldType;
     };
 
     // Parse job steps
@@ -224,12 +232,49 @@ fn parseJob(
     return .{
         .name = try gpa.dupe(u8, name),
         .steps = try steps.toOwnedSlice(gpa),
-        .run_on = switch (run_on) {
-            .local => .local,
-            .remote => |r| .{ .remote = try gpa.dupe(u8, r) },
-        },
+        .run_on = try run_on.dupe(gpa),
         .deps = deps,
     };
+}
+
+/// Parse map form of the run location.
+///
+/// Allowed forms:
+///
+/// run_on:
+///   type: local
+///
+/// run_on:
+///   type: remote
+///   name: runner1
+///   addr: 127.0.0.1
+fn parseRunLocationMap(map: yaml.Yaml.Map) !task.RunLocation {
+    const type_val = map.get("type") orelse return error.MissingRunLocation;
+    const typ = type_val.asScalar() orelse return ParseError.InvalidFieldType;
+
+    if (std.mem.eql(u8, typ, "local")) return .local;
+    if (std.mem.eql(u8, typ, "remote")) {
+        const remote_name = blk: {
+            const name = map.get("name") orelse return error.InvalidRunnerName;
+            break :blk name.asScalar() orelse return ParseError.InvalidFieldType;
+        };
+        const remote_addr: ?[]const u8 = blk: {
+            const a = map.get("addr") orelse break :blk null;
+            const addr = a.asScalar() orelse return ParseError.InvalidFieldType;
+            // Validate address
+            _ = std.net.Address.parseIp4(addr, 0) catch
+                return error.InvalidRunnerAddr;
+            break :blk addr;
+        };
+        // Unknown fields
+        if (map.count() > 3) return ParseError.InvalidFieldName;
+
+        return .{ .remote = .{
+            .name = remote_name,
+            .addr = remote_addr,
+        } };
+    }
+    return error.InvalidRunOnType;
 }
 
 pub fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
@@ -344,8 +389,43 @@ test "parse_task" {
     try std.testing.expect(build_job.run_on == .local);
     const test_job = t.jobs.get("test").?;
     try std.testing.expect(test_job.run_on == .remote);
-    try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote, "runner1"));
+    try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote.name, "runner1"));
     try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
+}
+
+test "parse_run_on" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ jobs:
+        \\   job1:
+        \\     steps: []
+        \\     run_on:
+        \\       type: local
+        \\   job2:
+        \\     steps: []
+        \\     run_on: remote:runner1@127.0.0.1
+        \\   job3:
+        \\     steps: []
+        \\     run_on:
+        \\       type: remote
+        \\       name: runner2
+        \\       addr: 192.168.0.1
+    ;
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
+    const job1 = t.jobs.get("job1").?;
+    try std.testing.expect(job1.run_on == .local);
+
+    const job2 = t.jobs.get("job2").?;
+    try std.testing.expect(job2.run_on == .remote);
+    try std.testing.expect(std.mem.eql(u8, job2.run_on.remote.name, "runner1"));
+    try std.testing.expect(std.mem.eql(u8, job2.run_on.remote.addr.?, "127.0.0.1"));
+
+    const job3 = t.jobs.get("job3").?;
+    try std.testing.expect(job3.run_on == .remote);
+    try std.testing.expect(std.mem.eql(u8, job3.run_on.remote.name, "runner2"));
+    try std.testing.expect(std.mem.eql(u8, job3.run_on.remote.addr.?, "192.168.0.1"));
 }
 
 test "parse_trigger_time" {
