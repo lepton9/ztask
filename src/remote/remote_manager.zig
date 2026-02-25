@@ -5,6 +5,7 @@ const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
 const connection = @import("connection.zig");
 
+const RemoteRunSpec = @import("../types/task.zig").RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
@@ -13,15 +14,16 @@ const Scheduler = scheduler_zig.Scheduler;
 
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
-/// Try to run job again within time limit (seconds)
-const RETRY_LIMIT_S = 5;
 
 pub const DispatchRequest = struct {
-    agent_name: []const u8,
+    agent: RemoteRunSpec,
     job_node: *localrunner.JobNode,
     scheduler: *Scheduler,
     /// Timestamp of the first attempt to find an agent after failure
     first_try_ts: i64 = 0,
+
+    /// Try to run job again within time limit (seconds)
+    const RETRY_TIMEOUT = 5;
 };
 
 pub const AgentHandle = struct {
@@ -252,26 +254,30 @@ pub const RemoteManager = struct {
     /// Dispatch all jobs in the queue to agents
     fn dispatchJobs(self: *RemoteManager) !void {
         while (self.dispatch_queue.pop()) |req| {
-            const agent = self.findAgent(req.agent_name) orelse {
-                var request = req;
-                const now = std.time.timestamp();
-                if (request.first_try_ts == 0) request.first_try_ts = now;
-                // Try to find the remote agent again
-                if (now - request.first_try_ts < RETRY_LIMIT_S) {
-                    try self.dispatch_queue.append(self.gpa, request);
-                    return;
-                }
-                try req.scheduler.result_queue.append(self.gpa, .{
-                    .node = req.job_node,
-                    .result = .{
-                        .err = ResultError.NoRunnerFound,
-                        .exit_code = 1,
-                        .runner = .remote,
-                    },
-                });
+            if (self.findAgent(req.agent)) |agent| {
+                try self.dispatchJob(agent, req);
                 continue;
-            };
-            try self.dispatchJob(agent, req);
+            }
+            // Check for timeout
+            var request = req;
+            const now = std.time.timestamp();
+            if (request.first_try_ts == 0) request.first_try_ts = now;
+            // Try to find the remote agent again
+            if (now - request.first_try_ts < DispatchRequest.RETRY_TIMEOUT) {
+                try self.dispatch_queue.append(self.gpa, request);
+                return;
+            }
+
+            // Failed to find matching agent
+            try req.scheduler.result_queue.append(self.gpa, .{
+                .node = req.job_node,
+                .result = .{
+                    .err = ResultError.NoRunnerFound,
+                    .exit_code = 1,
+                    .runner = .remote,
+                    .msg = "No matching remote runner found",
+                },
+            });
         }
     }
 
@@ -310,8 +316,8 @@ pub const RemoteManager = struct {
         };
     }
 
-    /// Cancel a job from running
-    /// Send a cancel request to the remote agent if currently running
+    /// Cancel a job from running.
+    /// Send a cancel request to the remote agent if currently running.
     pub fn cancelJob(self: *RemoteManager, job_id: usize) !void {
         const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return {
             var it = self.dispatch_queue.iterator();
@@ -321,7 +327,7 @@ pub const RemoteManager = struct {
             };
         };
         const req = kv.value;
-        const agent = self.findAgent(req.agent_name) orelse return;
+        const agent = self.findAgent(req.agent) orelse return;
         const msg: protocol.CancelJobMsg = .{ .job_id = req.job_node.id };
         const payload = try self.parser.serialize(self.gpa, .{
             .cancel_job = msg,
@@ -330,8 +336,8 @@ pub const RemoteManager = struct {
         try self.sendMessage(agent, payload);
     }
 
-    /// Send a message to the agent
-    /// Remove agent if not connected
+    /// Send a message to the agent.
+    /// Remove agent if not connected.
     fn sendMessage(
         self: *RemoteManager,
         agent: *AgentHandle,
@@ -343,13 +349,31 @@ pub const RemoteManager = struct {
         };
     }
 
-    /// Find an agent based on the name
-    fn findAgent(self: *RemoteManager, name: []const u8) ?*AgentHandle {
+    /// Find an agent based on the spec
+    fn findAgent(self: *RemoteManager, spec: RemoteRunSpec) ?*AgentHandle {
         var it = self.agents.valueIterator();
         while (it.next()) |agent| {
-            if (std.mem.eql(u8, agent.name orelse continue, name)) return agent;
+            if (!matchesAgentSpec(agent, spec)) continue;
+            return agent;
         }
         return null;
+    }
+
+    /// Check if the agent matches the given spec.
+    fn matchesAgentSpec(agent: *AgentHandle, spec: RemoteRunSpec) bool {
+        if (!std.mem.eql(u8, agent.name orelse return false, spec.name))
+            return false;
+
+        // Check if the address matches
+        if (spec.addr) |want_ip| {
+            const agent_addr = agent.connection.conn.address;
+            if (agent_addr.any.family != posix.AF.INET) return false;
+            const want = std.net.Address.parseIp4(want_ip, 0) catch return false;
+            const agent_bytes: *const [4]u8 = @ptrCast(&agent_addr.in.sa.addr);
+            const want_bytes: *const [4]u8 = @ptrCast(&want.in.sa.addr);
+            if (!std.mem.eql(u8, agent_bytes[0..], want_bytes[0..])) return false;
+        }
+        return true;
     }
 
     /// Accept new connections

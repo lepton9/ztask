@@ -140,7 +140,7 @@ const commands = &[_]zcli.Cmd{
             .{
                 .long_name = "address",
                 .short_name = "a",
-                .desc = "Address of the main runner server",
+                .desc = "Address of the server to connect to",
                 .arg = .{
                     .name = "ADDR",
                     .default = @import("remote/remote_manager.zig").DEFAULT_ADDR,
@@ -150,7 +150,7 @@ const commands = &[_]zcli.Cmd{
             .{
                 .long_name = "port",
                 .short_name = "p",
-                .desc = "Port of the main server",
+                .desc = "Port of the server to connect to",
                 .arg = .{
                     .name = "PORT",
                     .default = std.fmt.comptimePrint(

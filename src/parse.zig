@@ -251,15 +251,21 @@ fn parseJob(
 fn parseRunLocationMap(map: yaml.Yaml.Map) !task.RunLocation {
     const type_val = map.get("type") orelse return error.MissingRunLocation;
     const typ = type_val.asScalar() orelse return ParseError.InvalidFieldType;
+    var fields_n: usize = 1;
 
-    if (std.mem.eql(u8, typ, "local")) return .local;
+    if (std.mem.eql(u8, typ, "local")) {
+        if (map.count() > fields_n) return ParseError.InvalidFieldName;
+        return .local;
+    }
     if (std.mem.eql(u8, typ, "remote")) {
         const remote_name = blk: {
             const name = map.get("name") orelse return error.InvalidRunnerName;
+            fields_n += 1;
             break :blk name.asScalar() orelse return ParseError.InvalidFieldType;
         };
         const remote_addr: ?[]const u8 = blk: {
             const a = map.get("addr") orelse break :blk null;
+            fields_n += 1;
             const addr = a.asScalar() orelse return ParseError.InvalidFieldType;
             // Validate address
             _ = std.net.Address.parseIp4(addr, 0) catch
@@ -267,7 +273,7 @@ fn parseRunLocationMap(map: yaml.Yaml.Map) !task.RunLocation {
             break :blk addr;
         };
         // Unknown fields
-        if (map.count() > 3) return ParseError.InvalidFieldName;
+        if (map.count() > fields_n) return ParseError.InvalidFieldName;
 
         return .{ .remote = .{
             .name = remote_name,

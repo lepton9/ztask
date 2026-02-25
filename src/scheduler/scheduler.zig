@@ -243,7 +243,7 @@ pub const Scheduler = struct {
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
 
         self.remote_manager.pushDispatch(.{
-            .agent_name = node.ptr.run_on.remote.name,
+            .agent = node.ptr.run_on.remote,
             .job_node = node,
             .scheduler = self,
         }) catch {};

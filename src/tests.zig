@@ -212,3 +212,43 @@ test "remote_job" {
     try std.testing.expect(agent.active_runners.count() == 0);
     try std.testing.expect(task_manager.events.len() == 1);
 }
+
+test "remote_job_addr" {
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: task7
+        \\ id: 7
+        \\ jobs:
+        \\   jobremote:
+        \\     steps: []
+        \\     run_on:
+        \\       type: remote
+        \\       name: agent
+        \\       addr: 127.0.0.1
+    ;
+    const task_manager = try manager.TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    });
+    defer task_manager.deinit();
+    const task = try parse.parseTaskBuffer(gpa, task_file);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+
+    var agent = try remote_agent.RemoteAgent.init(gpa, "agent", 5);
+    defer agent.deinit();
+    try agent.connect(task_manager.remote_manager.getAddress().?);
+    var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    try task_manager.beginTask(task.id.fmt(), .{});
+    task_manager.waitUntilIdle();
+
+    agent.stop();
+    t.join();
+
+    try std.testing.expect(task_manager.events.len() == 1);
+    const run = task_manager.events.pop().?.run_finished;
+    try std.testing.expect(run.status == .success);
+}
