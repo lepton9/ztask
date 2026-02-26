@@ -74,6 +74,11 @@ pub const TaskManager = struct {
         data: data.DataStore.InitOptions = .{},
     };
 
+    pub const StartOptions = struct {
+        listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
+        listen_port: u16 = remotemanager.DEFAULT_PORT,
+    };
+
     pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         return initWithOptions(gpa, runners_n, .{});
     }
@@ -172,12 +177,19 @@ pub const TaskManager = struct {
 
     /// Start task manager thread
     pub fn start(self: *TaskManager) !void {
-        _ = self.running.swap(true, .seq_cst);
+        return self.startWithOptions(.{});
+    }
+
+    /// Start task manager thread with configured options
+    pub fn startWithOptions(self: *TaskManager, options: StartOptions) !void {
+        self.running.store(true, .seq_cst);
+        errdefer self.running.store(false, .seq_cst);
+
         try self.watcher.start();
         try self.remote_manager.start(
             try std.net.Address.parseIp4(
-                remotemanager.DEFAULT_ADDR,
-                remotemanager.DEFAULT_PORT,
+                options.listen_addr,
+                options.listen_port,
             ),
         );
         self.thread = try std.Thread.spawn(.{}, run, .{self});

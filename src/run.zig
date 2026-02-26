@@ -14,9 +14,15 @@ pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
 pub const MAX_RUNNERS_N = 100;
 
+pub const ListenOptions = struct {
+    addr: []const u8 = DEFAULT_ADDR,
+    port: u16 = DEFAULT_PORT,
+};
+
 pub const TuiOptions = struct {
     runners_n: u8 = BASE_RUNNERS_N,
     data_dir: data.DataStore.DataDirMode = .auto,
+    listen: ListenOptions = .{},
 };
 
 pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
@@ -29,7 +35,10 @@ pub fn runTui(gpa: std.mem.Allocator, options: TuiOptions) !void {
         .{ .data = .{ .data_dir = options.data_dir } },
     );
     defer task_manager.deinit();
-    try task_manager.start();
+    try task_manager.startWithOptions(.{
+        .listen_addr = options.listen.addr,
+        .listen_port = options.listen.port,
+    });
 
     const model = try Model.init(gpa, task_manager);
     defer model.deinit();
@@ -108,6 +117,7 @@ pub const RunOptions = struct {
     retrigger: bool = false,
     runners_n: u8 = BASE_RUNNERS_N,
     data_dir: data.DataStore.DataDirMode = .auto,
+    listen: ListenOptions = .{},
 };
 
 /// Run a single task either with path or ID
@@ -151,7 +161,10 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     defer loop.stop();
 
     // Start task run
-    try task_manager.start();
+    try task_manager.startWithOptions(.{
+        .listen_addr = options.listen.addr,
+        .listen_port = options.listen.port,
+    });
     try task_manager.beginTask(task_id, .{
         .attach_job = options.attach_job,
         .retrigger = options.retrigger,

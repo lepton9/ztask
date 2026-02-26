@@ -2,8 +2,12 @@ pub const std = @import("std");
 pub const zcli = @import("zcli");
 const run = @import("run.zig");
 const options = @import("build_options");
+const remote_man = @import("remote/remote_manager.zig");
 
 const DataDirMode = @import("data.zig").DataStore.DataDirMode;
+const ListenOptions = run.ListenOptions;
+const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
+const DEFAULT_PORT = remote_man.DEFAULT_PORT;
 
 const fmtWrite = run.fmtWrite;
 const write = run.write;
@@ -28,6 +32,20 @@ pub const cli_spec: zcli.CliApp = .{
             .long_name = "global",
             .short_name = "g",
             .desc = "Force global data dir (ignore project + env)",
+        },
+        .{
+            .long_name = "listen-addr",
+            .desc = "Address the remote manager binds to",
+            .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
+        },
+        .{
+            .long_name = "listen-port",
+            .desc = "Port the remote manager binds to",
+            .arg = .{
+                .name = "PORT",
+                .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
+                .type = .Int,
+            },
         },
         .{ .long_name = "version", .short_name = "v", .desc = "Print version" },
         .{ .long_name = "help", .short_name = "h", .desc = "Print help" },
@@ -141,11 +159,7 @@ const commands = &[_]zcli.Cmd{
                 .long_name = "address",
                 .short_name = "a",
                 .desc = "Address of the server to connect to",
-                .arg = .{
-                    .name = "ADDR",
-                    .default = @import("remote/remote_manager.zig").DEFAULT_ADDR,
-                    .type = .Text,
-                },
+                .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
             },
             .{
                 .long_name = "port",
@@ -153,10 +167,7 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Port of the server to connect to",
                 .arg = .{
                     .name = "PORT",
-                    .default = std.fmt.comptimePrint(
-                        "{d}",
-                        .{@import("remote/remote_manager.zig").DEFAULT_PORT},
-                    ),
+                    .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
                     .type = .Int,
                 },
             },
@@ -246,6 +257,7 @@ const Ctx = struct {
     gpa: std.mem.Allocator,
     cli: *zcli.Cli,
     data_dir: DataDirMode,
+    listen: ListenOptions,
 };
 
 /// Handle init command
@@ -292,6 +304,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         },
         .retrigger = cli.find_opt("retrigger") != null,
         .data_dir = ctx.data_dir,
+        .listen = ctx.listen,
     };
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;
@@ -474,13 +487,46 @@ inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
     return .auto;
 }
 
+/// Get the remote manager address
+inline fn getListenAddr(cli: *zcli.Cli) []const u8 {
+    const opt = cli.find_opt("listen-addr") orelse return DEFAULT_ADDR;
+    const addr = opt.value.?.string;
+    _ = std.net.Address.parseIp4(addr, 0) catch fatal(
+        "Invalid listen address '{s}' (expected IPv4)",
+        .{addr},
+    );
+    return addr;
+}
+
+/// Get the remote manager port
+inline fn getListenPort(cli: *zcli.Cli) u16 {
+    const opt = cli.find_opt("listen-port") orelse return DEFAULT_PORT;
+    const port_i64 = opt.value.?.int;
+    if (port_i64 <= 0 or port_i64 > std.math.maxInt(u16)) fatal(
+        "Invalid listen port '{d}' (expected 1-65535)",
+        .{port_i64},
+    );
+    return @intCast(port_i64);
+}
+
 /// Handle parsed cli and call the command function
 pub fn handleArgs(gpa: std.mem.Allocator, cli: *zcli.Cli) !void {
     const data_dir_mode = getDataDirMode(cli);
+    const listen_opts: ListenOptions = .{
+        .addr = getListenAddr(cli),
+        .port = getListenPort(cli),
+    };
+
     const cmd = cli.cmd orelse return try run.runTui(gpa, .{
         .data_dir = data_dir_mode,
+        .listen = listen_opts,
     });
     const cmdFn = cmd.exec orelse return;
-    var ctx: Ctx = .{ .gpa = gpa, .cli = cli, .data_dir = data_dir_mode };
+    var ctx: Ctx = .{
+        .gpa = gpa,
+        .cli = cli,
+        .data_dir = data_dir_mode,
+        .listen = listen_opts,
+    };
     try cmdFn(&ctx);
 }
