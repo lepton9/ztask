@@ -526,9 +526,21 @@ pub const DataStore = struct {
         while (it.next() catch null) |e| switch (e.kind) {
             .directory => {
                 const task_id = std.fs.path.basename(e.name);
-                const meta = self.loadTaskMeta(gpa, task_id) catch null orelse
+                var meta = self.loadTaskMeta(gpa, task_id) catch null orelse
                     continue;
+
+                // Set the task file path to realpath if not already.
+                var changed: bool = false;
+                if (cwd.realpathAlloc(gpa, meta.file_path) catch null) |rp| {
+                    if (!std.mem.eql(u8, rp, meta.file_path)) {
+                        gpa.free(meta.file_path);
+                        meta.file_path = rp;
+                        changed = true;
+                    } else gpa.free(rp);
+                }
+
                 try self.tasks.put(gpa, meta.id, meta);
+                if (changed) try self.writeTaskMeta(gpa, &meta);
                 if (options.load_runs) try self.loadTaskRuns(gpa, task_id);
             },
             else => continue,
@@ -639,37 +651,25 @@ pub const DataStore = struct {
         path: []const u8,
     ) !*TaskMetadata {
         const cwd = std.fs.cwd();
-
-        // Convert to absolute path
-        const path_alloc: struct { []const u8, bool } = blk: {
-            if (!std.fs.path.isAbsolute(path)) {
-                const real_path = try std.fs.cwd().realpathAlloc(gpa, path);
-                break :blk .{ real_path, true };
-            }
-            break :blk .{ path, false };
-        };
-        defer if (path_alloc.@"1") gpa.free(path_alloc.@"0");
-        const real_path = path_alloc.@"0";
-
-        var file = cwd.openFile(real_path, .{}) catch return error.ErrorOpenFile;
+        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
-        if (!parse.isTaskFile(real_path)) return error.InvalidTaskFile;
+        if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
 
-        // Check for existing task
-        var id = task.Id.fromStr(real_path);
-        const id_value = id.fmt();
-        if (self.tasks.getPtr(id_value)) |_| return error.TaskExists;
+        const parsed = try parse.loadTask(gpa, path);
+        defer parsed.deinit(gpa);
 
-        // Add new task
-        const parsed = try parse.loadTask(gpa, real_path);
-        var meta = try TaskMetadata.init(gpa, .{
-            .file_path = real_path,
+        // Check for existing task using the task ID
+        if (self.tasks.getPtr(parsed.id.fmt())) |_| return error.TaskExists;
+
+        const meta = try TaskMetadata.init(gpa, .{
+            .file_path = parsed.file_path orelse unreachable,
             .id = parsed.id.fmt(),
             .name = parsed.name,
         });
         try self.tasks.put(gpa, meta.id, meta);
-        try self.writeTaskMeta(gpa, &meta);
-        return &meta;
+        const stored = self.tasks.getPtr(meta.id) orelse unreachable;
+        try self.writeTaskMeta(gpa, stored);
+        return stored;
     }
 
     /// Add all task files from a given directory.
