@@ -9,8 +9,8 @@
             .hash = "zig_yaml-0.2.0-C1161kqsAgAlnJFIEkGCMXUSq-QvDKF3vpqeg1XRKW-w",
         },
         .zcli = .{
-            .url = "git+https://github.com/lepton9/zcli#42477063808a3d35861ed0c369065151ade03183",
-            .hash = "zcli-0.3.4-Of3s8RI7AQC6IDw7pXxt4Y6axccCVx2WpZ5dUI-sCpOS",
+            .url = "git+https://github.com/lepton9/zcli#6fde80f2853c07fc43d2889b2452216ad932e593",
+            .hash = "zcli-0.3.4-Of3s8e4-AQDROQVC6t4LcTDsAXKA1EloMwXGG64Q1aPR",
         },
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#e70ca957a6bc2b62a9afab1091a57cfb00e8111c",

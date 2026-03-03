@@ -411,13 +411,16 @@ pub fn moveTask(
     from: []const u8,
     to: []const u8,
     data_dir: data.DataStore.DataDirMode,
+    options: data.DataStore.MoveTaskOptions,
 ) !void {
     var datastore = try data.DataStore.init(gpa, .{
         .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
-    try datastore.moveTask(gpa, from, to);
+    try datastore.moveTask(gpa, from, to, .{
+        .repair = options.repair,
+    });
 }
 
 /// Restore normal output behavior.

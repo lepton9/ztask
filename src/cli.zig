@@ -113,6 +113,10 @@ const commands = &[_]zcli.Cmd{
             .{ .name = "FROM", .desc = "Path to move from", .required = true },
             .{ .name = "TO", .desc = "Path to move to", .required = true },
         },
+        .options = &[_]zcli.Opt{.{
+            .long_name = "repair",
+            .desc = "Update metadata if FROM is missing but TO exists",
+        }},
         .action = cmdMoveFn,
     },
     .{
@@ -280,7 +284,10 @@ fn cmdMoveFn(ptr: *anyopaque) !void {
     const to_arg = cli.find_positional("TO") orelse unreachable;
     const from = from_arg.value;
     const to = to_arg.value;
-    run.moveTask(ctx.gpa, from, to, ctx.data_dir) catch |err| switch (err) {
+    const repair = cli.find_opt("repair") != null;
+    run.moveTask(ctx.gpa, from, to, ctx.data_dir, .{
+        .repair = repair,
+    }) catch |err| switch (err) {
         error.FileNotFound => fatal("File not found: '{s}'", .{from}),
         error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
         error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
