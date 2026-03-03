@@ -381,10 +381,12 @@ pub const TaskManager = struct {
         self: *TaskManager,
         task_id: []const u8,
         options: BeginTaskOptions,
-    ) (error{ WatcherAddUnsupported, TaskNotFound } || anyerror)!void {
+    ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const task = try self.loadTask(task_id);
+        errdefer self.unloadTask(task);
+
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| switch (s.status) {
                 .running, .waiting => return error.TaskRunning,
@@ -404,14 +406,20 @@ pub const TaskManager = struct {
                         if (task.jobs.count() == 0) break :attach null;
                         break :attach task.jobs.values()[0].name;
                     },
-                    .name => |n| break :attach n,
+                    .name => |n| {
+                        const values = task.jobs.values();
+                        for (0..values.len) |i| {
+                            const job = values[i];
+                            if (std.mem.eql(u8, n, job.name)) break :attach n;
+                        }
+                        return error.UnknownAttachJob;
+                    },
                 }
             };
             s.retrigger = options.retrigger;
             try self.schedulers.put(self.gpa, task, s);
             break :blk s;
         };
-        errdefer self.unloadTask(task);
 
         // Add trigger
         if (task.trigger) |t| {

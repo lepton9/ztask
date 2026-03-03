@@ -337,6 +337,10 @@ fn cmdRunFn(ptr: *anyopaque) !void {
             "Error opening file: '{s}'",
             .{opts.path orelse ""},
         ),
+        error.UnknownAttachJob => {
+            const attach_name = if (opts.attach_job) |a| a.name else "";
+            fatal("Unknown job to attach to '{s}'", .{attach_name});
+        },
         error.InvalidTaskFile => fatal("Invalid task file format", .{}),
         error.NoTaskFileGiven => fatal("No task file given", .{}),
         else => return err,
