@@ -1221,3 +1221,117 @@ pub fn openDir(
         else => return err,
     };
 }
+
+test "move_task" {
+    const gpa = std.testing.allocator;
+    const cwd = std.fs.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(gpa, .{
+        .data_dir = .{ .path = data_dir },
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    const old_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
+    defer gpa.free(old_path);
+    try writeFile(old_path, "name: a\n", .{
+        .make_path = true,
+        .truncate = true,
+    });
+    const old_real = try cwd.realpathAlloc(gpa, old_path);
+    defer gpa.free(old_real);
+
+    const new_path = try std.fs.path.join(gpa, &.{ tasks_dir, "moved", "a.yml" });
+    defer gpa.free(new_path);
+
+    _ = try store.addTask(gpa, old_path);
+    try std.testing.expect(store.tasks.count() == 1);
+
+    try store.moveTask(gpa, old_path, new_path, .{ .repair = false });
+    const new_real = try cwd.realpathAlloc(gpa, new_path);
+    defer gpa.free(new_real);
+
+    var new_id = task.Id.fromStr(new_real);
+    const new_id_str = new_id.fmt();
+    var old_id = task.Id.fromStr(old_real);
+    const old_id_str = old_id.fmt();
+
+    const moved = store.getTaskMetadata(new_id_str).?;
+    try std.testing.expect(std.mem.eql(u8, moved.file_path, new_real));
+    try std.testing.expect(std.mem.eql(u8, moved.id, new_id_str));
+    try std.testing.expect(store.getTaskMetadata(old_id_str) == null);
+}
+
+test "move_task_repair" {
+    const gpa = std.testing.allocator;
+    const cwd = std.fs.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(gpa, .{
+        .data_dir = .{ .path = data_dir },
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    const old_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
+    defer gpa.free(old_path);
+    try writeFile(old_path, "name: a\n", .{
+        .make_path = true,
+        .truncate = true,
+    });
+
+    const meta = try store.addTask(gpa, old_path);
+    const old_id = try gpa.dupe(u8, meta.id);
+    defer gpa.free(old_id);
+    const old_file_path = try gpa.dupe(u8, meta.file_path);
+    defer gpa.free(old_file_path);
+
+    var old_id_from_path = task.Id.fromStr(old_file_path);
+    try std.testing.expect(std.mem.eql(u8, old_id, old_id_from_path.fmt()));
+
+    const new_dir = try std.fs.path.join(gpa, &.{ root, "moved" });
+    defer gpa.free(new_dir);
+    try cwd.makePath(new_dir);
+    const new_path = try std.fs.path.join(gpa, &.{ new_dir, "a.yml" });
+    defer gpa.free(new_path);
+
+    // Move file
+    try std.fs.renameAbsolute(old_file_path, new_path);
+
+    // Repair moved task file
+    try store.moveTask(gpa, old_file_path, new_dir, .{ .repair = true });
+
+    const new_real = try cwd.realpathAlloc(gpa, new_path);
+    defer gpa.free(new_real);
+    var new_id_from_path = task.Id.fromStr(new_real);
+    const new_id = new_id_from_path.fmt();
+
+    const updated = store.getTaskMetadata(new_id).?;
+    try std.testing.expect(std.mem.eql(u8, updated.file_path, new_real));
+    try std.testing.expect(std.mem.eql(u8, updated.id, new_id));
+    try std.testing.expect(!std.mem.eql(u8, old_id, new_id));
+    try std.testing.expect(store.getTaskMetadata(old_id) == null);
+
+    const old_meta_path = try store.taskMetaPath(gpa, old_id);
+    defer gpa.free(old_meta_path);
+    try std.testing.expectError(error.FileNotFound, cwd.statFile(old_meta_path));
+}
