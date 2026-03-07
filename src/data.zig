@@ -38,6 +38,11 @@ pub const TaskMetadata = struct {
             .name = try gpa.dupe(u8, self.name),
         };
     }
+
+    pub fn idDerivedFromPath(self: *const TaskMetadata) bool {
+        var from_path = task.Id.fromStr(self.file_path);
+        return std.mem.eql(u8, self.id, from_path.fmt());
+    }
 };
 
 pub const TaskRunMetadata = struct {
@@ -745,6 +750,72 @@ pub const DataStore = struct {
         repair: bool = false,
     };
 
+    /// Check if some other task uses the same task file path.
+    fn checkDuplicateTaskPath(
+        self: *const DataStore,
+        meta_old: *const TaskMetadata,
+        path: []const u8,
+    ) !void {
+        var it = self.tasks.iterator();
+        while (it.next()) |e| {
+            const m = e.value_ptr;
+            if (m == meta_old) continue;
+            if (std.mem.eql(u8, m.file_path, path)) return error.TaskExists;
+        }
+    }
+
+    /// Ensure that the ID derived from path is not used by an existing task.
+    fn ensureIdAvailable(
+        self: *const DataStore,
+        meta: *const TaskMetadata,
+        path: []const u8,
+    ) !void {
+        var new_id = task.Id.fromStr(path);
+        const id_str = new_id.fmt();
+        if (std.mem.eql(u8, id_str, meta.id)) return;
+        if (self.tasks.get(id_str)) |_| return error.TaskExists;
+    }
+
+    /// Change the ID of the task and move all the necessary data to use new ID.
+    fn applyIdChange(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        meta_old: *TaskMetadata,
+        new_id_str: []const u8,
+    ) !*TaskMetadata {
+        if (std.mem.eql(u8, new_id_str, meta_old.id)) return meta_old;
+        if (self.tasks.get(new_id_str)) |_| return error.TaskExists;
+
+        const kv = self.tasks.fetchSwapRemove(meta_old.id) orelse unreachable;
+        var meta = kv.value;
+
+        // Rename the old task data dir to have the new id
+        const old_data_dir = try self.taskDataPath(gpa, meta.id);
+        defer gpa.free(old_data_dir);
+        const new_data_dir = try self.taskDataPath(gpa, new_id_str);
+        defer gpa.free(new_data_dir);
+        std.fs.renameAbsolute(old_data_dir, new_data_dir) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+
+        // Move cached runs map key if loaded
+        if (self.task_runs.fetchRemove(meta.id)) |rkv| {
+            const runs = rkv.value;
+            gpa.free(rkv.key);
+            const gop = try self.task_runs.getOrPut(gpa, new_id_str);
+            if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, new_id_str);
+            gop.value_ptr.* = runs;
+        }
+
+        // Set the new id and reinsert meta
+        gpa.free(meta.id);
+        meta.id = try gpa.dupe(u8, new_id_str);
+        const gop = try self.tasks.getOrPut(gpa, meta.id);
+        gop.value_ptr.* = meta;
+        return gop.value_ptr;
+    }
+
     /// Move a task file to a new directory
     ///
     /// Also moves all associated data linked to the task.
@@ -758,148 +829,76 @@ pub const DataStore = struct {
         const cwd = std.fs.cwd();
         if (to.len == 0) return error.InvalidTaskFile;
 
-        // Convert from path to realpath
-        const from_path_info: ?[]u8 = cwd.realpathAlloc(gpa, from) catch |err|
-            switch (err) {
-                error.FileNotFound => null,
-                else => return err,
-            };
-        defer if (from_path_info) |p| gpa.free(p);
-        if (from_path_info == null and !options.repair)
-            return error.FileNotFound;
-        const needs_move: bool = from_path_info != null;
+        const from_real = try realpathAllocOrNull(gpa, from);
+        defer if (from_real) |p| gpa.free(p);
+        if (from_real == null and !options.repair) return error.FileNotFound;
+        const needs_move: bool = from_real != null;
 
         const to_stat = cwd.statFile(to) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
-        const to_is_dir: bool = blk: {
-            if (to_stat) |st| break :blk st.kind == .directory;
-            if (to[to.len - 1] == std.fs.path.sep) break :blk true;
+        const to_is_dir = blk: {
+            if (to_stat) |s| break :blk s.kind == .directory;
+            if (to.len != 0 and to[to.len - 1] == std.fs.path.sep) break :blk true;
             break :blk false;
         };
         if (!to_is_dir and !parse.isTaskFile(to)) return error.InvalidTaskFile;
 
-        // Create the destination path
-        var dest_path_alloc: ?[]u8 = null;
-        const dest_path: []const u8 = blk: {
-            if (!to_is_dir) break :blk to;
+        // Resolve the destination path
+        const resolved_dest: []const u8, const dest_owned: bool = blk: {
+            if (!to_is_dir) break :blk .{ to, false };
             const base = std.fs.path.basename(from);
             const joined = try std.fs.path.join(gpa, &.{ to, base });
-            dest_path_alloc = joined;
-            break :blk joined;
+            break :blk .{ joined, true };
         };
-        defer if (dest_path_alloc) |p| gpa.free(p);
+        defer if (dest_owned) gpa.free(resolved_dest);
+
         if (needs_move) {
-            if (std.fs.path.dirname(dest_path)) |dir| try cwd.makePath(dir);
+            // Make path for the file to move
+            if (std.fs.path.dirname(resolved_dest)) |dir| try cwd.makePath(dir);
         }
-        const real_path_to = blk: {
-            const parent = std.fs.path.dirname(dest_path) orelse ".";
-            const parent_real = try cwd.realpathAlloc(gpa, parent);
-            defer gpa.free(parent_real);
-            const base = std.fs.path.basename(dest_path);
-            break :blk try std.fs.path.join(gpa, &.{ parent_real, base });
-        };
+        const real_path_to = try realPathFromParent(gpa, resolved_dest);
         defer gpa.free(real_path_to);
 
-        const meta_old: *TaskMetadata = blk: {
-            if (from_path_info) |real_path_from| {
-                break :blk self.findTaskMetaPath(real_path_from) orelse
-                    return error.TaskNotFound;
-            }
+        const meta_old: *TaskMetadata = if (from_real) |real_from|
+            self.findTaskMetaPath(real_from) orelse return error.TaskNotFound
+        else blk: {
             if (!options.repair) return error.FileNotFound;
-
-            // Find the task metadata of the task to repair
             const found = try self.findTaskMetaPathMissing(gpa, from);
             break :blk found orelse return error.TaskNotFound;
         };
 
+        // Ensure that the file in need of repair is already in target path
         if (!needs_move and options.repair) {
-            // Ensure the task file exists at destination
             _ = cwd.statFile(real_path_to) catch |err| switch (err) {
                 error.FileNotFound => return error.FileNotFound,
                 else => return err,
             };
         }
+        try self.checkDuplicateTaskPath(meta_old, real_path_to);
 
-        // Disallow a different task already claiming the destination path.
-        var overlap_it = self.tasks.iterator();
-        while (overlap_it.next()) |e| {
-            const m = e.value_ptr;
-            if (m == meta_old) continue;
-            if (std.mem.eql(u8, m.file_path, real_path_to)) return error.TaskExists;
-        }
+        const id_derived = meta_old.idDerivedFromPath();
+        if (id_derived) try self.ensureIdAvailable(meta_old, real_path_to);
 
-        var old_id_from_path = task.Id.fromStr(meta_old.file_path);
-        const old_id_from_path_str = old_id_from_path.fmt();
+        // Move task file
+        if (needs_move) try std.fs.renameAbsolute(from_real.?, real_path_to);
 
-        // If the task id is derived from path, make sure the new id won't collide
-        const not_custom_id = std.mem.eql(u8, meta_old.id, old_id_from_path_str);
-        if (not_custom_id) {
-            var new_id_pred = task.Id.fromStr(real_path_to);
-            const new_id_pred_str = new_id_pred.fmt();
-            if (!std.mem.eql(u8, new_id_pred_str, meta_old.id)) {
-                if (self.tasks.get(new_id_pred_str)) |_| return error.TaskExists;
-            }
-        }
-
-        if (needs_move) try std.fs.renameAbsolute(from_path_info.?, real_path_to);
-
-        // Canonicalize destination path (realpath) for metadata.
-        const real_path_to_final = cwd.realpathAlloc(gpa, dest_path) catch |err| switch (err) {
+        const real_path_dest = cwd.realpathAlloc(gpa, resolved_dest) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
-        defer gpa.free(real_path_to_final);
+        defer gpa.free(real_path_dest);
+        if (id_derived) try self.ensureIdAvailable(meta_old, real_path_dest);
 
-        if (not_custom_id) {
-            var new_id_final = task.Id.fromStr(real_path_to_final);
-            const new_id_final_str = new_id_final.fmt();
-            if (!std.mem.eql(u8, new_id_final_str, meta_old.id)) {
-                if (self.tasks.get(new_id_final_str)) |_| return error.TaskExists;
-            }
+        var meta_new: *TaskMetadata = meta_old;
+        if (id_derived) {
+            var new_id = task.Id.fromStr(real_path_dest);
+            meta_new = try self.applyIdChange(gpa, meta_old, new_id.fmt());
         }
 
-        const meta_new: *TaskMetadata = blk: {
-            if (!not_custom_id) break :blk meta_old; // Is user set ID
-
-            var new_id = task.Id.fromStr(real_path_to_final);
-            const new_id_str = new_id.fmt();
-            if (std.mem.eql(u8, new_id_str, meta_old.id)) break :blk meta_old;
-            if (self.tasks.get(new_id_str)) |_| return error.TaskExists;
-
-            const kv = self.tasks.fetchSwapRemove(meta_old.id) orelse unreachable;
-            var meta = kv.value;
-
-            // Rename the old task data dir to have the new id
-            const old_data_dir = try self.taskDataPath(gpa, meta.id);
-            defer gpa.free(old_data_dir);
-            const new_data_dir = try self.taskDataPath(gpa, new_id_str);
-            defer gpa.free(new_data_dir);
-            std.fs.renameAbsolute(old_data_dir, new_data_dir) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-
-            // Move cached runs map key if loaded
-            if (self.task_runs.fetchRemove(meta.id)) |rkv| {
-                const runs = rkv.value;
-                gpa.free(rkv.key);
-                const gop = try self.task_runs.getOrPut(gpa, new_id_str);
-                if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, new_id_str);
-                gop.value_ptr.* = runs;
-            }
-
-            // Set the new id
-            gpa.free(meta.id);
-            meta.id = try gpa.dupe(u8, new_id_str);
-            const gop = try self.tasks.getOrPut(gpa, meta.id);
-            gop.value_ptr.* = meta;
-            break :blk gop.value_ptr;
-        };
         gpa.free(meta_new.file_path);
-        meta_new.file_path = try gpa.dupe(u8, real_path_to_final);
-
+        meta_new.file_path = try gpa.dupe(u8, real_path_dest);
         try self.writeTaskMeta(gpa, meta_new);
     }
 
@@ -921,7 +920,7 @@ pub const DataStore = struct {
         };
         defer if (parent_real) |p| gpa.free(p);
 
-        // Fallback: purely string-resolve against cwd (no symlink resolution)
+        // Fallback if no parent_real
         const resolved_path = blk: {
             if (std.fs.path.isAbsolute(from)) break :blk try std.fs.path.resolve(gpa, &.{from});
             const cwd_path = try std.process.getCwdAlloc(gpa);
@@ -1220,6 +1219,26 @@ pub fn openDir(
         },
         else => return err,
     };
+}
+
+/// Return allocated realpath for path or null if not found.
+fn realpathAllocOrNull(gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const cwd = std.fs.cwd();
+    return cwd.realpathAlloc(gpa, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+}
+
+/// Resolve the real path based on the parent directory.
+/// Assumes that the parent directory exists.
+fn realPathFromParent(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const cwd = std.fs.cwd();
+    const parent = std.fs.path.dirname(path) orelse ".";
+    const parent_real = try cwd.realpathAlloc(gpa, parent);
+    defer gpa.free(parent_real);
+    const base = std.fs.path.basename(path);
+    return try std.fs.path.join(gpa, &.{ parent_real, base });
 }
 
 test "move_task" {
