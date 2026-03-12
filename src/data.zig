@@ -649,6 +649,78 @@ pub const DataStore = struct {
         return parse.loadTask(gpa, meta.file_path);
     }
 
+    const TaskCreateOptions = struct {
+        /// Task name
+        name: []const u8,
+        /// Path for the created task file
+        path: ?[]const u8 = null,
+        /// Custom task ID
+        id: ?[]const u8 = null,
+        /// Task trigger
+        trigger: ?task.Trigger = null,
+        /// Task jobs
+        jobs: ?[]task.Job = null,
+    };
+
+    /// Create a new task from the given content.
+    pub fn newTask(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        spec: TaskCreateOptions,
+    ) !*TaskMetadata {
+        const new_task = try task.Task.init(gpa, spec.name);
+        errdefer new_task.deinit(gpa);
+
+        // Set the file path for the new task file
+        new_task.file_path = spec.path orelse blk: {
+            const tasks_path = try self.tasksPath(gpa);
+            defer gpa.free(tasks_path);
+
+            var i: usize = 0;
+            while (true) : (i += 1) {
+                const file_name = if (i == 0)
+                    try std.fmt.allocPrint(gpa, "{s}.yml", .{new_task.name})
+                else
+                    try std.fmt.allocPrint(gpa, "{s}-{d}.yml", .{ new_task.name, i });
+                defer gpa.free(file_name);
+
+                const path = try std.fs.path.join(gpa, &.{ tasks_path, file_name });
+
+                const exists: bool = e: {
+                    _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+                        error.FileNotFound => break :e false,
+                        else => return err,
+                    };
+                    break :e true;
+                };
+                if (exists) {
+                    gpa.free(path);
+                    continue;
+                }
+                break :blk path;
+            }
+        };
+        new_task.trigger = spec.trigger;
+        new_task.id = if (spec.id) |id|
+            task.Id.fromStr(id)
+        else
+            task.Id.fromStr(new_task.file_path);
+        if (self.tasks.getPtr(new_task.id.fmt())) |_| return error.TaskExists;
+
+        // Insert jobs
+        if (spec.jobs) |jobs| for (jobs) |job| {
+            try new_task.addJob(gpa, job);
+        };
+
+        const file = try new_task.toText(gpa);
+        defer gpa.free(file);
+        try writeFile(new_task.file_path.?, file, .{
+            .make_path = true,
+            .truncate = true,
+        });
+        return try self.addTask(gpa, new_task.file_path);
+    }
+
     /// Create a new task and metadata from file path
     pub fn addTask(
         self: *DataStore,

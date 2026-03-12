@@ -31,6 +31,13 @@ pub const Task = struct {
     pub fn findJob(self: *Task, job_name: []const u8) ?*Job {
         return self.jobs.getPtr(job_name);
     }
+
+    /// Add a new job for the task. The job fields should be allocated before.
+    pub fn addJob(self: *Task, gpa: std.mem.Allocator, job: Job) !void {
+        const gop = try self.jobs.getOrPut(gpa, job.name);
+        if (gop.found_existing) return error.DuplicateJobName;
+        gop.value_ptr.* = job;
+    }
 };
 
 pub const Trigger = union(enum) {
