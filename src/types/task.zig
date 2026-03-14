@@ -38,6 +38,62 @@ pub const Task = struct {
         if (gop.found_existing) return error.DuplicateJobName;
         gop.value_ptr.* = job;
     }
+
+    /// Convert a task to YAML.
+    pub fn toText(task: *const Task, gpa: std.mem.Allocator) ![]const u8 {
+        var buf: [256]u8 = undefined;
+        var scratch: [256]u8 = undefined;
+        var file = try std.ArrayList(u8).initCapacity(gpa, 256);
+        const header = try std.fmt.bufPrint(&buf, "name: \"{s}\"\n", .{task.name});
+        try file.appendSlice(gpa, header);
+
+        if (task.trigger) |tr| try file.appendSlice(gpa, try std.fmt.bufPrint(
+            &buf,
+            "on:\n  {s}: \"{s}\"\n",
+            .{
+                @tagName(tr),
+                switch (tr) {
+                    .watch => |w| w.path,
+                    .interval => |i| try i.fmt(&scratch),
+                    .time => |time| try time.fmt(&scratch),
+                },
+            },
+        ));
+
+        // Convert jobs
+        if (task.jobs.count() == 0) {
+            try file.appendSlice(gpa, "\njobs: []\n");
+        } else {
+            try file.appendSlice(gpa, "\njobs:\n");
+            var it = task.jobs.iterator();
+            while (it.next()) |e| {
+                const job = e.value_ptr.*;
+                try file.appendSlice(
+                    gpa,
+                    try std.fmt.bufPrint(&scratch, "  {s}:\n", .{job.name}),
+                );
+
+                if (job.steps.len == 0) {
+                    try file.appendSlice(gpa, "    steps: []\n");
+                    continue;
+                }
+                try file.appendSlice(gpa, "    steps:\n");
+                for (0..job.steps.len) |i| {
+                    const step = job.steps[i];
+                    try file.appendSlice(
+                        gpa,
+                        try std.fmt.bufPrint(&scratch, "      - {s}: \"{s}\"\n", .{
+                            @tagName(step.kind),
+                            step.value,
+                        }),
+                    );
+                }
+            }
+        }
+        // TODO: convert the rest of the fields
+
+        return try file.toOwnedSlice(gpa);
+    }
 };
 
 pub const Trigger = union(enum) {
@@ -167,3 +223,83 @@ pub const Id = struct {
             unreachable;
     }
 };
+
+test "task_to_text" {
+    const gpa = std.testing.allocator;
+    var t = try Task.init(gpa, "test");
+    defer t.deinit(gpa);
+    t.trigger = .{
+        .watch = .{ .path = try gpa.dupe(u8, "src/main.zig"), .type = .file },
+    };
+
+    var steps = try std.ArrayList(Step).initCapacity(gpa, 2);
+
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job1"),
+        .run_on = .local,
+        .steps = try steps.toOwnedSlice(gpa),
+    });
+
+    try steps.append(gpa, .{
+        .kind = .command,
+        .value = try gpa.dupe(u8, "ls"),
+    });
+    try steps.append(gpa, .{
+        .kind = .command,
+        .value = try gpa.dupe(u8, "echo"),
+    });
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job2"),
+        .run_on = .local,
+        .steps = try steps.toOwnedSlice(gpa),
+    });
+
+    try steps.append(gpa, .{
+        .kind = .command,
+        .value = try gpa.dupe(u8, "zig build"),
+    });
+    var deps = try gpa.alloc([]const u8, 2);
+    deps[0] = try gpa.dupe(u8, t.jobs.values()[0].name);
+    deps[1] = try gpa.dupe(u8, t.jobs.values()[1].name);
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job3"),
+        .run_on = .{ .remote = .{
+            .name = try gpa.dupe(u8, "runner1"),
+            .addr = try gpa.dupe(u8, "127.0.0.1"),
+        } },
+        .steps = try steps.toOwnedSlice(gpa),
+        .deps = deps,
+    });
+
+    const expected_str =
+        \\name: "test"
+        \\on:
+        \\  watch: "src/main.zig"
+        \\
+        \\jobs:
+        \\  job1:
+        \\    steps: []
+        // \\    run_on: local
+        \\  job2:
+        \\    steps:
+        \\      - command: "ls"
+        \\      - command: "echo"
+        // \\    run_on: local
+        // \\    deps: [build]
+        \\  job3:
+        \\    steps:
+        \\      - command: "zig build"
+        \\
+        // \\    run_on:
+        // \\      type: remote
+        // \\      name: runner1
+        // \\      addr: 127.0.0.1
+        // \\    deps: [job1, job2]
+    ;
+
+    const task_str = try t.toText(gpa);
+    defer gpa.free(task_str);
+    // std.debug.print("\n{s}\n", .{task_str});
+    // std.debug.print("\n{s}\n", .{expected_str});
+    try std.testing.expect(std.mem.eql(u8, task_str, expected_str));
+}

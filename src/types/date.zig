@@ -9,7 +9,7 @@ pub const DateTime = struct {
         const t = self.time;
         return try std.fmt.bufPrint(
             buf,
-            "{d}-{d:0>2}-{d} {d}:{d}:{d}",
+            "{d}-{d:0>2}-{d} {d:0>2}:{d:0>2}:{d:0>2}",
             .{ d.year, d.month, d.day, t.h, t.min, t.sec },
         );
     }
@@ -26,6 +26,14 @@ pub const Time = struct {
     min: u6,
     sec: u6,
     ms: u30 = 0,
+
+    pub fn fmt(t: Time, buf: []u8) ![]u8 {
+        return try std.fmt.bufPrint(
+            buf,
+            "{d:0>2}:{d:0>2}:{d:0>2}",
+            .{ t.h, t.min, t.sec },
+        );
+    }
 };
 
 /// Check if the year is a leap year
