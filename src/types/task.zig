@@ -46,6 +46,8 @@ pub const Task = struct {
         var file = try std.ArrayList(u8).initCapacity(gpa, 256);
         const header = try std.fmt.bufPrint(&buf, "name: \"{s}\"\n", .{task.name});
         try file.appendSlice(gpa, header);
+        // TODO: make a better indent handling
+        // TODO: handle id
 
         if (task.trigger) |tr| try file.appendSlice(gpa, try std.fmt.bufPrint(
             &buf,
@@ -73,24 +75,53 @@ pub const Task = struct {
                     try std.fmt.bufPrint(&scratch, "  {s}:\n", .{job.name}),
                 );
 
+                // Convert steps
                 if (job.steps.len == 0) {
                     try file.appendSlice(gpa, "    steps: []\n");
-                    continue;
+                } else {
+                    try file.appendSlice(gpa, "    steps:\n");
+                    for (0..job.steps.len) |i| {
+                        const step = job.steps[i];
+                        try file.appendSlice(
+                            gpa,
+                            try std.fmt.bufPrint(&scratch, "      - {s}: \"{s}\"\n", .{
+                                @tagName(step.kind),
+                                step.value,
+                            }),
+                        );
+                    }
                 }
-                try file.appendSlice(gpa, "    steps:\n");
-                for (0..job.steps.len) |i| {
-                    const step = job.steps[i];
-                    try file.appendSlice(
+                switch (job.run_on) {
+                    .local => try file.appendSlice(gpa, "    run_on: local\n"),
+                    .remote => |r| {
+                        try file.appendSlice(gpa, try std.fmt.bufPrint(&scratch,
+                            \\    run_on:
+                            \\      type: remote
+                            \\      name: {s}
+                            \\
+                        , .{r.name}));
+                        const addr = r.addr orelse continue;
+                        try file.appendSlice(
+                            gpa,
+                            try std.fmt.bufPrint(&scratch, "      addr: {s}\n", .{addr}),
+                        );
+                    },
+                }
+
+                if (job.deps) |deps| {
+                    try file.appendSlice(gpa, "    deps: [");
+                    for (deps, 0..) |dep, i| try file.appendSlice(
                         gpa,
-                        try std.fmt.bufPrint(&scratch, "      - {s}: \"{s}\"\n", .{
-                            @tagName(step.kind),
-                            step.value,
-                        }),
+                        try std.fmt.bufPrint(
+                            &scratch,
+                            "{s}{s}",
+                            .{ dep, if (i == deps.len - 1) "" else ", " },
+                        ),
                     );
+                    try file.appendSlice(gpa, "]\n");
                 }
             }
         }
-        // TODO: convert the rest of the fields
 
         return try file.toOwnedSlice(gpa);
     }
@@ -248,10 +279,13 @@ test "task_to_text" {
         .kind = .command,
         .value = try gpa.dupe(u8, "echo"),
     });
+    var deps1 = try gpa.alloc([]const u8, 1);
+    deps1[0] = try gpa.dupe(u8, t.jobs.values()[0].name);
     try t.addJob(gpa, .{
         .name = try gpa.dupe(u8, "job2"),
         .run_on = .local,
         .steps = try steps.toOwnedSlice(gpa),
+        .deps = deps1,
     });
 
     try steps.append(gpa, .{
@@ -279,22 +313,22 @@ test "task_to_text" {
         \\jobs:
         \\  job1:
         \\    steps: []
-        // \\    run_on: local
+        \\    run_on: local
         \\  job2:
         \\    steps:
         \\      - command: "ls"
         \\      - command: "echo"
-        // \\    run_on: local
-        // \\    deps: [build]
+        \\    run_on: local
+        \\    deps: [job1]
         \\  job3:
         \\    steps:
         \\      - command: "zig build"
+        \\    run_on:
+        \\      type: remote
+        \\      name: runner1
+        \\      addr: 127.0.0.1
+        \\    deps: [job1, job2]
         \\
-        // \\    run_on:
-        // \\      type: remote
-        // \\      name: runner1
-        // \\      addr: 127.0.0.1
-        // \\    deps: [job1, job2]
     ;
 
     const task_str = try t.toText(gpa);
