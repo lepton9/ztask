@@ -61,6 +61,20 @@ const commands = &[_]zcli.Cmd{
         .action = cmdInitFn,
     },
     .{
+        .name = "new",
+        .desc = "Create a new task",
+        .action = cmdNewFn,
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "name",
+                .desc = "Name of the task",
+                .required = true,
+                .arg = .{ .name = "NAME", .type = .Text },
+            },
+            // TODO: edit option
+        },
+    },
+    .{
         .name = "data",
         .desc = "Print the current data directory",
         .action = cmdDataFn,
@@ -270,6 +284,17 @@ fn cmdInitFn(ptr: *anyopaque) !void {
     try run.initProjectDataDir(ctx.gpa);
 }
 
+/// Handle new command
+fn cmdNewFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    var cli = ctx.cli;
+    const name_opt = cli.find_opt("name") orelse unreachable;
+    const name = name_opt.value.?.string;
+    run.createNewTask(ctx.gpa, ctx.data_dir, name) catch |err| switch (err) {
+        else => fatal("Error {any}", .{err}),
+    };
+}
+
 /// Handle data command
 fn cmdDataFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
@@ -329,10 +354,10 @@ fn cmdRunFn(ptr: *anyopaque) !void {
             "Task not found with ID: {s}",
             .{opts.id orelse ""},
         ),
-        error.FileNotFound => fatal(
-            "Task file not found: '{s}'",
-            .{opts.path orelse ""},
-        ),
+        error.FileNotFound => if (opts.path) |p|
+            fatal("Task file not found: '{s}'", .{p})
+        else
+            fatal("Task not found", .{}),
         error.ErrorOpenFilePath => fatal(
             "Error opening file: '{s}'",
             .{opts.path orelse ""},

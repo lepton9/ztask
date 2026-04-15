@@ -63,9 +63,7 @@ pub const Task = struct {
         ));
 
         // Convert jobs
-        if (task.jobs.count() == 0) {
-            try file.appendSlice(gpa, "\njobs: []\n");
-        } else {
+        if (task.jobs.count() > 0) {
             try file.appendSlice(gpa, "\njobs:\n");
             var it = task.jobs.iterator();
             while (it.next()) |e| {

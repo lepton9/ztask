@@ -700,11 +700,12 @@ pub const DataStore = struct {
                 break :blk path;
             }
         };
+        const file_path = new_task.file_path orelse unreachable;
         new_task.trigger = spec.trigger;
         new_task.id = if (spec.id) |id|
             task.Id.fromStr(id)
         else
-            task.Id.fromStr(new_task.file_path);
+            task.Id.fromStr(file_path);
         if (self.tasks.getPtr(new_task.id.fmt())) |_| return error.TaskExists;
 
         // Insert jobs
@@ -718,7 +719,8 @@ pub const DataStore = struct {
             .make_path = true,
             .truncate = true,
         });
-        return try self.addTask(gpa, new_task.file_path);
+        errdefer std.fs.deleteFileAbsolute(file_path) catch {};
+        return try self.addTask(gpa, file_path);
     }
 
     /// Create a new task and metadata from file path
@@ -1213,7 +1215,11 @@ pub const DataStore = struct {
     }
 
     /// Save task metadata to a JSON file
-    pub fn writeTaskMeta(self: *const DataStore, gpa: std.mem.Allocator, meta: *const TaskMetadata) !void {
+    pub fn writeTaskMeta(
+        self: *const DataStore,
+        gpa: std.mem.Allocator,
+        meta: *const TaskMetadata,
+    ) !void {
         const path = try self.taskMetaPath(gpa, meta.id);
         defer gpa.free(path);
         const content = try toJson(gpa, meta);

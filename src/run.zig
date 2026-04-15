@@ -393,6 +393,20 @@ pub fn initProjectDataDir(gpa: std.mem.Allocator) !void {
     try fmtWrite("Initialized {s} in {s}\n", .{ marker_path, wd });
 }
 
+pub fn createNewTask(
+    gpa: std.mem.Allocator,
+    data_dir: data.DataStore.DataDirMode,
+    name: []const u8,
+) !void {
+    var datastore = try data.DataStore.init(gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer datastore.deinit(gpa);
+    const new = try datastore.newTask(gpa, .{ .name = name });
+    try fmtWrite("Task '{s}' created at: {s}", .{ new.name, new.file_path });
+}
+
 /// Show the currently used directory path for saving and fetching data.
 pub fn showCurDataDir(
     gpa: std.mem.Allocator,
