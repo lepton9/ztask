@@ -437,6 +437,34 @@ pub fn moveTask(
     });
 }
 
+/// Repair all the tasks
+pub fn repairTasks(
+    gpa: std.mem.Allocator,
+    data_dir: data.DataStore.DataDirMode,
+    dry_run: bool,
+) !void {
+    var datastore = try data.DataStore.init(gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer datastore.deinit(gpa);
+
+    var to_delete = try std.ArrayList([]const u8).initCapacity(gpa, 10);
+    defer to_delete.deinit(gpa);
+
+    var it = datastore.tasks.iterator();
+    while (it.next()) |e| {
+        const meta = e.value_ptr;
+        if (fileExists(meta.file_path)) continue;
+        try to_delete.append(gpa, meta.id);
+    }
+    for (to_delete.items) |id| {
+        try fmtWrite("Deleted {s}\n", .{id});
+        if (dry_run) continue;
+        try datastore.deleteTask(gpa, id);
+    }
+}
+
 /// Restore normal output behavior.
 fn setupInputTty(tty: *vaxis.Tty) !void {
     if (builtin.os.tag == .windows) {
@@ -466,4 +494,11 @@ pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
 /// Write all the data to stdout
 pub fn write(bytes: []const u8) !void {
     return fmtWrite("{s}", .{bytes});
+}
+
+/// Check if a file exists at the path
+fn fileExists(path: []const u8) bool {
+    const cwd = std.fs.cwd();
+    const stat = cwd.statFile(path) catch return false;
+    return stat.kind == .file;
 }

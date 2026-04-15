@@ -231,6 +231,14 @@ const commands = &[_]zcli.Cmd{
         .action = cmdListFn,
     },
     .{
+        .name = "repair",
+        .desc = "Delete non-existent tasks",
+        .options = &[_]zcli.Opt{
+            .{ .long_name = "dry", .desc = "Enable dry run" },
+        },
+        .action = cmdRepairFn,
+    },
+    .{
         .name = "completion",
         .desc = "Generate shell completions (bash|zsh|fish)",
         .positionals = &[_]zcli.PosArg{
@@ -450,6 +458,13 @@ fn cmdListFn(ptr: *anyopaque) !void {
         .sort = sorters[0..sort_count],
         .data_dir = ctx.data_dir,
     });
+}
+
+/// Handle repair command
+fn cmdRepairFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    const dry_run = ctx.cli.find_opt("dry") != null;
+    return try run.repairTasks(ctx.gpa, ctx.data_dir, dry_run);
 }
 
 /// Handle completion command
