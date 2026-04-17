@@ -395,18 +395,35 @@ pub fn initProjectDataDir(gpa: std.mem.Allocator) !void {
     try fmtWrite("Initialized {s} in {s}\n", .{ marker_path, wd });
 }
 
-pub fn createNewTask(
-    gpa: std.mem.Allocator,
+pub const CreateOptions = struct {
     data_dir: data.DataStore.DataDirMode,
+    edit: bool = false,
+    editor: ?[]const u8 = null,
     name: []const u8,
-) !void {
+};
+
+/// Create a new task
+pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
     var datastore = try data.DataStore.init(gpa, .{
-        .data_dir = data_dir,
+        .data_dir = options.data_dir,
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
-    const new = try datastore.newTask(gpa, .{ .name = name });
-    try fmtWrite("Task '{s}' created at: {s}", .{ new.name, new.file_path });
+    const new = try datastore.newTask(gpa, .{ .name = options.name });
+
+    try fmtWrite("Task '{s}' created at: {s}\n", .{ new.name, new.file_path });
+
+    // Edit the just created task file
+    if (options.edit) {
+        const res = try editTaskFile(gpa, new.file_path, options.editor);
+        switch (res) {
+            .success => {},
+            .err => |err| try fmtWrite(
+                "Invalid task file format: {s}\n",
+                .{@errorName(err)},
+            ),
+        }
+    }
 }
 
 /// Show the currently used directory path for saving and fetching data.
@@ -499,22 +516,14 @@ pub fn editTask(
     const meta = datastore.tasks.get(id) orelse
         return error.TaskNotFound;
 
-    // TODO: edit the meta file or the copy?
-    const temp_file = try std.fmt.allocPrint(gpa, "{s}.tmp", .{meta.file_path});
-    defer gpa.free(temp_file);
-    try std.fs.copyFileAbsolute(meta.file_path, temp_file, .{});
-
-    try editFile(gpa, temp_file, options.editor);
-
-    const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
-        try cwd.deleteFile(temp_file);
-        try fmtWrite("Invalid task file format: {s}", .{@errorName(err)});
-        return;
-    };
-    defer parsed.deinit(gpa);
-
-    try cwd.rename(temp_file, meta.file_path);
-    try fmtWrite("File saved: {s}", .{meta.file_path});
+    const res = try editTaskFile(gpa, meta.file_path, options.editor);
+    switch (res) {
+        .success => try fmtWrite("File saved: {s}\n", .{meta.file_path}),
+        .err => |err| try fmtWrite(
+            "Invalid task file format: {s}\n",
+            .{@errorName(err)},
+        ),
+    }
 }
 
 /// Restore normal output behavior.
@@ -532,6 +541,31 @@ fn setupInputTty(tty: *vaxis.Tty) !void {
     var tio = try std.posix.tcgetattr(tty.fd);
     tio.oflag.OPOST = true;
     try std.posix.tcsetattr(tty.fd, .FLUSH, tio);
+}
+
+const EditResult = union(enum) { success: void, err: anyerror };
+
+fn editTaskFile(
+    gpa: std.mem.Allocator,
+    file_path: []const u8,
+    editor: ?[]const u8,
+    // TODO: add a option to continue editing after parse error?
+) !EditResult {
+    const cwd = std.fs.cwd();
+    const temp_file = try std.fmt.allocPrint(gpa, "{s}.tmp", .{file_path});
+    defer gpa.free(temp_file);
+    try std.fs.copyFileAbsolute(file_path, temp_file, .{});
+
+    try editFile(gpa, temp_file, editor);
+
+    const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
+        try cwd.deleteFile(temp_file);
+        return .{ .err = err };
+    };
+    defer parsed.deinit(gpa);
+
+    try cwd.rename(temp_file, file_path);
+    return .success;
 }
 
 /// Edit a file with the given editor or the OS default if found
@@ -567,8 +601,11 @@ fn editFile(
 
 /// Return the default editor
 fn getDefaultEditor() ![]const u8 {
-    // TODO:
-    return "vim";
+    return switch (builtin.os.tag) {
+        .linux => "vi",
+        .windows => "notepad",
+        else => "vi",
+    };
 }
 
 /// Write to stdout with format

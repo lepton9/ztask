@@ -71,7 +71,16 @@ const commands = &[_]zcli.Cmd{
                 .required = true,
                 .arg = .{ .name = "NAME", .type = .Text },
             },
-            // TODO: edit option
+            .{
+                .long_name = "edit",
+                .short_name = "e",
+                .desc = "Go to edit the task after creation",
+            },
+            .{
+                .long_name = "editor",
+                .desc = "Text editor to use for editing",
+                .arg = .{ .name = "EDITOR", .type = .Text },
+            },
         },
     },
     .{
@@ -302,7 +311,21 @@ fn cmdNewFn(ptr: *anyopaque) !void {
     var cli = ctx.cli;
     const name_opt = cli.find_opt("name") orelse unreachable;
     const name = name_opt.value.?.string;
-    run.createNewTask(ctx.gpa, ctx.data_dir, name) catch |err| switch (err) {
+
+    var opts: run.CreateOptions = .{
+        .data_dir = ctx.data_dir,
+        .name = name,
+        .edit = cli.find_opt("edit") != null,
+    };
+    if (cli.find_opt("editor")) |opt| {
+        opts.editor = opt.value.?.string;
+    }
+
+    run.createNewTask(ctx.gpa, opts) catch |err| switch (err) {
+        error.EditorNotFound => if (opts.editor) |e|
+            fatal("Editor not found: '{s}'", .{e})
+        else
+            fatal("No default editor found", .{}),
         else => fatal("Error {any}", .{err}),
     };
 }
