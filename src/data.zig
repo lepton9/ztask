@@ -1228,6 +1228,10 @@ pub const DataStore = struct {
     }
 };
 
+pub fn loadTaskFile(gpa: std.mem.Allocator, path: []const u8) !*task.Task {
+    return parse.loadTask(gpa, path);
+}
+
 /// Parse a file from JSON to type `T`
 fn parseMetaFile(
     comptime T: type,

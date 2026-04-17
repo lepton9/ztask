@@ -106,18 +106,7 @@ const commands = &[_]zcli.Cmd{
     .{
         .name = "delete",
         .desc = "Delete a task",
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "path",
-                .desc = "Path of the task file",
-                .arg = .{ .name = "PATH", .type = .Path },
-            },
-            .{
-                .long_name = "id",
-                .desc = "ID of the task",
-                .arg = .{ .name = "ID", .type = .Text },
-            },
-        },
+        .options = task_options,
         .action = cmdDeleteFn,
     },
     .{
@@ -134,19 +123,21 @@ const commands = &[_]zcli.Cmd{
         .action = cmdMoveFn,
     },
     .{
+        .name = "edit",
+        .desc = "Edit a task file",
+        .options = task_options ++ &[_]zcli.Opt{
+            .{
+                .long_name = "editor",
+                .desc = "Text editor to use for editing",
+                .arg = .{ .name = "EDITOR", .type = .Text },
+            },
+        },
+        .action = cmdEditFn,
+    },
+    .{
         .name = "run",
         .desc = "Run a single task",
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "path",
-                .desc = "Path of the task file",
-                .arg = .{ .name = "PATH", .type = .Path },
-            },
-            .{
-                .long_name = "id",
-                .desc = "ID of the task",
-                .arg = .{ .name = "ID", .type = .Text },
-            },
+        .options = task_options ++ &[_]zcli.Opt{
             .{
                 .long_name = "attach",
                 .short_name = "a",
@@ -248,6 +239,19 @@ const commands = &[_]zcli.Cmd{
     },
 };
 
+const task_options = &[_]zcli.Opt{
+    .{
+        .long_name = "path",
+        .desc = "Path of the task file",
+        .arg = .{ .name = "PATH", .type = .Path },
+    },
+    .{
+        .long_name = "id",
+        .desc = "ID of the task",
+        .arg = .{ .name = "ID", .type = .Text },
+    },
+};
+
 const runner_n_option: zcli.Opt = .{
     .long_name = "runners",
     .short_name = "r",
@@ -325,6 +329,37 @@ fn cmdMoveFn(ptr: *anyopaque) !void {
         error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
         error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
         error.InvalidTaskFile => fatal("Moved file is not a task file: '{s}'", .{to}),
+        else => fatal("Error {any}", .{err}),
+    };
+}
+
+/// Handle edit command
+fn cmdEditFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    var cli = ctx.cli;
+
+    const task_opts: run.TaskOptions = if (cli.find_opt("path")) |path|
+        .{ .task = .{ .path = path.value.?.string } }
+    else if (cli.find_opt("id")) |id|
+        .{ .task = .{ .id = id.value.?.string } }
+    else
+        fatal("No task given to edit", .{});
+
+    var opts: run.EditOptions = .{ .task_options = task_opts };
+
+    if (cli.find_opt("editor")) |opt| {
+        opts.editor = opt.value.?.string;
+    }
+
+    run.editTask(ctx.gpa, ctx.data_dir, opts) catch |err| switch (err) {
+        error.FileNotFound => switch (task_opts.task) {
+            .path => |p| fatal("Task file not found: '{s}'", .{p}),
+            .id => |i| fatal("Task not found: '{s}'", .{i}),
+        },
+        error.EditorNotFound => if (opts.editor) |e|
+            fatal("Editor not found: '{s}'", .{e})
+        else
+            fatal("No default editor found", .{}),
         else => fatal("Error {any}", .{err}),
     };
 }

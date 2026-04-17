@@ -339,13 +339,15 @@ pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
     }
 }
 
-pub const DeleteOptions = struct {
+pub const TaskOptions = struct {
     task: union(enum) {
         path: []const u8,
         id: []const u8,
     },
     data_dir: data.DataStore.DataDirMode = .auto,
 };
+
+pub const DeleteOptions = TaskOptions;
 
 /// Delete a task with the given path or ID
 pub fn deleteTask(gpa: std.mem.Allocator, options: DeleteOptions) !void {
@@ -465,6 +467,56 @@ pub fn repairTasks(
     }
 }
 
+pub const EditOptions = struct {
+    task_options: TaskOptions,
+    editor: ?[]const u8 = null,
+};
+
+/// Edit the YAML file of the task
+pub fn editTask(
+    gpa: std.mem.Allocator,
+    data_dir: data.DataStore.DataDirMode,
+    options: EditOptions,
+) !void {
+    var datastore = try data.DataStore.init(gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer datastore.deinit(gpa);
+    const cwd = std.fs.cwd();
+
+    const id = blk: switch (options.task_options.task) {
+        .path => |path| {
+            const real_path = try cwd.realpathAlloc(gpa, path);
+            defer gpa.free(real_path);
+            const meta = datastore.findTaskMetaPath(real_path) orelse
+                return error.TaskNotFound;
+            break :blk meta.id;
+        },
+        .id => |id| break :blk id,
+    };
+
+    const meta = datastore.tasks.get(id) orelse
+        return error.TaskNotFound;
+
+    // TODO: edit the meta file or the copy?
+    const temp_file = try std.fmt.allocPrint(gpa, "{s}.tmp", .{meta.file_path});
+    defer gpa.free(temp_file);
+    try std.fs.copyFileAbsolute(meta.file_path, temp_file, .{});
+
+    try editFile(gpa, temp_file, options.editor);
+
+    const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
+        try cwd.deleteFile(temp_file);
+        try fmtWrite("Invalid task file format: {s}", .{@errorName(err)});
+        return;
+    };
+    defer parsed.deinit(gpa);
+
+    try cwd.rename(temp_file, meta.file_path);
+    try fmtWrite("File saved: {s}", .{meta.file_path});
+}
+
 /// Restore normal output behavior.
 fn setupInputTty(tty: *vaxis.Tty) !void {
     if (builtin.os.tag == .windows) {
@@ -480,6 +532,43 @@ fn setupInputTty(tty: *vaxis.Tty) !void {
     var tio = try std.posix.tcgetattr(tty.fd);
     tio.oflag.OPOST = true;
     try std.posix.tcsetattr(tty.fd, .FLUSH, tio);
+}
+
+/// Edit a file with the given editor or the OS default if found
+fn editFile(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    editor_name: ?[]const u8,
+) !void {
+    const editor = editor_name orelse try getDefaultEditor();
+    var editor_args_it = std.mem.splitScalar(u8, editor, ' ');
+    var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
+    defer argv.deinit(gpa);
+    while (editor_args_it.next()) |a| try argv.append(gpa, a);
+    try argv.append(gpa, path);
+
+    var child = std.process.Child.init(argv.items, gpa);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    // TODO: fix wait for gui editors
+    const term = child.spawnAndWait() catch |err| switch (err) {
+        error.FileNotFound => return error.EditorNotFound,
+        else => return err,
+    };
+
+    const exit_code: i32 = switch (term) {
+        .Exited => |code| @intCast(code),
+        .Signal => |sig| @intCast(sig),
+        else => 1,
+    };
+    _ = exit_code;
+}
+
+/// Return the default editor
+fn getDefaultEditor() ![]const u8 {
+    // TODO:
+    return "vim";
 }
 
 /// Write to stdout with format

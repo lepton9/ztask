@@ -307,8 +307,9 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
 }
 
 pub fn isTaskFile(file: []const u8) bool {
-    return std.mem.endsWith(u8, file, ".yaml") or
-        std.mem.endsWith(u8, file, ".yml");
+    const suffix = std.fs.path.extension(file);
+    return std.mem.eql(u8, suffix, ".yaml") or
+        std.mem.eql(u8, suffix, ".yml");
 }
 
 test "parse_empty" {
