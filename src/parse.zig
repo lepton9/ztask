@@ -12,6 +12,7 @@ pub const ParseError = error{
     InvalidFileFormat,
     EmptyTaskFile,
     UnnamedTask,
+    InvalidId,
     UnknownDependency,
     DuplicateJobName,
     DuplicateKey,
@@ -73,7 +74,8 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     }
 
     const t = try Task.init(gpa, name);
-    if (id_maybe) |id| t.id = task.Id.fromStr(id);
+    if (id_maybe) |id| t.id = task.Id.fromCustom(gpa, id) catch
+        return ParseError.InvalidId;
     t.trigger = trigger;
     t.jobs = jobs;
     return t;
@@ -302,7 +304,8 @@ pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
     defer gpa.free(yaml_file);
     const t = try parseTaskBuffer(gpa, yaml_file);
     t.file_path = try std.fs.cwd().realpathAlloc(gpa, path);
-    if (t.id.value == 0) t.id = task.Id.fromStr(t.file_path orelse unreachable);
+    if (t.id.str == null and t.id.value == 0)
+        t.id = .fromPath(t.file_path orelse unreachable);
     return t;
 }
 
@@ -386,7 +389,8 @@ test "parse_task" {
     ;
     const t = try parseTaskBuffer(gpa, source);
     defer t.deinit(gpa);
-    try std.testing.expect(t.id.value == task.Id.fromStr("123").value);
+    try std.testing.expect(t.id.str != null);
+    try std.testing.expect(std.mem.eql(u8, t.id.str.?, "123"));
     try std.testing.expect(std.mem.eql(u8, t.name, "test"));
     try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src/main.zig"));
     try std.testing.expect(t.jobs.count() == 3);

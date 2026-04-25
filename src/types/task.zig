@@ -21,6 +21,7 @@ pub const Task = struct {
         var it = self.jobs.iterator();
         while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
         self.jobs.deinit(gpa);
+        self.id.deinit(gpa);
 
         if (self.file_path) |path| gpa.free(path);
         if (self.trigger) |trigger| trigger.deinit(gpa);
@@ -47,7 +48,11 @@ pub const Task = struct {
         const header = try std.fmt.bufPrint(&buf, "name: \"{s}\"\n", .{task.name});
         try file.appendSlice(gpa, header);
         // TODO: make a better indent handling
-        // TODO: handle id
+
+        if (task.id.str) |id_str| {
+            const task_id = try std.fmt.bufPrint(&buf, "id: {s}\n", .{id_str});
+            try file.appendSlice(gpa, task_id);
+        }
 
         if (task.trigger) |tr| try file.appendSlice(gpa, try std.fmt.bufPrint(
             &buf,
@@ -239,17 +244,47 @@ pub const Step = struct {
 pub const Id = struct {
     value: u64 = 0,
     bytes: [16]u8 = [_]u8{0} ** 16,
+    /// Allocated custom id string.
+    str: ?[]const u8 = null,
 
-    /// Make Id from a string value
-    pub fn fromStr(str: []const u8) Id {
-        const value = std.hash.XxHash64.hash(0, str);
+    pub fn deinit(self: *Id, gpa: std.mem.Allocator) void {
+        if (self.str) |s| gpa.free(s);
+        self.* = .{};
+    }
+
+    fn validateCustom(raw: []const u8) bool {
+        if (raw.len == 0) return false;
+        for (raw) |c| {
+            if (std.ascii.isAlphanumeric(c)) continue;
+            switch (c) {
+                '_', '-', '.' => continue,
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    /// Make a custom ID from a string value.
+    pub fn fromCustom(gpa: std.mem.Allocator, raw: []const u8) !Id {
+        const trimmed = std.mem.trim(u8, raw, " \t\n\r");
+        if (!validateCustom(trimmed)) return error.InvalidCustomId;
+        const duped = try gpa.dupe(u8, trimmed);
+        const value = std.hash.XxHash64.hash(0, duped);
+        return .{ .value = value, .str = duped };
+    }
+
+    /// Make Id from a path.
+    pub fn fromPath(path: []const u8) Id {
+        const value = std.hash.XxHash64.hash(0, path);
         return .{ .value = value };
     }
 
-    /// Format u64 id to a hex value
+    /// Format the task ID to a string.
     pub fn fmt(self: *Id) []const u8 {
-        return std.fmt.bufPrint(self.bytes[0..], "{x}", .{self.value}) catch
-            unreachable;
+        if (self.str) |s| return s;
+        return std.fmt.bufPrint(self.bytes[0..], "{x}", .{
+            self.value,
+        }) catch unreachable;
     }
 };
 
@@ -257,6 +292,7 @@ test "task_to_text" {
     const gpa = std.testing.allocator;
     var t = try Task.init(gpa, "test");
     defer t.deinit(gpa);
+    t.id = try .fromCustom(gpa, "custom-id");
     t.trigger = .{
         .watch = .{ .path = try gpa.dupe(u8, "src/main.zig"), .type = .file },
     };
@@ -305,6 +341,7 @@ test "task_to_text" {
 
     const expected_str =
         \\name: "test"
+        \\id: custom-id
         \\on:
         \\  watch: "src/main.zig"
         \\
@@ -331,7 +368,5 @@ test "task_to_text" {
 
     const task_str = try t.toText(gpa);
     defer gpa.free(task_str);
-    // std.debug.print("\n{s}\n", .{task_str});
-    // std.debug.print("\n{s}\n", .{expected_str});
     try std.testing.expect(std.mem.eql(u8, task_str, expected_str));
 }

@@ -140,6 +140,9 @@ test "complete_tasks" {
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(gpa, task2_file);
+
+    const task1_id_value = task1.id.value;
+    const task2_id_value = task2.id.value;
     try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
     try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
 
@@ -162,7 +165,7 @@ test "complete_tasks" {
         .run_finished => |e| {
             try std.testing.expect(e.status == .success);
             try std.testing.expect(
-                e.task_id == task1.id.value or e.task_id == task2.id.value,
+                e.task_id == task1_id_value or e.task_id == task2_id_value,
             );
         },
         else => {},

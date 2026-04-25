@@ -40,7 +40,7 @@ pub const TaskMetadata = struct {
     }
 
     pub fn idDerivedFromPath(self: *const TaskMetadata) bool {
-        var from_path = task.Id.fromStr(self.file_path);
+        var from_path = task.Id.fromPath(self.file_path);
         return std.mem.eql(u8, self.id, from_path.fmt());
     }
 };
@@ -627,7 +627,7 @@ pub const DataStore = struct {
     /// Find task metadata with task file path
     pub fn findTaskMetaPath(self: *DataStore, file_path: []const u8) ?*TaskMetadata {
         // Try to find with id
-        var id = task.Id.fromStr(file_path);
+        var id = task.Id.fromPath(file_path);
         if (self.tasks.getPtr(id.fmt())) |meta| return meta;
 
         // Find by iterating
@@ -703,9 +703,9 @@ pub const DataStore = struct {
         const file_path = new_task.file_path orelse unreachable;
         new_task.trigger = spec.trigger;
         new_task.id = if (spec.id) |id|
-            task.Id.fromStr(id)
+            try task.Id.fromCustom(gpa, id)
         else
-            task.Id.fromStr(file_path);
+            task.Id.fromPath(file_path);
         if (self.tasks.getPtr(new_task.id.fmt())) |_| return error.TaskExists;
 
         // Insert jobs
@@ -844,7 +844,7 @@ pub const DataStore = struct {
         meta: *const TaskMetadata,
         path: []const u8,
     ) !void {
-        var new_id = task.Id.fromStr(path);
+        var new_id = task.Id.fromPath(path);
         const id_str = new_id.fmt();
         if (std.mem.eql(u8, id_str, meta.id)) return;
         if (self.tasks.get(id_str)) |_| return error.TaskExists;
@@ -967,7 +967,7 @@ pub const DataStore = struct {
 
         var meta_new: *TaskMetadata = meta_old;
         if (id_derived) {
-            var new_id = task.Id.fromStr(real_path_dest);
+            var new_id = task.Id.fromPath(real_path_dest);
             meta_new = try self.applyIdChange(gpa, meta_old, new_id.fmt());
         }
 
@@ -1362,9 +1362,9 @@ test "move_task" {
     const new_real = try cwd.realpathAlloc(gpa, new_path);
     defer gpa.free(new_real);
 
-    var new_id = task.Id.fromStr(new_real);
+    var new_id = task.Id.fromPath(new_real);
     const new_id_str = new_id.fmt();
-    var old_id = task.Id.fromStr(old_real);
+    var old_id = task.Id.fromPath(old_real);
     const old_id_str = old_id.fmt();
 
     const moved = store.getTaskMetadata(new_id_str).?;
@@ -1406,7 +1406,7 @@ test "move_task_repair" {
     const old_file_path = try gpa.dupe(u8, meta.file_path);
     defer gpa.free(old_file_path);
 
-    var old_id_from_path = task.Id.fromStr(old_file_path);
+    var old_id_from_path = task.Id.fromPath(old_file_path);
     try std.testing.expect(std.mem.eql(u8, old_id, old_id_from_path.fmt()));
 
     const new_dir = try std.fs.path.join(gpa, &.{ root, "moved" });
@@ -1423,7 +1423,7 @@ test "move_task_repair" {
 
     const new_real = try cwd.realpathAlloc(gpa, new_path);
     defer gpa.free(new_real);
-    var new_id_from_path = task.Id.fromStr(new_real);
+    var new_id_from_path = task.Id.fromPath(new_real);
     const new_id = new_id_from_path.fmt();
 
     const updated = store.getTaskMetadata(new_id).?;
