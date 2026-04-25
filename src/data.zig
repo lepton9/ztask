@@ -890,6 +890,30 @@ pub const DataStore = struct {
         return gop.value_ptr;
     }
 
+    /// Apply task metadata changes after a task file edit.
+    pub fn applyEditedTaskMeta(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        old_id: []const u8,
+        new_id: []const u8,
+        new_name: []const u8,
+    ) !*TaskMetadata {
+        var meta: *TaskMetadata = self.tasks.getPtr(old_id) orelse
+            return error.TaskNotFound;
+
+        if (!std.mem.eql(u8, new_id, meta.id)) {
+            meta = try self.applyIdChange(gpa, meta, new_id);
+        }
+
+        if (!std.mem.eql(u8, new_name, meta.name)) {
+            gpa.free(meta.name);
+            meta.name = try gpa.dupe(u8, new_name);
+        }
+
+        try self.writeTaskMeta(gpa, meta);
+        return meta;
+    }
+
     /// Move a task file to a new directory
     ///
     /// Also moves all associated data linked to the task.
@@ -1435,4 +1459,58 @@ test "move_task_repair" {
     const old_meta_path = try store.taskMetaPath(gpa, old_id);
     defer gpa.free(old_meta_path);
     try std.testing.expectError(error.FileNotFound, cwd.statFile(old_meta_path));
+}
+
+test "edit_task_updates_id" {
+    const gpa = std.testing.allocator;
+    const cwd = std.fs.cwd();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(gpa, .{
+        .data_dir = .{ .path = data_dir },
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
+    defer gpa.free(task_path);
+    try writeFile(task_path, "name: a\n", .{ .make_path = true, .truncate = true });
+
+    const meta = try store.addTask(gpa, task_path);
+    const old_id = try gpa.dupe(u8, meta.id);
+    defer gpa.free(old_id);
+
+    const new_name = "b";
+    const new_id = "custom-1";
+
+    // Edit task name and ID
+    try writeFile(
+        task_path,
+        "name: " ++ new_name ++ "\nid: \"" ++ new_id ++ "\"\n",
+        .{ .truncate = true },
+    );
+
+    const updated = try store.applyEditedTaskMeta(gpa, old_id, new_id, new_name);
+    try std.testing.expect(std.mem.eql(u8, updated.id, new_id));
+    try std.testing.expect(std.mem.eql(u8, updated.name, new_name));
+    try std.testing.expect(store.getTaskMetadata(old_id) == null);
+    try std.testing.expect(store.getTaskMetadata(new_id) != null);
+
+    // Data directory of the task should be moved
+    const old_data_dir = try store.taskDataPath(gpa, old_id);
+    defer gpa.free(old_data_dir);
+    const new_data_dir = try store.taskDataPath(gpa, new_id);
+    defer gpa.free(new_data_dir);
+
+    try std.testing.expectError(error.FileNotFound, cwd.statFile(old_data_dir));
+    _ = try cwd.statFile(new_data_dir);
 }

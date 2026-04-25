@@ -415,9 +415,17 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
 
     // Edit the just created task file
     if (options.edit) {
+        const old_id = try gpa.dupe(u8, new.id);
+        defer gpa.free(old_id);
         const res = try editTaskFile(gpa, new.file_path, options.editor);
         switch (res) {
-            .success => {},
+            .success => |s| {
+                defer {
+                    gpa.free(s.id);
+                    gpa.free(s.name);
+                }
+                _ = try datastore.applyEditedTaskMeta(gpa, old_id, s.id, s.name);
+            },
             .err => |err| try fmtWrite(
                 "Invalid task file format: {s}\n",
                 .{@errorName(err)},
@@ -516,9 +524,19 @@ pub fn editTask(
     const meta = datastore.tasks.get(id) orelse
         return error.TaskNotFound;
 
+    const old_id = try gpa.dupe(u8, meta.id);
+    defer gpa.free(old_id);
+
     const res = try editTaskFile(gpa, meta.file_path, options.editor);
     switch (res) {
-        .success => try fmtWrite("File saved: {s}\n", .{meta.file_path}),
+        .success => |s| {
+            defer {
+                gpa.free(s.id);
+                gpa.free(s.name);
+            }
+            const updated = try datastore.applyEditedTaskMeta(gpa, old_id, s.id, s.name);
+            try fmtWrite("File saved: {s} (id: {s})\n", .{ updated.file_path, updated.id });
+        },
         .err => |err| try fmtWrite(
             "Invalid task file format: {s}\n",
             .{@errorName(err)},
@@ -543,7 +561,13 @@ fn setupInputTty(tty: *vaxis.Tty) !void {
     try std.posix.tcsetattr(tty.fd, .FLUSH, tio);
 }
 
-const EditResult = union(enum) { success: void, err: anyerror };
+const EditResult = union(enum) {
+    success: struct {
+        id: []u8,
+        name: []u8,
+    },
+    err: anyerror,
+};
 
 fn editTaskFile(
     gpa: std.mem.Allocator,
@@ -565,7 +589,10 @@ fn editTaskFile(
     defer parsed.deinit(gpa);
 
     try cwd.rename(temp_file, file_path);
-    return .success;
+
+    const id = try gpa.dupe(u8, parsed.id.fmt());
+    const name = try gpa.dupe(u8, parsed.name);
+    return .{ .success = .{ .id = id, .name = name } };
 }
 
 /// Edit a file with the given editor or the OS default if found
