@@ -232,7 +232,7 @@ const commands = &[_]zcli.Cmd{
     },
     .{
         .name = "repair",
-        .desc = "Delete non-existent tasks",
+        .desc = "Delete non-existent tasks and detect ID and name changes",
         .options = &[_]zcli.Opt{
             .{ .long_name = "dry", .desc = "Enable dry run" },
         },
@@ -522,7 +522,14 @@ fn cmdListFn(ptr: *anyopaque) !void {
 fn cmdRepairFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const dry_run = ctx.cli.find_opt("dry") != null;
-    return try run.repairTasks(ctx.gpa, ctx.data_dir, dry_run);
+    return run.repairTasks(
+        ctx.gpa,
+        ctx.data_dir,
+        dry_run,
+    ) catch |err| switch (err) {
+        error.UnresolvedConflict => fatal("Unresolved conflicts", .{}),
+        else => fatal("Failed to repair some of the tasks", .{}),
+    };
 }
 
 /// Handle completion command

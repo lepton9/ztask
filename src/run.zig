@@ -464,7 +464,109 @@ pub fn moveTask(
     });
 }
 
-/// Repair all the tasks
+/// Scan all tasks currently in the datastore and report issues through `sink`.
+///
+/// The `sink` must contain the following functions:
+/// `onMissing(@This(), *const data.TaskMetadata) !void`
+/// `onMismatch(
+///     self: @This(),
+///     meta: *const data.TaskMetadata,
+///     new_id: []const u8,
+///     new_name: []const u8,
+///     id_change: bool,
+///     name_change: bool,
+/// ) !void`
+fn scanTasks(gpa: std.mem.Allocator, store: *data.DataStore, sink: anytype) !void {
+    var it = store.tasks.iterator();
+    while (it.next()) |e| {
+        const meta = e.value_ptr;
+        if (!fileExists(meta.file_path)) {
+            try sink.onMissing(meta);
+            continue;
+        }
+
+        const parsed = data.loadTaskFile(gpa, meta.file_path) catch |err| {
+            try fmtWrite(
+                "Failed to parse task file '{s}' ({s})\n",
+                .{ meta.file_path, @errorName(err) },
+            );
+            continue;
+        };
+        defer parsed.deinit(gpa);
+
+        const new_id = parsed.id.fmt();
+        const new_name = parsed.name;
+        const id_change = !std.mem.eql(u8, meta.id, new_id);
+        const name_change = !std.mem.eql(u8, meta.name, new_name);
+        if (!id_change and !name_change) continue;
+
+        try sink.onMismatch(meta, new_id, new_name, id_change, name_change);
+    }
+}
+
+const RepairSinkDry = struct {
+    pub fn onMissing(_: @This(), meta: *const data.TaskMetadata) !void {
+        try fmtWrite("Would delete {s}\n", .{meta.id});
+    }
+
+    pub fn onMismatch(
+        _: @This(),
+        meta: *const data.TaskMetadata,
+        new_id: []const u8,
+        new_name: []const u8,
+        id_change: bool,
+        name_change: bool,
+    ) !void {
+        if (id_change and name_change) {
+            try fmtWrite(
+                "Would repair {s} -> {s} (name: '{s}' -> '{s}')\n",
+                .{ meta.id, new_id, meta.name, new_name },
+            );
+        } else if (id_change) {
+            try fmtWrite("Would repair {s} -> {s}\n", .{ meta.id, new_id });
+        } else {
+            try fmtWrite(
+                "Would update {s} name: '{s}' -> '{s}'\n",
+                .{ meta.id, meta.name, new_name },
+            );
+        }
+    }
+};
+
+const RepairSinkCollect = struct {
+    gpa: std.mem.Allocator,
+    to_delete: *std.ArrayList([]u8),
+    actions: *std.ArrayList(RepairAction),
+
+    pub fn onMissing(self: @This(), meta: *const data.TaskMetadata) !void {
+        try self.to_delete.append(self.gpa, try self.gpa.dupe(u8, meta.id));
+    }
+
+    pub fn onMismatch(
+        self: @This(),
+        meta: *const data.TaskMetadata,
+        new_id: []const u8,
+        new_name: []const u8,
+        _: bool,
+        _: bool,
+    ) !void {
+        try self.actions.append(self.gpa, .{
+            .old_id = try self.gpa.dupe(u8, meta.id),
+            .new_id = try self.gpa.dupe(u8, new_id),
+            .new_name = try self.gpa.dupe(u8, new_name),
+        });
+    }
+};
+
+const RepairAction = struct {
+    old_id: []u8,
+    new_id: []u8,
+    new_name: []u8,
+};
+
+/// Repair all the tasks.
+///
+/// Delete missing tasks and handle task ID and name changes.
 pub fn repairTasks(
     gpa: std.mem.Allocator,
     data_dir: data.DataStore.DataDirMode,
@@ -476,19 +578,105 @@ pub fn repairTasks(
     });
     defer datastore.deinit(gpa);
 
-    var to_delete = try std.ArrayList([]const u8).initCapacity(gpa, 10);
-    defer to_delete.deinit(gpa);
-
-    var it = datastore.tasks.iterator();
-    while (it.next()) |e| {
-        const meta = e.value_ptr;
-        if (fileExists(meta.file_path)) continue;
-        try to_delete.append(gpa, meta.id);
+    if (dry_run) {
+        try scanTasks(gpa, &datastore, RepairSinkDry{});
+        return;
     }
+
+    var to_delete = try std.ArrayList([]u8).initCapacity(gpa, 16);
+    defer {
+        for (to_delete.items) |id| gpa.free(id);
+        to_delete.deinit(gpa);
+    }
+
+    var actions = try std.ArrayList(RepairAction).initCapacity(gpa, 16);
+    defer {
+        for (actions.items) |a| {
+            gpa.free(a.old_id);
+            gpa.free(a.new_id);
+            gpa.free(a.new_name);
+        }
+        actions.deinit(gpa);
+    }
+
+    // Collect all the repair actions
+    try scanTasks(gpa, &datastore, RepairSinkCollect{
+        .gpa = gpa,
+        .to_delete = &to_delete,
+        .actions = &actions,
+    });
+
+    // Delete missing tasks
     for (to_delete.items) |id| {
         try fmtWrite("Deleted {s}\n", .{id});
-        if (dry_run) continue;
-        try datastore.deleteTask(gpa, id);
+        datastore.deleteTask(gpa, id) catch |err|
+            try fmtWrite("Failed deleting {s}: {s}\n", .{ id, @errorName(err) });
+    }
+
+    if (actions.items.len == 0) return;
+
+    // Repair tasks with mismatched YAML id/name
+    var old_id_index = std.StringHashMapUnmanaged(usize){};
+    defer old_id_index.deinit(gpa);
+    for (actions.items, 0..) |a, idx| try old_id_index.put(gpa, a.old_id, idx);
+
+    var processed_actions = try gpa.alloc(bool, actions.items.len);
+    defer gpa.free(processed_actions);
+    @memset(processed_actions, false);
+
+    var remaining_actions: usize = actions.items.len;
+    var last_remaining_n: usize = remaining_actions;
+    while (remaining_actions > 0 and last_remaining_n != remaining_actions) {
+        last_remaining_n = remaining_actions;
+        for (actions.items, 0..) |a, i| {
+            if (processed_actions[i]) continue;
+
+            // If the desired ID is going to change, try to handle that first
+            // (A -> B) (B -> C)
+            if (old_id_index.get(a.new_id)) |dep_idx| {
+                if (dep_idx != i and !processed_actions[dep_idx]) continue;
+            }
+
+            const updated = datastore.applyEditedTaskMeta(
+                gpa,
+                a.old_id,
+                a.new_id,
+                a.new_name,
+            ) catch |err| switch (err) {
+                error.TaskExists => continue, // Maybe another action will free the ID
+                error.TaskNotFound => {
+                    try fmtWrite("Skipped repair for {s}: Task not found\n", .{a.old_id});
+                    processed_actions[i] = true;
+                    remaining_actions -= 1;
+                    continue;
+                },
+                else => {
+                    try fmtWrite(
+                        "Failed repairing {s} -> {s}: {s}\n",
+                        .{ a.old_id, a.new_id, @errorName(err) },
+                    );
+                    processed_actions[i] = true;
+                    remaining_actions -= 1;
+                    continue;
+                },
+            };
+
+            try fmtWrite("Repaired {s} -> {s}\n", .{ a.old_id, updated.id });
+            processed_actions[i] = true;
+            remaining_actions -= 1;
+        }
+    }
+
+    // Report the unresolved actions
+    if (remaining_actions > 0) {
+        for (actions.items, 0..) |a, i| {
+            if (processed_actions[i]) continue;
+            try fmtWrite(
+                "Unresolved ID conflict: {s} -> {s}\n",
+                .{ a.old_id, a.new_id },
+            );
+        }
+        return error.UnresolvedConflict;
     }
 }
 
