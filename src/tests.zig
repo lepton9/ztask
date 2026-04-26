@@ -1,9 +1,14 @@
 const std = @import("std");
 const parse = @import("parse.zig");
 const manager = @import("taskmanager.zig");
+const data = @import("data.zig");
+const run = @import("run.zig");
+const task_types = @import("types/task.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 
 const TaskManager = manager.TaskManager;
+
+const expect = std.testing.expect;
 
 test {
     _ = manager;
@@ -252,6 +257,72 @@ test "remote_job_addr" {
     t.join();
 
     try std.testing.expect(task_manager.events.len() == 1);
-    const run = task_manager.events.pop().?.run_finished;
-    try std.testing.expect(run.status == .success);
+    const finished = task_manager.events.pop().?.run_finished;
+    try std.testing.expect(finished.status == .success);
+}
+
+fn overwriteTaskFile(path: []const u8, name: []const u8, id: ?[]const u8) !void {
+    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    var buf: [256]u8 = undefined;
+    const content = if (id) |new_id|
+        try std.fmt.bufPrint(&buf, "name: {s}\nid: \"{s}\"\n", .{ name, new_id })
+    else
+        try std.fmt.bufPrint(&buf, "name: {s}\n", .{name});
+    try file.writeAll(content);
+}
+
+test "repair_tasks_id_change" {
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var store = try data.DataStore.init(gpa, .{
+        .data_dir = .{ .path = env.data_dir },
+    });
+    defer store.deinit(gpa);
+
+    const a_meta = try store.newTask(gpa, .{ .name = "task-a", .id = "a" });
+    const b_meta = try store.newTask(gpa, .{ .name = "task-b", .id = "b" });
+
+    try overwriteTaskFile(a_meta.file_path, "task-a-new", "a-new");
+    try overwriteTaskFile(b_meta.file_path, "task-b-new", null);
+
+    try run.repairTasks(gpa, .{ .path = env.data_dir }, false);
+
+    var repaired = try data.DataStore.init(gpa, .{
+        .data_dir = .{ .path = env.data_dir },
+        .load = .{ .tasks = true },
+    });
+    defer repaired.deinit(gpa);
+
+    var id_b = task_types.Id.fromPath(b_meta.file_path);
+
+    try expect(
+        repaired.tasks.get("a") == null and repaired.tasks.get("a-new") != null,
+    );
+    try expect(
+        repaired.tasks.get("b") == null and repaired.tasks.get(id_b.fmt()) != null,
+    );
+
+    const meta_a_new = repaired.tasks.get("a-new") orelse unreachable;
+    const meta_b_new = repaired.tasks.get(id_b.fmt()) orelse unreachable;
+    try expect(std.mem.eql(u8, meta_a_new.name, "task-a-new"));
+    try expect(std.mem.eql(u8, meta_b_new.name, "task-b-new"));
+
+    // Check that the metafile paths have moved
+    const old_meta_path_a = try repaired.taskMetaPath(gpa, "a");
+    defer gpa.free(old_meta_path_a);
+    const new_meta_path_a = try repaired.taskMetaPath(gpa, meta_a_new.id);
+    defer gpa.free(new_meta_path_a);
+
+    const old_meta_path_b = try repaired.taskMetaPath(gpa, "b");
+    defer gpa.free(old_meta_path_b);
+    const new_meta_path_b = try repaired.taskMetaPath(gpa, meta_b_new.id);
+    defer gpa.free(new_meta_path_b);
+
+    try expect(!(run.fileExists(old_meta_path_a)));
+    try expect(run.fileExists(new_meta_path_a));
+    try expect(!(run.fileExists(old_meta_path_b)));
+    try expect(run.fileExists(new_meta_path_b));
 }

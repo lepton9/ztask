@@ -625,7 +625,7 @@ pub fn repairTasks(
     @memset(processed_actions, false);
 
     var remaining_actions: usize = actions.items.len;
-    var last_remaining_n: usize = remaining_actions;
+    var last_remaining_n: usize = 0;
     while (remaining_actions > 0 and last_remaining_n != remaining_actions) {
         last_remaining_n = remaining_actions;
         for (actions.items, 0..) |a, i| {
@@ -825,6 +825,7 @@ fn getDefaultEditor() ![]const u8 {
 
 /// Write to stdout with format
 pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
+    if (builtin.is_test) return;
     var buffer: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buffer);
     const stdout = &writer.interface;
@@ -838,7 +839,7 @@ pub fn write(bytes: []const u8) !void {
 }
 
 /// Check if a file exists at the path
-fn fileExists(path: []const u8) bool {
+pub fn fileExists(path: []const u8) bool {
     const cwd = std.fs.cwd();
     const stat = cwd.statFile(path) catch return false;
     return stat.kind == .file;

@@ -669,7 +669,7 @@ pub const DataStore = struct {
         spec: TaskCreateOptions,
     ) !*TaskMetadata {
         const new_task = try task.Task.init(gpa, spec.name);
-        errdefer new_task.deinit(gpa);
+        defer new_task.deinit(gpa);
 
         // Set the file path for the new task file
         new_task.file_path = spec.path orelse blk: {
