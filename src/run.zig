@@ -417,7 +417,7 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
     if (options.edit) {
         const old_id = try gpa.dupe(u8, new.id);
         defer gpa.free(old_id);
-        const res = try editTaskFile(gpa, new.file_path, options.editor);
+        const res = try editTaskFile(gpa, new.file_path, options.editor, false);
         try applyEditResult(gpa, &datastore, old_id, res);
     }
 }
@@ -671,6 +671,8 @@ pub fn repairTasks(
 pub const EditOptions = struct {
     task_options: TaskOptions,
     editor: ?[]const u8 = null,
+    /// Reuse a saved edit buffer from a previous failed edit.
+    continue_failed: bool = false,
 };
 
 /// Edit the YAML file of the task
@@ -703,7 +705,12 @@ pub fn editTask(
     const old_id = try gpa.dupe(u8, meta.id);
     defer gpa.free(old_id);
 
-    const res = try editTaskFile(gpa, meta.file_path, options.editor);
+    const res = try editTaskFile(
+        gpa,
+        meta.file_path,
+        options.editor,
+        options.continue_failed,
+    );
     try applyEditResult(gpa, &datastore, old_id, res);
 }
 
@@ -763,40 +770,62 @@ fn editTaskFile(
     gpa: std.mem.Allocator,
     file_path: []const u8,
     editor: ?[]const u8,
+    resume_failed: bool,
 ) !EditResult {
-    const temp_file = try allocUniqueTempPath(gpa, file_path);
-    defer gpa.free(temp_file);
-    try std.fs.copyFileAbsolute(file_path, temp_file, .{});
+    const resume_file = try allocResumeEditPath(gpa, file_path);
+    defer gpa.free(resume_file);
+
+    var temp_file: ?[]u8 = null;
+    defer if (temp_file) |p| gpa.free(p);
+
+    const resume_edit = resume_failed and fileExistsAbsolute(resume_file);
+    const edit_path: []const u8 = if (resume_edit) resume_file else blk: {
+        const tmp = try allocUniqueTempPath(gpa, file_path);
+        temp_file = tmp;
+        try std.fs.copyFileAbsolute(file_path, tmp, .{});
+        break :blk tmp;
+    };
 
     // Track whether the user modified something
-    var before_hash = try fileHash(gpa, temp_file);
+    var before_hash = try fileHash(gpa, edit_path);
 
     // Edit while valid task file or user canceled
     while (true) {
-        const result = try editFile(gpa, temp_file, editor);
-        const after_hash = try fileHash(gpa, temp_file);
+        const result = try editFile(gpa, edit_path, editor);
+        const after_hash = try fileHash(gpa, edit_path);
+        const changed = before_hash != after_hash;
+        before_hash = after_hash;
 
-        if ((result == .detached or before_hash == after_hash) and stdinIsTty()) {
+        if ((result == .detached or !changed) and stdinIsTty()) {
             try fmtWrite("Save/close the file, then press Enter to continue...\n", .{});
             try waitForEnter();
         }
-        before_hash = after_hash;
 
         // Validate the task file
-        const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
+        const parsed = data.loadTaskFile(gpa, edit_path) catch |err| {
             const ans = try promptYesNo(
                 "Invalid task file format: {any}. Re-edit? [Y/n] ",
                 .{err},
             );
             if (ans) continue;
 
-            // Keep the temp file so the user can recover their edits
-            try fmtWrite("Kept temporary file at: {s}\n", .{temp_file});
+            const is_resume = std.mem.eql(u8, edit_path, resume_file);
+            const kept = if (is_resume) true else if (changed) blk: {
+                try std.fs.renameAbsolute(edit_path, resume_file);
+                break :blk true;
+            } else blk: {
+                std.fs.deleteFileAbsolute(edit_path) catch {};
+                break :blk false;
+            };
+
+            if (kept) {
+                try fmtWrite("Kept temporary file at: {s}\n", .{resume_file});
+            }
             return .{ .err = err };
         };
         defer parsed.deinit(gpa);
 
-        try std.fs.renameAbsolute(temp_file, file_path);
+        try std.fs.renameAbsolute(edit_path, file_path);
 
         const id = try gpa.dupe(u8, parsed.id.fmt());
         const name = try gpa.dupe(u8, parsed.name);
@@ -967,10 +996,28 @@ fn promptYesNo(comptime fmt: []const u8, args: anytype) !bool {
 }
 
 fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{
-        file_path,
-        std.time.nanoTimestamp(),
-    });
+    const dir = std.fs.path.dirname(file_path) orelse ".";
+    const base = std.fs.path.basename(file_path);
+    const name = try std.fmt.allocPrint(
+        gpa,
+        ".{s}.tmp.{d}",
+        .{ base, std.time.nanoTimestamp() },
+    );
+    defer gpa.free(name);
+    return std.fs.path.join(gpa, &.{ dir, name });
+}
+
+fn allocResumeEditPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    const dir = std.fs.path.dirname(file_path) orelse ".";
+    const base = std.fs.path.basename(file_path);
+    const name = try std.fmt.allocPrint(gpa, ".{s}.ztask-edit", .{base});
+    defer gpa.free(name);
+    return std.fs.path.join(gpa, &.{ dir, name });
+}
+
+fn fileExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
 }
 
 /// Write to stdout with format

@@ -140,6 +140,11 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Text editor to use for editing",
                 .arg = .{ .name = "EDITOR", .type = .Text },
             },
+            .{
+                .long_name = "continue",
+                .short_name = "c",
+                .desc = "Continue the last failed edit",
+            },
         },
         .action = cmdEditFn,
     },
@@ -373,6 +378,7 @@ fn cmdEditFn(ptr: *anyopaque) !void {
     if (cli.find_opt("editor")) |opt| {
         opts.editor = opt.value.?.string;
     }
+    opts.continue_failed = cli.find_opt("continue") != null;
 
     run.editTask(ctx.gpa, ctx.data_dir, opts) catch |err| switch (err) {
         error.FileNotFound => switch (task_opts.task) {
