@@ -757,18 +757,35 @@ const EditResult = union(enum) {
     err: anyerror,
 };
 
+const EditorSpawnResult = enum { waited, detached };
+
 fn editTaskFile(
     gpa: std.mem.Allocator,
     file_path: []const u8,
     editor: ?[]const u8,
     // TODO: add a option to continue editing after parse error?
 ) !EditResult {
+    const max_read_bytes = 1024 * 1024;
     const cwd = std.fs.cwd();
     const temp_file = try std.fmt.allocPrint(gpa, "{s}.tmp", .{file_path});
     defer gpa.free(temp_file);
     try std.fs.copyFileAbsolute(file_path, temp_file, .{});
 
-    try editFile(gpa, temp_file, editor);
+    // Track whether the user modified something
+    const before_bytes = try cwd.readFileAlloc(gpa, temp_file, max_read_bytes);
+    defer gpa.free(before_bytes);
+    const before_hash = std.hash.Wyhash.hash(0, before_bytes);
+
+    const result = try editFile(gpa, temp_file, editor);
+
+    const after_bytes = try cwd.readFileAlloc(gpa, temp_file, max_read_bytes);
+    defer gpa.free(after_bytes);
+    const after_hash = std.hash.Wyhash.hash(0, after_bytes);
+
+    if ((result == .detached or before_hash == after_hash) and stdinIsTty()) {
+        try fmtWrite("Save/close the file, then press Enter to continue...\n", .{});
+        try waitForEnter();
+    }
 
     const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
         try cwd.deleteFile(temp_file);
@@ -783,44 +800,142 @@ fn editTaskFile(
     return .{ .success = .{ .id = id, .name = name } };
 }
 
-/// Edit a file with the given editor or the OS default if found
+/// Edit a file with the given editor or the OS default if found.
 fn editFile(
     gpa: std.mem.Allocator,
     path: []const u8,
     editor_name: ?[]const u8,
-) !void {
-    const editor = editor_name orelse try getDefaultEditor();
-    var editor_args_it = std.mem.splitScalar(u8, editor, ' ');
-    var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
+) !EditorSpawnResult {
+    if (editor_name) |explicit| {
+        return runEditorCommand(gpa, explicit, path) catch |err| switch (err) {
+            error.FileNotFound => return error.EditorNotFound,
+            else => return err,
+        };
+    }
+
+    // Try to find and use a default editor
+    var candidates = try std.ArrayList(EditorCmd).initCapacity(gpa, 8);
+    defer {
+        for (candidates.items) |c| c.deinit(gpa);
+        candidates.deinit(gpa);
+    }
+    try collectDefaultEditors(gpa, &candidates);
+
+    for (candidates.items) |c| {
+        const res = runEditorCommand(gpa, c.cmd, path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return res;
+    }
+    return error.EditorNotFound;
+}
+
+/// Run an editor command and open the file path.
+fn runEditorCommand(
+    gpa: std.mem.Allocator,
+    editor_cmd: []const u8,
+    path: []const u8,
+) !EditorSpawnResult {
+    var it = std.mem.splitScalar(u8, editor_cmd, ' ');
+    var argv = try std.ArrayList([]const u8).initCapacity(gpa, 8);
     defer argv.deinit(gpa);
-    while (editor_args_it.next()) |a| try argv.append(gpa, a);
+    while (it.next()) |a| {
+        if (a.len == 0) continue;
+        try argv.append(gpa, a);
+    }
+    if (argv.items.len == 0) return error.EditorNotFound;
     try argv.append(gpa, path);
 
+    // Spawn the editor child process
     var child = std.process.Child.init(argv.items, gpa);
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    // TODO: fix wait for gui editors
-    const term = child.spawnAndWait() catch |err| switch (err) {
-        error.FileNotFound => return error.EditorNotFound,
-        else => return err,
-    };
 
-    const exit_code: i32 = switch (term) {
-        .Exited => |code| @intCast(code),
-        .Signal => |sig| @intCast(sig),
-        else => 1,
-    };
-    _ = exit_code;
+    const start_ns = std.time.nanoTimestamp();
+    const term = try child.spawnAndWait();
+    const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() -| start_ns);
+    const wait_treshold_ns = std.time.ns_per_s;
+
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) return error.EditorFailed;
+            // Is likely a GUI editor if the process exits immediately
+            if (elapsed_ns < wait_treshold_ns) return .detached;
+            return .waited;
+        },
+        else => return error.EditorFailed,
+    }
 }
 
 /// Return the default editor
-fn getDefaultEditor() ![]const u8 {
-    return switch (builtin.os.tag) {
-        .linux => "vi",
-        .windows => "notepad",
-        else => "vi",
+const EditorCmd = struct {
+    cmd: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+        if (self.owned) gpa.free(self.cmd);
+    }
+};
+
+/// Get the possible default editors in preference order.
+fn collectDefaultEditors(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(EditorCmd),
+) !void {
+    try appendEnvEditor(gpa, out, "VISUAL");
+    try appendEnvEditor(gpa, out, "EDITOR");
+
+    switch (builtin.os.tag) {
+        .linux => {
+            try out.append(gpa, .{ .cmd = "nano" });
+            try out.append(gpa, .{ .cmd = "vim" });
+            try out.append(gpa, .{ .cmd = "vi" });
+        },
+        .macos => {
+            try out.append(gpa, .{ .cmd = "vim" });
+            try out.append(gpa, .{ .cmd = "vi" });
+        },
+        .windows => {
+            try out.append(gpa, .{ .cmd = "notepad" });
+        },
+        else => {
+            try out.append(gpa, .{ .cmd = "vi" });
+        },
+    }
+}
+
+/// Add the editor in the ENV variable to the back of the list.
+fn appendEnvEditor(
+    gpa: std.mem.Allocator,
+    out: *std.ArrayList(EditorCmd),
+    name: []const u8,
+) !void {
+    const env = std.process.getEnvVarOwned(gpa, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return,
+        else => return err,
     };
+    if (env.len == 0) {
+        gpa.free(env);
+        return;
+    }
+    try out.append(gpa, .{ .cmd = env, .owned = true });
+}
+
+fn stdinIsTty() bool {
+    return std.fs.File.stdin().isTty();
+}
+
+/// Wait until enter key is pressed
+fn waitForEnter() !void {
+    var c: [1]u8 = undefined;
+    const stdin = std.fs.File.stdin();
+    while (true) {
+        const n = try stdin.read(&c);
+        if (n == 0) return;
+        if (c[0] == '\n') return;
+    }
 }
 
 /// Write to stdout with format
