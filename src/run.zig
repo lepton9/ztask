@@ -418,19 +418,7 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
         const old_id = try gpa.dupe(u8, new.id);
         defer gpa.free(old_id);
         const res = try editTaskFile(gpa, new.file_path, options.editor);
-        switch (res) {
-            .success => |s| {
-                defer {
-                    gpa.free(s.id);
-                    gpa.free(s.name);
-                }
-                _ = try datastore.applyEditedTaskMeta(gpa, old_id, s.id, s.name);
-            },
-            .err => |err| try fmtWrite(
-                "Invalid task file format: {s}\n",
-                .{@errorName(err)},
-            ),
-        }
+        try applyEditResult(gpa, &datastore, old_id, res);
     }
 }
 
@@ -716,20 +704,7 @@ pub fn editTask(
     defer gpa.free(old_id);
 
     const res = try editTaskFile(gpa, meta.file_path, options.editor);
-    switch (res) {
-        .success => |s| {
-            defer {
-                gpa.free(s.id);
-                gpa.free(s.name);
-            }
-            const updated = try datastore.applyEditedTaskMeta(gpa, old_id, s.id, s.name);
-            try fmtWrite("File saved: {s} (id: {s})\n", .{ updated.file_path, updated.id });
-        },
-        .err => |err| try fmtWrite(
-            "Invalid task file format: {s}\n",
-            .{@errorName(err)},
-        ),
-    }
+    try applyEditResult(gpa, &datastore, old_id, res);
 }
 
 /// Restore normal output behavior.
@@ -757,47 +732,76 @@ const EditResult = union(enum) {
     err: anyerror,
 };
 
+fn applyEditResult(
+    gpa: std.mem.Allocator,
+    datastore: *data.DataStore,
+    old_id: []const u8,
+    res: EditResult,
+) !void {
+    switch (res) {
+        .success => |s| {
+            defer {
+                gpa.free(s.id);
+                gpa.free(s.name);
+            }
+            const updated = try datastore.applyEditedTaskMeta(gpa, old_id, s.id, s.name);
+            try fmtWrite(
+                "File saved: {s} (id: {s})\n",
+                .{ updated.file_path, updated.id },
+            );
+        },
+        .err => |err| try fmtWrite(
+            "Invalid task file format: {s}\n",
+            .{@errorName(err)},
+        ),
+    }
+}
+
 const EditorSpawnResult = enum { waited, detached };
 
 fn editTaskFile(
     gpa: std.mem.Allocator,
     file_path: []const u8,
     editor: ?[]const u8,
-    // TODO: add a option to continue editing after parse error?
 ) !EditResult {
-    const max_read_bytes = 1024 * 1024;
-    const cwd = std.fs.cwd();
-    const temp_file = try std.fmt.allocPrint(gpa, "{s}.tmp", .{file_path});
+    const temp_file = try allocUniqueTempPath(gpa, file_path);
     defer gpa.free(temp_file);
     try std.fs.copyFileAbsolute(file_path, temp_file, .{});
 
     // Track whether the user modified something
-    const before_bytes = try cwd.readFileAlloc(gpa, temp_file, max_read_bytes);
-    defer gpa.free(before_bytes);
-    const before_hash = std.hash.Wyhash.hash(0, before_bytes);
+    var before_hash = try fileHash(gpa, temp_file);
 
-    const result = try editFile(gpa, temp_file, editor);
+    // Edit while valid task file or user canceled
+    while (true) {
+        const result = try editFile(gpa, temp_file, editor);
+        const after_hash = try fileHash(gpa, temp_file);
 
-    const after_bytes = try cwd.readFileAlloc(gpa, temp_file, max_read_bytes);
-    defer gpa.free(after_bytes);
-    const after_hash = std.hash.Wyhash.hash(0, after_bytes);
+        if ((result == .detached or before_hash == after_hash) and stdinIsTty()) {
+            try fmtWrite("Save/close the file, then press Enter to continue...\n", .{});
+            try waitForEnter();
+        }
+        before_hash = after_hash;
 
-    if ((result == .detached or before_hash == after_hash) and stdinIsTty()) {
-        try fmtWrite("Save/close the file, then press Enter to continue...\n", .{});
-        try waitForEnter();
+        // Validate the task file
+        const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
+            const ans = try promptYesNo(
+                "Invalid task file format: {any}. Re-edit? [Y/n] ",
+                .{err},
+            );
+            if (ans) continue;
+
+            // Keep the temp file so the user can recover their edits
+            try fmtWrite("Kept temporary file at: {s}\n", .{temp_file});
+            return .{ .err = err };
+        };
+        defer parsed.deinit(gpa);
+
+        try std.fs.renameAbsolute(temp_file, file_path);
+
+        const id = try gpa.dupe(u8, parsed.id.fmt());
+        const name = try gpa.dupe(u8, parsed.name);
+        return .{ .success = .{ .id = id, .name = name } };
     }
-
-    const parsed = data.loadTaskFile(gpa, temp_file) catch |err| {
-        try cwd.deleteFile(temp_file);
-        return .{ .err = err };
-    };
-    defer parsed.deinit(gpa);
-
-    try cwd.rename(temp_file, file_path);
-
-    const id = try gpa.dupe(u8, parsed.id.fmt());
-    const name = try gpa.dupe(u8, parsed.name);
-    return .{ .success = .{ .id = id, .name = name } };
 }
 
 /// Edit a file with the given editor or the OS default if found.
@@ -938,6 +942,37 @@ fn waitForEnter() !void {
     }
 }
 
+/// Prompt the user for a Y/n answer
+fn promptYesNo(comptime fmt: []const u8, args: anytype) !bool {
+    if (!stdinIsTty() or builtin.is_test) return false;
+    try fmtWrite(fmt, args);
+
+    const stdin = std.fs.File.stdin();
+    var buf: [1]u8 = undefined;
+    var first: ?u8 = null;
+    while (true) {
+        const n = try stdin.read(&buf);
+        if (n == 0) break;
+        const b = buf[0];
+        if (b == '\n') break;
+        if (b == '\r') continue;
+        if (first == null and b != ' ' and b != '\t') first = b;
+    }
+
+    const c = first orelse '\n';
+    return switch (c) {
+        'y', 'Y', '\n' => true,
+        else => false,
+    };
+}
+
+fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{
+        file_path,
+        std.time.nanoTimestamp(),
+    });
+}
+
 /// Write to stdout with format
 pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
     if (builtin.is_test) return;
@@ -951,6 +986,16 @@ pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
 /// Write all the data to stdout
 pub fn write(bytes: []const u8) !void {
     return fmtWrite("{s}", .{bytes});
+}
+
+/// Return the hash of the file contents
+fn fileHash(gpa: std.mem.Allocator, file_path: []const u8) !u64 {
+    const max_read_bytes = 1024 * 1024;
+    var file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    const bytes = try file.readToEndAlloc(gpa, max_read_bytes);
+    defer gpa.free(bytes);
+    return std.hash.Wyhash.hash(0, bytes);
 }
 
 /// Check if a file exists at the path
