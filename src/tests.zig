@@ -321,8 +321,8 @@ test "repair_tasks_id_change" {
     const new_meta_path_b = try repaired.taskMetaPath(gpa, meta_b_new.id);
     defer gpa.free(new_meta_path_b);
 
-    try expect(!(run.fileExists(old_meta_path_a)));
-    try expect(run.fileExists(new_meta_path_a));
-    try expect(!(run.fileExists(old_meta_path_b)));
-    try expect(run.fileExists(new_meta_path_b));
+    try expect(!(data.fileExists(old_meta_path_a)));
+    try expect(data.fileExists(new_meta_path_a));
+    try expect(!(data.fileExists(old_meta_path_b)));
+    try expect(data.fileExists(new_meta_path_b));
 }

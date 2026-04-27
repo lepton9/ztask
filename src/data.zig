@@ -7,6 +7,8 @@ pub const APP_DATA_SUBDIR: []const u8 = "ztask";
 const RUN_COUNTER_FILE: []const u8 = "run_counter";
 const DATA_DIR_NAME: []const u8 = "data";
 const TASKS_DIR_NAME: []const u8 = "tasks";
+const TMP_TASK_BASE_NAME: []const u8 = ".ztask-tmp";
+const EDIT_TASK_BASE_NAME: []const u8 = ".ztask-edit";
 
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
 pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
@@ -767,10 +769,14 @@ pub const DataStore = struct {
         var it = dir.iterate();
         while (it.next() catch null) |entry| switch (entry.kind) {
             .file => {
+                if (std.mem.startsWith(u8, entry.name, EDIT_TASK_BASE_NAME) or
+                    std.mem.startsWith(u8, entry.name, TMP_TASK_BASE_NAME))
+                    continue;
+
                 const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
                 defer gpa.free(path);
                 _ = self.addTask(gpa, path) catch |err| switch (err) {
-                    error.TaskExists => continue,
+                    error.TaskExists, error.InvalidTaskFile => continue,
                     else => return err,
                 };
             },
@@ -1327,6 +1333,16 @@ pub fn openDir(
     };
 }
 
+/// Split path into directory, stem and extension.
+fn splitPath(
+    path: []const u8,
+) struct { dir: []const u8, stem: []const u8, ext: []const u8 } {
+    const dir = std.fs.path.dirname(path) orelse ".";
+    const stem = std.fs.path.stem(path);
+    const ext = std.fs.path.extension(path);
+    return .{ .dir = dir, .stem = stem, .ext = ext };
+}
+
 /// Return allocated realpath for path or null if not found.
 fn realpathAllocOrNull(gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
     const cwd = std.fs.cwd();
@@ -1345,6 +1361,56 @@ fn realPathFromParent(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     defer gpa.free(parent_real);
     const base = std.fs.path.basename(path);
     return try std.fs.path.join(gpa, &.{ parent_real, base });
+}
+
+/// Allocate a unique temporary task file path.
+pub fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    const p = splitPath(file_path);
+    const ext = p.ext;
+    const is_yaml = std.mem.eql(u8, ext, ".yml") or std.mem.eql(u8, ext, ".yaml");
+    const out_ext: []const u8 = if (is_yaml) ext else ".yml";
+
+    const name = try std.fmt.allocPrint(gpa, "{s}.{s}.{d}{s}", .{
+        TMP_TASK_BASE_NAME,
+        p.stem,
+        std.time.nanoTimestamp(),
+        out_ext,
+    });
+    defer gpa.free(name);
+    return std.fs.path.join(gpa, &.{ p.dir, name });
+}
+
+/// Allocate a path for a failed edit task file.
+pub fn allocResumeEditPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    const p = splitPath(file_path);
+    const ext = p.ext;
+    const is_yaml = std.mem.eql(u8, ext, ".yml") or std.mem.eql(u8, ext, ".yaml");
+    const out_ext: []const u8 = if (is_yaml) ext else ".yml";
+
+    const name = try std.fmt.allocPrint(gpa, "{s}.{s}{s}", .{
+        EDIT_TASK_BASE_NAME,
+        p.stem,
+        out_ext,
+    });
+    defer gpa.free(name);
+    return std.fs.path.join(gpa, &.{ p.dir, name });
+}
+
+/// Return the hash of the file contents
+pub fn fileHash(gpa: std.mem.Allocator, file_path: []const u8) !u64 {
+    const max_read_bytes = 1024 * 1024;
+    var file = try std.fs.openFileAbsolute(file_path, .{});
+    defer file.close();
+    const bytes = try file.readToEndAlloc(gpa, max_read_bytes);
+    defer gpa.free(bytes);
+    return std.hash.Wyhash.hash(0, bytes);
+}
+
+/// Check if a file exists at the path
+pub fn fileExists(path: []const u8) bool {
+    const cwd = std.fs.cwd();
+    const stat = cwd.statFile(path) catch return false;
+    return stat.kind == .file;
 }
 
 test "move_task" {

@@ -468,7 +468,7 @@ fn scanTasks(gpa: std.mem.Allocator, store: *data.DataStore, sink: anytype) !voi
     var it = store.tasks.iterator();
     while (it.next()) |e| {
         const meta = e.value_ptr;
-        if (!fileExists(meta.file_path)) {
+        if (!data.fileExists(meta.file_path)) {
             try sink.onMissing(meta);
             continue;
         }
@@ -772,27 +772,26 @@ fn editTaskFile(
     editor: ?[]const u8,
     resume_failed: bool,
 ) !EditResult {
-    const resume_file = try allocResumeEditPath(gpa, file_path);
+    const resume_file = try data.allocResumeEditPath(gpa, file_path);
     defer gpa.free(resume_file);
+    const edit_path = try data.allocUniqueTempPath(gpa, file_path);
+    defer gpa.free(edit_path);
 
-    var temp_file: ?[]u8 = null;
-    defer if (temp_file) |p| gpa.free(p);
-
-    const resume_edit = resume_failed and fileExistsAbsolute(resume_file);
-    const edit_path: []const u8 = if (resume_edit) resume_file else blk: {
-        const tmp = try allocUniqueTempPath(gpa, file_path);
-        temp_file = tmp;
-        try std.fs.copyFileAbsolute(file_path, tmp, .{});
-        break :blk tmp;
-    };
+    const resume_exists = resume_failed and data.fileExists(resume_file);
+    if (resume_exists) {
+        try std.fs.copyFileAbsolute(resume_file, edit_path, .{});
+    } else {
+        try std.fs.copyFileAbsolute(file_path, edit_path, .{});
+    }
 
     // Track whether the user modified something
-    var before_hash = try fileHash(gpa, edit_path);
+    const original_hash = try data.fileHash(gpa, edit_path);
+    var before_hash = original_hash;
 
     // Edit while valid task file or user canceled
     while (true) {
         const result = try editFile(gpa, edit_path, editor);
-        const after_hash = try fileHash(gpa, edit_path);
+        const after_hash = try data.fileHash(gpa, edit_path);
         const changed = before_hash != after_hash;
         before_hash = after_hash;
 
@@ -809,23 +808,18 @@ fn editTaskFile(
             );
             if (ans) continue;
 
-            const is_resume = std.mem.eql(u8, edit_path, resume_file);
-            const kept = if (is_resume) true else if (changed) blk: {
+            if (original_hash != after_hash) {
                 try std.fs.renameAbsolute(edit_path, resume_file);
-                break :blk true;
-            } else blk: {
-                std.fs.deleteFileAbsolute(edit_path) catch {};
-                break :blk false;
-            };
-
-            if (kept) {
                 try fmtWrite("Kept temporary file at: {s}\n", .{resume_file});
+            } else {
+                std.fs.deleteFileAbsolute(edit_path) catch {};
             }
             return .{ .err = err };
         };
         defer parsed.deinit(gpa);
 
         try std.fs.renameAbsolute(edit_path, file_path);
+        std.fs.deleteFileAbsolute(resume_file) catch {};
 
         const id = try gpa.dupe(u8, parsed.id.fmt());
         const name = try gpa.dupe(u8, parsed.name);
@@ -995,31 +989,6 @@ fn promptYesNo(comptime fmt: []const u8, args: anytype) !bool {
     };
 }
 
-fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(file_path) orelse ".";
-    const base = std.fs.path.basename(file_path);
-    const name = try std.fmt.allocPrint(
-        gpa,
-        ".{s}.tmp.{d}",
-        .{ base, std.time.nanoTimestamp() },
-    );
-    defer gpa.free(name);
-    return std.fs.path.join(gpa, &.{ dir, name });
-}
-
-fn allocResumeEditPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
-    const dir = std.fs.path.dirname(file_path) orelse ".";
-    const base = std.fs.path.basename(file_path);
-    const name = try std.fmt.allocPrint(gpa, ".{s}.ztask-edit", .{base});
-    defer gpa.free(name);
-    return std.fs.path.join(gpa, &.{ dir, name });
-}
-
-fn fileExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
-    return true;
-}
-
 /// Write to stdout with format
 pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
     if (builtin.is_test) return;
@@ -1033,21 +1002,4 @@ pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
 /// Write all the data to stdout
 pub fn write(bytes: []const u8) !void {
     return fmtWrite("{s}", .{bytes});
-}
-
-/// Return the hash of the file contents
-fn fileHash(gpa: std.mem.Allocator, file_path: []const u8) !u64 {
-    const max_read_bytes = 1024 * 1024;
-    var file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    const bytes = try file.readToEndAlloc(gpa, max_read_bytes);
-    defer gpa.free(bytes);
-    return std.hash.Wyhash.hash(0, bytes);
-}
-
-/// Check if a file exists at the path
-pub fn fileExists(path: []const u8) bool {
-    const cwd = std.fs.cwd();
-    const stat = cwd.statFile(path) catch return false;
-    return stat.kind == .file;
 }
