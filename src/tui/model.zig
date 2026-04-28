@@ -88,6 +88,90 @@ pub const Model = struct {
         };
     }
 
+    fn drawStatusBar(
+        self: *Model,
+        ctx: vxfw.DrawContext,
+        max_width: u16,
+    ) AllocError!vxfw.Surface {
+        const status = self.snapshot.status;
+        const w: usize = @intCast(max_width);
+
+        const dim: vaxis.Style = .{ .dim = true };
+        const separator = " | ";
+
+        var segs = try std.ArrayList(vxfw.RichText.TextSpan).initCapacity(ctx.arena, 16);
+
+        const active_seg: vxfw.RichText.TextSpan = .{
+            .text = try std.fmt.allocPrint(ctx.arena, "{d}", .{status.active_tasks}),
+            .style = .{
+                .fg = if (status.active_tasks == 0) COLOR_GREEN else COLOR_YELLOW,
+            },
+        };
+        const local_seg: vxfw.RichText.TextSpan = .{
+            .text = try std.fmt.allocPrint(ctx.arena, "{d}", .{status.free_local_runners}),
+            .style = .{
+                .fg = if (status.free_local_runners == 0) COLOR_RED else COLOR_GREEN,
+            },
+        };
+        const remote_seg: vxfw.RichText.TextSpan = .{
+            .text = try std.fmt.allocPrint(ctx.arena, "{d}", .{status.connected_remote_runners}),
+            .style = .{
+                .fg = if (status.connected_remote_runners == 0) .default else COLOR_GREEN,
+            },
+        };
+
+        // Add status segments
+        segs.appendAssumeCapacity(
+            .{ .text = "ztask", .style = .{ .fg = COLOR_SELECTED } },
+        );
+        segs.appendAssumeCapacity(.{ .text = separator, .style = dim });
+        segs.appendAssumeCapacity(.{ .text = "tasks ", .style = dim });
+        segs.appendAssumeCapacity(active_seg);
+        segs.appendAssumeCapacity(.{ .text = separator, .style = dim });
+        segs.appendAssumeCapacity(.{ .text = "local ", .style = dim });
+        segs.appendAssumeCapacity(local_seg);
+        segs.appendAssumeCapacity(.{ .text = separator, .style = dim });
+        segs.appendAssumeCapacity(.{ .text = "remote ", .style = dim });
+        segs.appendAssumeCapacity(remote_seg);
+
+        const left_len: usize = blk: {
+            var len: usize = 0;
+            for (segs.items) |seg| {
+                len += seg.text.len;
+            }
+            break :blk len;
+        };
+
+        // Display help text
+        const right_content: struct { []const u8, vaxis.Style } = blk: {
+            if (self.confirm != null) break :blk .{
+                self.info.text orelse "",
+                .{ .fg = COLOR_YELLOW },
+            };
+            if (self.info.text) |t| break :blk .{ t, .{ .fg = .default } };
+            break :blk .{ switch (self.active) {
+                .task_view => " tab switch  enter open  esc back  q quit",
+                .task_list => " j/k move  r run  s stop  d delete  enter open  q quit",
+                else => " q quit",
+            }, dim };
+        };
+
+        const space_left: usize = w -| left_len;
+        const right_txt = try truncateWithEllipsis(ctx.arena, right_content.@"0", space_left);
+        const pad = try repeatSpaces(ctx.arena, w -| (left_len + right_txt.len));
+
+        if (pad.len != 0) segs.appendAssumeCapacity(.{ .text = pad, .style = dim });
+        if (right_txt.len != 0) {
+            segs.appendAssumeCapacity(.{ .text = right_txt, .style = right_content.@"1" });
+        }
+
+        const status_bar = vxfw.RichText{ .text = try segs.toOwnedSlice(ctx.arena) };
+        return status_bar.draw(ctx.withConstraints(
+            .{ .width = 1, .height = 1 },
+            .{ .width = max_width, .height = 1 },
+        ));
+    }
+
     /// Event handler callback
     fn eventHandler(ptr: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
         const self: *Model = @ptrCast(@alignCast(ptr));
@@ -136,7 +220,9 @@ pub const Model = struct {
                 }
                 ctx.consumeEvent();
             },
-            .focus_in => {},
+            .focus_in => {
+                self.active = if (self.confirm != null) .info else .status;
+            },
             else => {},
         }
     }
@@ -159,50 +245,9 @@ pub const Model = struct {
     fn drawFn(ptr: *anyopaque, ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const self: *Model = @ptrCast(@alignCast(ptr));
         const max_size = ctx.max.size();
-
-        var buf: [512]u8 = undefined;
-
-        // Status text
-        const status = self.snapshot.status;
-        const status_text = try ctx.arena.dupe(u8, std.fmt.bufPrint(
-            &buf,
-            "Active tasks: {d} | Free runners: {d} | Remote runners: {d}",
-            .{
-                status.active_tasks,
-                status.free_local_runners,
-                status.connected_remote_runners,
-            },
-        ) catch "");
-        const status_border: vxfw.Border = .{
-            .child = (vxfw.Text{ .text = status_text }).widget(),
-            .labels = &[_]vxfw.Border.BorderLabel{.{
-                .text = "Status",
-                .alignment = .top_left,
-            }},
-        };
-
-        var bar_children =
-            try std.ArrayList(vxfw.FlexItem).initCapacity(ctx.arena, 2);
-        bar_children.appendAssumeCapacity(.init(status_border.widget(), 1));
-
-        if (self.info.text) |info| {
-            const info_border: vxfw.Border = .{
-                .child = (vxfw.Text{ .text = info }).widget(),
-                .labels = &[_]vxfw.Border.BorderLabel{.{
-                    .text = "Info",
-                    .alignment = .top_left,
-                }},
-                .style = .{ .fg = if (self.active == .info) COLOR_SELECTED else .default },
-            };
-            bar_children.appendAssumeCapacity(.init(info_border.widget(), 1));
-        }
-
-        const status_bar_flex: vxfw.FlexRow = .{
-            .children = try bar_children.toOwnedSlice(ctx.arena),
-        };
         const status_bar_surf: vxfw.SubSurface = .{
             .origin = .{ .row = 0, .col = 0 },
-            .surface = try status_bar_flex.draw(ctx),
+            .surface = try self.drawStatusBar(ctx, max_size.width),
         };
 
         const task_split_surf: vxfw.SubSurface = .{
@@ -1530,4 +1575,25 @@ fn keyUp(key: vaxis.Key) bool {
 /// Check if pressed key is down
 fn keyDown(key: vaxis.Key) bool {
     return key.matches('j', .{ .ctrl = false }) or key.matches(vaxis.Key.down, .{});
+}
+
+/// Allocate a string containing `n` spaces.
+fn repeatSpaces(arena: std.mem.Allocator, n: usize) ![]const u8 {
+    if (n == 0) return "";
+    const buf = try arena.alloc(u8, n);
+    @memset(buf, ' ');
+    return buf;
+}
+
+/// Truncate the string to fit into the max_len.
+/// Ends in an ellipsis '...' if the content is too long.
+fn truncateWithEllipsis(
+    arena: std.mem.Allocator,
+    s: []const u8,
+    max_len: usize,
+) ![]const u8 {
+    if (max_len == 0) return "";
+    if (s.len <= max_len) return s;
+    if (max_len <= 3) return try arena.dupe(u8, s[0..max_len]);
+    return try std.fmt.allocPrint(arena, "{s}...", .{s[0 .. max_len - 3]});
 }
