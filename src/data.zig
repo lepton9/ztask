@@ -670,7 +670,8 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         spec: TaskCreateOptions,
     ) !*TaskMetadata {
-        const new_task = try task.Task.init(gpa, spec.name);
+        const name = try parse.parseStringField(spec.name);
+        const new_task = try task.Task.init(gpa, name);
         defer new_task.deinit(gpa);
 
         // Set the file path for the new task file

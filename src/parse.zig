@@ -20,6 +20,7 @@ pub const ParseError = error{
     InvalidStepKind,
     InvalidFieldType,
     InvalidFieldName,
+    InvalidFieldValue,
     InvalidTrigger,
     InvalidTriggerHour,
     InvalidTriggerMin,
@@ -31,12 +32,14 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     // Task name
     const name: []const u8 = blk: {
         const nv = map.get("name") orelse return ParseError.UnnamedTask;
-        break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
+        const name = nv.asScalar() orelse return ParseError.InvalidFieldType;
+        break :blk try parseStringField(name);
     };
 
     const id_maybe: ?[]const u8 = blk: {
         const nv = map.get("id") orelse break :blk null;
-        break :blk nv.asScalar() orelse return ParseError.InvalidFieldType;
+        const id = nv.asScalar() orelse return ParseError.InvalidFieldType;
+        break :blk try parseStringField(id);
     };
 
     // Trigger
@@ -283,6 +286,12 @@ fn parseRunLocationMap(map: yaml.Yaml.Map) !task.RunLocation {
         } };
     }
     return error.InvalidRunOnType;
+}
+
+pub fn parseStringField(str: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, str, " \t\r\n");
+    if (trimmed.len == 0) return ParseError.InvalidFieldValue;
+    return trimmed;
 }
 
 pub fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {

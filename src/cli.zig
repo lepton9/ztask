@@ -3,7 +3,9 @@ pub const zcli = @import("zcli");
 const run = @import("run.zig");
 const options = @import("build_options");
 const remote_man = @import("remote/remote_manager.zig");
+const builtin = @import("builtin");
 
+const ParseError = @import("parse.zig").ParseError;
 const DataDirMode = @import("data.zig").DataStore.DataDirMode;
 const ListenOptions = run.ListenOptions;
 const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
@@ -70,6 +72,11 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Name of the task",
                 .required = true,
                 .arg = .{ .name = "NAME", .type = .Text },
+            },
+            .{
+                .long_name = "id",
+                .desc = "ID of the task",
+                .arg = .{ .name = "ID", .type = .Text },
             },
             .{
                 .long_name = "edit",
@@ -273,10 +280,22 @@ const runner_n_option: zcli.Opt = .{
     .arg = .{ .name = "INT", .type = .Int },
 };
 
-/// Write error message and exit the program
+/// Write error message and exit the program.
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    fmtWrite(fmt, args) catch {};
+    const fmt_nl = comptime blk: {
+        if (std.mem.endsWith(u8, fmt, "\n")) break :blk fmt;
+        break :blk fmt ++ "\n";
+    };
+    fmtWrite(fmt_nl, args) catch {};
     std.process.exit(1);
+}
+
+/// Check if the error is in the given error set.
+fn inErrorSet(err: anyerror, comptime E: type) bool {
+    if (@typeInfo(E).error_set) |err_set| for (err_set) |err_info| {
+        if (std.mem.eql(u8, @errorName(err), err_info.name)) return true;
+    };
+    return false;
 }
 
 /// Generate shell completions
@@ -325,13 +344,26 @@ fn cmdNewFn(ptr: *anyopaque) !void {
     if (cli.find_opt("editor")) |opt| {
         opts.editor = opt.value.?.string;
     }
+    if (cli.find_opt("id")) |opt| {
+        opts.id = opt.value.?.string;
+    }
 
     run.createNewTask(ctx.gpa, opts) catch |err| switch (err) {
         error.EditorNotFound => if (opts.editor) |e|
             fatal("Editor not found: '{s}'", .{e})
         else
             fatal("No default editor found", .{}),
-        else => fatal("Error {any}", .{err}),
+        error.TaskExists => if (opts.id) |e|
+            fatal("Task exists with ID: {s}", .{e})
+        else
+            fatal("Task already exists with the given ID", .{}),
+        else => {
+            if (inErrorSet(err, ParseError)) {
+                fatal("Invalid task file: {any}", .{err});
+                return;
+            }
+            fatal("Error: {any}", .{err});
+        },
     };
 }
 
@@ -357,7 +389,7 @@ fn cmdMoveFn(ptr: *anyopaque) !void {
         error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
         error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
         error.InvalidTaskFile => fatal("Moved file is not a task file: '{s}'", .{to}),
-        else => fatal("Error {any}", .{err}),
+        else => fatal("Error: {any}", .{err}),
     };
 }
 
@@ -389,7 +421,13 @@ fn cmdEditFn(ptr: *anyopaque) !void {
             fatal("Editor not found: '{s}'", .{e})
         else
             fatal("No default editor found", .{}),
-        else => fatal("Error {any}", .{err}),
+        else => {
+            if (inErrorSet(err, ParseError)) {
+                fatal("Invalid task file: {any}", .{err});
+                return;
+            }
+            fatal("Error: {any}", .{err});
+        },
     };
 }
 
@@ -410,6 +448,10 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .data_dir = ctx.data_dir,
         .listen = ctx.listen,
     };
+    if (opts.path != null and opts.id != null) {
+        fatal("Options '--path' and '--id' are mutually exclusive.", .{});
+    }
+
     if (cli.find_opt("runners")) |opt| {
         const n = opt.value.?.int;
         if (n < 0 or n > run.MAX_RUNNERS_N) fatal(
@@ -566,7 +608,7 @@ fn cmdAddFn(ptr: *anyopaque) !void {
         error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
         error.InvalidTaskFile => fatal("Not a task file", .{}),
         error.TaskExists => fatal("Task already exists", .{}),
-        else => fatal("Error {any}", .{err}),
+        else => fatal("Error: {any}", .{err}),
     };
 }
 
@@ -592,7 +634,7 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
             }
         },
         error.FileNotFound => fatal("File not found: '{s}'", .{opts.task.path}),
-        else => fatal("Error {any}", .{err}),
+        else => fatal("Error: {any}", .{err}),
     };
 }
 
@@ -650,5 +692,10 @@ pub fn handleArgs(gpa: std.mem.Allocator, cli: *zcli.Cli) !void {
         .data_dir = data_dir_mode,
         .listen = listen_opts,
     };
-    try cmdFn(&ctx);
+    cmdFn(&ctx) catch |err| {
+        if (builtin.mode == .Debug) {
+            std.debug.dumpStackTrace(@errorReturnTrace().?.*);
+        }
+        fatal("Unexpected error: {any}", .{err});
+    };
 }

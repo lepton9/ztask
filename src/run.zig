@@ -400,6 +400,7 @@ pub const CreateOptions = struct {
     edit: bool = false,
     editor: ?[]const u8 = null,
     name: []const u8,
+    id: ?[]const u8 = null,
 };
 
 /// Create a new task
@@ -409,7 +410,7 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
-    const new = try datastore.newTask(gpa, .{ .name = options.name });
+    const new = try datastore.newTask(gpa, .{ .name = options.name, .id = options.id });
 
     try fmtWrite("Task '{s}' created at: {s}\n", .{ new.name, new.file_path });
 
