@@ -93,6 +93,9 @@ pub const RemoteAgent = struct {
             self.handleLogs() catch {};
             self.handleResults();
         }
+
+        self.handleLogs() catch {};
+        self.handleResults();
     }
 
     /// Stop the agent
@@ -255,8 +258,9 @@ pub const RemoteAgent = struct {
     fn handleLogs(self: *RemoteAgent) !void {
         while (self.log_queue.pop()) |event| switch (event) {
             .job_started => |e| {
+                defer if (e.name) |name| self.gpa.free(name);
                 const msg: protocol.JobStartMsg = .{
-                    .job_id = e.job_node.id,
+                    .job_id = e.job_id,
                     .timestamp = e.timestamp_ms,
                 };
                 const payload = try self.parser.serialize(self.gpa, .{
@@ -264,12 +268,15 @@ pub const RemoteAgent = struct {
                 });
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
-                log.info("Starting job {s}", .{e.job_node.ptr.name});
+                if (e.name) |name|
+                    log.info("Starting job {s}", .{name})
+                else
+                    log.info("Starting job {x}", .{e.job_id});
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
                 const msg: protocol.JobLogMsg = .{
-                    .job_id = e.job_node.id,
+                    .job_id = e.job_id,
                     .data = e.data,
                     .step = e.step,
                 };
@@ -280,8 +287,9 @@ pub const RemoteAgent = struct {
                 self.sendMessage(payload);
             },
             .job_finished => |e| {
+                defer if (e.name) |name| self.gpa.free(name);
                 const msg: protocol.JobEndMsg = .{
-                    .job_id = e.job_node.id,
+                    .job_id = e.job_id,
                     .timestamp = e.timestamp_ms,
                     .exit_code = e.exit_code,
                 };
@@ -290,7 +298,10 @@ pub const RemoteAgent = struct {
                 });
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
-                log.info("Finished job {s}", .{e.job_node.ptr.name});
+                if (e.name) |name|
+                    log.info("Finished job {s}", .{name})
+                else
+                    log.info("Finished job {x}", .{e.job_id});
             },
         };
     }

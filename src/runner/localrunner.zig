@@ -14,9 +14,12 @@ pub const Result = struct {
 };
 
 pub const LogEvent = union(enum) {
-    job_started: struct { job_node: *JobNode, timestamp_ms: i64 },
-    job_output: struct { job_node: *JobNode, step: u32, data: []const u8 },
-    job_finished: struct { job_node: *JobNode, exit_code: i32, timestamp_ms: i64 },
+    /// Consumers must free the `name`.
+    job_started: struct { job_id: u64, name: ?[]u8, timestamp_ms: i64 },
+    /// Consumers must free the `data`.
+    job_output: struct { job_id: u64, step: u32, data: []u8 },
+    /// Consumers must free the `name`.
+    job_finished: struct { job_id: u64, name: ?[]u8, exit_code: i32, timestamp_ms: i64 },
 };
 
 pub const ResultQueue = queue.MutexQueue(Result);
@@ -107,7 +110,8 @@ pub const LocalRunner = struct {
         log.debug("Start job: {s} ({d})", .{ job.ptr.name, job.id });
 
         logs.append(gpa, .{ .job_started = .{
-            .job_node = job,
+            .job_id = job.id,
+            .name = gpa.dupe(u8, job.ptr.name) catch null,
             .timestamp_ms = std.time.milliTimestamp(),
         } }) catch {};
 
@@ -143,7 +147,8 @@ pub const LocalRunner = struct {
         if (!self.running.load(.seq_cst)) return;
 
         logs.append(gpa, .{ .job_finished = .{
-            .job_node = job,
+            .job_id = job.id,
+            .name = gpa.dupe(u8, job.ptr.name) catch null,
             .exit_code = exit_code,
             .timestamp_ms = std.time.milliTimestamp(),
         } }) catch {};
@@ -286,7 +291,7 @@ fn readLogs(
     reader.end = 0;
 
     logs.append(gpa, .{ .job_output = .{
-        .job_node = job,
+        .job_id = job.id,
         .step = @intCast(step_index),
         .data = data,
     } }) catch {};

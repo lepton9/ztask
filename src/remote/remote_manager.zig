@@ -201,7 +201,8 @@ pub const RemoteManager = struct {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
                 try req.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
-                    .job_node = req.job_node,
+                    .job_id = req.job_node.id,
+                    .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
                     .timestamp_ms = m.timestamp,
                 } });
             },
@@ -209,7 +210,7 @@ pub const RemoteManager = struct {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
                 try req.scheduler.log_queue.append(self.gpa, .{ .job_output = .{
-                    .job_node = req.job_node,
+                    .job_id = req.job_node.id,
                     .step = m.step,
                     .data = try self.gpa.dupe(u8, m.data),
                 } });
@@ -219,7 +220,8 @@ pub const RemoteManager = struct {
                     return error.NoDispatchedJob;
                 const req = kv.value;
                 try req.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
-                    .job_node = req.job_node,
+                    .job_id = req.job_node.id,
+                    .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
                     .exit_code = m.exit_code,
                     .timestamp_ms = m.timestamp,
                 } });

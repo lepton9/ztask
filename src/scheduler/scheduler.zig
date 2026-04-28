@@ -55,7 +55,7 @@ pub const Scheduler = struct {
 
     logger: logger.RunLogger,
     task_meta: data.TaskRunMetadata,
-    job_metas: std.AutoHashMapUnmanaged(*JobNode, data.JobRunMetadata),
+    job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -99,7 +99,7 @@ pub const Scheduler = struct {
         try scheduler.job_metas.ensureTotalCapacity(gpa, @intCast(node_n));
         for (scheduler.nodes) |*node| {
             node.id = @intFromPtr(node); // Set temporary ID for job node
-            scheduler.job_metas.putAssumeCapacity(node, .{
+            scheduler.job_metas.putAssumeCapacity(node.id, .{
                 .job_name = node.ptr.name,
             });
         }
@@ -191,7 +191,7 @@ pub const Scheduler = struct {
         // Reset job nodes
         for (self.nodes) |*node| {
             node.reset();
-            const job_meta = self.job_metas.getPtr(node) orelse unreachable;
+            const job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
             self.logger.initJobMeta(self.gpa, job_meta) catch {};
         }
 
@@ -223,7 +223,7 @@ pub const Scheduler = struct {
         node.status = .running;
 
         self.active_runners.putAssumeCapacity(node, runner);
-        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
         const exec_mode: ExecMode = if (self.attach_job) |attach_name|
@@ -238,7 +238,7 @@ pub const Scheduler = struct {
         const node = self.queue.pop() orelse return;
         node.status = .running;
 
-        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
 
@@ -314,7 +314,7 @@ pub const Scheduler = struct {
     fn skipJob(self: *Scheduler, node: *JobNode) void {
         node.status = .skipped;
         // Log job metadata
-        var job_meta = self.job_metas.getPtr(node) orelse unreachable;
+        var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .interrupted;
         job_meta.end_time_ms = std.time.timestamp();
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
@@ -347,17 +347,19 @@ pub const Scheduler = struct {
     fn handleLogs(self: *Scheduler) void {
         while (self.log_queue.pop()) |event| switch (event) {
             .job_started => |e| {
-                var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                defer if (e.name) |name| self.gpa.free(name);
+                var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 job_meta.start_time_ms = e.timestamp_ms;
                 self.logger.logJobMetadata(self.gpa, job_meta) catch {};
             },
             .job_output => |e| {
-                const job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 defer self.gpa.free(e.data); // Allocated by runner or remote manager
                 self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
-                var job_meta = self.job_metas.getPtr(e.job_node) orelse unreachable;
+                defer if (e.name) |name| self.gpa.free(name);
+                var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 job_meta.end_time_ms = e.timestamp_ms;
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;

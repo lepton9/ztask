@@ -578,7 +578,7 @@ pub const TaskManager = struct {
                 var jobs = try arena.alloc(snap.UiJobSnap, job_nodes.len);
 
                 for (job_nodes, 0..) |*node, i| {
-                    const job_meta = sched.job_metas.get(node) orelse unreachable;
+                    const job_meta = sched.job_metas.get(node.id) orelse unreachable;
                     jobs[i] = .{
                         .job_name = try arena.dupe(u8, job_meta.job_name),
                         .status = if (sched.status == .waiting)
