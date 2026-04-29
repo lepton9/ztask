@@ -339,11 +339,13 @@ pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
     }
 }
 
+pub const TaskSelect = union(enum) {
+    path: []const u8,
+    id: []const u8,
+};
+
 pub const TaskOptions = struct {
-    task: union(enum) {
-        path: []const u8,
-        id: []const u8,
-    },
+    task: TaskSelect,
     data_dir: data.DataStore.DataDirMode = .auto,
 };
 

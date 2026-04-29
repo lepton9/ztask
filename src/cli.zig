@@ -21,6 +21,7 @@ pub const cli_spec: zcli.CliApp = .{
         .auto_help = true,
         .auto_version = true,
         .help_max_width = 80,
+        .exclusive_group_mode = .combined,
     },
     .commands = commands,
     .options = &[_]zcli.Opt{
@@ -103,13 +104,15 @@ const commands = &[_]zcli.Cmd{
                 .name = "path",
                 .desc = "Path for a file or directory",
                 .required = false,
+                .exclusive_group = TASK_SELECT_TAG,
             },
         },
         .options = &[_]zcli.Opt{
             .{
                 .long_name = "path",
-                .desc = "Path of the task file",
+                .desc = "Path of the task file or a directory",
                 .arg = .{ .name = "PATH", .type = .Path },
+                .exclusive_group = TASK_SELECT_TAG,
             },
             .{
                 .long_name = "recursive",
@@ -123,6 +126,7 @@ const commands = &[_]zcli.Cmd{
         .name = "delete",
         .desc = "Delete a task",
         .options = task_options,
+        .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdDeleteFn,
     },
     .{
@@ -153,6 +157,7 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Continue the last failed edit",
             },
         },
+        .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdEditFn,
     },
     .{
@@ -172,6 +177,7 @@ const commands = &[_]zcli.Cmd{
             },
             runner_n_option,
         },
+        .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdRunFn,
     },
     .{
@@ -260,17 +266,29 @@ const commands = &[_]zcli.Cmd{
     },
 };
 
+/// Mutually exclusive group
+const TASK_SELECT_TAG = "task_group";
+
 const task_options = &[_]zcli.Opt{
     .{
         .long_name = "path",
         .desc = "Path of the task file",
         .arg = .{ .name = "PATH", .type = .Path },
+        .exclusive_group = TASK_SELECT_TAG,
     },
     .{
         .long_name = "id",
         .desc = "ID of the task",
         .arg = .{ .name = "ID", .type = .Text },
+        .exclusive_group = TASK_SELECT_TAG,
     },
+};
+
+const path_positional: zcli.PosArg = .{
+    .name = "path",
+    .desc = "Path of the task file",
+    .required = false,
+    .exclusive_group = TASK_SELECT_TAG,
 };
 
 const runner_n_option: zcli.Opt = .{
@@ -304,7 +322,7 @@ fn generate_completion(
     comptime spec: *const zcli.CliApp,
 ) !noreturn {
     var buf: [8096]u8 = undefined;
-    const shell = cli.find_positional("shell") orelse unreachable;
+    const shell = cli.findPositional("shell") orelse unreachable;
     const script = try zcli.complete.getCompletion(
         &buf,
         spec,
@@ -333,18 +351,18 @@ fn cmdInitFn(ptr: *anyopaque) !void {
 fn cmdNewFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
-    const name_opt = cli.find_opt("name") orelse unreachable;
+    const name_opt = cli.findOption("name") orelse unreachable;
     const name = name_opt.value.?.string;
 
     var opts: run.CreateOptions = .{
         .data_dir = ctx.data_dir,
         .name = name,
-        .edit = cli.find_opt("edit") != null,
+        .edit = cli.findOption("edit") != null,
     };
-    if (cli.find_opt("editor")) |opt| {
+    if (cli.findOption("editor")) |opt| {
         opts.editor = opt.value.?.string;
     }
-    if (cli.find_opt("id")) |opt| {
+    if (cli.findOption("id")) |opt| {
         opts.id = opt.value.?.string;
     }
 
@@ -377,11 +395,11 @@ fn cmdDataFn(ptr: *anyopaque) !void {
 fn cmdMoveFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
-    const from_arg = cli.find_positional("FROM") orelse unreachable;
-    const to_arg = cli.find_positional("TO") orelse unreachable;
+    const from_arg = cli.findPositional("FROM") orelse unreachable;
+    const to_arg = cli.findPositional("TO") orelse unreachable;
     const from = from_arg.value;
     const to = to_arg.value;
-    const repair = cli.find_opt("repair") != null;
+    const repair = cli.findOption("repair") != null;
     run.moveTask(ctx.gpa, from, to, ctx.data_dir, .{
         .repair = repair,
     }) catch |err| switch (err) {
@@ -398,24 +416,25 @@ fn cmdEditFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
 
-    const task_opts: run.TaskOptions = if (cli.find_opt("path")) |path|
-        .{ .task = .{ .path = path.value.?.string } }
-    else if (cli.find_opt("id")) |id|
-        .{ .task = .{ .id = id.value.?.string } }
-    else
+    const task_arg = getTaskInput(cli) orelse
         fatal("No task given to edit", .{});
+
+    const task_opts: run.TaskOptions = switch (task_arg) {
+        .id => |id| .{ .task = .{ .id = id } },
+        .path => |path| .{ .task = .{ .path = path } },
+    };
 
     var opts: run.EditOptions = .{ .task_options = task_opts };
 
-    if (cli.find_opt("editor")) |opt| {
+    if (cli.findOption("editor")) |opt| {
         opts.editor = opt.value.?.string;
     }
-    opts.continue_failed = cli.find_opt("continue") != null;
+    opts.continue_failed = cli.findOption("continue") != null;
 
     run.editTask(ctx.gpa, ctx.data_dir, opts) catch |err| switch (err) {
-        error.FileNotFound => switch (task_opts.task) {
+        error.FileNotFound, error.TaskNotFound => switch (task_opts.task) {
             .path => |p| fatal("Task file not found: '{s}'", .{p}),
-            .id => |i| fatal("Task not found: '{s}'", .{i}),
+            .id => |i| fatal("Task not found with ID: '{s}'", .{i}),
         },
         error.EditorNotFound => if (opts.editor) |e|
             fatal("Editor not found: '{s}'", .{e})
@@ -436,23 +455,26 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
 
+    const task_arg = getTaskInput(cli) orelse
+        fatal("No task given to run", .{});
+
     var opts: run.RunOptions = .{
-        .path = if (cli.find_opt("path")) |o| o.value.?.string else null,
-        .id = if (cli.find_opt("id")) |o| o.value.?.string else null,
         .attach_job = blk: {
-            const o = cli.find_opt("attach") orelse break :blk null;
+            const o = cli.findOption("attach") orelse break :blk null;
             const value = o.value orelse break :blk .first;
             break :blk .{ .name = value.string };
         },
-        .retrigger = cli.find_opt("retrigger") != null,
+        .retrigger = cli.findOption("retrigger") != null,
         .data_dir = ctx.data_dir,
         .listen = ctx.listen,
     };
-    if (opts.path != null and opts.id != null) {
-        fatal("Options '--path' and '--id' are mutually exclusive.", .{});
+
+    switch (task_arg) {
+        .id => |id| opts.id = id,
+        .path => |path| opts.path = path,
     }
 
-    if (cli.find_opt("runners")) |opt| {
+    if (cli.findOption("runners")) |opt| {
         const n = opt.value.?.int;
         if (n < 0 or n > run.MAX_RUNNERS_N) fatal(
             "Invalid amount of runners '{d}'. (0 < n < {d})",
@@ -491,14 +513,14 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     var cli = ctx.cli;
 
-    const name_opt = cli.find_opt("name") orelse unreachable;
+    const name_opt = cli.findOption("name") orelse unreachable;
     const name = name_opt.value.?.string;
     const trimmed = std.mem.trim(u8, name, " \t");
     if (std.mem.eql(u8, trimmed, "")) fatal("Invalid runner name '{s}'", .{name});
 
-    const addr = cli.find_opt("address");
+    const addr = cli.findOption("address");
     const port: ?u16 = blk: {
-        if (cli.find_opt("port")) |p| {
+        if (cli.findOption("port")) |p| {
             const port = p.value.?.int;
             if (port < 0) return error.InvalidPort;
             break :blk @truncate(@as(u64, @intCast(port)));
@@ -508,7 +530,7 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
 
     if (addr) |a| opts.addr = a.value.?.string;
     if (port) |p| opts.port = p;
-    if (cli.find_opt("runners")) |opt| {
+    if (cli.findOption("runners")) |opt| {
         const n = opt.value.?.int;
         if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
         opts.runners_n = @intCast(n);
@@ -569,7 +591,7 @@ fn cmdListFn(ptr: *anyopaque) !void {
 /// Handle repair command
 fn cmdRepairFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    const dry_run = ctx.cli.find_opt("dry") != null;
+    const dry_run = ctx.cli.findOption("dry") != null;
     return run.repairTasks(
         ctx.gpa,
         ctx.data_dir,
@@ -591,14 +613,15 @@ fn cmdAddFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
 
-    const path: []const u8 = if (cli.find_positional("path")) |p|
-        p.value
-    else if (cli.find_opt("path")) |o|
-        o.value.?.string
-    else
+    const task_arg = getTaskInput(cli) orelse
         fatal("No path argument given", .{});
 
-    const recursive = cli.find_opt("recursive") != null;
+    const path: []const u8 = switch (task_arg) {
+        .path => |p| p,
+        else => unreachable, // Can't be id
+    };
+
+    const recursive = cli.findOption("recursive") != null;
     return run.addTasks(ctx.gpa, .{
         .path = path,
         .recursive = recursive,
@@ -617,14 +640,13 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
 
-    var opts: run.DeleteOptions = if (cli.find_opt("path")) |path|
-        .{ .task = .{ .path = path.value.?.string } }
-    else if (cli.find_opt("id")) |id|
-        .{ .task = .{ .id = id.value.?.string } }
-    else
+    const task_arg = getTaskInput(cli) orelse
         fatal("No task given to delete", .{});
 
-    opts.data_dir = ctx.data_dir;
+    const opts: run.DeleteOptions = .{
+        .task = task_arg,
+        .data_dir = ctx.data_dir,
+    };
 
     return run.deleteTask(ctx.gpa, opts) catch |err| switch (err) {
         error.TaskNotFound => {
@@ -638,10 +660,24 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
     };
 }
 
+/// Get the task input either from a path or id argument.
+///
+/// The task input must be in the 'TASK_SELECT_TAG' group.
+inline fn getTaskInput(cli: *zcli.Cli) ?run.TaskSelect {
+    const task_arg = cli.findGroupArg(TASK_SELECT_TAG) orelse return null;
+    return switch (task_arg) {
+        .option => |o| if (std.mem.eql(u8, o.name, "id"))
+            .{ .id = o.value.?.string }
+        else
+            .{ .path = o.value.?.string },
+        .positional => |p| .{ .path = p.value },
+    };
+}
+
 /// Get the used data directory selection.
 inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
-    const use_global = cli.find_opt("global") != null;
-    const data_dir_opt = cli.find_opt("data-dir");
+    const use_global = cli.findOption("global") != null;
+    const data_dir_opt = cli.findOption("data-dir");
     if (use_global and data_dir_opt != null) fatal(
         "Options '--global' and '--data-dir' are mutually exclusive.",
         .{},
@@ -653,7 +689,7 @@ inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
 
 /// Get the remote manager address
 inline fn getListenAddr(cli: *zcli.Cli) []const u8 {
-    const opt = cli.find_opt("listen-addr") orelse return DEFAULT_ADDR;
+    const opt = cli.findOption("listen-addr") orelse return DEFAULT_ADDR;
     const addr = opt.value.?.string;
     _ = std.net.Address.parseIp4(addr, 0) catch fatal(
         "Invalid listen address '{s}' (expected IPv4)",
@@ -664,7 +700,7 @@ inline fn getListenAddr(cli: *zcli.Cli) []const u8 {
 
 /// Get the remote manager port
 inline fn getListenPort(cli: *zcli.Cli) u16 {
-    const opt = cli.find_opt("listen-port") orelse return DEFAULT_PORT;
+    const opt = cli.findOption("listen-port") orelse return DEFAULT_PORT;
     const port_i64 = opt.value.?.int;
     if (port_i64 <= 0 or port_i64 > std.math.maxInt(u16)) fatal(
         "Invalid listen port '{d}' (expected 1-65535)",
