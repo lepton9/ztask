@@ -169,6 +169,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     try task_manager.beginTask(task_id, .{
         .attach_job = options.attach_job,
         .retrigger = options.retrigger,
+        .verbose_events = options.verbose,
     });
 
     const log = std.log.scoped(.run);
@@ -200,10 +201,19 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                     }
                     if (!task_has_trigger) exit = true;
                 },
+                .info => |e| {
+                    defer gpa.free(e.msg);
+                    if (!options.verbose) continue;
+                    if (e.task_id != task_id_value) continue;
+                    log.info(
+                        "{s:<12} task={s} {s}",
+                        .{ "info", task_id, e.msg },
+                    );
+                },
                 .err => |e| {
-                    if (!options.verbose) break;
+                    if (!options.verbose) continue;
                     log.err(
-                        "{s:<12} scope={s} msg={s}",
+                        "{s:<12} scope={s} ({s})",
                         .{ "error", @tagName(e.scope), e.msg },
                     );
                 },

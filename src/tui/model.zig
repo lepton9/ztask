@@ -288,6 +288,7 @@ pub const Model = struct {
                 "Finished task {x} ({s})",
                 .{ r.task_id, @tagName(r.status) },
             ),
+            .info => |e| self.gpa.free(e.msg),
             .err => |e| try self.setInfo("Error {s}: '{s}'", .{ @tagName(e.scope), e.msg }),
         };
     }

@@ -31,6 +31,24 @@ const LogEvent = localrunner.LogEvent;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
+/// Scheduler -> TaskManager event sink.
+pub const EventSink = struct {
+    ptr: *anyopaque,
+    emit: *const fn (ptr: *anyopaque, ev: Event) void,
+
+    pub const Event = union(enum) {
+        task_started: struct { task_id: u64 },
+        job_started: struct { task_id: u64, job_name: []const u8 },
+        job_finished: struct { task_id: u64, job_name: []const u8, exit_code: i32 },
+        job_error: struct {
+            task_id: u64,
+            job_name: []const u8,
+            err_name: []const u8,
+            msg: ?[]const u8 = null,
+        },
+    };
+};
+
 /// Scheduler for executing one task
 pub const Scheduler = struct {
     gpa: std.mem.Allocator,
@@ -57,12 +75,15 @@ pub const Scheduler = struct {
     task_meta: data.TaskRunMetadata,
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
+    event_sink: ?EventSink = null,
+
     pub fn init(
         gpa: std.mem.Allocator,
         task: *Task,
         pool: *RunnerPool,
         remote_manager: *remote.RemoteManager,
         datastore: *data.DataStore,
+        event_sink: ?EventSink,
     ) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
@@ -89,6 +110,7 @@ pub const Scheduler = struct {
             .logger = try .init(gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
             .job_metas = .{},
+            .event_sink = event_sink,
         };
 
         // Build the job node DAG
@@ -180,6 +202,8 @@ pub const Scheduler = struct {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
         try self.logger.startTask(self.gpa, &self.task_meta, run_id);
+
+        self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
 
         // Task has no jobs
         if (self.nodes.len == 0) {
@@ -351,6 +375,11 @@ pub const Scheduler = struct {
                 var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 job_meta.start_time_ms = e.timestamp_ms;
                 self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+
+                self.emitEvent(.{ .job_started = .{
+                    .task_id = self.task.id.value,
+                    .job_name = job_meta.job_name,
+                } });
             },
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
@@ -364,6 +393,12 @@ pub const Scheduler = struct {
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;
                 self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+
+                self.emitEvent(.{ .job_finished = .{
+                    .task_id = self.task.id.value,
+                    .job_name = job_meta.job_name,
+                    .exit_code = e.exit_code,
+                } });
             },
         };
     }
@@ -372,8 +407,15 @@ pub const Scheduler = struct {
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
         node.status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |err| {
-            log.debug("{}", .{err});
             node.status = .failed;
+            log.debug("{}", .{err});
+
+            self.emitEvent(.{ .job_error = .{
+                .task_id = self.task.id.value,
+                .job_name = node.ptr.name,
+                .err_name = @errorName(err),
+                .msg = result.msg,
+            } });
         }
         if (node.status == .failed) self.skipRemainingJobs();
 
@@ -388,6 +430,12 @@ pub const Scheduler = struct {
             self.tryScheduleJobs();
             if (self.allJobsCompleted()) self.completeTask();
         }
+    }
+
+    /// Emit an event to the sink if it is set.
+    inline fn emitEvent(self: *Scheduler, ev: EventSink.Event) void {
+        const sink = self.event_sink orelse return;
+        sink.emit(sink.ptr, ev);
     }
 
     /// Check if task is being executed

@@ -25,6 +25,8 @@ pub const BeginTaskOptions = struct {
     attach_job: ?AttachJob = null,
     /// Retrigger the task if trigger event occurs while the task is running
     retrigger: bool = false,
+    /// Emit additional events into the event queue.
+    verbose_events: bool = false,
 };
 
 /// Manages all tasks and triggers
@@ -58,10 +60,18 @@ pub const TaskManager = struct {
     tasks_changed: std.atomic.Value(bool) = .init(true),
 
     pub const Event = union(enum) {
+        /// Event for informing that the run finished.
         run_finished: struct {
             task_id: u64,
             status: data.TaskRunStatus,
         },
+        /// Informational events intended for verbose output.
+        /// The field `msg` is owned by the receiver and must be freed.
+        info: struct {
+            task_id: u64,
+            msg: []u8,
+        },
+        /// General error event.
         err: struct {
             scope: ErrorScope,
             msg: []const u8,
@@ -156,7 +166,7 @@ pub const TaskManager = struct {
     }
 
     /// Handle error and push it to the event queue
-    fn handleError(
+    fn emitError(
         self: *TaskManager,
         scope: Event.ErrorScope,
         err: anyerror,
@@ -166,6 +176,44 @@ pub const TaskManager = struct {
             .scope = scope,
             .msg = @errorName(err),
         } }) catch {};
+    }
+
+    /// Add an info event to the event queue.
+    fn emitInfo(
+        self: *TaskManager,
+        task_id: u64,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
+        const msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        self.events.append(self.gpa, .{
+            .info = .{ .task_id = task_id, .msg = msg },
+        }) catch {
+            self.gpa.free(msg);
+        };
+    }
+
+    /// Callback for the scheduler for adding info events.
+    fn onSchedulerEvent(opq: *anyopaque, ev: scheduler.EventSink.Event) void {
+        const self: *TaskManager = @ptrCast(@alignCast(opq));
+        switch (ev) {
+            .task_started => |e| self.emitInfo(e.task_id, "task_started", .{}),
+            .job_started => |e| self.emitInfo(
+                e.task_id,
+                "job_started: '{s}'",
+                .{e.job_name},
+            ),
+            .job_finished => |e| self.emitInfo(
+                e.task_id,
+                "job_finished: '{s}' (exit_code: {d})",
+                .{ e.job_name, e.exit_code },
+            ),
+            .job_error => |e| self.emitInfo(
+                e.task_id,
+                "job_error: '{s}' ({s})",
+                .{ e.job_name, if (e.msg) |m| m else e.err_name },
+            ),
+        }
     }
 
     /// Amount of tasks currently running
@@ -264,13 +312,13 @@ pub const TaskManager = struct {
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
             self.checkWatcher() catch |err| {
-                self.handleError(.watcher, err);
+                self.emitError(.watcher, err);
             };
             self.updateRemoteManager() catch |err| {
-                self.handleError(.remote_manager, err);
+                self.emitError(.remote_manager, err);
             };
             self.updateSchedulers() catch |err| {
-                self.handleError(.scheduler, err);
+                self.emitError(.scheduler, err);
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }
@@ -398,6 +446,10 @@ pub const TaskManager = struct {
                 self.pool,
                 self.remote_manager,
                 &self.datastore,
+                if (options.verbose_events)
+                    .{ .ptr = self, .emit = TaskManager.onSchedulerEvent }
+                else
+                    null,
             );
             s.attach_job = attach: {
                 const a = options.attach_job orelse break :attach null;
