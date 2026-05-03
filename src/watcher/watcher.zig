@@ -124,6 +124,14 @@ pub const Watcher = struct {
     pub fn addFileWatch(self: *Watcher, path: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        const stat = std.fs.cwd().statFile(path) catch |err| return switch (err) {
+            error.FileNotFound => error.InvalidWatchPath,
+            else => err,
+        };
+        if (stat.kind != .file and stat.kind != .directory)
+            return error.InvalidWatchPath;
+
         if (self.file_watcher) |fw| {
             try fw.addWatch(self.gpa, path);
             self.cond.signal();

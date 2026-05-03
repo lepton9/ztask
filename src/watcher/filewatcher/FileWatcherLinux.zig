@@ -59,8 +59,6 @@ fn deinit(opq: *anyopaque, gpa: std.mem.Allocator) void {
 /// Add a file path to watch list
 fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
     const self: *@This() = @ptrCast(@alignCast(opq));
-    // TODO: handle wildcards
-
     const p = try splitPath(path);
 
     const IN = linux.IN;

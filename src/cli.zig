@@ -492,19 +492,26 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         ),
         error.FileNotFound => if (opts.path) |p|
             fatal("Task file not found: '{s}'", .{p})
+        else if (opts.id) |id|
+            fatal("Task file missing for ID: '{s}'", .{id})
         else
             fatal("Task not found", .{}),
         error.ErrorOpenFilePath => fatal(
             "Error opening file: '{s}'",
             .{opts.path orelse ""},
         ),
+        error.TaskExists => fatal("Another task exists with the same ID", .{}),
         error.UnknownAttachJob => {
             const attach_name = if (opts.attach_job) |a| a.name else "";
             fatal("Unknown job to attach to '{s}'", .{attach_name});
         },
         error.InvalidTaskFile => fatal("Invalid task file format", .{}),
+        error.InvalidWatchPath => fatal("Invalid file path for watch trigger", .{}),
         error.NoTaskFileGiven => fatal("No task file given", .{}),
-        else => return err,
+        else => {
+            if (inErrorSet(err, ParseError)) fatal("Invalid task file: {any}", .{err});
+            return err;
+        },
     };
 }
 
