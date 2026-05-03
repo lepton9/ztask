@@ -70,15 +70,9 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
     };
 
     // Initialize event loop to handle input
-    var tty = try vaxis.Tty.init(&.{});
-    defer tty.deinit();
-    try setupInputTty(&tty);
-    var vx = try vaxis.init(gpa, .{});
-    defer vx.deinit(null, tty.writer());
-    var loop: vaxis.Loop(Event) = .{ .tty = &tty, .vaxis = &vx };
-    try loop.init();
-    try loop.start();
-    defer loop.stop();
+    var input_loop = try InputLoop(Event).init(gpa);
+    defer input_loop.deinit(gpa);
+    const loop = &input_loop.loop;
 
     const agentStart = struct {
         fn start(
@@ -93,8 +87,8 @@ pub fn runAgent(gpa: std.mem.Allocator, options: AgentOptions) !void {
             a.run();
         }
     }.start;
-    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address, &loop });
 
+    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address, loop });
     while (true) {
         const event = loop.nextEvent();
         switch (event) {
@@ -150,16 +144,13 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     const task_id_value = task.id.value;
     const task_has_trigger = task.trigger != null;
 
-    // Initialize event loop to handle input
-    var tty = try vaxis.Tty.init(&.{});
-    defer tty.deinit();
-    try setupInputTty(&tty);
-    var vx = try vaxis.init(gpa, .{});
-    defer vx.deinit(null, tty.writer());
-    var loop: vaxis.Loop(vaxis.Event) = .{ .tty = &tty, .vaxis = &vx };
-    try loop.init();
-    try loop.start();
-    defer loop.stop();
+    // Initialize event loop to handle input.
+    // Only if we don't attach to a job.
+    const input_loop: ?*InputLoop(vaxis.Event) = blk: {
+        if (options.attach_job != null) break :blk null;
+        break :blk try InputLoop(vaxis.Event).init(gpa);
+    };
+    defer if (input_loop) |il| il.deinit(gpa);
 
     // Start task run
     try task_manager.startWithOptions(.{
@@ -176,7 +167,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     var exit: bool = false;
 
     while (true) {
-        while (loop.tryEvent()) |event| switch (event) {
+        if (input_loop) |l| while (l.loop.tryEvent()) |event| switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) {
                     task_manager.stopTask(task_id);
@@ -986,6 +977,39 @@ fn appendEnvEditor(
 
 fn stdinIsTty() bool {
     return std.fs.File.stdin().isTty();
+}
+
+/// Input handling using the `vaxis` library.
+fn InputLoop(T: type) type {
+    return struct {
+        tty: vaxis.Tty,
+        vx: vaxis.Vaxis,
+        loop: vaxis.Loop(T),
+
+        fn init(gpa: std.mem.Allocator) !*@This() {
+            var self: *@This() = try gpa.create(@This());
+            errdefer gpa.destroy(self);
+
+            self.tty = try vaxis.Tty.init(&.{});
+            errdefer self.tty.deinit();
+            try setupInputTty(&self.tty);
+
+            self.vx = try vaxis.init(gpa, .{});
+            errdefer self.vx.deinit(null, self.tty.writer());
+
+            self.loop = .{ .tty = &self.tty, .vaxis = &self.vx };
+            try self.loop.init();
+            try self.loop.start();
+            return self;
+        }
+
+        fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            self.loop.stop();
+            self.vx.deinit(gpa, self.tty.writer());
+            self.tty.deinit();
+            gpa.destroy(self);
+        }
+    };
 }
 
 /// Wait until enter key is pressed
