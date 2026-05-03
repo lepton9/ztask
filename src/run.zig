@@ -115,6 +115,7 @@ pub const RunOptions = struct {
     id: ?[]const u8 = null,
     attach_job: ?manager.AttachJob = null,
     retrigger: bool = false,
+    verbose: bool = false,
     runners_n: u8 = BASE_RUNNERS_N,
     data_dir: data.DataStore.DataDirMode = .auto,
     listen: ListenOptions = .{},
@@ -170,6 +171,9 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         .retrigger = options.retrigger,
     });
 
+    const log = std.log.scoped(.run);
+    var exit: bool = false;
+
     while (true) {
         while (loop.tryEvent()) |event| switch (event) {
             .key_press => |key| {
@@ -183,13 +187,29 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         };
 
         // Drain task events
-        while (task_manager.tryPopEvent()) |ev| switch (ev) {
-            .run_finished => |e| {
-                if (e.task_id != task_id_value) continue;
-                if (!task_has_trigger) return;
-            },
-            .err => {},
-        };
+        while (task_manager.tryPopEvent()) |ev| {
+            switch (ev) {
+                .run_finished => |e| {
+                    if (e.task_id != task_id_value) continue;
+
+                    if (options.verbose) {
+                        log.info(
+                            "{s:<12} task={s} status={s}",
+                            .{ "run_finished", task_id, @tagName(e.status) },
+                        );
+                    }
+                    if (!task_has_trigger) exit = true;
+                },
+                .err => |e| {
+                    if (!options.verbose) break;
+                    log.err(
+                        "{s:<12} scope={s} msg={s}",
+                        .{ "error", @tagName(e.scope), e.msg },
+                    );
+                },
+            }
+        }
+        if (exit) return;
 
         std.Thread.sleep(std.time.ns_per_ms * 25);
     }

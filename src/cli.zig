@@ -176,6 +176,7 @@ const commands = &[_]zcli.Cmd{
                 .desc = "Restart task if a trigger occurs while running",
             },
             runner_n_option,
+            .{ .long_name = "verbose", .desc = "Print extra status messages" },
         },
         .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdRunFn,
@@ -467,6 +468,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .retrigger = cli.findOption("retrigger") != null,
         .data_dir = ctx.data_dir,
         .listen = ctx.listen,
+        .verbose = cli.findOption("verbose") != null,
     };
 
     switch (task_arg) {
