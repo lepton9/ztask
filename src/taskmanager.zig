@@ -198,6 +198,21 @@ pub const TaskManager = struct {
         const self: *TaskManager = @ptrCast(@alignCast(opq));
         switch (ev) {
             .task_started => |e| self.emitInfo(e.task_id, "task_started", .{}),
+            .task_interrupted => |e| self.emitInfo(
+                e.task_id,
+                "task_interrupted: reason={s}",
+                .{@tagName(e.reason)},
+            ),
+            .task_failed => |e| self.emitInfo(
+                e.task_id,
+                "task_failed: job='{s}'",
+                .{e.job_name},
+            ),
+            .task_completed => |e| self.emitInfo(
+                e.task_id,
+                "task_completed: status={s} jobs={d}/{d} duration_ms={any} run_id={any}",
+                .{ @tagName(e.status), e.jobs_completed, e.jobs_total, e.duration_ms, e.run_id },
+            ),
             .job_started => |e| self.emitInfo(
                 e.task_id,
                 "job_started: '{s}'",
@@ -205,8 +220,8 @@ pub const TaskManager = struct {
             ),
             .job_finished => |e| self.emitInfo(
                 e.task_id,
-                "job_finished: '{s}' (exit_code: {d})",
-                .{ e.job_name, e.exit_code },
+                "job_finished: '{s}' exit={d} duration_ms={any}",
+                .{ e.job_name, e.exit_code, e.duration_ms },
             ),
             .job_error => |e| self.emitInfo(
                 e.task_id,
@@ -267,7 +282,7 @@ pub const TaskManager = struct {
     fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
         switch (s.*.status) {
             .running => {
-                s.*.forceStop();
+                s.*.forceStop(.user_interrupt);
                 self.removeFromWatchList(s);
             },
             .waiting, .completed => {
@@ -341,7 +356,7 @@ pub const TaskManager = struct {
             },
             else => {
                 if (!s.retrigger) return;
-                s.forceStop();
+                s.forceStop(.retrigger);
                 try s.trigger();
             },
         }

@@ -38,8 +38,23 @@ pub const EventSink = struct {
 
     pub const Event = union(enum) {
         task_started: struct { task_id: u64 },
+        task_interrupted: struct { task_id: u64, reason: InterruptReason },
+        task_failed: struct { task_id: u64, job_name: []const u8 },
+        task_completed: struct {
+            task_id: u64,
+            run_id: ?u64,
+            status: data.TaskRunStatus,
+            jobs_completed: usize,
+            jobs_total: usize,
+            duration_ms: ?i64,
+        },
         job_started: struct { task_id: u64, job_name: []const u8 },
-        job_finished: struct { task_id: u64, job_name: []const u8, exit_code: i32 },
+        job_finished: struct {
+            task_id: u64,
+            job_name: []const u8,
+            exit_code: i32,
+            duration_ms: ?i64,
+        },
         job_error: struct {
             task_id: u64,
             job_name: []const u8,
@@ -48,6 +63,8 @@ pub const EventSink = struct {
         },
     };
 };
+
+pub const InterruptReason = enum { user_interrupt, retrigger };
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
@@ -76,6 +93,9 @@ pub const Scheduler = struct {
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
     event_sink: ?EventSink = null,
+
+    /// Task starting timestamp in milliseconds.
+    task_start_ms: ?i64 = null,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -202,6 +222,7 @@ pub const Scheduler = struct {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
         try self.logger.startTask(self.gpa, &self.task_meta, run_id);
+        self.task_start_ms = std.time.milliTimestamp();
 
         self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
 
@@ -292,8 +313,14 @@ pub const Scheduler = struct {
     }
 
     /// Force stop if scheduler is running and skip remaining jobs
-    pub fn forceStop(self: *Scheduler) void {
+    pub fn forceStop(self: *Scheduler, reason: InterruptReason) void {
         self.status = if (self.status == .running) .interrupted else .inactive;
+
+        self.emitEvent(.{ .task_interrupted = .{
+            .task_id = self.task.id.value,
+            .reason = reason,
+        } });
+
         self.handleResults();
 
         // Force stop running local runners
@@ -314,6 +341,16 @@ pub const Scheduler = struct {
         // Log task metadata
         self.task_meta.status = .interrupted;
         self.task_meta.jobs_completed = self.completedJobs();
+
+        self.emitEvent(.{ .task_completed = .{
+            .task_id = self.task.id.value,
+            .run_id = self.task_meta.run_id,
+            .status = .interrupted,
+            .jobs_completed = self.task_meta.jobs_completed,
+            .jobs_total = self.task_meta.jobs_total,
+            .duration_ms = self.taskDuration(),
+        } });
+
         self.endTask() catch {};
     }
 
@@ -398,6 +435,7 @@ pub const Scheduler = struct {
                     .task_id = self.task.id.value,
                     .job_name = job_meta.job_name,
                     .exit_code = e.exit_code,
+                    .duration_ms = self.taskDuration(),
                 } });
             },
         };
@@ -405,9 +443,9 @@ pub const Scheduler = struct {
 
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
-        node.status = if (result.exit_code == 0) .success else .failed;
+        var status: dag.Status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |err| {
-            node.status = .failed;
+            status = .failed;
             log.debug("{}", .{err});
 
             self.emitEvent(.{ .job_error = .{
@@ -417,7 +455,16 @@ pub const Scheduler = struct {
                 .msg = result.msg,
             } });
         }
-        if (node.status == .failed) self.skipRemainingJobs();
+        if (status == .failed) {
+            // Only send the task failed event once
+            if (!self.hasAnyFailedJobs()) self.emitEvent(.{ .task_failed = .{
+                .task_id = self.task.id.value,
+                .job_name = node.ptr.name,
+            } });
+            node.status = status;
+            self.skipRemainingJobs();
+        }
+        node.status = status;
 
         for (node.getDependents()) |dep| {
             dep.dependencyDone();
@@ -447,10 +494,36 @@ pub const Scheduler = struct {
         return true;
     }
 
+    /// Check if the task has any failed jobs.
+    fn hasAnyFailedJobs(self: *Scheduler) bool {
+        for (self.nodes) |n| {
+            if (n.status == .failed) return true;
+        }
+        return false;
+    }
+
+    /// Return the task running duration until now in milliseconds.
+    fn taskDuration(self: *const Scheduler) ?i64 {
+        return if (self.task_start_ms) |st|
+            (std.time.milliTimestamp() - st)
+        else
+            null;
+    }
+
     /// Mark task as completed and log the final metadata
     fn completeTask(self: *Scheduler) void {
         self.task_meta.status = self.taskStatus();
         self.task_meta.jobs_completed = self.completedJobs();
+
+        self.emitEvent(.{ .task_completed = .{
+            .task_id = self.task.id.value,
+            .run_id = self.task_meta.run_id,
+            .status = self.task_meta.status,
+            .jobs_completed = self.task_meta.jobs_completed,
+            .jobs_total = self.task_meta.jobs_total,
+            .duration_ms = self.taskDuration(),
+        } });
+
         self.endTask() catch {};
         self.status = .completed;
     }

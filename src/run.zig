@@ -181,7 +181,8 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                 if (key.matches('c', .{ .ctrl = true })) {
                     task_manager.stopTask(task_id);
                     task_manager.waitUntilIdle();
-                    return error.Interrupted;
+                    exit = true;
+                    break;
                 }
             },
             else => {},
