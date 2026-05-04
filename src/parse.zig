@@ -28,7 +28,48 @@ pub const ParseError = error{
     InvalidTriggerMs,
 };
 
+const VALID_TASK_FIELDS = makeVoidSet(
+    &[_][]const u8{ "name", "id", "on", "jobs" },
+);
+const VALID_TRIGGER_FIELDS = makeVoidSet(
+    &[_][]const u8{ "watch", "time", "interval" },
+);
+const VALID_JOB_FIELDS = makeVoidSet(
+    &[_][]const u8{ "steps", "deps", "run_on" },
+);
+
+/// Generate a static string map from the keys at compile time.
+fn makeVoidSet(comptime keys: []const []const u8) std.StaticStringMap(void) {
+    comptime var kvs: [keys.len]struct { []const u8, void } = undefined;
+    inline for (keys, 0..) |k, i| kvs[i] = .{ k, {} };
+    return std.StaticStringMap(void).initComptime(kvs);
+}
+
+/// Check that all the keys in the map are in `valid_fields`.
+fn validate_fields(map: yaml.Yaml.Map, valid_fields: std.StaticStringMap(void)) bool {
+    var it = map.iterator();
+    while (it.next()) |e| {
+        const field = e.key_ptr.*;
+        if (valid_fields.get(field) == null) return false;
+    }
+    return true;
+}
+
+fn validate_task_fields(map: yaml.Yaml.Map) bool {
+    return validate_fields(map, VALID_TASK_FIELDS);
+}
+
+fn validate_trigger_fields(map: yaml.Yaml.Map) bool {
+    return validate_fields(map, VALID_TRIGGER_FIELDS);
+}
+
+fn validate_job_fields(map: yaml.Yaml.Map) bool {
+    return validate_fields(map, VALID_JOB_FIELDS);
+}
+
 fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
+    if (!validate_task_fields(map)) return ParseError.InvalidFieldName;
+
     // Task name
     const name: []const u8 = blk: {
         const nv = map.get("name") orelse return ParseError.UnnamedTask;
@@ -46,6 +87,8 @@ fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map) !*Task {
     const trigger: ?task.Trigger = blk: {
         const on_val = map.get("on") orelse break :blk null;
         const on = on_val.asMap() orelse return ParseError.InvalidFieldType;
+        if (!validate_trigger_fields(on)) return ParseError.InvalidTrigger;
+
         if (on.get("watch")) |watch| {
             const path = watch.asScalar() orelse return ParseError.InvalidFieldType;
             break :blk .{
@@ -156,6 +199,8 @@ fn parseJobs(
             const job_name = entry.key_ptr.*;
             const job_map = entry.value_ptr.*.asMap() orelse
                 return ParseError.InvalidFieldType;
+
+            if (!validate_job_fields(job_map)) return ParseError.InvalidFieldName;
 
             // Check if job already exists
             if (jobs.get(job_name)) |_| return ParseError.DuplicateJobName;
