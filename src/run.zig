@@ -5,7 +5,10 @@ const remote_agent = @import("remote/remote_agent.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const builtin = @import("builtin");
+const parse = @import("parse.zig");
 
+const ParseDiag = parse.ParseDiag;
+const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
 const RemoteAgent = remote_agent.RemoteAgent;
 
@@ -13,6 +16,40 @@ pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
 pub const MAX_RUNNERS_N = 100;
+
+pub const CmdDiagnostics = struct {
+    err: ?anyerror = null,
+    message: ?[]u8 = null,
+
+    pub fn deinit(self: *CmdDiagnostics, gpa: std.mem.Allocator) void {
+        if (self.message) |msg| gpa.free(msg);
+    }
+
+    fn setFmt(
+        self: *CmdDiagnostics,
+        gpa: std.mem.Allocator,
+        err: anyerror,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) !void {
+        self.deinit(gpa);
+        self.err = err;
+        self.message = try std.fmt.allocPrint(gpa, fmt, args);
+    }
+};
+
+/// Convert the parse error to a proper error message.
+fn extractParseError(
+    gpa: std.mem.Allocator,
+    cd: *CmdDiagnostics,
+    pd: *ParseDiag,
+) !void {
+    const err = pd.err orelse return;
+    const msg = pd.message orelse @errorName(err);
+    const field = pd.field orelse "";
+    try cd.setFmt(gpa, err, "ParseError: {s}: '{s}'", .{ msg, field });
+    return err;
+}
 
 pub const ListenOptions = struct {
     addr: []const u8 = DEFAULT_ADDR,
@@ -113,6 +150,8 @@ pub const RunOptions = struct {
     runners_n: u8 = BASE_RUNNERS_N,
     data_dir: data.DataStore.DataDirMode = .auto,
     listen: ListenOptions = .{},
+    /// Optional diagnostics for errors.
+    diagnostics: ?*CmdDiagnostics = null,
 };
 
 /// Run a single task either with path or ID
@@ -123,16 +162,31 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         .{ .data = .{ .data_dir = options.data_dir } },
     );
     defer task_manager.deinit();
+
+    var parse_diag: ?ParseDiag = if (options.diagnostics != null) .{} else null;
+    defer if (parse_diag) |*d| d.deinit(gpa);
+    const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
+
     const task = blk: {
-        if (options.path) |p| {
-            break :blk task_manager.loadOrCreateWithPath(p) catch |err| {
+        if (options.path) |path| {
+            break :blk task_manager.loadOrCreateWithPath(path, pd) catch |err| {
+                if (inErrorSet(err, ParseError)) {
+                    const d = options.diagnostics orelse return err;
+                    const p = pd orelse return err;
+                    return extractParseError(gpa, d, p);
+                }
                 return switch (err) {
                     error.ErrorOpenFile => error.ErrorOpenFilePath,
                     else => err,
                 };
             };
         }
-        if (options.id) |i| break :blk task_manager.loadTaskWithId(i) catch |err| {
+        if (options.id) |i| break :blk task_manager.loadTaskWithId(i, pd) catch |err| {
+            if (inErrorSet(err, ParseError)) {
+                const d = options.diagnostics orelse return err;
+                const p = pd orelse return err;
+                return extractParseError(gpa, d, p);
+            }
             return switch (err) {
                 error.TaskNotFound => error.TaskNotFoundId,
                 else => err,
@@ -1047,17 +1101,39 @@ fn promptYesNo(comptime fmt: []const u8, args: anytype) !bool {
     };
 }
 
-/// Write to stdout with format
+/// Write to stdout with format.
 pub fn fmtWrite(comptime fmt: []const u8, args: anytype) !void {
-    if (builtin.is_test) return;
-    var buffer: [1024]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buffer);
-    const stdout = &writer.interface;
-    try stdout.print(fmt, args);
-    try stdout.flush();
+    return fmtWriteFile(std.fs.File.stdout(), fmt, args);
 }
 
-/// Write all the data to stdout
+/// Write all the data to stdout.
 pub fn write(bytes: []const u8) !void {
     return fmtWrite("{s}", .{bytes});
+}
+
+/// Write to stderr with format.
+pub fn fmtWriteErr(comptime fmt: []const u8, args: anytype) !void {
+    return fmtWriteFile(std.fs.File.stderr(), fmt, args);
+}
+
+/// Write all the data to stderr.
+pub fn writeErr(bytes: []const u8) !void {
+    return fmtWriteErr("{s}", .{bytes});
+}
+
+pub fn fmtWriteFile(file: std.fs.File, comptime fmt: []const u8, args: anytype) !void {
+    if (builtin.is_test) return;
+    var buffer: [1024]u8 = undefined;
+    var writer = file.writer(&buffer);
+    const out = &writer.interface;
+    try out.print(fmt, args);
+    try out.flush();
+}
+
+/// Check if the error is in the given error set.
+pub fn inErrorSet(err: anyerror, comptime E: type) bool {
+    if (@typeInfo(E).error_set) |err_set| for (err_set) |err_info| {
+        if (std.mem.eql(u8, @errorName(err), err_info.name)) return true;
+    };
+    return false;
 }

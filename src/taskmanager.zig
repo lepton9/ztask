@@ -447,7 +447,7 @@ pub const TaskManager = struct {
     ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const task = try self.loadTask(task_id);
+        const task = try self.loadTask(task_id, null);
         errdefer self.unloadTask(task);
 
         const task_scheduler = blk: {
@@ -529,27 +529,43 @@ pub const TaskManager = struct {
     }
 
     /// Load a task from file path or create the meta file
-    pub fn loadOrCreateWithPath(self: *TaskManager, file_path: []const u8) !*Task {
+    pub fn loadOrCreateWithPath(
+        self: *TaskManager,
+        file_path: []const u8,
+        diagnostics: ?*parse.ParseDiag,
+    ) !*Task {
         self.mutex.lock();
         defer self.mutex.unlock();
         const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
         defer self.gpa.free(real_path);
         const meta = self.datastore.findTaskMetaPath(real_path) orelse
             try self.datastore.addTask(self.gpa, real_path);
-        return self.loadTask(meta.id);
+        return self.loadTask(meta.id, diagnostics);
     }
 
     /// Load task with ID
-    pub fn loadTaskWithId(self: *TaskManager, task_id: []const u8) !*Task {
+    pub fn loadTaskWithId(
+        self: *TaskManager,
+        task_id: []const u8,
+        diagnostics: ?*parse.ParseDiag,
+    ) !*Task {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.loadTask(task_id);
+        return self.loadTask(task_id, diagnostics);
     }
 
     /// Parse task file and load the task to memory
-    fn loadTask(self: *TaskManager, task_id: []const u8) !*Task {
+    fn loadTask(
+        self: *TaskManager,
+        task_id: []const u8,
+        diagnostics: ?*parse.ParseDiag,
+    ) !*Task {
         return self.loaded_tasks.get(task_id) orelse blk: {
-            const task = try self.datastore.loadTask(self.gpa, task_id) orelse
+            const task = try self.datastore.loadTask(
+                self.gpa,
+                task_id,
+                diagnostics,
+            ) orelse
                 return error.TaskNotFound;
             const id = task.id.fmt();
             try self.loaded_tasks.put(self.gpa, id, task);

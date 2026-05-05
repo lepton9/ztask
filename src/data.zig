@@ -646,9 +646,10 @@ pub const DataStore = struct {
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
+        diagnostics: ?*parse.ParseDiag,
     ) !?*task.Task {
         const meta = self.tasks.get(task_id) orelse return null;
-        return parse.loadTask(gpa, meta.file_path);
+        return parse.loadTaskDiag(gpa, meta.file_path, diagnostics);
     }
 
     const TaskCreateOptions = struct {

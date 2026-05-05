@@ -229,8 +229,17 @@ fn requireField(
     map: yaml.Yaml.Map,
     field_name: []const u8,
 ) !yaml.Yaml.Value {
+    return requireFieldErr(cx, map, field_name, ParseError.MissingRequiredField);
+}
+
+fn requireFieldErr(
+    cx: ParseCtx,
+    map: yaml.Yaml.Map,
+    field_name: []const u8,
+    err: ParseError,
+) !yaml.Yaml.Value {
     return map.get(field_name) orelse cx.at(field_name).failf(
-        ParseError.MissingRequiredField,
+        err,
         null,
         "Missing required field '{s}'",
         .{field_name},
@@ -295,7 +304,7 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
 
     // Task name
     const name: []const u8 = blk: {
-        const nv = try requireField(cx.at("name"), map, "name");
+        const nv = try requireField(cx, map, "name");
         const name = try requireScalar(cx.at("name"), nv);
         break :blk try parseStringFieldDiag(name, cx.at("name"));
     };
@@ -504,7 +513,7 @@ fn parseJob(
                 step_kind_str,
             ) orelse return cx.at("steps").failf(
                 ParseError.InvalidStepKind,
-                step_kind_str,
+                null,
                 "Unknown step kind '{s}'",
                 .{step_kind_str},
             );
@@ -600,11 +609,7 @@ fn parseRunLocationMap(
     cx: ParseCtx,
     map: yaml.Yaml.Map,
 ) !task.RunLocation {
-    const type_val = map.get("type") orelse return cx.at("type").fail(
-        ParseError.MissingRunLocation,
-        null,
-        "Missing required field 'type'",
-    );
+    const type_val = try requireFieldErr(cx, map, "type", ParseError.MissingRunLocation);
     const run_type = try requireScalar(cx.at("type"), type_val);
 
     try rejectUnknown(cx, map, VALID_RUN_LOC_FIELDS, ParseError.InvalidFieldName);
@@ -614,11 +619,7 @@ fn parseRunLocationMap(
     }
     if (std.mem.eql(u8, run_type, "remote")) {
         const remote_name = blk: {
-            const name = map.get("name") orelse return cx.at("name").fail(
-                ParseError.MissingRunnerName,
-                null,
-                "Missing required field 'name'",
-            );
+            const name = try requireFieldErr(cx, map, "name", ParseError.MissingRunnerName);
             break :blk try requireScalar(cx.at("name"), name);
         };
         const remote_addr: ?[]const u8 = blk: {

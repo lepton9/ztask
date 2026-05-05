@@ -11,8 +11,7 @@ const ListenOptions = run.ListenOptions;
 const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
 const DEFAULT_PORT = remote_man.DEFAULT_PORT;
 
-const fmtWrite = run.fmtWrite;
-const write = run.write;
+const inErrorSet = run.inErrorSet;
 
 /// Cli configuration
 pub const cli_spec: zcli.CliApp = .{
@@ -305,16 +304,8 @@ fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
         if (std.mem.endsWith(u8, fmt, "\n")) break :blk fmt;
         break :blk fmt ++ "\n";
     };
-    fmtWrite(fmt_nl, args) catch {};
+    run.fmtWriteErr(fmt_nl, args) catch {};
     std.process.exit(1);
-}
-
-/// Check if the error is in the given error set.
-fn inErrorSet(err: anyerror, comptime E: type) bool {
-    if (@typeInfo(E).error_set) |err_set| for (err_set) |err_info| {
-        if (std.mem.eql(u8, @errorName(err), err_info.name)) return true;
-    };
-    return false;
 }
 
 /// Generate shell completions
@@ -330,7 +321,7 @@ fn generate_completion(
         spec.config.name.?,
         shell.value,
     );
-    try write(script);
+    try run.write(script);
     std.process.exit(0);
 }
 
@@ -459,6 +450,9 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     const task_arg = getTaskInput(cli) orelse
         fatal("No task given to run", .{});
 
+    var diagnostics: run.CmdDiagnostics = .{};
+    defer diagnostics.deinit(ctx.gpa);
+
     var opts: run.RunOptions = .{
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
@@ -469,6 +463,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .data_dir = ctx.data_dir,
         .listen = ctx.listen,
         .verbose = cli.findOption("verbose") != null,
+        .diagnostics = &diagnostics,
     };
 
     switch (task_arg) {
@@ -484,33 +479,41 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         );
         opts.runners_n = @intCast(n);
     }
-    return run.runTask(ctx.gpa, opts) catch |err| switch (err) {
-        error.TaskNotFoundId => fatal(
-            "Task not found with ID: {s}",
-            .{opts.id orelse ""},
-        ),
-        error.FileNotFound => if (opts.path) |p|
-            fatal("Task file not found: '{s}'", .{p})
-        else if (opts.id) |id|
-            fatal("Task file missing for ID: '{s}'", .{id})
-        else
-            fatal("Task not found", .{}),
-        error.ErrorOpenFilePath => fatal(
-            "Error opening file: '{s}'",
-            .{opts.path orelse ""},
-        ),
-        error.TaskExists => fatal("Another task exists with the same ID", .{}),
-        error.UnknownAttachJob => {
-            const attach_name = if (opts.attach_job) |a| a.name else "";
-            fatal("Unknown job to attach to '{s}'", .{attach_name});
-        },
-        error.InvalidTaskFile => fatal("Invalid task file format", .{}),
-        error.InvalidWatchPath => fatal("Invalid file path for watch trigger", .{}),
-        error.NoTaskFileGiven => fatal("No task file given", .{}),
-        else => {
-            if (inErrorSet(err, ParseError)) fatal("Invalid task file: {any}", .{err});
-            return err;
-        },
+    return run.runTask(ctx.gpa, opts) catch |err| {
+        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+
+        // Handle other errors
+        switch (err) {
+            error.TaskNotFoundId => fatal(
+                "Task not found with ID: {s}",
+                .{opts.id orelse ""},
+            ),
+            error.FileNotFound => if (opts.path) |p|
+                fatal("Task file not found: '{s}'", .{p})
+            else if (opts.id) |id|
+                fatal("Task file missing for ID: '{s}'", .{id})
+            else
+                fatal("Task not found", .{}),
+            error.ErrorOpenFilePath => fatal(
+                "Error opening file: '{s}'",
+                .{opts.path orelse ""},
+            ),
+            error.TaskExists => fatal("Another task exists with the same ID", .{}),
+            error.UnknownAttachJob => {
+                const attach_name = if (opts.attach_job) |a| a.name else "";
+                fatal("Unknown job to attach to '{s}'", .{attach_name});
+            },
+            error.InvalidTaskFile => fatal("Invalid task file format", .{}),
+            error.InvalidWatchPath => fatal("Invalid file path for watch trigger", .{}),
+            error.NoTaskFileGiven => fatal("No task file given", .{}),
+            else => {
+                if (inErrorSet(err, ParseError)) fatal(
+                    "Invalid task file: {any}",
+                    .{err},
+                );
+                return err;
+            },
+        }
     };
 }
 

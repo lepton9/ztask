@@ -177,39 +177,6 @@ pub const RunLocation = union(enum) {
             else => {},
         }
     }
-
-    /// Parse a run location from a string.
-    ///
-    /// Syntax:
-    /// - local
-    /// - remote:<name>
-    /// - remote:<name>@<addr>
-    pub fn parse(l: []const u8) !RunLocation {
-        if (std.mem.eql(u8, l, "local")) return .local;
-        const colon_idx = std.mem.indexOfScalar(u8, l, ':') orelse
-            return error.InvalidRemoteRunner;
-
-        if (!std.mem.eql(u8, l[0..colon_idx], "remote"))
-            return error.InvalidRunnerType;
-        if (colon_idx == l.len) return error.InvalidRunnerName;
-
-        const rest = l[colon_idx + 1 ..];
-        if (rest.len == 0) return error.InvalidRunnerName;
-
-        const at_idx = std.mem.indexOfScalar(u8, rest, '@') orelse
-            return .{ .remote = .{ .name = rest } };
-
-        // Parse address
-        const name = rest[0..at_idx];
-        const addr_port = rest[at_idx + 1 ..];
-        if (name.len == 0) return error.InvalidRunnerName;
-        if (addr_port.len == 0) return error.InvalidRunnerAddr;
-
-        // Validate address (IPv4)
-        _ = std.net.Address.parseIp4(addr_port, 0) catch
-            return error.InvalidRunnerAddr;
-        return .{ .remote = .{ .name = name, .addr = addr_port } };
-    }
 };
 
 pub const Job = struct {
