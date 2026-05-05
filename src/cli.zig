@@ -450,7 +450,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     const task_arg = getTaskInput(cli) orelse
         fatal("No task given to run", .{});
 
-    var diagnostics: run.CmdDiagnostics = .{};
+    var diagnostics: run.GenericDiagnostics = .{};
     defer diagnostics.deinit(ctx.gpa);
 
     var opts: run.RunOptions = .{

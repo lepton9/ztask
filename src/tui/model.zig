@@ -9,6 +9,7 @@ const vxfw = vaxis.vxfw;
 const Widget = vxfw.Widget;
 const AllocError = std.mem.Allocator.Error;
 const UiSnapshot = snap.UiSnapshot;
+const GenericDiagnostics = tm.GenericDiagnostics;
 
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
@@ -334,9 +335,9 @@ pub const Model = struct {
         args: anytype,
     ) !void {
         self.deinitConfirm();
+        try self.setInfo(fmt, args);
         self.confirm = .{ .last_active = self.active, .action = action };
         self.active = .info;
-        try self.setInfo(fmt, args);
         try ctx.requestFocus(self.widget());
         ctx.consumeAndRedraw();
     }
@@ -461,8 +462,15 @@ pub const Model = struct {
 
     /// Begin task run
     fn dispatchTask(self: *Model, task_id: []const u8) !void {
-        self.taskmanager.beginTask(task_id, .{}) catch |err| {
-            try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
+        var diag: GenericDiagnostics = .{};
+        defer diag.deinit(self.gpa);
+
+        self.taskmanager.beginTask(task_id, .{ .diagnostics = &diag }) catch |err| {
+            if (diag.message) |err_msg| {
+                try self.setInfo("{s}: {s}", .{ task_id, err_msg });
+            } else {
+                try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
+            }
             return;
         };
         try self.setInfo("Started task {s}", .{task_id});
@@ -475,6 +483,7 @@ pub const Model = struct {
 
     /// Set info text and restart the info display time
     fn setInfo(self: *Model, comptime fmt: []const u8, args: anytype) !void {
+        if (self.confirm != null) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = try std.fmt.allocPrint(self.gpa, fmt, args);
         self.info.timestamp = std.time.timestamp();

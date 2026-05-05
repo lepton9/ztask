@@ -11,45 +11,12 @@ const ParseDiag = parse.ParseDiag;
 const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
 const RemoteAgent = remote_agent.RemoteAgent;
+pub const GenericDiagnostics = manager.GenericDiagnostics;
 
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
 pub const MAX_RUNNERS_N = 100;
-
-pub const CmdDiagnostics = struct {
-    err: ?anyerror = null,
-    message: ?[]u8 = null,
-
-    pub fn deinit(self: *CmdDiagnostics, gpa: std.mem.Allocator) void {
-        if (self.message) |msg| gpa.free(msg);
-    }
-
-    fn setFmt(
-        self: *CmdDiagnostics,
-        gpa: std.mem.Allocator,
-        err: anyerror,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) !void {
-        self.deinit(gpa);
-        self.err = err;
-        self.message = try std.fmt.allocPrint(gpa, fmt, args);
-    }
-};
-
-/// Convert the parse error to a proper error message.
-fn extractParseError(
-    gpa: std.mem.Allocator,
-    cd: *CmdDiagnostics,
-    pd: *ParseDiag,
-) !void {
-    const err = pd.err orelse return;
-    const msg = pd.message orelse @errorName(err);
-    const field = pd.field orelse "";
-    try cd.setFmt(gpa, err, "ParseError: {s}: '{s}'", .{ msg, field });
-    return err;
-}
 
 pub const ListenOptions = struct {
     addr: []const u8 = DEFAULT_ADDR,
@@ -151,7 +118,7 @@ pub const RunOptions = struct {
     data_dir: data.DataStore.DataDirMode = .auto,
     listen: ListenOptions = .{},
     /// Optional diagnostics for errors.
-    diagnostics: ?*CmdDiagnostics = null,
+    diagnostics: ?*GenericDiagnostics = null,
 };
 
 /// Run a single task either with path or ID
@@ -173,7 +140,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                 if (inErrorSet(err, ParseError)) {
                     const d = options.diagnostics orelse return err;
                     const p = pd orelse return err;
-                    return extractParseError(gpa, d, p);
+                    return d.extractParseError(gpa, p);
                 }
                 return switch (err) {
                     error.ErrorOpenFile => error.ErrorOpenFilePath,
@@ -185,7 +152,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
             if (inErrorSet(err, ParseError)) {
                 const d = options.diagnostics orelse return err;
                 const p = pd orelse return err;
-                return extractParseError(gpa, d, p);
+                return d.extractParseError(gpa, p);
             }
             return switch (err) {
                 error.TaskNotFound => error.TaskNotFoundId,
