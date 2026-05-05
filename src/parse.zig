@@ -10,6 +10,7 @@ const max_size = 8192 * 128;
 
 pub const ParseError = error{
     InvalidFileFormat,
+    MissingRequiredField,
     EmptyTaskFile,
     UnnamedTask,
     InvalidId,
@@ -26,6 +27,13 @@ pub const ParseError = error{
     InvalidTriggerMin,
     InvalidTriggerSec,
     InvalidTriggerMs,
+    MissingRunLocation,
+    InvalidRunOnType,
+    InvalidRemoteRunner,
+    MissingRunnerName,
+    InvalidRunnerAddr,
+    InvalidRunnerType,
+    InvalidRunnerName,
 };
 
 const VALID_TASK_FIELDS = makeVoidSet(
@@ -55,6 +63,8 @@ pub const ParseDiag = struct {
         self.* = .{};
     }
 
+    /// Allocate memory for the field path where the error occurred
+    /// and additional error information.
     fn set(
         self: *ParseDiag,
         gpa: std.mem.Allocator,
@@ -71,6 +81,8 @@ pub const ParseDiag = struct {
         self.message = if (message) |s| try gpa.dupe(u8, s) else null;
     }
 
+    /// Allocate memory for the field path where the error occurred
+    /// and store additional error information.
     fn setOwned(
         self: *ParseDiag,
         gpa: std.mem.Allocator,
@@ -87,6 +99,8 @@ pub const ParseDiag = struct {
         self.message = owned_message;
     }
 
+    /// Allocate memory for the field path where the error occurred
+    /// and additional error information.
     fn setFmt(
         self: *ParseDiag,
         gpa: std.mem.Allocator,
@@ -123,6 +137,139 @@ fn diagSetFmt(
     d.setFmt(gpa, err, field, fmt, args) catch {};
 }
 
+const ParseCtx = struct {
+    gpa: std.mem.Allocator,
+    diag: ?*ParseDiag,
+
+    /// Prefix path parts. Only joined and allocated on error.
+    parts: [16][]const u8 = undefined,
+    parts_len: u8 = 0,
+
+    fn init(gpa: std.mem.Allocator, diag: ?*ParseDiag) ParseCtx {
+        return .{ .gpa = gpa, .diag = diag };
+    }
+
+    /// Add a path part to the context.
+    fn at(self: ParseCtx, part: []const u8) ParseCtx {
+        var out = self;
+        if (out.parts_len < out.parts.len) {
+            out.parts[out.parts_len] = part;
+            out.parts_len += 1;
+        }
+        return out;
+    }
+
+    /// Allocate a field path from the existing parts and add
+    /// the leaf to the end of the path.
+    ///
+    /// Only used when `diag != null`.
+    /// Does not add the leaf to the end of the parts list in context.
+    fn joinAlloc(self: ParseCtx, leaf: ?[]const u8) error{OutOfMemory}!?[]u8 {
+        if (self.diag == null) return null;
+
+        const seg_n: usize = @as(usize, self.parts_len) + @intFromBool(leaf != null);
+        if (seg_n == 0) return null;
+
+        var total: usize = 0;
+        for (self.parts[0..self.parts_len]) |p| total += p.len;
+        if (leaf) |l| total += l.len;
+        total += seg_n - 1; // For '.' separators
+
+        const buf = try self.gpa.alloc(u8, total);
+
+        var i: usize = 0;
+        for (self.parts[0..self.parts_len]) |p| {
+            if (i > 0) {
+                buf[i] = '.';
+                i += 1;
+            }
+            @memcpy(buf[i .. i + p.len], p);
+            i += p.len;
+        }
+        if (leaf) |l| {
+            if (i > 0) {
+                buf[i] = '.';
+                i += 1;
+            }
+            @memcpy(buf[i .. i + l.len], l);
+            i += l.len;
+        }
+        return buf;
+    }
+
+    /// Allocate error diagnostics at the current location if `diag` is not null.
+    /// Returns the same error.
+    fn fail(self: ParseCtx, err: ParseError, leaf: ?[]const u8, msg: []const u8) ParseError {
+        const tmp = self.joinAlloc(leaf) catch null;
+        defer if (tmp) |t| self.gpa.free(t);
+        const field: ?[]const u8 = if (tmp) |t| t else leaf;
+        diagSet(self.diag, self.gpa, err, field, msg);
+        return err;
+    }
+
+    /// Allocate error diagnostics at the current location if `diag` is not null.
+    /// Returns the same error.
+    fn failf(
+        self: ParseCtx,
+        err: ParseError,
+        leaf: ?[]const u8,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) ParseError {
+        const tmp = self.joinAlloc(leaf) catch null;
+        defer if (tmp) |t| self.gpa.free(t);
+        const field: ?[]const u8 = if (tmp) |t| t else leaf;
+        diagSetFmt(self.diag, self.gpa, err, field, fmt, args);
+        return err;
+    }
+};
+
+fn requireField(
+    cx: ParseCtx,
+    map: yaml.Yaml.Map,
+    field_name: []const u8,
+) !yaml.Yaml.Value {
+    return map.get(field_name) orelse cx.at(field_name).failf(
+        ParseError.MissingRequiredField,
+        null,
+        "Missing required field '{s}'",
+        .{field_name},
+    );
+}
+
+fn requireMap(cx: ParseCtx, v: yaml.Yaml.Value) !yaml.Yaml.Map {
+    return v.asMap() orelse
+        cx.fail(ParseError.InvalidFieldType, null, "Must be a map");
+}
+
+fn requireList(cx: ParseCtx, v: yaml.Yaml.Value) ![]yaml.Yaml.Value {
+    return v.asList() orelse
+        cx.fail(ParseError.InvalidFieldType, null, "Must be a list");
+}
+
+fn requireScalar(cx: ParseCtx, v: yaml.Yaml.Value) ![]const u8 {
+    return requireScalarMsg(cx, v, "Must be a string");
+}
+
+fn requireScalarMsg(
+    cx: ParseCtx,
+    v: yaml.Yaml.Value,
+    comptime msg: []const u8,
+) ![]const u8 {
+    return v.asScalar() orelse cx.fail(ParseError.InvalidFieldType, null, msg);
+}
+
+fn rejectUnknown(
+    cx: ParseCtx,
+    map: yaml.Yaml.Map,
+    valid_fields: std.StaticStringMap(void),
+    err: ParseError,
+) !void {
+    if (firstUnknownField(map, valid_fields)) |unknown| {
+        return cx.failf(err, unknown, "Unknown field '{s}'", .{unknown});
+    }
+}
+
 /// Generate a static string map from the keys at compile time.
 fn makeVoidSet(comptime keys: []const []const u8) std.StaticStringMap(void) {
     comptime var kvs: [keys.len]struct { []const u8, void } = undefined;
@@ -143,144 +290,69 @@ fn firstUnknownField(
     return null;
 }
 
-fn parseTask(gpa: std.mem.Allocator, map: yaml.Yaml.Map, diag: ?*ParseDiag) !*Task {
-    if (firstUnknownField(map, VALID_TASK_FIELDS)) |unknown| {
-        diagSetFmt(
-            diag,
-            gpa,
-            ParseError.InvalidFieldName,
-            unknown,
-            "Unknown field '{s}'",
-            .{unknown},
-        );
-        return ParseError.InvalidFieldName;
-    }
+fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
+    try rejectUnknown(cx, map, VALID_TASK_FIELDS, ParseError.InvalidFieldName);
 
     // Task name
     const name: []const u8 = blk: {
-        const nv = map.get("name") orelse {
-            diagSet(diag, gpa, ParseError.UnnamedTask, "name", "Missing required field 'name'");
-            return ParseError.UnnamedTask;
-        };
-        const name = nv.asScalar() orelse {
-            diagSet(
-                diag,
-                gpa,
-                ParseError.InvalidFieldType,
-                "name",
-                "Field 'name' must be a string",
-            );
-            return ParseError.InvalidFieldType;
-        };
-        break :blk try parseStringFieldDiag(name, diag, gpa, "name");
+        const nv = try requireField(cx.at("name"), map, "name");
+        const name = try requireScalar(cx.at("name"), nv);
+        break :blk try parseStringFieldDiag(name, cx.at("name"));
     };
 
     const id_maybe: ?[]const u8 = blk: {
         const nv = map.get("id") orelse break :blk null;
-        const id = nv.asScalar() orelse {
-            diagSet(
-                diag,
-                gpa,
-                ParseError.InvalidFieldType,
-                "id",
-                "Field 'id' must be a string",
-            );
-            return ParseError.InvalidFieldType;
-        };
-        break :blk try parseStringFieldDiag(id, diag, gpa, "id");
+        const id = try requireScalar(cx.at("id"), nv);
+        break :blk try parseStringFieldDiag(id, cx.at("id"));
     };
 
     // Trigger
     const trigger: ?task.Trigger = blk: {
         const on_val = map.get("on") orelse break :blk null;
-        const on = on_val.asMap() orelse {
-            diagSet(
-                diag,
-                gpa,
-                ParseError.InvalidFieldType,
-                "on",
-                "Field 'on' must be a map",
-            );
-            return ParseError.InvalidFieldType;
-        };
-        if (firstUnknownField(on, VALID_TRIGGER_FIELDS)) |unknown| {
-            diagSetFmt(
-                diag,
-                gpa,
-                ParseError.InvalidTrigger,
-                unknown,
-                "Unknown trigger field '{s}'",
-                .{unknown},
-            );
-            return ParseError.InvalidTrigger;
-        }
+        const on_cx = cx.at("on");
+        const on = try requireMap(on_cx, on_val);
+        try rejectUnknown(on_cx, on, VALID_TRIGGER_FIELDS, ParseError.InvalidTrigger);
 
         if (on.get("watch")) |watch| {
-            const path = watch.asScalar() orelse {
-                diagSet(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    "on.watch",
-                    "Trigger field 'watch' must be a string",
-                );
-                return ParseError.InvalidFieldType;
-            };
+            const path = try requireScalar(on_cx.at("watch"), watch);
             break :blk .{
-                .watch = .{ .path = try gpa.dupe(u8, path), .type = .file },
+                .watch = .{ .path = try cx.gpa.dupe(u8, path), .type = .file },
             };
         }
         if (on.get("time")) |time_val| {
-            const time_str = time_val.asScalar() orelse {
-                diagSet(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    "on.time",
-                    "Trigger field 'time' must be a string",
-                );
-                return ParseError.InvalidFieldType;
-            };
-            const t = try parseTimeDiag(time_str, diag, gpa, "on.time");
+            const time_str = try requireScalar(on_cx.at("time"), time_val);
+            const t = try parseTimeDiag(time_str, on_cx.at("time"));
             break :blk .{ .time = t };
         }
         if (on.get("interval")) |interval_val| {
-            const interval_str = interval_val.asScalar() orelse {
-                diagSet(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    "on.interval",
-                    "Trigger field 'interval' must be a string",
-                );
-                return ParseError.InvalidFieldType;
-            };
-            const t = try parseTimeDiag(interval_str, diag, gpa, "on.interval");
+            const interval_str = try requireScalar(on_cx.at("interval"), interval_val);
+            const t = try parseTimeDiag(interval_str, on_cx.at("interval"));
             break :blk .{ .interval = t };
         }
-        diagSet(
-            diag,
-            gpa,
+        return on_cx.fail(
             ParseError.InvalidTrigger,
-            "on",
+            null,
             "Trigger must specify one of: watch, time, interval",
         );
-        return ParseError.InvalidTrigger;
     };
-    errdefer if (trigger) |t| t.deinit(gpa);
+    errdefer if (trigger) |t| t.deinit(cx.gpa);
 
     // Parse all jobs
-    var jobs = try parseJobs(gpa, map, diag);
+    var jobs = try parseJobs(cx, map);
     errdefer {
         var it = jobs.iterator();
-        while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
-        jobs.deinit(gpa);
+        while (it.next()) |entry| entry.value_ptr.*.deinit(cx.gpa);
+        jobs.deinit(cx.gpa);
     }
 
-    const t = try Task.init(gpa, name);
-    if (id_maybe) |id| t.id = task.Id.fromCustom(gpa, id) catch {
-        diagSetFmt(diag, gpa, ParseError.InvalidId, "id", "Invalid id value '{s}'", .{id});
-        return ParseError.InvalidId;
+    const t = try Task.init(cx.gpa, name);
+    if (id_maybe) |id| t.id = task.Id.fromCustom(cx.gpa, id) catch {
+        return cx.at("id").failf(
+            ParseError.InvalidId,
+            null,
+            "Invalid id value '{s}'",
+            .{id},
+        );
     };
     t.trigger = trigger;
     t.jobs = jobs;
@@ -340,76 +412,38 @@ fn parseTime(str: []const u8) ParseError!date.Time {
     };
 }
 
-fn parseTimeDiag(
-    str: []const u8,
-    diag: ?*ParseDiag,
-    gpa: std.mem.Allocator,
-    field_path: []const u8,
-) ParseError!date.Time {
+fn parseTimeDiag(str: []const u8, cx: ParseCtx) ParseError!date.Time {
     return parseTime(str) catch |err| {
-        diagSetFmt(diag, gpa, err, field_path, "Invalid time value '{s}'", .{str});
-        return err;
+        return cx.failf(err, null, "Invalid time value '{s}'", .{str});
     };
 }
 
 /// Parse all the jobs to a hashmap.
-fn parseJobs(
-    gpa: std.mem.Allocator,
-    map: yaml.Yaml.Map,
-    diag: ?*ParseDiag,
-) !std.StringArrayHashMapUnmanaged(task.Job) {
+fn parseJobs(cx: ParseCtx, map: yaml.Yaml.Map) !std.StringArrayHashMapUnmanaged(task.Job) {
     var jobs: std.StringArrayHashMapUnmanaged(task.Job) = .{};
     errdefer {
         var it = jobs.iterator();
-        while (it.next()) |entry| entry.value_ptr.*.deinit(gpa);
-        jobs.deinit(gpa);
+        while (it.next()) |entry| entry.value_ptr.*.deinit(cx.gpa);
+        jobs.deinit(cx.gpa);
     }
     if (map.get("jobs")) |jobs_val| {
-        const jobs_map = jobs_val.asMap() orelse {
-            diagSet(
-                diag,
-                gpa,
-                ParseError.InvalidFieldType,
-                "jobs",
-                "Field 'jobs' must be a map",
-            );
-            return ParseError.InvalidFieldType;
-        };
+        const jobs_map = try requireMap(cx.at("jobs"), jobs_val);
 
         var it = jobs_map.iterator();
         while (it.next()) |entry| {
             // Parse job
             const job_name = entry.key_ptr.*;
-            const job_map = entry.value_ptr.*.asMap() orelse {
-                diagSetFmt(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    job_name,
-                    "Job '{s}' must be a map",
-                    .{job_name},
-                );
-                return ParseError.InvalidFieldType;
-            };
-
-            if (firstUnknownField(job_map, VALID_JOB_FIELDS)) |unknown| {
-                diagSetFmt(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldName,
-                    unknown,
-                    "Unknown field '{s}' in job '{s}'",
-                    .{ unknown, job_name },
-                );
-                return ParseError.InvalidFieldName;
-            }
+            const job_cx = cx.at("jobs").at(job_name);
+            const job_map = entry.value_ptr.*.asMap() orelse
+                return job_cx.fail(ParseError.InvalidFieldType, null, "Job must be a map");
+            try rejectUnknown(job_cx, job_map, VALID_JOB_FIELDS, ParseError.InvalidFieldName);
 
             // Check if job already exists
             if (jobs.get(job_name)) |_| return ParseError.DuplicateJobName;
 
             // Add new job
-            const job = try parseJob(gpa, job_name, job_map, diag);
-            try jobs.put(gpa, job.name, job);
+            const job = try parseJob(job_cx, job_name, job_map);
+            try jobs.put(cx.gpa, job.name, job);
         }
     }
     return jobs;
@@ -417,85 +451,73 @@ fn parseJobs(
 
 /// Parse one job.
 fn parseJob(
-    gpa: std.mem.Allocator,
+    cx: ParseCtx,
     name: []const u8,
     map: yaml.Yaml.Map,
-    diag: ?*ParseDiag,
 ) !task.Job {
     const step_values: []yaml.Yaml.Value = blk: {
         const steps_value = map.get("steps") orelse break :blk &.{};
-        break :blk steps_value.asList() orelse {
-            diagSetFmt(
-                diag,
-                gpa,
-                ParseError.InvalidFieldType,
-                "steps",
-                "Field 'steps' in job '{s}' must be a list",
-                .{name},
-            );
-            return ParseError.InvalidFieldType;
-        };
+        break :blk try requireList(cx.at("steps"), steps_value);
     };
 
     // Parse run location
     const run_on: task.RunLocation = blk: {
         const on_val = map.get("run_on") orelse break :blk .local;
         if (on_val.asScalar()) |on_str| {
-            break :blk try task.RunLocation.parse(on_str);
+            break :blk parseRunLocationString(on_str) catch |err| {
+                return cx.at("run_on").failf(
+                    err,
+                    null,
+                    "Invalid run_on value '{s}'",
+                    .{on_str},
+                );
+            };
         }
         if (on_val.asMap()) |on_map| {
-            break :blk try parseRunLocationMap(on_map, diag, gpa, name);
+            break :blk try parseRunLocationMap(cx.at("run_on"), on_map);
         }
-        diagSetFmt(
-            diag,
-            gpa,
+        return cx.at("run_on").fail(
             ParseError.InvalidFieldType,
-            "run_on",
-            "Field 'run_on' in job '{s}' must be a string or map",
-            .{name},
+            null,
+            "Field 'run_on' must be a string or map",
         );
-        return ParseError.InvalidFieldType;
     };
 
     // Parse job steps
-    var steps = try std.ArrayList(task.Step).initCapacity(gpa, 5);
+    var steps = try std.ArrayList(task.Step).initCapacity(cx.gpa, 5);
     errdefer {
-        for (steps.items) |step| step.deinit(gpa);
-        steps.deinit(gpa);
+        for (steps.items) |step| step.deinit(cx.gpa);
+        steps.deinit(cx.gpa);
     }
     for (step_values) |step| {
-        const s = step.asMap() orelse return ParseError.InvalidStep;
+        const s = step.asMap() orelse return cx.at("steps").fail(
+            ParseError.InvalidStep,
+            null,
+            "Step must be a map",
+        );
         var step_it = s.iterator();
         while (step_it.next()) |step_e| {
             const step_kind_str = step_e.key_ptr.*;
+
             const kind = std.meta.stringToEnum(
                 task.StepKind,
                 step_kind_str,
-            ) orelse {
-                diagSetFmt(
-                    diag,
-                    gpa,
-                    ParseError.InvalidStepKind,
-                    step_kind_str,
-                    "Unknown step kind '{s}' in job '{s}'",
-                    .{ step_kind_str, name },
-                );
-                return ParseError.InvalidStepKind;
-            };
-            const step_value = step_e.value_ptr.*.asScalar() orelse {
-                diagSetFmt(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    step_kind_str,
-                    "Step value for '{s}' in job '{s}' must be a string",
-                    .{ step_kind_str, name },
-                );
-                return ParseError.InvalidFieldType;
-            };
-            try steps.append(gpa, .{
+            ) orelse return cx.at("steps").failf(
+                ParseError.InvalidStepKind,
+                step_kind_str,
+                "Unknown step kind '{s}'",
+                .{step_kind_str},
+            );
+
+            const step_value = try requireScalarMsg(
+                cx.at("steps"),
+                step_e.value_ptr.*,
+                "Step value must be a string",
+            );
+
+            try steps.append(cx.gpa, .{
                 .kind = kind,
-                .value = try gpa.dupe(u8, step_value),
+                .value = try cx.gpa.dupe(u8, step_value),
             });
         }
     }
@@ -503,38 +525,64 @@ fn parseJob(
     // Parse job dependencies
     const deps: ?[]const []const u8 = blk: {
         const deps_values = if (map.get("deps")) |deps|
-            deps.asList() orelse {
-                diagSetFmt(
-                    diag,
-                    gpa,
-                    ParseError.InvalidFieldType,
-                    "deps",
-                    "Field 'deps' in job '{s}' must be a list",
-                    .{name},
-                );
-                return ParseError.InvalidFieldType;
-            }
+            try requireList(cx.at("deps"), deps)
         else
             break :blk null;
-        var deps = try std.ArrayList([]const u8).initCapacity(gpa, 5);
-        errdefer deps.deinit(gpa);
+        var deps = try std.ArrayList([]const u8).initCapacity(cx.gpa, 5);
+        errdefer deps.deinit(cx.gpa);
         for (deps_values) |val| {
-            const job_dep = val.asScalar() orelse
-                return ParseError.InvalidFieldType;
-            try deps.append(gpa, try gpa.dupe(u8, job_dep));
+            const job_dep = try requireScalarMsg(
+                cx.at("deps"),
+                val,
+                "Dependency value must be a string",
+            );
+            try deps.append(cx.gpa, try cx.gpa.dupe(u8, job_dep));
         }
-        break :blk try deps.toOwnedSlice(gpa);
+        break :blk try deps.toOwnedSlice(cx.gpa);
     };
     errdefer if (deps) |d| {
-        for (d) |dep| gpa.free(dep);
-        gpa.free(d);
+        for (d) |dep| cx.gpa.free(dep);
+        cx.gpa.free(d);
     };
     return .{
-        .name = try gpa.dupe(u8, name),
-        .steps = try steps.toOwnedSlice(gpa),
-        .run_on = try run_on.dupe(gpa),
+        .name = try cx.gpa.dupe(u8, name),
+        .steps = try steps.toOwnedSlice(cx.gpa),
+        .run_on = try run_on.dupe(cx.gpa),
         .deps = deps,
     };
+}
+
+/// Parse a run location from a string.
+///
+/// Syntax:
+/// - local
+/// - remote:<name>
+/// - remote:<name>@<addr>
+fn parseRunLocationString(l: []const u8) ParseError!task.RunLocation {
+    if (std.mem.eql(u8, l, "local")) return .local;
+    const colon_idx = std.mem.indexOfScalar(u8, l, ':') orelse
+        return ParseError.InvalidRemoteRunner;
+
+    if (!std.mem.eql(u8, l[0..colon_idx], "remote"))
+        return ParseError.InvalidRunnerType;
+    if (colon_idx == l.len) return ParseError.InvalidRunnerName;
+
+    const rest = l[colon_idx + 1 ..];
+    if (rest.len == 0) return ParseError.InvalidRunnerName;
+
+    const at_idx = std.mem.indexOfScalar(u8, rest, '@') orelse
+        return .{ .remote = .{ .name = rest } };
+
+    // Parse address
+    const name = rest[0..at_idx];
+    const addr_port = rest[at_idx + 1 ..];
+    if (name.len == 0) return ParseError.InvalidRunnerName;
+    if (addr_port.len == 0) return ParseError.InvalidRunnerAddr;
+
+    // Validate address (IPv4)
+    _ = std.net.Address.parseIp4(addr_port, 0) catch
+        return ParseError.InvalidRunnerAddr;
+    return .{ .remote = .{ .name = name, .addr = addr_port } };
 }
 
 /// Parse map form of the run location.
@@ -549,40 +597,42 @@ fn parseJob(
 ///   name: runner1
 ///   addr: 127.0.0.1
 fn parseRunLocationMap(
+    cx: ParseCtx,
     map: yaml.Yaml.Map,
-    diag: ?*ParseDiag,
-    gpa: std.mem.Allocator,
-    job_name: []const u8,
 ) !task.RunLocation {
-    const type_val = map.get("type") orelse return error.MissingRunLocation;
-    const run_type = type_val.asScalar() orelse return ParseError.InvalidFieldType;
+    const type_val = map.get("type") orelse return cx.at("type").fail(
+        ParseError.MissingRunLocation,
+        null,
+        "Missing required field 'type'",
+    );
+    const run_type = try requireScalar(cx.at("type"), type_val);
 
-    if (firstUnknownField(map, VALID_RUN_LOC_FIELDS)) |unknown| {
-        diagSetFmt(
-            diag,
-            gpa,
-            ParseError.InvalidFieldName,
-            unknown,
-            "Unknown run_on field '{s}' in job '{s}'",
-            .{ unknown, job_name },
-        );
-        return ParseError.InvalidFieldName;
-    }
+    try rejectUnknown(cx, map, VALID_RUN_LOC_FIELDS, ParseError.InvalidFieldName);
 
     if (std.mem.eql(u8, run_type, "local")) {
         return .local;
     }
     if (std.mem.eql(u8, run_type, "remote")) {
         const remote_name = blk: {
-            const name = map.get("name") orelse return error.InvalidRunnerName;
-            break :blk name.asScalar() orelse return ParseError.InvalidFieldType;
+            const name = map.get("name") orelse return cx.at("name").fail(
+                ParseError.MissingRunnerName,
+                null,
+                "Missing required field 'name'",
+            );
+            break :blk try requireScalar(cx.at("name"), name);
         };
         const remote_addr: ?[]const u8 = blk: {
             const a = map.get("addr") orelse break :blk null;
-            const addr = a.asScalar() orelse return ParseError.InvalidFieldType;
+            const addr = try requireScalar(cx.at("addr"), a);
             // Validate address
-            _ = std.net.Address.parseIp4(addr, 0) catch
-                return error.InvalidRunnerAddr;
+            _ = std.net.Address.parseIp4(addr, 0) catch {
+                return cx.at("addr").failf(
+                    ParseError.InvalidRunnerAddr,
+                    null,
+                    "Invalid runner address '{s}'",
+                    .{addr},
+                );
+            };
             break :blk addr;
         };
 
@@ -591,7 +641,12 @@ fn parseRunLocationMap(
             .addr = remote_addr,
         } };
     }
-    return error.InvalidRunOnType;
+    return cx.at("type").failf(
+        ParseError.InvalidRunOnType,
+        null,
+        "Invalid run_on type '{s}'",
+        .{run_type},
+    );
 }
 
 pub fn parseStringField(str: []const u8) ![]const u8 {
@@ -600,51 +655,43 @@ pub fn parseStringField(str: []const u8) ![]const u8 {
     return trimmed;
 }
 
-fn parseStringFieldDiag(
-    str: []const u8,
-    diag: ?*ParseDiag,
-    gpa: std.mem.Allocator,
-    field_path: []const u8,
-) ![]const u8 {
+fn parseStringFieldDiag(str: []const u8, cx: ParseCtx) ![]const u8 {
     return parseStringField(str) catch |err| {
-        diagSetFmt(diag, gpa, err, field_path, "Invalid string value for '{s}'", .{
-            field_path,
-        });
-        return err;
+        return cx.failf(err, null, "Invalid string value '{s}'", .{str});
     };
 }
 
+/// Parse the task file buffer.
+/// Report error diagnostics using `ParseDiag` if not null.
 pub fn parseTaskBufferDiag(
     gpa: std.mem.Allocator,
     buf: []const u8,
     diag: ?*ParseDiag,
 ) !*Task {
+    const cx = ParseCtx.init(gpa, diag);
     var yaml_parser: yaml.Yaml = .{ .source = buf };
     defer yaml_parser.deinit(gpa);
+
     yaml_parser.load(gpa) catch |err| return switch (err) {
-        error.DuplicateMapKey => blk: {
-            diagSet(diag, gpa, ParseError.DuplicateKey, null, "Duplicate key in the map");
-            break :blk ParseError.DuplicateKey;
-        },
-        else => blk: {
-            diagSetFmt(
-                diag,
-                gpa,
-                ParseError.InvalidFileFormat,
-                null,
-                "Invalid YAML format: {any}",
-                .{err},
-            );
-            break :blk ParseError.InvalidFileFormat;
-        },
+        error.DuplicateMapKey => cx.fail(
+            ParseError.DuplicateKey,
+            null,
+            "Duplicate key in the map",
+        ),
+        else => cx.failf(
+            ParseError.InvalidFileFormat,
+            null,
+            "Invalid YAML format: {any}",
+            .{err},
+        ),
     };
+
     const values = yaml_parser.docs.items;
     if (values.len == 0) {
-        diagSet(diag, gpa, ParseError.EmptyTaskFile, null, "Empty task file");
-        return ParseError.EmptyTaskFile;
+        return cx.fail(ParseError.EmptyTaskFile, null, "Empty task file");
     }
     const map = values[0].map;
-    return parseTask(gpa, map, diag);
+    return parseTask(cx, map);
 }
 
 pub fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
@@ -690,7 +737,8 @@ test "missing_name" {
         \\   watch: "src/main.zig"
     ;
     try std.testing.expect(
-        parseTaskBuffer(std.testing.allocator, source) == ParseError.UnnamedTask,
+        parseTaskBuffer(std.testing.allocator, source) ==
+            ParseError.MissingRequiredField,
     );
 }
 
