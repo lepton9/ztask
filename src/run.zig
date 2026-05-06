@@ -541,7 +541,7 @@ fn scanTasks(gpa: std.mem.Allocator, store: *data.DataStore, sink: anytype) !voi
     }
 }
 
-const RepairSinkDry = struct {
+const SyncSinkDry = struct {
     pub fn onMissing(_: @This(), meta: *const data.TaskMetadata) !void {
         try fmtWrite("Would delete {s}\n", .{meta.id});
     }
@@ -556,11 +556,11 @@ const RepairSinkDry = struct {
     ) !void {
         if (id_change and name_change) {
             try fmtWrite(
-                "Would repair {s} -> {s} (name: '{s}' -> '{s}')\n",
+                "Would update {s} -> {s} (name: '{s}' -> '{s}')\n",
                 .{ meta.id, new_id, meta.name, new_name },
             );
         } else if (id_change) {
-            try fmtWrite("Would repair {s} -> {s}\n", .{ meta.id, new_id });
+            try fmtWrite("Would update ID: {s} -> {s}\n", .{ meta.id, new_id });
         } else {
             try fmtWrite(
                 "Would update {s} name: '{s}' -> '{s}'\n",
@@ -570,10 +570,10 @@ const RepairSinkDry = struct {
     }
 };
 
-const RepairSinkCollect = struct {
+const SyncSinkCollect = struct {
     gpa: std.mem.Allocator,
     to_delete: *std.ArrayList([]u8),
-    actions: *std.ArrayList(RepairAction),
+    actions: *std.ArrayList(SyncAction),
 
     pub fn onMissing(self: @This(), meta: *const data.TaskMetadata) !void {
         try self.to_delete.append(self.gpa, try self.gpa.dupe(u8, meta.id));
@@ -595,16 +595,16 @@ const RepairSinkCollect = struct {
     }
 };
 
-const RepairAction = struct {
+const SyncAction = struct {
     old_id: []u8,
     new_id: []u8,
     new_name: []u8,
 };
 
-/// Repair all the tasks.
+/// Sync all the tasks.
 ///
 /// Delete missing tasks and handle task ID and name changes.
-pub fn repairTasks(
+pub fn syncTasks(
     gpa: std.mem.Allocator,
     data_dir: data.DataStore.DataDirMode,
     dry_run: bool,
@@ -616,7 +616,7 @@ pub fn repairTasks(
     defer datastore.deinit(gpa);
 
     if (dry_run) {
-        try scanTasks(gpa, &datastore, RepairSinkDry{});
+        try scanTasks(gpa, &datastore, SyncSinkDry{});
         return;
     }
 
@@ -626,7 +626,7 @@ pub fn repairTasks(
         to_delete.deinit(gpa);
     }
 
-    var actions = try std.ArrayList(RepairAction).initCapacity(gpa, 16);
+    var actions = try std.ArrayList(SyncAction).initCapacity(gpa, 16);
     defer {
         for (actions.items) |a| {
             gpa.free(a.old_id);
@@ -636,8 +636,8 @@ pub fn repairTasks(
         actions.deinit(gpa);
     }
 
-    // Collect all the repair actions
-    try scanTasks(gpa, &datastore, RepairSinkCollect{
+    // Collect all the sync actions
+    try scanTasks(gpa, &datastore, SyncSinkCollect{
         .gpa = gpa,
         .to_delete = &to_delete,
         .actions = &actions,
@@ -652,7 +652,7 @@ pub fn repairTasks(
 
     if (actions.items.len == 0) return;
 
-    // Repair tasks with mismatched YAML id/name
+    // Sync tasks with mismatched YAML id/name
     var old_id_index = std.StringHashMapUnmanaged(usize){};
     defer old_id_index.deinit(gpa);
     for (actions.items, 0..) |a, idx| try old_id_index.put(gpa, a.old_id, idx);
@@ -682,14 +682,14 @@ pub fn repairTasks(
             ) catch |err| switch (err) {
                 error.TaskExists => continue, // Maybe another action will free the ID
                 error.TaskNotFound => {
-                    try fmtWrite("Skipped repair for {s}: Task not found\n", .{a.old_id});
+                    try fmtWrite("Skipped syncing for {s}: Task not found\n", .{a.old_id});
                     processed_actions[i] = true;
                     remaining_actions -= 1;
                     continue;
                 },
                 else => {
                     try fmtWrite(
-                        "Failed repairing {s} -> {s}: {s}\n",
+                        "Failed to sync ID {s} -> {s}: {s}\n",
                         .{ a.old_id, a.new_id, @errorName(err) },
                     );
                     processed_actions[i] = true;
@@ -698,7 +698,7 @@ pub fn repairTasks(
                 },
             };
 
-            try fmtWrite("Repaired {s} -> {s}\n", .{ a.old_id, updated.id });
+            try fmtWrite("Synced ID change {s} -> {s}\n", .{ a.old_id, updated.id });
             processed_actions[i] = true;
             remaining_actions -= 1;
         }

@@ -255,12 +255,12 @@ const commands = &[_]zcli.Cmd{
         .action = cmdListFn,
     },
     .{
-        .name = "repair",
-        .desc = "Delete non-existent tasks and detect ID and name changes",
+        .name = "sync",
+        .desc = "Delete non-existent tasks and sync ID and name changes",
         .options = &[_]zcli.Opt{
             .{ .long_name = "dry", .desc = "Enable dry run" },
         },
-        .action = cmdRepairFn,
+        .action = cmdSyncFn,
     },
     .{
         .name = "completion",
@@ -603,17 +603,17 @@ fn cmdListFn(ptr: *anyopaque) !void {
     });
 }
 
-/// Handle repair command
-fn cmdRepairFn(ptr: *anyopaque) !void {
+/// Handle sync command
+fn cmdSyncFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const dry_run = ctx.cli.findOption("dry") != null;
-    return run.repairTasks(
+    return run.syncTasks(
         ctx.gpa,
         ctx.data_dir,
         dry_run,
     ) catch |err| switch (err) {
         error.UnresolvedConflict => fatal("Unresolved conflicts", .{}),
-        else => fatal("Failed to repair some of the tasks", .{}),
+        else => fatal("Failed to sync some of the tasks", .{}),
     };
 }
 
