@@ -12,6 +12,7 @@ const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 const Watcher = watcher_zig.Watcher;
 const ParseDiag = parse.ParseDiag;
+const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 
 const log = std.log.scoped(.taskmanager);
 
@@ -451,15 +452,7 @@ pub const TaskManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var parse_diag: ?ParseDiag = if (options.diagnostics != null) .{} else null;
-        defer if (parse_diag) |*d| d.deinit(self.gpa);
-        const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
-
-        const task = self.loadTask(task_id, pd) catch |err| {
-            const d = options.diagnostics orelse return err;
-            try d.extractParseError(self.gpa, pd);
-            return err;
-        };
+        const task = try self.loadTask(task_id, options.diagnostics);
         errdefer self.unloadTask(task);
 
         const task_scheduler = blk: {
@@ -544,14 +537,16 @@ pub const TaskManager = struct {
     pub fn loadOrCreateWithPath(
         self: *TaskManager,
         file_path: []const u8,
-        diagnostics: ?*parse.ParseDiag,
+        diagnostics: ?*GenericDiagnostics,
     ) !*Task {
         self.mutex.lock();
         defer self.mutex.unlock();
         const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
         defer self.gpa.free(real_path);
         const meta = self.datastore.findTaskMetaPath(real_path) orelse
-            try self.datastore.addTask(self.gpa, real_path);
+            try self.datastore.addTask(self.gpa, real_path, .{
+                .diagnostics = diagnostics,
+            });
         return self.loadTask(meta.id, diagnostics);
     }
 
@@ -559,7 +554,7 @@ pub const TaskManager = struct {
     pub fn loadTaskWithId(
         self: *TaskManager,
         task_id: []const u8,
-        diagnostics: ?*parse.ParseDiag,
+        diagnostics: ?*GenericDiagnostics,
     ) !*Task {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -570,14 +565,18 @@ pub const TaskManager = struct {
     fn loadTask(
         self: *TaskManager,
         task_id: []const u8,
-        diagnostics: ?*parse.ParseDiag,
+        diagnostics: ?*GenericDiagnostics,
     ) !*Task {
+        var parse_diag: ?ParseDiag = if (diagnostics != null) .{} else null;
+        defer if (parse_diag) |*d| d.deinit(self.gpa);
+        const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
+
         return self.loaded_tasks.get(task_id) orelse blk: {
-            const task = try self.datastore.loadTask(
-                self.gpa,
-                task_id,
-                diagnostics,
-            ) orelse
+            const task = self.datastore.loadTask(self.gpa, task_id, pd) catch |err| {
+                const d = diagnostics orelse return err;
+                try d.extractParseError(self.gpa, pd);
+                return err;
+            } orelse
                 return error.TaskNotFound;
             const id = task.id.fmt();
             try self.loaded_tasks.put(self.gpa, id, task);
@@ -762,41 +761,5 @@ pub const TaskManager = struct {
             .connected_remote_runners = self.remote_manager.agents.count(),
             .free_local_runners = self.pool.free_idx.items.len,
         };
-    }
-};
-
-/// Generic diagnostics struct for reporting error messages.
-pub const GenericDiagnostics = struct {
-    err: ?anyerror = null,
-    message: ?[]u8 = null,
-
-    pub fn deinit(self: *GenericDiagnostics, gpa: std.mem.Allocator) void {
-        if (self.message) |msg| gpa.free(msg);
-    }
-
-    pub fn failf(
-        self: *GenericDiagnostics,
-        gpa: std.mem.Allocator,
-        err: anyerror,
-        comptime fmt: []const u8,
-        args: anytype,
-    ) !void {
-        self.deinit(gpa);
-        self.err = err;
-        self.message = try std.fmt.allocPrint(gpa, fmt, args);
-        return err;
-    }
-
-    /// Convert the parse error to a proper error message.
-    pub fn extractParseError(
-        self: *GenericDiagnostics,
-        gpa: std.mem.Allocator,
-        parse_diag: ?*ParseDiag,
-    ) !void {
-        const pd = parse_diag orelse return;
-        const err = pd.err orelse return;
-        const msg = pd.message orelse @errorName(err);
-        const field = pd.field orelse "";
-        return self.failf(gpa, err, "ParseError: {s}: '{s}'", .{ msg, field });
     }
 };

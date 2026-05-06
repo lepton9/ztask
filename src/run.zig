@@ -11,7 +11,7 @@ const ParseDiag = parse.ParseDiag;
 const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
 const RemoteAgent = remote_agent.RemoteAgent;
-pub const GenericDiagnostics = manager.GenericDiagnostics;
+const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
@@ -130,34 +130,22 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     );
     defer task_manager.deinit();
 
-    var parse_diag: ?ParseDiag = if (options.diagnostics != null) .{} else null;
-    defer if (parse_diag) |*d| d.deinit(gpa);
-    const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
-
     const task = blk: {
         if (options.path) |path| {
-            break :blk task_manager.loadOrCreateWithPath(path, pd) catch |err| {
-                if (inErrorSet(err, ParseError)) {
-                    const d = options.diagnostics orelse return err;
-                    const p = pd orelse return err;
-                    return d.extractParseError(gpa, p);
-                }
-                return switch (err) {
-                    error.ErrorOpenFile => error.ErrorOpenFilePath,
-                    else => err,
-                };
-            };
-        }
-        if (options.id) |i| break :blk task_manager.loadTaskWithId(i, pd) catch |err| {
-            if (inErrorSet(err, ParseError)) {
-                const d = options.diagnostics orelse return err;
-                const p = pd orelse return err;
-                return d.extractParseError(gpa, p);
-            }
-            return switch (err) {
-                error.TaskNotFound => error.TaskNotFoundId,
+            break :blk task_manager.loadOrCreateWithPath(
+                path,
+                options.diagnostics,
+            ) catch |err| return switch (err) {
+                error.ErrorOpenFile => error.ErrorOpenFilePath,
                 else => err,
             };
+        }
+        if (options.id) |i| break :blk task_manager.loadTaskWithId(
+            i,
+            options.diagnostics,
+        ) catch |err| return switch (err) {
+            error.TaskNotFound => error.TaskNotFoundId,
+            else => err,
         };
         return error.NoTaskFileGiven;
     };
@@ -362,7 +350,11 @@ pub const AddOptions = struct {
     path: []const u8,
     /// Only when path is a directory
     recursive: bool = false,
+    /// Skip failed tasks. Only if path is a directory.
+    skip: bool = false,
     data_dir: data.DataStore.DataDirMode = .auto,
+    /// Optional diagnostics for errors.
+    diagnostics: ?*GenericDiagnostics = null,
 };
 
 /// Add one task or a directory
@@ -373,13 +365,24 @@ pub fn addTasks(gpa: std.mem.Allocator, options: AddOptions) !void {
     });
     defer datastore.deinit(gpa);
 
+    const old_task_count = datastore.tasks.count();
+
+    const opts: data.DataStore.TaskAddOptions = .{
+        .recursive = options.recursive,
+        .diagnostics = options.diagnostics,
+        .skip = options.skip,
+    };
+
     const cwd = std.fs.cwd();
     const stat = try cwd.statFile(options.path);
     switch (stat.kind) {
-        .directory => try datastore.addTasksInDir(gpa, options.path, options.recursive),
-        .file => _ = try datastore.addTask(gpa, options.path),
+        .directory => try datastore.addTasksInDir(gpa, options.path, opts),
+        .file => _ = try datastore.addTask(gpa, options.path, opts),
         else => return error.NotFileOrDir,
     }
+    const added = datastore.tasks.count() - old_task_count;
+    if (added == 0) return;
+    try fmtWrite("Added {d} tasks", .{added});
 }
 
 pub const TaskSelect = union(enum) {
@@ -519,7 +522,7 @@ fn scanTasks(gpa: std.mem.Allocator, store: *data.DataStore, sink: anytype) !voi
             continue;
         }
 
-        const parsed = data.loadTaskFile(gpa, meta.file_path) catch |err| {
+        const parsed = data.loadTaskFile(gpa, meta.file_path, null) catch |err| {
             try fmtWrite(
                 "Failed to parse task file '{s}' ({s})\n",
                 .{ meta.file_path, @errorName(err) },
@@ -782,7 +785,10 @@ const EditResult = union(enum) {
         id: []u8,
         name: []u8,
     },
-    err: anyerror,
+    err: struct {
+        err: anyerror,
+        message: ?[]const u8 = null,
+    },
 };
 
 fn applyEditResult(
@@ -803,10 +809,17 @@ fn applyEditResult(
                 .{ updated.file_path, updated.id },
             );
         },
-        .err => |err| try fmtWrite(
-            "Invalid task file format: {s}\n",
-            .{@errorName(err)},
-        ),
+        .err => |err| {
+            if (err.message) |msg| {
+                defer gpa.free(msg);
+                try fmtWrite("{s}\n", .{msg});
+                return;
+            }
+            try fmtWrite(
+                "Invalid task file format: {s}\n",
+                .{@errorName(err.err)},
+            );
+        },
     }
 }
 
@@ -834,6 +847,11 @@ fn editTaskFile(
     const original_hash = try data.fileHash(gpa, edit_path);
     var before_hash = original_hash;
 
+    var buf: [256]u8 = undefined;
+
+    var diag: ParseDiag = .{};
+    defer diag.deinit(gpa);
+
     // Edit while valid task file or user canceled
     while (true) {
         const result = try editFile(gpa, edit_path, editor);
@@ -847,11 +865,12 @@ fn editTaskFile(
         }
 
         // Validate the task file
-        const parsed = data.loadTaskFile(gpa, edit_path) catch |err| {
-            const ans = try promptYesNo(
-                "Invalid task file format: {any}. Re-edit? [Y/n] ",
-                .{err},
-            );
+        const parsed = data.loadTaskFile(gpa, edit_path, &diag) catch |err| {
+            const msg = diag.message orelse @errorName(err);
+            const field = diag.field orelse "";
+
+            const err_msg = try std.fmt.bufPrint(&buf, "{s}: '{s}'", .{ msg, field });
+            const ans = try promptYesNo("{s}. Re-edit? [Y/n] ", .{err_msg});
             if (ans) continue;
 
             if (original_hash != after_hash) {
@@ -860,7 +879,9 @@ fn editTaskFile(
             } else {
                 std.fs.deleteFileAbsolute(edit_path) catch {};
             }
-            return .{ .err = err };
+            return .{
+                .err = .{ .err = err, .message = try gpa.dupe(u8, err_msg) },
+            };
         };
         defer parsed.deinit(gpa);
 

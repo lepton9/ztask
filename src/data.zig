@@ -2,6 +2,9 @@ const std = @import("std");
 const parse = @import("parse.zig");
 const task = @import("types/task.zig");
 
+const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
+const ParseDiag = parse.ParseDiag;
+
 pub const PROJECT_MARKER_DIR: []const u8 = ".ztask";
 pub const APP_DATA_SUBDIR: []const u8 = "ztask";
 const RUN_COUNTER_FILE: []const u8 = "run_counter";
@@ -724,21 +727,40 @@ pub const DataStore = struct {
             .truncate = true,
         });
         errdefer std.fs.deleteFileAbsolute(file_path) catch {};
-        return try self.addTask(gpa, file_path);
+        return try self.addTask(gpa, file_path, .{});
     }
+
+    pub const TaskAddOptions = struct {
+        /// Add all tasks recursively in the directory.
+        /// If the path is a directory.
+        recursive: bool = false,
+        /// Skip tasks on parse errors.
+        skip: bool = false,
+        /// Optional diagnostics to report errors.
+        diagnostics: ?*GenericDiagnostics = null,
+    };
 
     /// Create a new task and metadata from file path
     pub fn addTask(
         self: *DataStore,
         gpa: std.mem.Allocator,
         path: []const u8,
+        options: TaskAddOptions,
     ) !*TaskMetadata {
         const cwd = std.fs.cwd();
         var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
         defer file.close();
         if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
 
-        const parsed = try parse.loadTask(gpa, path);
+        var parse_diag: ?ParseDiag = if (options.diagnostics != null) .{} else null;
+        defer if (parse_diag) |*d| d.deinit(gpa);
+        const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
+
+        const parsed = parse.loadTaskDiag(gpa, path, pd) catch |err| {
+            const d = options.diagnostics orelse return err;
+            try d.extractParseErrorPrefix(gpa, pd, "{s}", .{path});
+            return err;
+        };
         defer parsed.deinit(gpa);
 
         // Check for existing task using the task ID
@@ -761,7 +783,7 @@ pub const DataStore = struct {
         self: *DataStore,
         gpa: std.mem.Allocator,
         dir_path: []const u8,
-        recursive: bool,
+        options: TaskAddOptions,
     ) !void {
         const cwd = std.fs.cwd();
         var dir = cwd.openDir(dir_path, .{ .iterate = true }) catch
@@ -777,16 +799,16 @@ pub const DataStore = struct {
 
                 const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
                 defer gpa.free(path);
-                _ = self.addTask(gpa, path) catch |err| switch (err) {
+                _ = self.addTask(gpa, path, options) catch |err| switch (err) {
                     error.TaskExists, error.InvalidTaskFile => continue,
-                    else => return err,
+                    else => if (options.skip) continue else return err,
                 };
             },
             .directory => {
-                if (!recursive) continue;
+                if (!options.recursive) continue;
                 const path = try std.fs.path.join(gpa, &.{ dir_path, entry.name });
                 defer gpa.free(path);
-                try self.addTasksInDir(gpa, path, recursive);
+                try self.addTasksInDir(gpa, path, options);
             },
             else => continue,
         };
@@ -1260,8 +1282,12 @@ pub const DataStore = struct {
     }
 };
 
-pub fn loadTaskFile(gpa: std.mem.Allocator, path: []const u8) !*task.Task {
-    return parse.loadTask(gpa, path);
+pub fn loadTaskFile(
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    diagnostics: ?*parse.ParseDiag,
+) !*task.Task {
+    return parse.loadTaskDiag(gpa, path, diagnostics);
 }
 
 /// Parse a file from JSON to type `T`

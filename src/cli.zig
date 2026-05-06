@@ -5,6 +5,7 @@ const options = @import("build_options");
 const remote_man = @import("remote/remote_manager.zig");
 const builtin = @import("builtin");
 
+const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 const ParseError = @import("parse.zig").ParseError;
 const DataDirMode = @import("data.zig").DataStore.DataDirMode;
 const ListenOptions = run.ListenOptions;
@@ -117,6 +118,11 @@ const commands = &[_]zcli.Cmd{
                 .long_name = "recursive",
                 .short_name = "r",
                 .desc = "Add task files recursively in a directory",
+            },
+            .{
+                .long_name = "skip",
+                .short_name = "s",
+                .desc = "Skip and continue if failed to add some task",
             },
         },
         .action = cmdAddFn,
@@ -450,7 +456,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     const task_arg = getTaskInput(cli) orelse
         fatal("No task given to run", .{});
 
-    var diagnostics: run.GenericDiagnostics = .{};
+    var diagnostics: GenericDiagnostics = .{};
     defer diagnostics.deinit(ctx.gpa);
 
     var opts: run.RunOptions = .{
@@ -630,17 +636,24 @@ fn cmdAddFn(ptr: *anyopaque) !void {
         else => unreachable, // Can't be id
     };
 
-    const recursive = cli.findOption("recursive") != null;
+    var diagnostics: GenericDiagnostics = .{};
+    defer diagnostics.deinit(ctx.gpa);
+
     return run.addTasks(ctx.gpa, .{
         .path = path,
-        .recursive = recursive,
+        .recursive = cli.findOption("recursive") != null,
+        .skip = cli.findOption("skip") != null,
         .data_dir = ctx.data_dir,
-    }) catch |err| switch (err) {
-        error.ErrorOpenFile => fatal("Failed to open file: {s}", .{path}),
-        error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
-        error.InvalidTaskFile => fatal("Not a task file", .{}),
-        error.TaskExists => fatal("Task already exists", .{}),
-        else => fatal("Error: {any}", .{err}),
+        .diagnostics = &diagnostics,
+    }) catch |err| {
+        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+        switch (err) {
+            error.ErrorOpenFile => fatal("Failed to open file: {s}", .{path}),
+            error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
+            error.InvalidTaskFile => fatal("Not a task file", .{}),
+            error.TaskExists => fatal("Task already exists", .{}),
+            else => fatal("Error: {any}", .{err}),
+        }
     };
 }
 

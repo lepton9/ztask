@@ -9,7 +9,7 @@ const vxfw = vaxis.vxfw;
 const Widget = vxfw.Widget;
 const AllocError = std.mem.Allocator.Error;
 const UiSnapshot = snap.UiSnapshot;
-const GenericDiagnostics = tm.GenericDiagnostics;
+const GenericDiagnostics = @import("../diagnostics.zig").GenericDiagnostics;
 
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
