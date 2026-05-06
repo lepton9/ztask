@@ -1485,7 +1485,7 @@ test "move_task" {
     const new_path = try std.fs.path.join(gpa, &.{ tasks_dir, "moved", "a.yml" });
     defer gpa.free(new_path);
 
-    _ = try store.addTask(gpa, old_path);
+    _ = try store.addTask(gpa, old_path, .{});
     try std.testing.expect(store.tasks.count() == 1);
 
     try store.moveTask(gpa, old_path, new_path, .{ .repair = false });
@@ -1530,7 +1530,7 @@ test "move_task_repair" {
         .truncate = true,
     });
 
-    const meta = try store.addTask(gpa, old_path);
+    const meta = try store.addTask(gpa, old_path, .{});
     const old_id = try gpa.dupe(u8, meta.id);
     defer gpa.free(old_id);
     const old_file_path = try gpa.dupe(u8, meta.file_path);
@@ -1591,7 +1591,7 @@ test "edit_task_updates_id" {
     defer gpa.free(task_path);
     try writeFile(task_path, "name: a\n", .{ .make_path = true, .truncate = true });
 
-    const meta = try store.addTask(gpa, task_path);
+    const meta = try store.addTask(gpa, task_path, .{});
     const old_id = try gpa.dupe(u8, meta.id);
     defer gpa.free(old_id);
 

@@ -9,6 +9,7 @@ const EventType = FileWatcher.EventType;
 const splitPath = FileWatcher.splitPath;
 const addEventFn = FileWatcher.addEventFn;
 
+gpa: std.mem.Allocator,
 fd: i32,
 wd_map: std.AutoHashMapUnmanaged(i32, Dir),
 dir_to_wd: std.StringHashMapUnmanaged(i32),
@@ -37,6 +38,7 @@ pub fn fileWatcher(gpa: std.mem.Allocator) !FileWatcher {
 fn init(gpa: std.mem.Allocator) !*FileWatcherLinux {
     const w = try gpa.create(FileWatcherLinux);
     w.* = .{
+        .gpa = gpa,
         .fd = try std.posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC),
         .wd_map = .{},
         .dir_to_wd = .{},
@@ -107,7 +109,10 @@ fn removeWatch(opq: *anyopaque, path: []const u8) void {
 
     if (!dir.watch_self and dir.file_table.count() == 0) {
         const dirname = dir.dirname;
-        _ = self.wd_map.remove(wd);
+        if (self.wd_map.fetchRemove(wd)) |kv| {
+            var removed_dir = kv.value;
+            removed_dir.file_table.deinit(self.gpa);
+        }
         _ = self.dir_to_wd.remove(dirname);
         std.posix.inotify_rm_watch(self.fd, wd);
     }

@@ -7,6 +7,7 @@ const vxfw = vaxis.vxfw;
 const builtin = @import("builtin");
 const parse = @import("parse.zig");
 
+const Id = @import("types/task.zig").Id;
 const ParseDiag = parse.ParseDiag;
 const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
@@ -894,7 +895,12 @@ fn editTaskFile(
         try std.fs.renameAbsolute(edit_path, file_path);
         std.fs.deleteFileAbsolute(resume_file) catch {};
 
-        const id = try gpa.dupe(u8, parsed.id.fmt());
+        var id_value: Id = if (parsed.id.str != null)
+            parsed.id
+        else
+            Id.fromPath(file_path);
+
+        const id = try gpa.dupe(u8, id_value.fmt());
         const name = try gpa.dupe(u8, parsed.name);
         return .{ .success = .{ .id = id, .name = name } };
     }

@@ -272,7 +272,7 @@ fn overwriteTaskFile(path: []const u8, name: []const u8, id: ?[]const u8) !void 
     try file.writeAll(content);
 }
 
-test "repair_tasks_id_change" {
+test "sync_tasks_id_change" {
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -288,7 +288,7 @@ test "repair_tasks_id_change" {
     try overwriteTaskFile(a_meta.file_path, "task-a-new", "a-new");
     try overwriteTaskFile(b_meta.file_path, "task-b-new", null);
 
-    try run.repairTasks(gpa, .{ .path = env.data_dir }, false);
+    try run.syncTasks(gpa, .{ .path = env.data_dir }, false);
 
     var repaired = try data.DataStore.init(gpa, .{
         .data_dir = .{ .path = env.data_dir },
