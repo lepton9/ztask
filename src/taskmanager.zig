@@ -452,7 +452,9 @@ pub const TaskManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const task = try self.loadTask(task_id, options.diagnostics);
+        const diagnostics = options.diagnostics;
+
+        const task = try self.loadTask(task_id, diagnostics);
         errdefer self.unloadTask(task);
 
         const task_scheduler = blk: {
@@ -484,7 +486,9 @@ pub const TaskManager = struct {
                             const job = values[i];
                             if (std.mem.eql(u8, n, job.name)) break :attach n;
                         }
-                        return error.UnknownAttachJob;
+                        const err = error.UnknownAttachJob;
+                        const d = diagnostics orelse return err;
+                        return d.failf(self.gpa, err, "Unknown job to attach to: '{s}'", .{n});
                     },
                 }
             };
@@ -501,6 +505,22 @@ pub const TaskManager = struct {
                     self.watcher.addFileWatch(watch.path) catch |err|
                         return switch (err) {
                             error.UnsupportedPlatform => error.WatcherAddUnsupported,
+                            error.InvalidWatchPath => {
+                                return (diagnostics orelse return err).failf(
+                                    self.gpa,
+                                    err,
+                                    "Watch path must be a file or directory: {s}",
+                                    .{watch.path},
+                                );
+                            },
+                            error.WatchPathNotFound => {
+                                return (diagnostics orelse return err).failf(
+                                    self.gpa,
+                                    err,
+                                    "Watch path not found: {s}",
+                                    .{watch.path},
+                                );
+                            },
                             else => err,
                         };
                     const res = try self.watch_map.getOrPut(self.gpa, watch.path);

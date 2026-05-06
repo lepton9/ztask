@@ -210,31 +210,33 @@ pub const Step = struct {
 
 pub const Id = struct {
     value: u64 = 0,
-    bytes: [16]u8 = [_]u8{0} ** 16,
+    bytes: [MAX_LEN]u8 = [_]u8{0} ** MAX_LEN,
     /// Allocated custom id string.
     str: ?[]const u8 = null,
+
+    const MAX_LEN = 16;
 
     pub fn deinit(self: *Id, gpa: std.mem.Allocator) void {
         if (self.str) |s| gpa.free(s);
         self.* = .{};
     }
 
-    fn validateCustom(raw: []const u8) bool {
-        if (raw.len == 0) return false;
+    fn validateCustom(raw: []const u8) !void {
+        if (raw.len == 0) return error.EmptyIdValue;
+        if (raw.len > MAX_LEN) return error.IdTooLong;
         for (raw) |c| {
             if (std.ascii.isAlphanumeric(c)) continue;
             switch (c) {
                 '_', '-', '.' => continue,
-                else => return false,
+                else => return error.InvalidIdCharacter,
             }
         }
-        return true;
     }
 
     /// Make a custom ID from a string value.
     pub fn fromCustom(gpa: std.mem.Allocator, raw: []const u8) !Id {
         const trimmed = std.mem.trim(u8, raw, " \t\n\r");
-        if (!validateCustom(trimmed)) return error.InvalidCustomId;
+        try validateCustom(trimmed);
         const duped = try gpa.dupe(u8, trimmed);
         const value = std.hash.XxHash64.hash(0, duped);
         return .{ .value = value, .str = duped };

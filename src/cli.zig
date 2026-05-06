@@ -352,10 +352,14 @@ fn cmdNewFn(ptr: *anyopaque) !void {
     const name_opt = cli.findOption("name") orelse unreachable;
     const name = name_opt.value.?.string;
 
+    var diagnostics: GenericDiagnostics = .{};
+    defer diagnostics.deinit(ctx.gpa);
+
     var opts: run.CreateOptions = .{
         .data_dir = ctx.data_dir,
         .name = name,
         .edit = cli.findOption("edit") != null,
+        .diagnostics = &diagnostics,
     };
     if (cli.findOption("editor")) |opt| {
         opts.editor = opt.value.?.string;
@@ -364,22 +368,25 @@ fn cmdNewFn(ptr: *anyopaque) !void {
         opts.id = opt.value.?.string;
     }
 
-    run.createNewTask(ctx.gpa, opts) catch |err| switch (err) {
-        error.EditorNotFound => if (opts.editor) |e|
-            fatal("Editor not found: '{s}'", .{e})
-        else
-            fatal("No default editor found", .{}),
-        error.TaskExists => if (opts.id) |e|
-            fatal("Task exists with ID: {s}", .{e})
-        else
-            fatal("Task already exists with the given ID", .{}),
-        else => {
-            if (inErrorSet(err, ParseError)) {
-                fatal("Invalid task file: {any}", .{err});
-                return;
-            }
-            fatal("Error: {any}", .{err});
-        },
+    run.createNewTask(ctx.gpa, opts) catch |err| {
+        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+        switch (err) {
+            error.EditorNotFound => if (opts.editor) |e|
+                fatal("Editor not found: '{s}'", .{e})
+            else
+                fatal("No default editor found", .{}),
+            error.TaskExists => if (opts.id) |e|
+                fatal("Task exists with ID: {s}", .{e})
+            else
+                fatal("Task already exists with the given ID", .{}),
+            else => {
+                if (inErrorSet(err, ParseError)) {
+                    fatal("Invalid task file: {any}", .{err});
+                    return;
+                }
+                fatal("Error: {any}", .{err});
+            },
+        }
     };
 }
 
@@ -511,6 +518,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
             },
             error.InvalidTaskFile => fatal("Invalid task file format", .{}),
             error.InvalidWatchPath => fatal("Invalid file path for watch trigger", .{}),
+            error.WatchPathNotFound => fatal("File path for watch trigger not found", .{}),
             error.NoTaskFileGiven => fatal("No task file given", .{}),
             else => {
                 if (inErrorSet(err, ParseError)) fatal(

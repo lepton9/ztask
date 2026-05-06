@@ -126,7 +126,7 @@ pub const Watcher = struct {
         defer self.mutex.unlock();
 
         const stat = std.fs.cwd().statFile(path) catch |err| return switch (err) {
-            error.FileNotFound => error.InvalidWatchPath,
+            error.FileNotFound => error.WatchPathNotFound,
             else => err,
         };
         if (stat.kind != .file and stat.kind != .directory)

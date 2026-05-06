@@ -16,7 +16,7 @@ pub const GenericDiagnostics = struct {
         err: anyerror,
         comptime fmt: []const u8,
         args: anytype,
-    ) !void {
+    ) anyerror {
         self.deinit(gpa);
         self.err = err;
         self.message = try std.fmt.allocPrint(gpa, fmt, args);

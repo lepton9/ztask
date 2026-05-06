@@ -449,6 +449,8 @@ pub const CreateOptions = struct {
     editor: ?[]const u8 = null,
     name: []const u8,
     id: ?[]const u8 = null,
+    /// Optional diagnostics for errors.
+    diagnostics: ?*GenericDiagnostics = null,
 };
 
 /// Create a new task
@@ -458,7 +460,11 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
         .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
-    const new = try datastore.newTask(gpa, .{ .name = options.name, .id = options.id });
+    const new = try datastore.newTask(gpa, .{
+        .name = options.name,
+        .id = options.id,
+        .diagnostics = options.diagnostics,
+    });
 
     try fmtWrite("Task '{s}' created at: {s}\n", .{ new.name, new.file_path });
 

@@ -666,20 +666,22 @@ pub const DataStore = struct {
         trigger: ?task.Trigger = null,
         /// Task jobs
         jobs: ?[]task.Job = null,
+        /// Optional diagnostics to report errors.
+        diagnostics: ?*GenericDiagnostics = null,
     };
 
     /// Create a new task from the given content.
     pub fn newTask(
         self: *DataStore,
         gpa: std.mem.Allocator,
-        spec: TaskCreateOptions,
+        options: TaskCreateOptions,
     ) !*TaskMetadata {
-        const name = try parse.parseStringField(spec.name);
+        const name = try parse.parseStringField(options.name);
         const new_task = try task.Task.init(gpa, name);
         defer new_task.deinit(gpa);
 
         // Set the file path for the new task file
-        new_task.file_path = spec.path orelse blk: {
+        new_task.file_path = options.path orelse blk: {
             const tasks_path = try self.tasksPath(gpa);
             defer gpa.free(tasks_path);
 
@@ -708,15 +710,23 @@ pub const DataStore = struct {
             }
         };
         const file_path = new_task.file_path orelse unreachable;
-        new_task.trigger = spec.trigger;
-        new_task.id = if (spec.id) |id|
-            try task.Id.fromCustom(gpa, id)
+        new_task.trigger = options.trigger;
+        new_task.id = if (options.id) |id|
+            task.Id.fromCustom(gpa, id) catch |err| {
+                const d = options.diagnostics orelse return err;
+                return d.failf(
+                    gpa,
+                    err,
+                    "Invalid id value '{s}' ({any})",
+                    .{ id, err },
+                );
+            }
         else
             task.Id.fromPath(file_path);
         if (self.tasks.getPtr(new_task.id.fmt())) |_| return error.TaskExists;
 
         // Insert jobs
-        if (spec.jobs) |jobs| for (jobs) |job| {
+        if (options.jobs) |jobs| for (jobs) |job| {
             try new_task.addJob(gpa, job);
         };
 
@@ -727,7 +737,9 @@ pub const DataStore = struct {
             .truncate = true,
         });
         errdefer std.fs.deleteFileAbsolute(file_path) catch {};
-        return try self.addTask(gpa, file_path, .{});
+        return try self.addTask(gpa, file_path, .{
+            .diagnostics = options.diagnostics,
+        });
     }
 
     pub const TaskAddOptions = struct {

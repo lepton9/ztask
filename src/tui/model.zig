@@ -151,7 +151,7 @@ pub const Model = struct {
             };
             if (self.info.text) |t| break :blk .{ t, .{ .fg = .default } };
             break :blk .{ switch (self.active) {
-                .task_view => " tab switch  enter open  esc back  q quit",
+                .task_view => " j/k move r run  s stop tab switch  enter open  esc back  q quit",
                 .task_list => " j/k move  r run  s stop  d delete  enter open  q quit",
                 else => " q quit",
             }, dim };

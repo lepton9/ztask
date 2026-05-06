@@ -355,12 +355,13 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
     }
 
     const t = try Task.init(cx.gpa, name);
-    if (id_maybe) |id| t.id = task.Id.fromCustom(cx.gpa, id) catch {
+    errdefer t.deinit(cx.gpa);
+    if (id_maybe) |id| t.id = task.Id.fromCustom(cx.gpa, id) catch |err| {
         return cx.at("id").failf(
             ParseError.InvalidId,
             null,
-            "Invalid id value '{s}'",
-            .{id},
+            "Invalid id value '{s}' ({any})",
+            .{ id, err },
         );
     };
     t.trigger = trigger;
