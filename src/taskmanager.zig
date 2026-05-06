@@ -498,10 +498,11 @@ pub const TaskManager = struct {
         };
 
         // Add trigger
-        if (task.trigger) |t| {
+        if (task.trigger) |*t| {
             task_scheduler.status = .waiting;
-            switch (t) {
-                .watch => |watch| {
+            switch (t.*) {
+                .watch => |*watch| {
+                    try task.resolveWatchPath(self.gpa);
                     self.watcher.addFileWatch(watch.path) catch |err|
                         return switch (err) {
                             error.UnsupportedPlatform => error.WatcherAddUnsupported,

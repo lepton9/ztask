@@ -275,7 +275,14 @@ pub const Scheduler = struct {
             (if (std.mem.eql(u8, attach_name, node.ptr.name)) .attached else .piped)
         else
             .piped;
-        runner.runJobWithMode(self.gpa, node, self.result_queue, self.log_queue, exec_mode);
+        runner.runJobWithMode(
+            self.gpa,
+            node,
+            self.result_queue,
+            self.log_queue,
+            exec_mode,
+            self.task.cwd,
+        );
     }
 
     /// Run the next job in the queue with a remote runner

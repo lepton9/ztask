@@ -4,6 +4,7 @@ const date = @import("date.zig");
 pub const Task = struct {
     id: Id = .{},
     name: []const u8,
+    cwd: ?[]const u8 = null,
     file_path: ?[]const u8 = null,
     trigger: ?Trigger = null,
     jobs: std.StringArrayHashMapUnmanaged(Job),
@@ -23,6 +24,7 @@ pub const Task = struct {
         self.jobs.deinit(gpa);
         self.id.deinit(gpa);
 
+        if (self.cwd) |path| gpa.free(path);
         if (self.file_path) |path| gpa.free(path);
         if (self.trigger) |trigger| trigger.deinit(gpa);
         gpa.free(self.name);
@@ -38,6 +40,24 @@ pub const Task = struct {
         const gop = try self.jobs.getOrPut(gpa, job.name);
         if (gop.found_existing) return error.DuplicateJobName;
         gop.value_ptr.* = job;
+    }
+
+    /// Resolve the watch trigger path if a working directory is set.
+    /// Does nothing if the trigger is not of type `watch`.
+    pub fn resolveWatchPath(self: *Task, gpa: std.mem.Allocator) !void {
+        const t = if (self.trigger) |*t| t else return;
+        if (t.* != .watch) return;
+        const watch = &t.watch;
+        const cwd = self.cwd orelse return;
+        if (std.fs.path.isAbsolute(watch.path)) return;
+        var path = try std.fs.path.join(gpa, &.{ cwd, watch.path });
+        const abs = std.fs.cwd().realpathAlloc(gpa, path) catch null;
+        if (abs) |a| {
+            gpa.free(path);
+            path = a;
+        }
+        gpa.free(watch.path);
+        watch.path = path;
     }
 
     /// Convert a task to YAML.

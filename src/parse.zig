@@ -14,6 +14,9 @@ pub const ParseError = error{
     EmptyTaskFile,
     UnnamedTask,
     InvalidId,
+    InvalidTaskCwd,
+    CwdNotFound,
+    CwdNotDirectory,
     UnknownDependency,
     DuplicateJobName,
     DuplicateKey,
@@ -37,7 +40,7 @@ pub const ParseError = error{
 };
 
 const VALID_TASK_FIELDS = makeVoidSet(
-    &[_][]const u8{ "name", "id", "on", "jobs" },
+    &[_][]const u8{ "name", "id", "on", "jobs", "cwd" },
 );
 const VALID_TRIGGER_FIELDS = makeVoidSet(
     &[_][]const u8{ "watch", "time", "interval" },
@@ -309,11 +312,14 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
         break :blk try parseStringFieldDiag(name, cx.at("name"));
     };
 
+    // Custom ID
     const id_maybe: ?[]const u8 = blk: {
         const nv = map.get("id") orelse break :blk null;
         const id = try requireScalar(cx.at("id"), nv);
         break :blk try parseStringFieldDiag(id, cx.at("id"));
     };
+
+    const cwd_maybe: ?[]const u8 = try parseTaskCwd(cx, map);
 
     // Trigger
     const trigger: ?task.Trigger = blk: {
@@ -364,9 +370,34 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
             .{ id, err },
         );
     };
+    t.cwd = if (cwd_maybe) |cwd| try cx.gpa.dupe(u8, cwd) else null;
     t.trigger = trigger;
     t.jobs = jobs;
     return t;
+}
+
+/// Parse task working directory and check if it's a directory.
+fn parseTaskCwd(cx: ParseCtx, map: yaml.Yaml.Map) !?[]const u8 {
+    const nv = map.get("cwd") orelse return null;
+    const cx_cwd = cx.at("cwd");
+
+    const cwd = try requireScalar(cx_cwd, nv);
+    const path = try parseStringFieldDiag(cwd, cx_cwd);
+
+    const stat = std.fs.cwd().statFile(path) catch |err| {
+        if (err == error.FileNotFound) {
+            const fmt = "Working directory path not found: {s}";
+            return cx_cwd.failf(ParseError.CwdNotFound, null, fmt, .{path});
+        } else {
+            const fmt = "Failed to open working directory: {s} ({any})";
+            return cx_cwd.failf(ParseError.InvalidTaskCwd, null, fmt, .{ path, err });
+        }
+    };
+    if (stat.kind != .directory) {
+        const fmt = "Task working directory must be a directory: {s}";
+        return cx_cwd.failf(ParseError.CwdNotDirectory, null, fmt, .{path});
+    }
+    return path;
 }
 
 /// Parse a time from a string.

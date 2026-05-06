@@ -47,6 +47,8 @@ pub const LocalRunner = struct {
     job: ?*JobNode = null,
     /// Child process for the job commands
     process: ?*std.process.Child = null,
+    /// Optional working directory for the current job.
+    cwd: ?[]const u8 = null,
     /// Execution mode of the job
     mode: ExecMode = .piped,
 
@@ -61,7 +63,7 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
     ) void {
-        self.runJobWithMode(gpa, job, results, logs, .piped);
+        self.runJobWithMode(gpa, job, results, logs, .piped, null);
     }
 
     /// Run a job with an execution mode
@@ -75,10 +77,12 @@ pub const LocalRunner = struct {
         results: *ResultQueue,
         logs: *LogQueue,
         mode: ExecMode,
+        cwd: ?[]const u8,
     ) void {
         self.running.store(true, .seq_cst);
         self.job = job;
         self.mode = mode;
+        self.cwd = cwd;
 
         self.thread = std.Thread.spawn(.{}, runFn, .{
             self,
@@ -167,6 +171,7 @@ pub const LocalRunner = struct {
         self.thread = null;
         self.process = null;
         self.job = null;
+        self.cwd = null;
     }
 
     /// Force runner to stop executing the job if running
@@ -188,6 +193,7 @@ pub const LocalRunner = struct {
                 if (self.thread) |t| t.detach();
                 self.thread = null;
                 self.job = null;
+                self.cwd = null;
             },
         }
     }
@@ -214,6 +220,7 @@ pub const LocalRunner = struct {
 
         // Create child process
         var child = std.process.Child.init(argv.items, gpa);
+        child.cwd = self.cwd;
         self.process = &child;
 
         switch (mode) {
