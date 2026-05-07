@@ -312,6 +312,153 @@ pub const DataStore = struct {
         );
     }
 
+    /// Find the last run count of a task by iterating the runs on disk.
+    fn maxRunIdOnDisk(
+        self: *const DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+    ) !u64 {
+        const runs_path = try self.taskRunsPath(gpa, task_id);
+        defer gpa.free(runs_path);
+
+        var last: u64 = 0;
+        var dir = openDir(runs_path, .{ .iterate = true, .create = false }) catch
+            return 0;
+        defer dir.close();
+        var it = dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const run_id_str = std.fs.path.basename(e.name);
+                const id = std.fmt.parseInt(u64, run_id_str, 10) catch continue;
+                if (id > last) last = id;
+            },
+            else => continue,
+        };
+        return last;
+    }
+
+    /// Update the task ID and run ID inside the run meta file.
+    fn rewriteRunMetaIds(
+        self: *const DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        run_id: u64,
+    ) !void {
+        var buf: [64]u8 = undefined;
+        const run_id_str = try std.fmt.bufPrint(&buf, "{d}", .{run_id});
+        const meta_path = try self.taskRunMetaPath(gpa, task_id, run_id_str);
+        defer gpa.free(meta_path);
+
+        var file = std.fs.cwd().openFile(meta_path, .{ .mode = .read_only }) catch
+            return;
+        defer file.close();
+
+        const bytes = try file.readToEndAlloc(gpa, 128 * 1024);
+        defer gpa.free(bytes);
+
+        var parsed = try std.json.parseFromSlice(TaskRunMetadata, gpa, bytes, .{});
+        defer parsed.deinit();
+
+        var meta = parsed.value;
+        meta.task_id = task_id;
+        meta.run_id = run_id;
+
+        const json = try toJson(gpa, meta);
+        defer gpa.free(json);
+        try writeFile(meta_path, json, .{ .truncate = true, .make_path = true });
+    }
+
+    /// Move run history from `from_id` to `to_id`, renumbering runs if needed.
+    pub fn mergeTaskRuns(
+        self: *const DataStore,
+        gpa: std.mem.Allocator,
+        from_id: []const u8,
+        to_id: []const u8,
+    ) !void {
+        if (std.mem.eql(u8, from_id, to_id)) return;
+        const cwd = std.fs.cwd();
+
+        const from_runs_path = try self.taskRunsPath(gpa, from_id);
+        defer gpa.free(from_runs_path);
+        const to_runs_path = try self.taskRunsPath(gpa, to_id);
+        defer gpa.free(to_runs_path);
+
+        var from_dir = openDir(from_runs_path, .{
+            .iterate = true,
+            .create = false,
+        }) catch return;
+        defer from_dir.close();
+        try cwd.makePath(to_runs_path);
+
+        // Collect and sort run IDs from the source task.
+        var ids: std.ArrayList(u64) = .{};
+        defer ids.deinit(gpa);
+
+        var it = from_dir.iterate();
+        while (it.next() catch null) |e| switch (e.kind) {
+            .directory => {
+                const run_id_str = std.fs.path.basename(e.name);
+                const id = std.fmt.parseInt(u64, run_id_str, 10) catch continue;
+                try ids.append(gpa, id);
+            },
+            else => continue,
+        };
+
+        const Less = struct {
+            pub fn lessThan(_: @This(), a: u64, b: u64) bool {
+                return a < b;
+            }
+        };
+        std.mem.sort(u64, ids.items, Less{}, Less.lessThan);
+
+        var max_dest = try self.maxRunIdOnDisk(gpa, to_id);
+        var next_free: u64 = max_dest + 1;
+
+        for (ids.items) |src_id| {
+            var src_buf: [64]u8 = undefined;
+            var dst_buf: [64]u8 = undefined;
+            const src_id_str = try std.fmt.bufPrint(&src_buf, "{d}", .{src_id});
+
+            // Find the fitting run number for the run to merge.
+            var target_id: u64 = src_id;
+            while (true) {
+                const target_str = if (target_id == src_id)
+                    src_id_str
+                else
+                    try std.fmt.bufPrint(&dst_buf, "{d}", .{target_id});
+
+                // Check if a run exist with the same run ID.
+                const dst_path = try std.fs.path.join(gpa, &.{ to_runs_path, target_str });
+                defer gpa.free(dst_path);
+                _ = cwd.statFile(dst_path) catch |err| switch (err) {
+                    error.FileNotFound => break,
+                    else => return err,
+                };
+                // The same run exists. Add the run to the end.
+                target_id = if (target_id == src_id) next_free else target_id + 1;
+            }
+            if (target_id > max_dest) {
+                max_dest = target_id;
+                next_free = target_id + 1;
+            }
+
+            // Move the run data to the destination.
+            const src_dir = try std.fs.path.join(gpa, &.{ from_runs_path, src_id_str });
+            defer gpa.free(src_dir);
+            const dst_id_str = if (target_id == src_id)
+                src_id_str
+            else
+                try std.fmt.bufPrint(&dst_buf, "{d}", .{target_id});
+            const dst_dir = try std.fs.path.join(gpa, &.{ to_runs_path, dst_id_str });
+            defer gpa.free(dst_dir);
+
+            try std.fs.renameAbsolute(src_dir, dst_dir);
+            try self.rewriteRunMetaIds(gpa, to_id, target_id);
+        }
+
+        try self.setRunCounterNextId(gpa, to_id, max_dest + 1);
+    }
+
     /// Get and allocate the path for a task run jobs directory
     pub fn taskRunJobsPath(
         self: *const DataStore,
@@ -365,7 +512,7 @@ pub const DataStore = struct {
         });
     }
 
-    /// Returns the next run ID for a task, incrementing it on disk
+    /// Returns the next run ID for a task, incrementing it on disk.
     pub fn nextRunId(
         self: *const DataStore,
         gpa: std.mem.Allocator,
@@ -393,12 +540,34 @@ pub const DataStore = struct {
         };
 
         std.mem.writeInt(u64, &buf, next_id + 1, .little);
-        try writeFile(
-            counter_file_path,
-            &buf,
-            .{ .truncate = true, .make_path = true },
-        );
+        try writeFile(counter_file_path, &buf, .{
+            .truncate = true,
+            .make_path = true,
+        });
         return next_id;
+    }
+
+    /// Set the run counter for a task.
+    fn setRunCounterNextId(
+        self: *const DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        next_id: u64,
+    ) !void {
+        const task_dir = try self.taskDataPath(gpa, task_id);
+        defer gpa.free(task_dir);
+        const counter_path = try std.fs.path.join(gpa, &.{
+            task_dir,
+            RUN_COUNTER_FILE,
+        });
+        defer gpa.free(counter_path);
+
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, next_id, .little);
+        try writeFile(counter_path, &buf, .{
+            .truncate = true,
+            .make_path = true,
+        });
     }
 
     /// Iterate the runs directory and find the last run id
@@ -549,7 +718,12 @@ pub const DataStore = struct {
                     } else gpa.free(rp);
                 }
 
-                try self.tasks.put(gpa, meta.id, meta);
+                const gop = try self.tasks.getOrPut(gpa, meta.id);
+                if (gop.found_existing) {
+                    meta.deinit(gpa);
+                    return error.DuplicateTaskId;
+                }
+                gop.value_ptr.* = meta;
                 if (changed) try self.writeTaskMeta(gpa, &meta);
                 if (options.load_runs) try self.loadTaskRuns(gpa, task_id);
             },

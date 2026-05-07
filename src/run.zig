@@ -548,6 +548,39 @@ fn scanTasks(gpa: std.mem.Allocator, store: *data.DataStore, sink: anytype) !voi
     }
 }
 
+/// Check if the two tasks point to the same task file.
+/// If yes, merge the data between them.
+fn tryMerge(
+    gpa: std.mem.Allocator,
+    store: *data.DataStore,
+    old_id: []const u8,
+    desired_id: []const u8,
+    desired_name: []const u8,
+) !bool {
+    const old_meta = store.tasks.get(old_id) orelse return false;
+    const desired_meta = store.tasks.get(desired_id) orelse return false;
+    if (!std.mem.eql(u8, old_meta.file_path, desired_meta.file_path)) return false;
+
+    // Two tasks with different IDs have the same task file.
+    try store.mergeTaskRuns(gpa, old_id, desired_id);
+    store.deleteTask(gpa, old_id) catch |err| switch (err) {
+        error.TaskNotFound => {},
+        else => return err,
+    };
+
+    // Try to delete the duplicate data dir.
+    blk: {
+        const dir = store.taskDataPath(gpa, old_id) catch break :blk;
+        defer gpa.free(dir);
+        std.fs.cwd().deleteTree(dir) catch {};
+    }
+
+    if (!std.mem.eql(u8, desired_meta.name, desired_name)) {
+        _ = try store.applyEditedTaskMeta(gpa, desired_id, desired_id, desired_name);
+    }
+    return true;
+}
+
 const SyncSinkDry = struct {
     pub fn onMissing(_: @This(), meta: *const data.TaskMetadata) !void {
         try fmtWrite("Would delete {s}\n", .{meta.id});
@@ -687,7 +720,17 @@ pub fn syncTasks(
                 a.new_id,
                 a.new_name,
             ) catch |err| switch (err) {
-                error.TaskExists => continue, // Maybe another action will free the ID
+                error.TaskExists => {
+                    if (try tryMerge(gpa, &datastore, a.old_id, a.new_id, a.new_name)) {
+                        try fmtWrite(
+                            "Resolved duplicate task by merging {s} -> {s}\n",
+                            .{ a.old_id, a.new_id },
+                        );
+                        processed_actions[i] = true;
+                        remaining_actions -= 1;
+                    }
+                    continue; // Maybe another action will free the ID
+                },
                 error.TaskNotFound => {
                     try fmtWrite("Skipped syncing for {s}: Task not found\n", .{a.old_id});
                     processed_actions[i] = true;
