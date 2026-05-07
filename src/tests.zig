@@ -326,3 +326,135 @@ test "sync_tasks_id_change" {
     try expect(!(data.fileExists(old_meta_path_b)));
     try expect(data.fileExists(new_meta_path_b));
 }
+
+test "sync_dedup_same_task_file_path" {
+    const gpa = std.testing.allocator;
+    const cwd = std.fs.cwd();
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var store = try data.DataStore.init(gpa, .{
+        .data_dir = .{ .path = env.data_dir },
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    // Create task file and add the task
+    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "python.yml" });
+    defer gpa.free(task_path);
+    const task_id = "task-a-id";
+    try data.writeFile(
+        task_path,
+        "name: taskA\nid: " ++ task_id ++ "\n",
+        .{ .make_path = true, .truncate = true },
+    );
+    const real_task_path = try cwd.realpathAlloc(gpa, task_path);
+    defer gpa.free(real_task_path);
+    _ = try store.addTask(gpa, task_path, .{});
+    try std.testing.expect(store.getTaskMetadata(task_id) != null);
+
+    // Create a duplicate meta dir with a different id but the same file_path.
+    const dup_id = "duplicate-task-id";
+    const dup_task_dir = try store.taskDataPath(gpa, dup_id);
+    defer gpa.free(dup_task_dir);
+    try cwd.makePath(dup_task_dir);
+    const dup_meta_path = try store.taskMetaPath(gpa, dup_id);
+    defer gpa.free(dup_meta_path);
+    const dup_meta_json = try data.toJson(gpa, data.TaskMetadata{
+        .id = dup_id,
+        .file_path = real_task_path,
+        .name = "taskB",
+    });
+    defer gpa.free(dup_meta_json);
+    try data.writeFile(dup_meta_path, dup_meta_json, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Add run 1 for the real task.
+    const run1_dir = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", task_id, "runs", "1" },
+    );
+    defer gpa.free(run1_dir);
+    try cwd.makePath(run1_dir);
+    const run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
+        .task_id = task_id,
+        .run_id = 1,
+        .start_time = 0,
+        .end_time = 1,
+        .status = .success,
+        .jobs_total = 0,
+        .jobs_completed = 0,
+    });
+    defer gpa.free(run1_meta);
+    const run1_meta_path = try std.fs.path.join(gpa, &.{ run1_dir, "meta.json" });
+    defer gpa.free(run1_meta_path);
+    try data.writeFile(run1_meta_path, run1_meta, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Add run 1 for duplicate id (will need to be moved to avoid collision).
+    const dup_run1_dir = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", dup_id, "runs", "1" },
+    );
+    defer gpa.free(dup_run1_dir);
+    try cwd.makePath(dup_run1_dir);
+    const dup_run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
+        .task_id = dup_id,
+        .run_id = 1,
+        .start_time = 2,
+        .end_time = 3,
+        .status = .failed,
+        .jobs_total = 0,
+        .jobs_completed = 0,
+    });
+    defer gpa.free(dup_run1_meta);
+    const dup_run1_meta_path = try std.fs.path.join(gpa, &.{
+        dup_run1_dir,
+        "meta.json",
+    });
+    defer gpa.free(dup_run1_meta_path);
+    try data.writeFile(dup_run1_meta_path, dup_run1_meta, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Set wrong run counter for the real task
+    const counter_path = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", task_id, "run_counter" },
+    );
+    defer gpa.free(counter_path);
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, 1, .little);
+    try data.writeFile(counter_path, buf[0..], .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Run sync
+    try run.syncTasks(gpa, .{ .path = env.data_dir }, false);
+    var repaired = try data.DataStore.init(gpa, .{
+        .data_dir = .{ .path = env.data_dir },
+        .load = .{ .tasks = true, .runs = true },
+    });
+    defer repaired.deinit(gpa);
+
+    // Duplicate was removed
+    try std.testing.expect(repaired.getTaskMetadata(dup_id) == null);
+    try std.testing.expect(repaired.getTaskMetadata(task_id) != null);
+
+    const runs = try repaired.getTaskRuns(gpa, task_id);
+    try std.testing.expect(runs.count() == 2);
+    try std.testing.expect(runs.get(1) != null);
+    try std.testing.expect(runs.get(2) != null);
+
+    const next = try repaired.nextRunId(gpa, task_id);
+    try std.testing.expect(next >= 3);
+}

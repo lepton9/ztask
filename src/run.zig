@@ -748,7 +748,10 @@ pub fn syncTasks(
                 },
             };
 
-            try fmtWrite("Synced ID change {s} -> {s}\n", .{ a.old_id, updated.id });
+            if (std.mem.eql(u8, a.old_id, updated.id))
+                try fmtWrite("Updated name for {s}: '{s}'\n", .{ updated.id, a.new_name })
+            else
+                try fmtWrite("Synced ID change {s} -> {s}\n", .{ a.old_id, updated.id });
             processed_actions[i] = true;
             remaining_actions -= 1;
         }

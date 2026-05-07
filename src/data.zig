@@ -718,10 +718,16 @@ pub const DataStore = struct {
                     } else gpa.free(rp);
                 }
 
+                // User probably made a manual copy or moved the task data dir.
+                if (!std.mem.eql(u8, task_id, meta.id)) {
+                    meta.deinit(gpa);
+                    continue;
+                }
+
                 const gop = try self.tasks.getOrPut(gpa, meta.id);
                 if (gop.found_existing) {
                     meta.deinit(gpa);
-                    return error.DuplicateTaskId;
+                    continue;
                 }
                 gop.value_ptr.* = meta;
                 if (changed) try self.writeTaskMeta(gpa, &meta);
