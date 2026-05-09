@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli_zig = @import("cli.zig");
 const zcli = cli_zig.zcli;
 
@@ -10,8 +11,11 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{
+        .safety = comptime builtin.mode == .Debug,
+    }).init;
     const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
 
     // Parse cli args
     const cli: *zcli.Cli = try zcli.parseArgs(allocator, &cli_zig.cli_spec);

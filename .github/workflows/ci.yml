@@ -2,6 +2,7 @@ name: CI
 on:
   push:
     branches: ['main']
+    tags: ['v*.*.*']
   pull_request:
     branches: ['main']
   workflow_dispatch:
@@ -24,3 +25,30 @@ jobs:
         run: zig fmt --check ./*.zig src/*.zig
       - name: Build and run tests
         run: zig build ci
+
+  release:
+    needs: [test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Create release builds
+        run: zig build release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: zig-out/releases/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

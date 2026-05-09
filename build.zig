@@ -5,8 +5,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe, const tests = setupExe(b, target, optimize);
+    const exe = setupExe(b, target, optimize);
     b.installArtifact(exe);
+
+    const tests = setupTests(b, target, optimize);
 
     // Run step
     const run_step = b.step("run", "Run the executable");
@@ -24,13 +26,17 @@ pub fn build(b: *std.Build) void {
     const ci_step = b.step("ci", "Build for all platforms and run tests");
     setupCi(b, ci_step);
     ci_step.dependOn(test_step);
+
+    // Release
+    const release_step = b.step("release", "Create release builds");
+    setupRelease(b, release_step);
 }
 
 pub fn setupExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-) struct { *std.Build.Step.Compile, *std.Build.Step.Compile } {
+) *std.Build.Step.Compile {
     const options = b.addOptions();
     options.addOption([]const u8, "PROGRAM_NAME", @tagName(zon.name));
 
@@ -61,6 +67,17 @@ pub fn setupExe(
     });
     exe.root_module.addOptions("build_options", options);
 
+    return exe;
+}
+
+pub fn setupTests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    const yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize });
+    const yaml_mod = yaml.module("yaml");
+
     // Test module
     const tests_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
@@ -70,23 +87,70 @@ pub fn setupExe(
             .{ .name = "yaml", .module = yaml_mod },
         },
     });
-    const exe_test = b.addTest(.{ .root_module = tests_mod });
-    return .{ exe, exe_test };
+    return b.addTest(.{ .root_module = tests_mod });
 }
 
 pub fn setupCi(b: *std.Build, step: *std.Build.Step) void {
-    const targets: []const std.Target.Query = &.{
-        .{ .cpu_arch = .x86_64, .os_tag = .linux },
-        .{ .cpu_arch = .aarch64, .os_tag = .linux },
-        .{ .cpu_arch = .x86_64, .os_tag = .windows },
-        .{ .cpu_arch = .aarch64, .os_tag = .windows },
-    };
-
     for (targets) |t| {
         const target = b.resolveTargetQuery(t);
-        const optimize = .Debug;
-        const exe, const tests = setupExe(b, target, optimize);
+        const optimize: std.builtin.OptimizeMode = .Debug;
+        const exe = setupExe(b, target, optimize);
+        const tests = setupTests(b, target, optimize);
         step.dependOn(&exe.step);
         step.dependOn(&tests.step);
     }
 }
+
+pub fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
+    for (targets) |t| {
+        const target = b.resolveTargetQuery(t);
+        const optimize: std.builtin.OptimizeMode = .ReleaseFast;
+        const exe = setupExe(b, target, optimize);
+
+        switch (t.os_tag.?) {
+            .windows, .macos => {
+                const archive_name = b.fmt("{s}.zip", .{
+                    t.zigTriple(b.allocator) catch unreachable,
+                });
+
+                const zip = b.addSystemCommand(&.{ "zip", "-9", "-q", "-j" });
+                const archive = zip.addOutputFileArg(archive_name);
+                zip.addDirectoryArg(exe.getEmittedBin());
+                _ = zip.captureStdOut();
+
+                step.dependOn(&b.addInstallFileWithDir(
+                    archive,
+                    .{ .custom = "releases" },
+                    archive_name,
+                ).step);
+            },
+            else => {
+                const archive_name = b.fmt("{s}.tar.xz", .{
+                    t.zigTriple(b.allocator) catch unreachable,
+                });
+
+                const tar = b.addSystemCommand(&.{ "tar", "-cJf" });
+
+                const archive = tar.addOutputFileArg(archive_name);
+                tar.addArg("-C");
+
+                tar.addDirectoryArg(exe.getEmittedBinDirectory());
+                tar.addArg("ztask");
+                _ = tar.captureStdOut();
+
+                step.dependOn(&b.addInstallFileWithDir(
+                    archive,
+                    .{ .custom = "releases" },
+                    archive_name,
+                ).step);
+            },
+        }
+    }
+}
+
+const targets: []const std.Target.Query = &.{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows },
+    .{ .cpu_arch = .aarch64, .os_tag = .windows },
+};
