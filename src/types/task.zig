@@ -74,18 +74,31 @@ pub const Task = struct {
             try file.appendSlice(gpa, task_id);
         }
 
-        if (task.trigger) |tr| try file.appendSlice(gpa, try std.fmt.bufPrint(
-            &buf,
-            "on:\n  {s}: \"{s}\"\n",
-            .{
-                @tagName(tr),
-                switch (tr) {
-                    .watch => |w| w.path,
-                    .interval => |i| try i.fmt(&scratch),
-                    .time => |time| try time.fmt(&scratch),
-                },
+        if (task.trigger) |tr| switch (tr) {
+            .watch => |w| if (!w.recursive) {
+                try file.appendSlice(gpa, try std.fmt.bufPrint(
+                    &buf,
+                    "on:\n  watch: \"{s}\"\n",
+                    .{w.path},
+                ));
+            } else {
+                try file.appendSlice(gpa, try std.fmt.bufPrint(
+                    &buf,
+                    "on:\n  watch:\n    path: \"{s}\"\n    recursive: true\n",
+                    .{w.path},
+                ));
             },
-        ));
+            .interval => |i| try file.appendSlice(gpa, try std.fmt.bufPrint(
+                &buf,
+                "on:\n  interval: \"{s}\"\n",
+                .{try i.fmt(&scratch)},
+            )),
+            .time => |time| try file.appendSlice(gpa, try std.fmt.bufPrint(
+                &buf,
+                "on:\n  time: \"{s}\"\n",
+                .{try time.fmt(&scratch)},
+            )),
+        };
 
         // Convert jobs
         if (task.jobs.count() > 0) {
@@ -151,12 +164,16 @@ pub const Task = struct {
 };
 
 pub const Trigger = union(enum) {
-    watch: struct {
-        type: enum { dir, file },
-        path: []const u8,
-    },
+    watch: WatchSpec,
     interval: date.Time,
     time: date.Time,
+
+    pub const WatchSpec = struct {
+        /// File path or directory to watch.
+        path: []const u8,
+        /// If `path` is a directory, watch all subdirectories too.
+        recursive: bool = false,
+    };
 
     pub fn deinit(self: Trigger, gpa: std.mem.Allocator) void {
         switch (self) {
@@ -283,7 +300,7 @@ test "task_to_text" {
     defer t.deinit(gpa);
     t.id = try .fromCustom(gpa, "custom-id");
     t.trigger = .{
-        .watch = .{ .path = try gpa.dupe(u8, "src/main.zig"), .type = .file },
+        .watch = .{ .path = try gpa.dupe(u8, "src/main.zig") },
     };
 
     var steps = try std.ArrayList(Step).initCapacity(gpa, 2);

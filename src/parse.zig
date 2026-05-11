@@ -45,6 +45,9 @@ const VALID_TASK_FIELDS = makeVoidSet(
 const VALID_TRIGGER_FIELDS = makeVoidSet(
     &[_][]const u8{ "watch", "time", "interval" },
 );
+const VALID_WATCH_FIELDS = makeVoidSet(
+    &[_][]const u8{ "path", "recursive" },
+);
 const VALID_JOB_FIELDS = makeVoidSet(
     &[_][]const u8{ "steps", "deps", "run_on" },
 );
@@ -329,10 +332,54 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
         try rejectUnknown(on_cx, on, VALID_TRIGGER_FIELDS, ParseError.InvalidTrigger);
 
         if (on.get("watch")) |watch| {
-            const path = try requireScalar(on_cx.at("watch"), watch);
-            break :blk .{
-                .watch = .{ .path = try cx.gpa.dupe(u8, path), .type = .file },
+            const watch_cx = on_cx.at("watch");
+
+            const spec: task.Trigger.WatchSpec = spec_blk: {
+                if (watch.asScalar()) |path_str| {
+                    break :spec_blk .{ .path = path_str, .recursive = false };
+                }
+
+                const wm = watch.asMap() orelse return watch_cx.fail(
+                    ParseError.InvalidFieldType,
+                    null,
+                    "Field 'watch' must be a string or map",
+                );
+
+                try rejectUnknown(watch_cx, wm, VALID_WATCH_FIELDS, ParseError.InvalidTrigger);
+                const path_val = try requireField(watch_cx, wm, "path");
+                const path_str = try requireScalar(watch_cx.at("path"), path_val);
+
+                var recursive: bool = false;
+                if (wm.get("recursive")) |rval| {
+                    const rstr = try requireScalarMsg(
+                        watch_cx.at("recursive"),
+                        rval,
+                        "Must be a bool",
+                    );
+                    const trimmed = std.mem.trim(u8, rstr, " \t\r\n");
+                    if (std.ascii.eqlIgnoreCase(trimmed, "true") or
+                        std.mem.eql(u8, trimmed, "1"))
+                    {
+                        recursive = true;
+                    } else if (std.ascii.eqlIgnoreCase(trimmed, "false") or
+                        std.mem.eql(u8, trimmed, "0"))
+                    {
+                        recursive = false;
+                    } else {
+                        return watch_cx.at("recursive").failf(
+                            ParseError.InvalidFieldValue,
+                            null,
+                            "Invalid bool value '{s}' (expected true/false)",
+                            .{rstr},
+                        );
+                    }
+                }
+                break :spec_blk .{ .path = path_str, .recursive = recursive };
             };
+            break :blk .{ .watch = .{
+                .path = try cx.gpa.dupe(u8, spec.path),
+                .recursive = spec.recursive,
+            } };
         }
         if (on.get("time")) |time_val| {
             const time_str = try requireScalar(on_cx.at("time"), time_val);
@@ -846,6 +893,22 @@ test "parse_task" {
     try std.testing.expect(test_job.run_on == .remote);
     try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote.name, "runner1"));
     try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
+}
+
+test "parse_watch_recursive" {
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   watch:
+        \\     path: "src"
+        \\     recursive: true
+    ;
+    const t = try parseTaskBuffer(gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.trigger.? == .watch);
+    try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src"));
+    try std.testing.expect(t.trigger.?.watch.recursive);
 }
 
 test "parse_run_on" {
