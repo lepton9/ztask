@@ -80,11 +80,6 @@ pub const Scheduler = struct {
     /// Option to retrigger while running
     retrigger: bool = false,
 
-    /// Watch path list used for file watch triggers.
-    /// Managed and allocated by `TaskManager`.
-    /// Used to keep track of paths that are connected to this scheduler.
-    watch_paths: std.ArrayListUnmanaged([]const u8) = .{},
-
     /// Ready queue of jobs that can run
     queue: Queue(*JobNode),
     /// Runners currently running jobs
@@ -97,10 +92,16 @@ pub const Scheduler = struct {
     task_meta: data.TaskRunMetadata,
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
-    event_sink: ?EventSink = null,
-
     /// Task starting timestamp in milliseconds.
     task_start_ms: ?i64 = null,
+
+    event_sink: ?EventSink = null,
+    /// Used by `TaskManager` to dedupe watch-trigger bursts.
+    last_watch_epoch: u64 = 0,
+    /// Watch path list used for file watch triggers.
+    /// Managed and allocated by `TaskManager`.
+    /// Used to keep track of paths that are connected to this scheduler.
+    watch_paths: std.ArrayListUnmanaged([]const u8) = .{},
 
     pub fn init(
         gpa: std.mem.Allocator,

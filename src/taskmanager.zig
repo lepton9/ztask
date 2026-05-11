@@ -60,6 +60,9 @@ pub const TaskManager = struct {
     /// Maps paths to active schedulers
     watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
 
+    /// Epoch counter used to dedupe watcher-event bursts.
+    watch_epoch: u64 = 0,
+
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
 
@@ -187,7 +190,7 @@ pub const TaskManager = struct {
         // TODO: allocate the event msg
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
         defer self.gpa.free(custom_msg);
-        log.debug("{}: error: {} - '{}'", .{ scope, err, custom_msg });
+        log.debug("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .msg = @errorName(err),
@@ -467,8 +470,29 @@ pub const TaskManager = struct {
         return self.remote_manager.update();
     }
 
-    /// Handle a watcher event for a scheduler.
-    fn handleTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
+    /// Handle a file-watch event for a scheduler.
+    fn handleFileTriggerEvent(self: *TaskManager, s: *Scheduler, epoch: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Combine multiple fs events into one to avoid constant retriggering
+        if (s.last_watch_epoch == epoch) return;
+        s.last_watch_epoch = epoch;
+
+        switch (s.status) {
+            .waiting => {
+                try s.trigger();
+            },
+            else => {
+                if (!s.retrigger) return;
+                s.forceStop(.retrigger);
+                try s.trigger();
+            },
+        }
+    }
+
+    /// Handle a time trigger event for a scheduler.
+    fn handleTimeTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (s.status) {
@@ -484,13 +508,18 @@ pub const TaskManager = struct {
     }
 
     /// Handle watcher events and trigger corresponding schedulers.
+    /// Handle only one event per scheduler during each event drain.
     fn checkWatcher(self: *TaskManager) !void {
+        // Set a new epoch for this event drain
+        self.watch_epoch +%= 1;
+        const epoch = self.watch_epoch;
+
         while (self.watcher.getEvent()) |event| switch (event) {
             .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
-                for (l.items) |s| try self.handleTriggerEvent(s);
+                for (l.items) |s| try self.handleFileTriggerEvent(s, epoch);
             },
             .timeEvent => |te| if (self.getScheduler(te.task_id)) |s| {
-                try self.handleTriggerEvent(s);
+                try self.handleTimeTriggerEvent(s);
             },
         };
     }

@@ -201,7 +201,7 @@ test "remote_job" {
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
-    try task_manager.start();
+    try task_manager.startWithOptions(.{ .listen_port = 0 });
 
     var agent = try remote_agent.RemoteAgent.init(gpa, "runner1", 5);
     defer agent.deinit();
@@ -243,7 +243,7 @@ test "remote_job_addr" {
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
-    try task_manager.start();
+    try task_manager.startWithOptions(.{ .listen_port = 0 });
 
     var agent = try remote_agent.RemoteAgent.init(gpa, "agent", 5);
     defer agent.deinit();
