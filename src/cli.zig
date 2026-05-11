@@ -493,10 +493,8 @@ fn cmdRunFn(ptr: *anyopaque) !void {
                 "Task not found with ID: {s}",
                 .{opts.id orelse ""},
             ),
-            error.FileNotFound => if (opts.path) |p|
+            error.TaskNotFoundPath => if (opts.path) |p|
                 fatal("Task file not found: '{s}'", .{p})
-            else if (opts.id) |id|
-                fatal("Task file missing for ID: '{s}'", .{id})
             else
                 fatal("Task not found", .{}),
             error.ErrorOpenFilePath => fatal(

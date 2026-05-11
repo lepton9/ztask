@@ -80,6 +80,11 @@ pub const Scheduler = struct {
     /// Option to retrigger while running
     retrigger: bool = false,
 
+    /// Watch path list used for file watch triggers.
+    /// Managed and allocated by `TaskManager`.
+    /// Used to keep track of paths that are connected to this scheduler.
+    watch_paths: std.ArrayListUnmanaged([]const u8) = .{},
+
     /// Ready queue of jobs that can run
     queue: Queue(*JobNode),
     /// Runners currently running jobs
@@ -151,6 +156,8 @@ pub const Scheduler = struct {
 
     pub fn deinit(self: *Scheduler) void {
         if (self.status == .running) return;
+
+        self.watch_paths.deinit(self.gpa);
         for (self.nodes) |*node| node.deinit(self.gpa);
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);

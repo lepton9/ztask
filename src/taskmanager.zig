@@ -154,7 +154,14 @@ pub const TaskManager = struct {
         self.pool.deinit();
         self.remote_manager.deinit();
         self.watcher.deinit();
+
+        var w_it = self.watch_map.iterator();
+        while (w_it.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            e.value_ptr.*.deinit(self.gpa);
+        }
         self.watch_map.deinit(self.gpa);
+
         self.datastore.deinit(self.gpa);
         self.gpa.destroy(self);
     }
@@ -304,27 +311,111 @@ pub const TaskManager = struct {
         const t = s.task.trigger orelse return;
         switch (t) {
             .watch => |w| {
-                const path = w.path;
-                if (self.watch_map.getEntry(path)) |e| {
-                    var list = e.value_ptr.*;
-                    for (0..list.items.len) |i| {
-                        if (@intFromPtr(list.items[i]) == @intFromPtr(s)) {
-                            _ = list.orderedRemove(i);
+                const paths: []const []const u8 = blk: {
+                    if (s.watch_paths.items.len > 0) break :blk s.watch_paths.items;
+                    break :blk &.{w.path};
+                };
+
+                // Remove paths that are associated with the scheduler
+                for (paths) |path| {
+                    const e = self.watch_map.getEntry(path) orelse continue;
+
+                    // Remove scheduler
+                    const list_ptr = e.value_ptr;
+                    for (0..list_ptr.items.len) |i| {
+                        if (@intFromPtr(list_ptr.items[i]) == @intFromPtr(s)) {
+                            _ = list_ptr.orderedRemove(i);
                             break;
                         }
                     }
+
                     // No more schedulers that have the same watch path
-                    if (list.items.len == 0) {
-                        _ = self.watch_map.remove(path);
-                        list.deinit(self.gpa);
-                        self.watcher.removeFileWatch(path);
+                    if (list_ptr.items.len == 0) {
+                        if (self.watch_map.fetchRemove(path)) |kv| {
+                            self.watcher.removeFileWatch(kv.key);
+                            var list = kv.value;
+                            list.deinit(self.gpa);
+                            self.gpa.free(kv.key);
+                        }
                     }
                 }
+                s.watch_paths.clearRetainingCapacity();
             },
             .interval, .time => {
                 self.watcher.removeTimeWatch(s.task.id.fmt());
             },
         }
+    }
+
+    /// Add a file or directory path to the watch list.
+    /// Allocates the paths in `TaskManager.watch_map`.
+    fn addWatchPath(
+        self: *TaskManager,
+        s: *Scheduler,
+        path: []const u8,
+        diagnostics: ?*GenericDiagnostics,
+    ) !void {
+        const gop = try self.watch_map.getOrPut(self.gpa, path);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.gpa.dupe(u8, path);
+            gop.value_ptr.* = try .initCapacity(self.gpa, 1);
+        }
+        const key = gop.key_ptr.*;
+
+        self.watcher.addFileWatch(key) catch |err| {
+            if (!gop.found_existing) if (self.watch_map.fetchRemove(key)) |kv| {
+                var list = kv.value;
+                list.deinit(self.gpa);
+                self.gpa.free(kv.key);
+            };
+            return switch (err) {
+                error.UnsupportedPlatform => error.WatcherAddUnsupported,
+                error.InvalidWatchPath => {
+                    var d = diagnostics orelse return err;
+                    const fmt = "Watch path must be a file or directory: {s}";
+                    return d.failf(self.gpa, err, fmt, .{key});
+                },
+                error.WatchPathNotFound => {
+                    var d = diagnostics orelse return err;
+                    const fmt = "Watch path not found: {s}";
+                    return d.failf(self.gpa, err, fmt, .{key});
+                },
+                else => err,
+            };
+        };
+
+        try gop.value_ptr.*.append(self.gpa, s);
+        try s.watch_paths.append(self.gpa, key);
+    }
+
+    /// Add all the directories recursively to the file watch list.
+    fn addWatchDirRecursive(
+        self: *TaskManager,
+        s: *Scheduler,
+        dir_path: []const u8,
+        diagnostics: ?*GenericDiagnostics,
+    ) !void {
+        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        defer dir.close();
+
+        var it = dir.iterate();
+        while (it.next() catch null) |entry| switch (entry.kind) {
+            .directory => {
+                const name = entry.name;
+                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, ".."))
+                    continue;
+
+                const sub_path = try std.fs.path.join(self.gpa, &.{
+                    dir_path,
+                    entry.name,
+                });
+                defer self.gpa.free(sub_path);
+
+                try self.addWatchPath(s, sub_path, diagnostics);
+                try self.addWatchDirRecursive(s, sub_path, diagnostics);
+            },
+            else => continue,
+        };
     }
 
     /// Main run loop
@@ -503,32 +594,32 @@ pub const TaskManager = struct {
             switch (t.*) {
                 .watch => |*watch| {
                     try task.resolveWatchPath(self.gpa);
-                    self.watcher.addFileWatch(watch.path) catch |err|
+                    task_scheduler.watch_paths.clearRetainingCapacity();
+
+                    const stat = std.fs.cwd().statFile(watch.path) catch |err| {
+                        const d = diagnostics orelse return err;
                         return switch (err) {
-                            error.UnsupportedPlatform => error.WatcherAddUnsupported,
-                            error.InvalidWatchPath => {
-                                return (diagnostics orelse return err).failf(
-                                    self.gpa,
-                                    err,
-                                    "Watch path must be a file or directory: {s}",
-                                    .{watch.path},
-                                );
-                            },
-                            error.WatchPathNotFound => {
-                                return (diagnostics orelse return err).failf(
-                                    self.gpa,
-                                    err,
-                                    "Watch path not found: {s}",
-                                    .{watch.path},
-                                );
-                            },
+                            error.FileNotFound => d.failf(
+                                self.gpa,
+                                err,
+                                "Watch path not found: {s}",
+                                .{watch.path},
+                            ),
                             else => err,
                         };
-                    const res = try self.watch_map.getOrPut(self.gpa, watch.path);
-                    if (!res.found_existing) {
-                        res.value_ptr.* = try .initCapacity(self.gpa, 1);
-                        res.value_ptr.*.appendAssumeCapacity(task_scheduler);
-                    } else try res.value_ptr.*.append(self.gpa, task_scheduler);
+                    };
+
+                    self.addWatchPath(task_scheduler, watch.path, diagnostics) catch |err| {
+                        self.removeFromWatchList(task_scheduler);
+                        return err;
+                    };
+
+                    if (stat.kind == .directory and watch.recursive) {
+                        self.addWatchDirRecursive(task_scheduler, watch.path, diagnostics) catch |err| {
+                            self.removeFromWatchList(task_scheduler);
+                            return err;
+                        };
+                    }
                 },
                 .interval => |interval| {
                     try self.watcher.addIntervalWatch(task.id.fmt(), interval);

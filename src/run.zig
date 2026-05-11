@@ -138,6 +138,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                 options.diagnostics,
             ) catch |err| return switch (err) {
                 error.ErrorOpenFile => error.ErrorOpenFilePath,
+                error.FileNotFound => error.TaskNotFoundPath,
                 else => err,
             };
         }
@@ -171,6 +172,7 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
         .attach_job = options.attach_job,
         .retrigger = options.retrigger,
         .verbose_events = options.verbose,
+        .diagnostics = options.diagnostics,
     });
 
     const log = std.log.scoped(.run);
