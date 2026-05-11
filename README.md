@@ -33,7 +33,8 @@ that do not have dependencies on other jobs can be executed in parallel. Within
 a job, steps are executed in sequence. Each step is a CLI command that is 
 executed.
 
-Added tasks can be ran using `ztask run` or from the TUI.
+Added tasks can be ran using `ztask run` or from the TUI. Existing tasks can be 
+seen using `ztask list` or in the TUI.
 
 ### Triggers
 
@@ -52,8 +53,8 @@ A trigger can be:
 Example:
 
 ```yaml
-name: example # Required name of the task
-id: 123 # Optional ID for the task
+name: "example" # Required name of the task
+id: "123" # Optional ID for the task
 cwd: "." # Current working directory
 
 # Trigger
@@ -67,7 +68,7 @@ jobs:
   test:
     deps: [build]
     steps:
-      - command: "zig fmt --check ./*.zig src/*.zig"
+      - command: "zig fmt --check . src"
       - command: "zig build test"
 ```
 
@@ -110,8 +111,8 @@ ztask runner --name runner1 --address 127.0.0.1 --port 5555
 ### Data directory
 
 The data directory is where the metadata and logs for tasks and task runs is 
-stored, and where new tasks are created by default. You can use `ztask data` to 
-print the active path.
+stored, and where new tasks are created by default. You can use `ztask env` to 
+print the active path and other information.
 
 Data directory selection:
 - Project-local `.ztask/`

@@ -1,7 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli_zig = @import("cli.zig");
-const zcli = cli_zig.zcli;
+const zcli = @import("zcli");
+
+const cli_spec = &cli_zig.cli_spec;
+const handleArgs = cli_zig.handleArgs;
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -17,8 +20,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    // Parse cli args
-    const cli: *zcli.Cli = try zcli.parseArgs(allocator, &cli_zig.cli_spec);
+    const cli: *zcli.Cli = try zcli.parseArgs(allocator, cli_spec);
     defer cli.deinit(allocator);
-    try cli_zig.handleArgs(allocator, cli);
+    try handleArgs(allocator, cli);
 }

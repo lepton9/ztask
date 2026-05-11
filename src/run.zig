@@ -478,16 +478,22 @@ pub fn createNewTask(gpa: std.mem.Allocator, options: CreateOptions) !void {
     }
 }
 
-/// Show the currently used directory path for saving and fetching data.
-pub fn showCurDataDir(
+/// Show the currently used data directory path and other environment info.
+pub fn showEnv(
     gpa: std.mem.Allocator,
     data_dir: data.DataStore.DataDirMode,
 ) !void {
-    const path = try data.DataStore.resolveRootDir(gpa, .{
+    var env = try data.DataStore.getEnv(gpa, .{
         .data_dir = data_dir,
     });
-    defer gpa.free(path);
-    try fmtWrite("Current data directory is {s}\n", .{path});
+    defer env.deinit(gpa);
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try std.json.Stringify.value(env, .{ .whitespace = .indent_4 }, &out.writer);
+    const bytes = try out.toOwnedSlice();
+    defer gpa.free(bytes);
+    try fmtWrite("{s}\n", .{bytes});
 }
 
 /// Move a task file to a new directory

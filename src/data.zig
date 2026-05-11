@@ -12,6 +12,7 @@ const DATA_DIR_NAME: []const u8 = "data";
 const TASKS_DIR_NAME: []const u8 = "tasks";
 const TMP_TASK_BASE_NAME: []const u8 = ".ztask-tmp";
 const EDIT_TASK_BASE_NAME: []const u8 = ".ztask-edit";
+const DATA_DIR_ENV_VAR: []const u8 = "ZTASK_DATA_DIR";
 
 pub const TaskRunStatus = enum { running, success, failed, interrupted };
 pub const JobRunStatus = enum { pending, running, success, failed, interrupted };
@@ -212,8 +213,41 @@ pub const DataStore = struct {
         return null;
     }
 
+    pub const DataEnv = struct {
+        data_dir: []const u8,
+        global_data_dir: []const u8,
+        env: struct {
+            ZTASK_DATA_DIR: ?[]const u8,
+        },
+
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.data_dir);
+            gpa.free(self.global_data_dir);
+            if (self.env.ZTASK_DATA_DIR) |e| gpa.free(e);
+        }
+    };
+
+    /// Get environment info.
+    pub fn getEnv(gpa: std.mem.Allocator, options: InitOptions) !DataEnv {
+        const path = try DataStore.resolveRootDir(gpa, .{
+            .data_dir = options.data_dir,
+        });
+        const env_data_dir: ?[]const u8 = std.process.getEnvVarOwned(
+            gpa,
+            DATA_DIR_ENV_VAR,
+        ) catch null;
+
+        return .{
+            .data_dir = path,
+            .global_data_dir = try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR),
+            .env = .{
+                .ZTASK_DATA_DIR = env_data_dir,
+            },
+        };
+    }
+
     /// Get the root directory to use for saving and fetching data.
-    pub fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
+    fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
         // Check the data dir mode
         switch (options.data_dir) {
             .path => |explicit| {
@@ -237,7 +271,7 @@ pub const DataStore = struct {
         // Override global path with env variable
         const env_data_dir = std.process.getEnvVarOwned(
             gpa,
-            "ZTASK_DATA_DIR",
+            DATA_DIR_ENV_VAR,
         ) catch |err| switch (err) {
             error.EnvironmentVariableNotFound => null,
             else => return err,

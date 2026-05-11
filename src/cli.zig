@@ -1,5 +1,5 @@
-pub const std = @import("std");
-pub const zcli = @import("zcli");
+const std = @import("std");
+const zcli = @import("zcli");
 const run = @import("run.zig");
 const options = @import("build_options");
 const remote_man = @import("remote/remote_manager.zig");
@@ -62,108 +62,6 @@ const commands = &[_]zcli.Cmd{
         .name = "init",
         .desc = "Initialize a project-local .ztask directory",
         .action = cmdInitFn,
-    },
-    .{
-        .name = "new",
-        .desc = "Create a new task",
-        .action = cmdNewFn,
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "name",
-                .desc = "Name of the task",
-                .required = true,
-                .arg = .{ .name = "NAME", .type = .Text },
-            },
-            .{
-                .long_name = "id",
-                .desc = "ID of the task",
-                .arg = .{ .name = "ID", .type = .Text },
-            },
-            .{
-                .long_name = "edit",
-                .short_name = "e",
-                .desc = "Go to edit the task after creation",
-            },
-            .{
-                .long_name = "editor",
-                .desc = "Text editor to use for editing",
-                .arg = .{ .name = "EDITOR", .type = .Text },
-            },
-        },
-    },
-    .{
-        .name = "data",
-        .desc = "Print the current data directory",
-        .action = cmdDataFn,
-    },
-    .{
-        .name = "add",
-        .desc = "Add a task or a directory of tasks",
-        .positionals = &[_]zcli.PosArg{
-            .{
-                .name = "path",
-                .desc = "Path for a file or directory",
-                .required = false,
-                .exclusive_group = TASK_SELECT_TAG,
-            },
-        },
-        .options = &[_]zcli.Opt{
-            .{
-                .long_name = "path",
-                .desc = "Path of the task file or a directory",
-                .arg = .{ .name = "PATH", .type = .Path },
-                .exclusive_group = TASK_SELECT_TAG,
-            },
-            .{
-                .long_name = "recursive",
-                .short_name = "r",
-                .desc = "Add task files recursively in a directory",
-            },
-            .{
-                .long_name = "skip",
-                .short_name = "s",
-                .desc = "Skip and continue if failed to add some task",
-            },
-        },
-        .action = cmdAddFn,
-    },
-    .{
-        .name = "delete",
-        .desc = "Delete a task",
-        .options = task_options,
-        .positionals = &[_]zcli.PosArg{path_positional},
-        .action = cmdDeleteFn,
-    },
-    .{
-        .name = "move",
-        .desc = "Move a task file to a new directory",
-        .positionals = &[_]zcli.PosArg{
-            .{ .name = "FROM", .desc = "Path to move from", .required = true },
-            .{ .name = "TO", .desc = "Path to move to", .required = true },
-        },
-        .options = &[_]zcli.Opt{.{
-            .long_name = "repair",
-            .desc = "Update metadata if FROM is missing but TO exists",
-        }},
-        .action = cmdMoveFn,
-    },
-    .{
-        .name = "edit",
-        .desc = "Edit a task file",
-        .options = task_options ++ &[_]zcli.Opt{
-            .{
-                .long_name = "editor",
-                .desc = "Text editor to use for editing",
-                .arg = .{ .name = "EDITOR", .type = .Text },
-            },
-            .{
-                .long_name = "continue",
-                .short_name = "c",
-                .desc = "Continue the last failed edit",
-            },
-        },
-        .positionals = &[_]zcli.PosArg{path_positional},
-        .action = cmdEditFn,
     },
     .{
         .name = "run",
@@ -255,8 +153,110 @@ const commands = &[_]zcli.Cmd{
         .action = cmdListFn,
     },
     .{
+        .name = "new",
+        .desc = "Create a new task",
+        .action = cmdNewFn,
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "name",
+                .desc = "Name of the task",
+                .required = true,
+                .arg = .{ .name = "NAME", .type = .Text },
+            },
+            .{
+                .long_name = "id",
+                .desc = "ID of the task",
+                .arg = .{ .name = "ID", .type = .Text },
+            },
+            .{
+                .long_name = "edit",
+                .short_name = "e",
+                .desc = "Go to edit the task after creation",
+            },
+            .{
+                .long_name = "editor",
+                .desc = "Text editor to use for editing",
+                .arg = .{ .name = "EDITOR", .type = .Text },
+            },
+        },
+    },
+    .{
+        .name = "add",
+        .desc = "Add a task or a directory of tasks",
+        .positionals = &[_]zcli.PosArg{
+            .{
+                .name = "path",
+                .desc = "Path for a file or directory",
+                .required = false,
+                .exclusive_group = TASK_SELECT_TAG,
+            },
+        },
+        .options = &[_]zcli.Opt{
+            .{
+                .long_name = "path",
+                .desc = "Path of the task file or a directory",
+                .arg = .{ .name = "PATH", .type = .Path },
+                .exclusive_group = TASK_SELECT_TAG,
+            },
+            .{
+                .long_name = "recursive",
+                .short_name = "r",
+                .desc = "Add task files recursively in a directory",
+            },
+            .{
+                .long_name = "skip",
+                .short_name = "s",
+                .desc = "Skip and continue if failed to add some task",
+            },
+        },
+        .action = cmdAddFn,
+    },
+    .{
+        .name = "delete",
+        .desc = "Delete a task",
+        .options = task_options,
+        .positionals = &[_]zcli.PosArg{path_positional},
+        .action = cmdDeleteFn,
+    },
+    .{
+        .name = "move",
+        .desc = "Move a task file to a new directory",
+        .positionals = &[_]zcli.PosArg{
+            .{ .name = "FROM", .desc = "Path to move from", .required = true },
+            .{ .name = "TO", .desc = "Path to move to", .required = true },
+        },
+        .options = &[_]zcli.Opt{.{
+            .long_name = "repair",
+            .desc = "Update metadata if FROM is missing but TO exists",
+        }},
+        .action = cmdMoveFn,
+    },
+    .{
+        .name = "edit",
+        .desc = "Edit a task file",
+        .options = task_options ++ &[_]zcli.Opt{
+            .{
+                .long_name = "editor",
+                .desc = "Text editor to use for editing",
+                .arg = .{ .name = "EDITOR", .type = .Text },
+            },
+            .{
+                .long_name = "continue",
+                .short_name = "c",
+                .desc = "Continue the last failed edit",
+            },
+        },
+        .positionals = &[_]zcli.PosArg{path_positional},
+        .action = cmdEditFn,
+    },
+    .{
+        .name = "env",
+        .desc = "Print data directory path and environment info",
+        .action = cmdEnvFn,
+    },
+    .{
         .name = "sync",
-        .desc = "Delete non-existent tasks and sync ID and name changes",
+        .desc = "Handle modified tasks and sync ID and name changes",
         .options = &[_]zcli.Opt{
             .{ .long_name = "dry", .desc = "Enable dry run" },
         },
@@ -390,10 +390,10 @@ fn cmdNewFn(ptr: *anyopaque) !void {
     };
 }
 
-/// Handle data command
-fn cmdDataFn(ptr: *anyopaque) !void {
+/// Handle env command
+fn cmdEnvFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    try run.showCurDataDir(ctx.gpa, ctx.data_dir);
+    try run.showEnv(ctx.gpa, ctx.data_dir);
 }
 
 /// Handle move command
