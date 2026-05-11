@@ -81,7 +81,7 @@ pub const TaskManager = struct {
             msg: []const u8,
         },
 
-        const ErrorScope = enum { watcher, remote_manager, scheduler };
+        const ErrorScope = enum { task_manager, watcher, remote_manager, scheduler };
     };
 
     pub const InitOptions = struct {
@@ -181,8 +181,13 @@ pub const TaskManager = struct {
         self: *TaskManager,
         scope: Event.ErrorScope,
         err: anyerror,
+        comptime fmt: []const u8,
+        args: anytype,
     ) void {
-        log.debug("{}: error: {}", .{ scope, err });
+        // TODO: allocate the event msg
+        const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        defer self.gpa.free(custom_msg);
+        log.debug("{}: error: {} - '{}'", .{ scope, err, custom_msg });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .msg = @errorName(err),
@@ -362,12 +367,13 @@ pub const TaskManager = struct {
         }
         const key = gop.key_ptr.*;
 
-        self.watcher.addFileWatch(key) catch |err| {
-            if (!gop.found_existing) if (self.watch_map.fetchRemove(key)) |kv| {
+        // Don't re-add a shared watch path
+        if (!gop.found_existing) self.watcher.addFileWatch(key) catch |err| {
+            if (self.watch_map.fetchRemove(key)) |kv| {
                 var list = kv.value;
                 list.deinit(self.gpa);
                 self.gpa.free(kv.key);
-            };
+            }
             return switch (err) {
                 error.UnsupportedPlatform => error.WatcherAddUnsupported,
                 error.InvalidWatchPath => {
@@ -394,8 +400,20 @@ pub const TaskManager = struct {
         s: *Scheduler,
         dir_path: []const u8,
         diagnostics: ?*GenericDiagnostics,
+        fatal_open: bool,
     ) !void {
-        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        var dir = std.fs.cwd().openDir(dir_path, .{
+            .iterate = true,
+        }) catch |err| {
+            if (fatal_open) return err;
+            self.emitError(
+                .task_manager,
+                err,
+                "skip watch dir (open failed): path={s} err={any}",
+                .{ dir_path, err },
+            );
+            return;
+        };
         defer dir.close();
 
         var it = dir.iterate();
@@ -411,8 +429,16 @@ pub const TaskManager = struct {
                 });
                 defer self.gpa.free(sub_path);
 
-                try self.addWatchPath(s, sub_path, diagnostics);
-                try self.addWatchDirRecursive(s, sub_path, diagnostics);
+                self.addWatchPath(s, sub_path, diagnostics) catch |err| {
+                    self.emitError(
+                        .task_manager,
+                        err,
+                        "skip watch dir (addWatch failed): path={s} err={any}",
+                        .{ dir_path, err },
+                    );
+                    continue;
+                };
+                try self.addWatchDirRecursive(s, sub_path, diagnostics, false);
             },
             else => continue,
         };
@@ -422,13 +448,13 @@ pub const TaskManager = struct {
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
             self.checkWatcher() catch |err| {
-                self.emitError(.watcher, err);
+                self.emitError(.watcher, err, "", .{});
             };
             self.updateRemoteManager() catch |err| {
-                self.emitError(.remote_manager, err);
+                self.emitError(.remote_manager, err, "", .{});
             };
             self.updateSchedulers() catch |err| {
-                self.emitError(.scheduler, err);
+                self.emitError(.scheduler, err, "", .{});
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }
@@ -615,7 +641,7 @@ pub const TaskManager = struct {
                     };
 
                     if (stat.kind == .directory and watch.recursive) {
-                        self.addWatchDirRecursive(task_scheduler, watch.path, diagnostics) catch |err| {
+                        self.addWatchDirRecursive(task_scheduler, watch.path, diagnostics, true) catch |err| {
                             self.removeFromWatchList(task_scheduler);
                             return err;
                         };

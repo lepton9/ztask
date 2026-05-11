@@ -63,7 +63,7 @@ occurs. Without a trigger, the task executes immediately.
 
 A trigger can be:
 
-- `watch: "src"`
+- `watch: "src/main.zig"`
   - Watches for file or directory changes.
 - `interval: "hh:mm:ss"`
   - Executes the task at specified intervals.
@@ -79,7 +79,9 @@ cwd: "." # Current working directory
 
 # Trigger
 on:
-  watch: "src/main.zig"
+  watch:
+    path: "src"
+    recursive: "true" # Watch all the directories recursively
 
 jobs:
   build: # Job name
