@@ -36,6 +36,7 @@ pub const cli_spec: zcli.CliApp = .{
             .short_name = "g",
             .desc = "Force global data dir (ignore project + env)",
         },
+        runner_n_option,
         .{
             .long_name = "listen-addr",
             .desc = "Address the remote manager binds to",
@@ -78,7 +79,6 @@ const commands = &[_]zcli.Cmd{
                 .short_name = "t",
                 .desc = "Restart task if a trigger occurs while running",
             },
-            runner_n_option,
             .{ .long_name = "verbose", .desc = "Print extra status messages" },
         },
         .positionals = &[_]zcli.PosArg{path_positional},
@@ -111,7 +111,6 @@ const commands = &[_]zcli.Cmd{
                     .type = .Int,
                 },
             },
-            runner_n_option,
         },
         .action = cmdRunnerFn,
     },
@@ -200,7 +199,6 @@ const commands = &[_]zcli.Cmd{
             },
             .{
                 .long_name = "recursive",
-                .short_name = "r",
                 .desc = "Add task files recursively in a directory",
             },
             .{
@@ -484,14 +482,8 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .path => |path| opts.path = path,
     }
 
-    if (cli.findOption("runners")) |opt| {
-        const n = opt.value.?.int;
-        if (n < 0 or n > run.MAX_RUNNERS_N) fatal(
-            "Invalid amount of runners '{d}'. (0 < n < {d})",
-            .{ n, run.MAX_RUNNERS_N + 1 },
-        );
-        opts.runners_n = @intCast(n);
-    }
+    if (getRunnerAmount(cli)) |n| opts.runners_n = n;
+
     return run.runTask(ctx.gpa, opts) catch |err| {
         if (diagnostics.message) |msg| fatal("{s}", .{msg});
 
@@ -553,11 +545,9 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
 
     if (addr) |a| opts.addr = a.value.?.string;
     if (port) |p| opts.port = p;
-    if (cli.findOption("runners")) |opt| {
-        const n = opt.value.?.int;
-        if (n <= 0 or n > run.MAX_RUNNERS_N) return error.InvalidRunnerAmount;
-        opts.runners_n = @intCast(n);
-    }
+
+    if (getRunnerAmount(cli)) |n| opts.runners_n = n;
+
     return run.runAgent(ctx.gpa, opts) catch |err| switch (err) {
         error.NameTaken => fatal(
             "Another remote runner with name '{s}' already connected to {s}:{d}",
@@ -704,6 +694,19 @@ inline fn getTaskInput(cli: *zcli.Cli) ?run.TaskSelect {
     };
 }
 
+/// Get the amount of runners if the option is given.
+inline fn getRunnerAmount(cli: *zcli.Cli) ?u8 {
+    if (cli.findOption("runners")) |opt| {
+        const n = opt.value.?.int;
+        if (n < 1 or n > run.MAX_RUNNERS_N) fatal(
+            "Invalid amount of runners '{d}'. (1 <= n <= {d})",
+            .{ n, run.MAX_RUNNERS_N },
+        );
+        return @intCast(n);
+    }
+    return null;
+}
+
 /// Get the used data directory selection.
 inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
     const use_global = cli.findOption("global") != null;
@@ -750,6 +753,7 @@ pub fn handleArgs(gpa: std.mem.Allocator, cli: *zcli.Cli) !void {
     const cmd = cli.cmd orelse return try run.runTui(gpa, .{
         .data_dir = data_dir_mode,
         .listen = listen_opts,
+        .runners_n = if (getRunnerAmount(cli)) |n| n else run.BASE_RUNNERS_N,
     });
     const cmdFn = cmd.exec orelse return;
     var ctx: Ctx = .{

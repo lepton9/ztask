@@ -17,7 +17,7 @@ const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 pub const DEFAULT_PORT = @import("remote/remote_manager.zig").DEFAULT_PORT;
 pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
-pub const MAX_RUNNERS_N = 100;
+pub const MAX_RUNNERS_N = 255;
 
 pub const ListenOptions = struct {
     addr: []const u8 = DEFAULT_ADDR,

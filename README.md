@@ -33,8 +33,28 @@ that do not have dependencies on other jobs can be executed in parallel. Within
 a job, steps are executed in sequence. Each step is a CLI command that is 
 executed.
 
+### Running tasks
+
 Added tasks can be ran using `ztask run` or from the TUI. Existing tasks can be 
 seen using `ztask list` or in the TUI.
+
+Tasks can be executed in either normal mode or attach mode. In normal mode, the 
+job outputs are piped to a log file, and the jobs run in the background. You can 
+view the logs of task runs from the TUI. In attach mode, the attached job's 
+outputs are inherited and displayed on the console. If the attached job is 
+interactive, user input is also forwarded to the command. You can only attach to 
+one job at a time.
+
+You can attach to a job run with `--attach` option:
+```bash
+ztask run <task> --attach <job_name>
+```
+If the job name is not specified, the first job of the task will be selected by 
+default.
+
+The number of runners that can be active simultaneously can be set using the 
+`--runners` option. This determines how many jobs can run in parallel using 
+threads. By default, the maximum number of runners is set to 10.
 
 ### Triggers
 
