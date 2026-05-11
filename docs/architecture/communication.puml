@@ -1,0 +1,30 @@
+@startuml
+left to right direction
+skinparam componentStyle rectangle
+
+component "CLI / TUI" as U
+component "TaskManager" as TM
+component "DataStore" as DS
+component "Watcher" as W
+component "Scheduler\n(per task)" as SCH
+component "Logger" as LOG
+component "LocalRunner" as LR
+component "RemoteManager\n(TCP server)" as RM
+component "RemoteAgent\n(remote runner)" as RA
+database "Disk" as FS
+
+U  "1" --> "1" TM : commands
+TM "1" --> "1" DS : load/save metadata
+DS "1" --> "1" FS : read/write files
+TM "1" --> "1" W  : add/remove watches
+W  "0..*" --> "1" TM : trigger events
+TM "1" --> "0..*" SCH : start/update/stop task
+SCH "1" --> "0..*" LR : run local jobs
+TM  "1" --> "1" RM : poll for packets
+SCH "0..*" --> "1" RM : dispatch remote jobs
+RM "1" --> "0..*" RA : TCP connection\nRUN_JOB/CANCEL
+RA "0..*" --> "1" RM : JOB_START/LOG/FINISH
+RM "1" --> "0..*" SCH : forward logs/results
+SCH "0..*" --> "1" LOG : write run/job meta\nappend logs
+LOG "0..*" --> "1" FS : write
+@enduml

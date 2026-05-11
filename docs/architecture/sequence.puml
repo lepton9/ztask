@@ -1,0 +1,73 @@
+@startuml
+title Running a Task (Sequence)
+
+actor "User\n(CLI/TUI)" as U
+participant "TaskManager" as TM
+participant "DataStore" as DS
+participant "Scheduler\n(per task)" as SCH
+participant "RunnerPool" as RP
+participant "LocalRunner" as LR
+participant "RemoteManager" as RM
+participant "RemoteAgent" as RA
+database "Disk" as FS
+
+U -> TM : beginTask(task_id)
+TM -> DS : loadTask(task_id)
+DS -> FS : read task YAML
+DS --> TM : Task (parsed)
+TM -> SCH : init(task)
+SCH -> SCH : build DAG + validate cycles
+
+alt task has trigger
+  TM -> SCH : set waiting\n(Watcher handles later)
+  TM --> U : "waiting for trigger"
+
+else no trigger
+  TM -> SCH : trigger()
+  SCH -> DS : nextRunId(task_id)
+  DS -> FS : read/write run_counter
+
+  loop while runnable jobs exist
+    alt job.run_on = local
+      SCH -> RP : tryAcquire()
+      RP --> SCH : runner available
+      SCH -> LR : runJob(job)
+      LR -> SCH : enqueue job_started event
+      SCH -> FS : write job meta (running)
+
+      loop each step (sequential)
+        LR -> LR : spawn command process
+        LR -> SCH : enqueue job_output chunks
+        SCH -> FS : append stdout.log
+      end
+
+      LR -> SCH : enqueue job_finished event
+      SCH -> FS : write job meta (success/failed)
+      SCH -> RP : release(runner)
+
+    else job.run_on = remote
+      SCH -> RM : pushDispatch(job, agent_spec)
+      RM -> RA : TCP RUN_JOB(steps)
+      RA -> RA : run steps locally
+      RA -> RM : TCP JOB_START / JOB_LOG* / JOB_FINISH(exit_code)
+      RM -> SCH : enqueue job events
+      SCH -> FS : append stdout.log\nwrite job meta (success/failed)
+    end
+    
+    alt job success
+      SCH -> SCH : unlock dependents
+    else job failed
+      SCH -> SCH : skip remaining queued jobs\ncancel running remote jobs
+      SCH -> FS : update remaining job metas as skipped
+      break task run failed
+      end
+    end
+
+  end
+  
+  SCH -> FS : write run meta (success/failed/interrupted)
+  SCH -> DS : addNewTaskRun(meta)
+  TM --> U : run_finished(status)
+
+end
+@enduml

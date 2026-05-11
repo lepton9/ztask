@@ -1,0 +1,45 @@
+@startuml
+skinparam componentStyle rectangle
+
+package "Main Thread (1)" {
+  component "CLI / TUI" as U
+}
+
+package "TaskManager Thread (1)" {
+  component "TaskManager" as TM
+  component "Scheduler(s)\n0..*" as SCH
+  component "RemoteManager\n(TCP server)" as RM
+}
+
+package "Watcher Thread (1)" {
+  component "Watcher" as W
+  component "FileWatcher" as FW
+  component "TimeWatcher" as TW
+}
+
+package "Local Runner Threads (N = runner pool size)" {
+  component "LocalRunner" as LR
+}
+
+package "Remote Agent Process" {
+  package "Agent Loop Thread (1)" {
+    component "RemoteAgent" as RA
+  }
+  package "Agent Local Runner Threads (N)" {
+    component "Agent LocalRunner" as ALR
+  }
+}
+
+U --> TM : begin
+TM --> W : configure watches
+W --> TM : events
+W --> FW : poll events
+W --> TW : poll events
+TM --> SCH : update
+SCH --> LR : spawn runner for a job
+TM --> RM : poll sockets
+SCH --> RM : dispatch remote jobs
+RM --> RA : TCP
+RA --> RM : TCP
+RA --> ALR : run jobs (threads)
+@enduml
