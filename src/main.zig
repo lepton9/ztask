@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const vaxis = @import("vaxis");
 const cli_zig = @import("cli.zig");
 const zcli = @import("zcli");
 
@@ -12,6 +13,13 @@ pub const std_options: std.Options = .{
         .{ .scope = .parser, .level = .info },
     },
 };
+
+// Restore terminal on panic.
+fn recoverPanic(msg: []const u8, ret_addr: ?usize) noreturn {
+    vaxis.recover();
+    std.debug.defaultPanic(msg, ret_addr);
+}
+pub const panic: type = std.debug.FullPanic(recoverPanic);
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{

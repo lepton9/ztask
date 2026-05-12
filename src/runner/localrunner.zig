@@ -180,18 +180,30 @@ pub const LocalRunner = struct {
             .piped => self.finishJob(),
             .attached => {
                 self.running.store(false, .seq_cst);
+
+                var pid_opt: ?std.process.Child.Id = null;
                 self.mutex.lock();
-                if (self.process) |child| {
-                    if (builtin.os.tag == .windows) {
-                        std.os.windows.TerminateProcess(child.id, 1) catch {};
-                    } else {
-                        _ = std.posix.kill(child.id, std.posix.SIG.INT) catch {};
-                    }
-                }
+                if (self.process) |child| pid_opt = child.id;
                 self.process = null;
                 self.mutex.unlock();
-                if (self.thread) |t| t.detach();
+
+                if (pid_opt) |pid| {
+                    if (builtin.os.tag == .windows) {
+                        std.os.windows.TerminateProcess(pid, 1) catch {};
+                    } else {
+                        const pid_i: std.posix.pid_t = @intCast(pid);
+                        std.posix.kill(pid_i, std.posix.SIG.INT) catch {};
+                        std.posix.kill(pid_i, std.posix.SIG.TERM) catch {};
+                        std.posix.kill(pid_i, std.posix.SIG.KILL) catch {};
+                    }
+                }
+
+                const stdout = std.fs.File.stdout();
+                if (stdout.isTty()) stdout.writeAll("\r\n") catch {};
+
+                if (self.thread) |t| t.join();
                 self.thread = null;
+                self.process = null;
                 self.job = null;
                 self.cwd = null;
             },
@@ -221,7 +233,6 @@ pub const LocalRunner = struct {
         // Create child process
         var child = std.process.Child.init(argv.items, gpa);
         child.cwd = self.cwd;
-        self.process = &child;
 
         switch (mode) {
             .attached => {
@@ -229,7 +240,12 @@ pub const LocalRunner = struct {
                 child.stdout_behavior = .Inherit;
                 child.stderr_behavior = .Inherit;
 
-                const term = try child.spawnAndWait();
+                try child.spawn();
+                self.mutex.lock();
+                self.process = &child;
+                self.mutex.unlock();
+
+                const term = try child.wait();
                 self.mutex.lock();
                 self.process = null;
                 self.mutex.unlock();
@@ -243,6 +259,10 @@ pub const LocalRunner = struct {
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Pipe;
                 try child.spawn();
+
+                self.mutex.lock();
+                self.process = &child;
+                self.mutex.unlock();
 
                 var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
                     .stdout = child.stdout.?,
@@ -274,6 +294,9 @@ pub const LocalRunner = struct {
                 }
 
                 const term = try child.wait();
+                self.mutex.lock();
+                self.process = null;
+                self.mutex.unlock();
                 return switch (term) {
                     .Exited => |code| @intCast(code),
                     .Signal => |sig| @intCast(sig),

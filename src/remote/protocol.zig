@@ -192,7 +192,7 @@ pub fn deserialize(comptime T: type, msg: []const u8) !T {
 
     switch (info) {
         .@"struct" => inline for (info.@"struct".fields) |field| {
-            if (pos > msg.len) @panic("Failed to deserialize the full struct");
+            if (pos > msg.len) return error.InvalidMsg;
             const FieldType = field.type;
             @field(out, field.name) = try deserializeField(FieldType, msg, &pos);
         },
@@ -287,6 +287,7 @@ fn deserializeField(
             return buffer[idx..pos.*];
         },
         .bool => {
+            if (pos.* + 1 > buffer.len) return error.InvalidMsg;
             const b = std.mem.readInt(u8, @ptrCast(buffer[pos.* .. pos.* + 1]), .little);
             pos.* += 1;
             return (b != 0);
