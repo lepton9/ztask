@@ -221,9 +221,7 @@ pub const Model = struct {
                 }
                 ctx.consumeEvent();
             },
-            .focus_in => {
-                self.active = if (self.confirm != null) .info else .status;
-            },
+            .focus_in => {},
             else => {},
         }
     }
