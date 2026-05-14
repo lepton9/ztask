@@ -19,6 +19,25 @@ pub const DEFAULT_ADDR = @import("remote/remote_manager.zig").DEFAULT_ADDR;
 pub const BASE_RUNNERS_N = 10;
 pub const MAX_RUNNERS_N = 255;
 
+// Signal handler
+const Sig = struct {
+    var seen: std.atomic.Value(bool) = .init(false);
+    fn handler(_: c_int) callconv(.c) void {
+        seen.store(true, .seq_cst);
+    }
+
+    fn init() void {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) return;
+        const action = std.posix.Sigaction{
+            .handler = .{ .handler = Sig.handler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &action, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &action, null);
+    }
+};
+
 pub const ListenOptions = struct {
     addr: []const u8 = DEFAULT_ADDR,
     port: u16 = DEFAULT_PORT,
@@ -155,6 +174,8 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     const task_id_value = task.id.value;
     const task_has_trigger = task.trigger != null;
 
+    if (options.attach_job != null) Sig.init();
+
     // Initialize event loop to handle input.
     // Only if we don't attach to a job.
     const input_loop: ?*InputLoop(vaxis.Event) = blk: {
@@ -179,17 +200,26 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
     var exit: bool = false;
 
     while (true) {
-        if (input_loop) |l| while (l.loop.tryEvent()) |event| switch (event) {
-            .key_press => |key| {
-                if (key.matches('c', .{ .ctrl = true })) {
-                    task_manager.stopTask(task_id);
-                    task_manager.waitUntilIdle();
-                    exit = true;
-                    break;
-                }
-            },
-            else => {},
-        };
+        if (input_loop) |l| {
+            // If not attached use vaxis input handling
+            while (l.loop.tryEvent()) |event| switch (event) {
+                .key_press => |key| {
+                    if (key.matches('c', .{ .ctrl = true })) {
+                        task_manager.stopTask(task_id);
+                        task_manager.waitUntilIdle();
+                        exit = true;
+                        break;
+                    }
+                },
+                else => {},
+            };
+        } else if (options.attach_job != null and Sig.seen.load(.seq_cst)) {
+            // Input in attached mode
+            Sig.seen.store(false, .seq_cst);
+            task_manager.stopTask(task_id);
+            task_manager.waitUntilIdle();
+            exit = true;
+        }
 
         // Drain task events
         while (task_manager.tryPopEvent()) |ev| {

@@ -191,10 +191,11 @@ pub const LocalRunner = struct {
                     if (builtin.os.tag == .windows) {
                         std.os.windows.TerminateProcess(pid, 1) catch {};
                     } else {
+                        // Kill the whole process group
                         const pid_i: std.posix.pid_t = @intCast(pid);
-                        std.posix.kill(pid_i, std.posix.SIG.INT) catch {};
-                        std.posix.kill(pid_i, std.posix.SIG.TERM) catch {};
-                        std.posix.kill(pid_i, std.posix.SIG.KILL) catch {};
+                        std.posix.kill(-pid_i, std.posix.SIG.INT) catch {};
+                        std.posix.kill(-pid_i, std.posix.SIG.TERM) catch {};
+                        std.posix.kill(-pid_i, std.posix.SIG.KILL) catch {};
                     }
                 }
 
@@ -236,14 +237,30 @@ pub const LocalRunner = struct {
 
         switch (mode) {
             .attached => {
+                const is_posix = builtin.os.tag != .windows and
+                    builtin.os.tag != .wasi;
+
+                // Save terminal state and restore it on exit
+                var tty: ?JobTty = if (is_posix) JobTty.init() else null;
+                defer if (tty) |*t| t.restore();
+
                 child.stdin_behavior = .Inherit;
                 child.stdout_behavior = .Inherit;
                 child.stderr_behavior = .Inherit;
+
+                // Create a new process group for the child
+                if (is_posix) child.pgid = 0;
 
                 try child.spawn();
                 self.mutex.lock();
                 self.process = &child;
                 self.mutex.unlock();
+
+                if (tty) |*t| {
+                    const pid_i: std.posix.pid_t = @intCast(child.id);
+                    std.posix.setpgid(pid_i, pid_i) catch {};
+                    t.setForeground(pid_i);
+                }
 
                 const term = try child.wait();
                 self.mutex.lock();
@@ -304,6 +321,70 @@ pub const LocalRunner = struct {
                 };
             },
         }
+    }
+};
+
+/// Tty for executing a job in attached mode.
+const JobTty = struct {
+    fd: std.posix.fd_t,
+    saved_termios: std.posix.termios,
+    saved_fg_pgrp: std.posix.pid_t,
+
+    fn init() ?JobTty {
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
+
+        const stdin = std.fs.File.stdin();
+        if (!stdin.isTty()) return null;
+        const fd: std.posix.fd_t = stdin.handle;
+
+        const termios = std.posix.tcgetattr(fd) catch {
+            std.posix.close(fd);
+            return null;
+        };
+        const fg_pgrp = std.posix.tcgetpgrp(fd) catch {
+            std.posix.close(fd);
+            return null;
+        };
+
+        return .{
+            .fd = fd,
+            .saved_termios = termios,
+            .saved_fg_pgrp = fg_pgrp,
+        };
+    }
+
+    /// Temporarily ignore SIGTTOU while changing terminal
+    /// foreground process group.
+    fn ignoreTTOU() std.posix.Sigaction {
+        var ign = std.posix.Sigaction{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        var old: std.posix.Sigaction = undefined;
+        std.posix.sigaction(std.posix.SIG.TTOU, &ign, &old);
+        return old;
+    }
+
+    /// Restore the previous SIGTTOU handler.
+    fn restoreTTOU(old: *const std.posix.Sigaction) void {
+        std.posix.sigaction(std.posix.SIG.TTOU, old, null);
+    }
+
+    /// Set the process group to foreground
+    fn setForeground(self: *JobTty, pgrp: std.posix.pid_t) void {
+        const old = ignoreTTOU();
+        defer restoreTTOU(&old);
+        std.posix.tcsetpgrp(self.fd, pgrp) catch {};
+    }
+
+    /// Restore the old terminal state
+    fn restore(self: *JobTty) void {
+        const old = ignoreTTOU();
+        defer restoreTTOU(&old);
+
+        std.posix.tcsetpgrp(self.fd, self.saved_fg_pgrp) catch {};
+        std.posix.tcsetattr(self.fd, .FLUSH, self.saved_termios) catch {};
     }
 };
 
