@@ -465,7 +465,10 @@ pub const Model = struct {
         var diag: GenericDiagnostics = .{};
         defer diag.deinit(self.gpa);
 
-        self.taskmanager.beginTask(task_id, .{ .diagnostics = &diag }) catch |err| {
+        self.taskmanager.beginTask(task_id, .{
+            .diagnostics = &diag,
+        }) catch |err| {
+            if (err == error.TaskRunning) return;
             if (diag.message) |err_msg| {
                 try self.setInfo("{s}: {s}", .{ task_id, err_msg });
             } else {
@@ -474,6 +477,7 @@ pub const Model = struct {
             return;
         };
         try self.setInfo("Started task {s}", .{task_id});
+        try self.requestSnapshot();
     }
 
     /// Stop task from running

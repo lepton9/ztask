@@ -76,6 +76,40 @@ test "manager_simple" {
     );
 }
 
+test "begin_task_while_running" {
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: task
+        \\ id: 100
+        \\ jobs:
+        \\   sleep:
+        \\     steps:
+        \\       - command: "sleep 1"
+    ;
+
+    const task_manager = try manager.TaskManager.initWithOptions(gpa, 2, .{
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    });
+    defer task_manager.deinit();
+
+    const task = try parse.parseTaskBuffer(gpa, task_file);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+
+    try task_manager.start();
+
+    try task_manager.beginTask(task.id.fmt(), .{});
+    try std.testing.expectError(
+        error.TaskRunning,
+        task_manager.beginTask(task.id.fmt(), .{}),
+    );
+    try std.testing.expect(task_manager.schedulers.count() == 1);
+
+    task_manager.waitUntilIdle();
+}
+
 test "force_interrupt" {
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);

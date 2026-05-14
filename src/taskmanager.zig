@@ -601,11 +601,15 @@ pub const TaskManager = struct {
         const diagnostics = options.diagnostics;
 
         const task = try self.loadTask(task_id, diagnostics);
-        errdefer self.unloadTask(task);
+        var unload_on_error = true;
+        errdefer if (unload_on_error) self.unloadTask(task);
 
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| switch (s.status) {
-                .running, .waiting => return error.TaskRunning,
+                .running, .waiting => {
+                    unload_on_error = false;
+                    return error.TaskRunning;
+                },
                 else => break :blk s,
             };
             const s = try Scheduler.init(
@@ -684,6 +688,9 @@ pub const TaskManager = struct {
                 },
             }
         } else try task_scheduler.trigger();
+
+        unload_on_error = false;
+        self.tasks_changed.store(true, .seq_cst);
     }
 
     /// Stop task.
@@ -734,17 +741,17 @@ pub const TaskManager = struct {
         task_id: []const u8,
         diagnostics: ?*GenericDiagnostics,
     ) !*Task {
-        var parse_diag: ?ParseDiag = if (diagnostics != null) .{} else null;
-        defer if (parse_diag) |*d| d.deinit(self.gpa);
-        const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
-
         return self.loaded_tasks.get(task_id) orelse blk: {
+            var parse_diag: ?ParseDiag = if (diagnostics != null) .{} else null;
+            defer if (parse_diag) |*d| d.deinit(self.gpa);
+            const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
+
             const task = self.datastore.loadTask(self.gpa, task_id, pd) catch |err| {
                 const d = diagnostics orelse return err;
                 try d.extractParseError(self.gpa, pd);
                 return err;
-            } orelse
-                return error.TaskNotFound;
+            } orelse return error.TaskNotFound;
+
             const id = task.id.fmt();
             try self.loaded_tasks.put(self.gpa, id, task);
 
