@@ -241,7 +241,7 @@ pub const LocalRunner = struct {
                     builtin.os.tag != .wasi;
 
                 // Save terminal state and restore it on exit
-                var tty: ?JobTty = if (is_posix) JobTty.init() else null;
+                var tty: ?JobTty = JobTty.init();
                 defer if (tty) |*t| t.restore();
 
                 child.stdin_behavior = .Inherit;
@@ -249,18 +249,18 @@ pub const LocalRunner = struct {
                 child.stderr_behavior = .Inherit;
 
                 // Create a new process group for the child
-                if (is_posix) child.pgid = 0;
+                if (comptime is_posix) child.pgid = 0;
 
                 try child.spawn();
                 self.mutex.lock();
                 self.process = &child;
                 self.mutex.unlock();
 
-                if (tty) |*t| {
+                if (comptime is_posix) if (tty) |*t| {
                     const pid_i: std.posix.pid_t = @intCast(child.id);
                     std.posix.setpgid(pid_i, pid_i) catch {};
                     t.setForeground(pid_i);
-                }
+                };
 
                 const term = try child.wait();
                 self.mutex.lock();
@@ -325,14 +325,27 @@ pub const LocalRunner = struct {
 };
 
 /// Tty for executing a job in attached mode.
-const JobTty = struct {
+const JobTty = blk: {
+    const tag = builtin.os.tag;
+    if (tag == .windows or tag == .wasi) break :blk struct {
+        fn init() ?@This() {
+            return null;
+        }
+
+        fn restore(_: *@This()) void {
+            return;
+        }
+    };
+
+    break :blk JobTtyPosix;
+};
+
+const JobTtyPosix = struct {
     fd: std.posix.fd_t,
     saved_termios: std.posix.termios,
     saved_fg_pgrp: std.posix.pid_t,
 
-    fn init() ?JobTty {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return null;
-
+    fn init() ?@This() {
         const stdin = std.fs.File.stdin();
         if (!stdin.isTty()) return null;
         const fd: std.posix.fd_t = stdin.handle;
@@ -372,14 +385,14 @@ const JobTty = struct {
     }
 
     /// Set the process group to foreground
-    fn setForeground(self: *JobTty, pgrp: std.posix.pid_t) void {
+    fn setForeground(self: *@This(), pgrp: std.posix.pid_t) void {
         const old = ignoreTTOU();
         defer restoreTTOU(&old);
         std.posix.tcsetpgrp(self.fd, pgrp) catch {};
     }
 
     /// Restore the old terminal state
-    fn restore(self: *JobTty) void {
+    fn restore(self: *@This()) void {
         const old = ignoreTTOU();
         defer restoreTTOU(&old);
 

@@ -27,7 +27,7 @@ const Sig = struct {
     }
 
     fn init() void {
-        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) return;
+        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
         const action = std.posix.Sigaction{
             .handler = .{ .handler = Sig.handler },
             .mask = std.posix.sigemptyset(),
