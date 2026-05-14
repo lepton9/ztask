@@ -102,4 +102,5 @@
 | 2026-05-10 22:10:00Z - 2026-05-11 02:40:00Z  | 4.5    | Making plantuml graphs
 | 2026-05-11 15:20:00Z - 2026-05-11 20:15:00Z  | 4.91   | Recursive dir watching, bug fixing
 | 2026-05-14 15:05:00Z - 2026-05-14 18:30:00Z  | 3.41   | Attached job process group, memory leak fixes
-|                                       Total: | 406.24 |
+| 2026-05-14 20:40:00Z - 2026-05-15 01:40:00Z  | 5      | Writing documentation for the course
+|                                       Total: | 411.24 |
