@@ -245,11 +245,13 @@ pub fn runTask(gpa: std.mem.Allocator, options: RunOptions) !void {
                     );
                 },
                 .err => |e| {
+                    defer if (e.msg) |m| gpa.free(m);
                     if (!options.verbose) continue;
-                    log.err(
-                        "{s:<12} scope={s} ({s})",
-                        .{ "error", @tagName(e.scope), e.msg },
-                    );
+                    log.err("{s:<12} scope={s} ({s})", .{
+                        "error",
+                        @tagName(e.scope),
+                        e.msg orelse @errorName(e.err),
+                    });
                 },
             }
         }

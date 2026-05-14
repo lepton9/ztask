@@ -269,9 +269,9 @@ pub const RemoteAgent = struct {
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
                 if (e.name) |name|
-                    log.info("Starting job {s}", .{name})
+                    log.info("{s:<12} job='{s}'", .{ "job_started", name })
                 else
-                    log.info("Starting job {x}", .{e.job_id});
+                    log.info("{s:<12} job={x}", .{ "job_started", e.job_id });
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
@@ -299,9 +299,15 @@ pub const RemoteAgent = struct {
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
                 if (e.name) |name|
-                    log.info("Finished job {s}", .{name})
+                    log.info(
+                        "{s:<12} job='{s}' exit={d}",
+                        .{ "job_finished", name, e.exit_code },
+                    )
                 else
-                    log.info("Finished job {x}", .{e.job_id});
+                    log.info(
+                        "{s:<12} job='{x}' exit={d}",
+                        .{ "job_finished", e.job_id, e.exit_code },
+                    );
             },
         };
     }

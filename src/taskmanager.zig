@@ -81,7 +81,8 @@ pub const TaskManager = struct {
         /// General error event.
         err: struct {
             scope: ErrorScope,
-            msg: []const u8,
+            err: anyerror,
+            msg: ?[]const u8 = null,
         },
 
         const ErrorScope = enum { task_manager, watcher, remote_manager, scheduler };
@@ -179,21 +180,36 @@ pub const TaskManager = struct {
         return self.events.popBlocking();
     }
 
-    /// Handle error and push it to the event queue
-    fn emitError(
+    /// Handle error and push it to the event queue.
+    /// Allocate a custom error message to the event.
+    fn emitErrorFmt(
         self: *TaskManager,
         scope: Event.ErrorScope,
         err: anyerror,
         comptime fmt: []const u8,
         args: anytype,
     ) void {
-        // TODO: allocate the event msg
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        defer self.gpa.free(custom_msg);
         log.debug("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
-            .msg = @errorName(err),
+            .msg = custom_msg,
+            .err = err,
+        } }) catch {
+            self.gpa.free(custom_msg);
+        };
+    }
+
+    /// Handle error and push it to the event queue.
+    fn emitError(
+        self: *TaskManager,
+        scope: Event.ErrorScope,
+        err: anyerror,
+    ) void {
+        log.debug("{any}: error: {any}", .{ scope, err });
+        self.events.append(self.gpa, .{ .err = .{
+            .scope = scope,
+            .err = err,
         } }) catch {};
     }
 
@@ -409,7 +425,7 @@ pub const TaskManager = struct {
             .iterate = true,
         }) catch |err| {
             if (fatal_open) return err;
-            self.emitError(
+            self.emitErrorFmt(
                 .task_manager,
                 err,
                 "skip watch dir (open failed): path={s} err={any}",
@@ -433,7 +449,7 @@ pub const TaskManager = struct {
                 defer self.gpa.free(sub_path);
 
                 self.addWatchPath(s, sub_path, diagnostics) catch |err| {
-                    self.emitError(
+                    self.emitErrorFmt(
                         .task_manager,
                         err,
                         "skip watch dir (addWatch failed): path={s} err={any}",
@@ -451,13 +467,13 @@ pub const TaskManager = struct {
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
             self.checkWatcher() catch |err| {
-                self.emitError(.watcher, err, "", .{});
+                self.emitError(.watcher, err);
             };
             self.updateRemoteManager() catch |err| {
-                self.emitError(.remote_manager, err, "", .{});
+                self.emitError(.remote_manager, err);
             };
             self.updateSchedulers() catch |err| {
-                self.emitError(.scheduler, err, "", .{});
+                self.emitError(.scheduler, err);
             };
             std.Thread.sleep(std.time.ns_per_ms * 100);
         }

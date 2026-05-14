@@ -290,7 +290,13 @@ pub const Model = struct {
                 .{ r.task_id, @tagName(r.status) },
             ),
             .info => |e| self.gpa.free(e.msg),
-            .err => |e| try self.setInfo("Error {s}: '{s}'", .{ @tagName(e.scope), e.msg }),
+            .err => |e| {
+                defer if (e.msg) |m| self.gpa.free(m);
+                try self.setInfo("Error {s}: '{s}'", .{
+                    @tagName(e.scope),
+                    e.msg orelse @errorName(e.err),
+                });
+            },
         };
     }
 

@@ -141,7 +141,8 @@ test "force_interrupt" {
     while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
     if (task_manager.tryPopEvent()) |event| switch (event) {
         .run_finished => |e| try std.testing.expect(e.status == .interrupted),
-        else => {},
+        .info => |e| gpa.free(e.msg),
+        .err => |e| if (e.msg) |m| gpa.free(m),
     };
 }
 
@@ -207,7 +208,8 @@ test "complete_tasks" {
                 e.task_id == task1_id_value or e.task_id == task2_id_value,
             );
         },
-        else => {},
+        .info => |e| gpa.free(e.msg),
+        .err => |e| if (e.msg) |m| gpa.free(m),
     };
 }
 
