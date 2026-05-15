@@ -8,7 +8,7 @@ Task automation and workflow runner written in Zig.
 - CLI and TUI dashboard
 - Remote runners (agents connect to a manager over TCP)
 
-Supported platforms: Linux, Windows
+Supported platforms: Linux, (Windows)
 
 ## Quickstart
 
@@ -32,6 +32,10 @@ Tasks can have multiple jobs, and each job can consist of multiple steps. Jobs
 that do not have dependencies on other jobs can be executed in parallel. Within 
 a job, steps are executed in sequence. Each step is a CLI command that is 
 executed.
+
+Task selection for task-specific commands can be performed using either the 
+`--path` or `--id` options, which are mutually exclusive. Additionally, the path 
+can be provided as a positional argument.
 
 ### Running tasks
 
@@ -143,6 +147,22 @@ init`
 - `ZTASK_DATA_DIR` environment variable
 - Default OS app data directory
 
+### Editing tasks
+
+Tasks can be modified using the `ztask edit` command, or manually with your 
+preferred text editor. If you make manual changes, you may need to run the 
+`ztask sync` command to ensure any critical updates, such as changes to the ID 
+or name, are properly synchronized.
+
+The `ztask sync` command includes a `--dry` option that allows you to preview 
+the changes it would make before actually executing them.
+
+#### Editor selection
+
+The `edit` command determines the default editor by first checking the `EDITOR` 
+and `VISUAL` environment variables. If neither is set, it attempts to select an 
+appropriate editor automatically. Alternatively, you can specify an editor 
+directly using the `--editor` option.
 
 ## Development
 
