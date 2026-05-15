@@ -1,0 +1,17 @@
+name: Remote
+id: remote
+
+jobs:
+  job1:
+    steps: []
+    run_on:
+      type: local
+  job2:
+    steps: []
+    run_on: remote:runner1@127.0.0.1
+  job3:
+    steps: []
+    run_on:
+      type: remote
+      name: runner2
+      addr: 192.168.0.1

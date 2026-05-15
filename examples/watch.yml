@@ -1,0 +1,12 @@
+name: "Watch trigger"
+id: watch
+
+on:
+  watch:
+    path: "src"
+    recursive: true
+
+jobs:
+  cat:
+    steps:
+      - command: "cat main.zig"

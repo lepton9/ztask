@@ -1,0 +1,19 @@
+name: "example" # Required name of the task
+id: "123" # Optional ID for the task
+cwd: "." # Current working directory
+
+# Trigger
+on:
+  watch:
+    path: "src"
+    recursive: "1" # Watch all the directories recursively
+
+jobs:
+  build: # Job name
+    steps:
+      - command: "zig build"
+  test:
+    deps: [build]
+    steps:
+      - command: "zig fmt --check . src"
+      - command: "zig build test"

@@ -1,0 +1,7 @@
+name: "Simple"
+id: simple
+
+jobs:
+  echo:
+    steps:
+      - command: "echo 'Hello world!'"

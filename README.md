@@ -25,6 +25,8 @@ Help for specific sub-commands: `ztask <cmd> --help`.
 Tasks are YAML files stored under `<data-dir>/tasks/` 
 (e.g. `.ztask/tasks/example.yml`) by default.
 
+More examples for task files can be found from [examples](./examples/).
+
 New tasks can be created using `ztask new`, or existing tasks can be added with 
 `ztask add`.
 

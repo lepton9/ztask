@@ -494,3 +494,32 @@ test "sync_dedup_same_task_file_path" {
     const next = try repaired.nextRunId(gpa, task_id);
     try std.testing.expect(next >= 3);
 }
+
+test "examples" {
+    const gpa = std.testing.allocator;
+    const cwd = std.fs.cwd();
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
+        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    });
+    defer task_manager.deinit();
+
+    const examples_dir = "examples";
+    var dir = try cwd.openDir(examples_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var it = dir.iterate();
+
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const task_path = try std.fs.path.join(gpa, &.{
+            examples_dir,
+            entry.name,
+        });
+        defer gpa.free(task_path);
+
+        _ = try task_manager.loadOrCreateWithPath(task_path, null);
+    }
+}

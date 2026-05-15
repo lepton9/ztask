@@ -110,6 +110,7 @@ pub const RemoteManager = struct {
 
     /// Poll the sockets for events
     fn poll(self: *RemoteManager) !void {
+        if (self.polls.items.len == 0) return;
         _ = try posix.poll(self.polls.items[0..self.polls.items.len], 0);
 
         // Listener socket

@@ -1,0 +1,17 @@
+name: Dependency
+id: depend
+
+jobs:
+  build:
+    steps:
+      - command: "zig fmt --check ./*.zig src/*.zig"
+      - command: "zig build"
+    run_on: local
+  test:
+    steps:
+      - command: "zig build test"
+    deps: [build]
+  depend:
+    steps:
+      - command: "./zig-out/bin/ztask --help"
+    deps: [build, test]
