@@ -21,14 +21,11 @@ fn recoverPanic(msg: []const u8, ret_addr: ?usize) noreturn {
 }
 pub const panic: type = std.debug.FullPanic(recoverPanic);
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = comptime builtin.mode == .Debug,
-    }).init;
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-    const cli: *zcli.Cli = try zcli.parseArgs(allocator, cli_spec);
-    defer cli.deinit(allocator);
-    try handleArgs(allocator, cli);
+    const cli: *zcli.Cli = try zcli.parseInit(init, cli_spec);
+    defer cli.deinit(gpa);
+    try handleArgs(io, gpa, init.environ_map, cli);
 }

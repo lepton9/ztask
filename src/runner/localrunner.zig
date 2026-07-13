@@ -39,7 +39,8 @@ pub const ExecResult = struct {
 
 /// Runner for one job
 pub const LocalRunner = struct {
-    mutex: std.Thread.Mutex = std.Thread.Mutex{},
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = .init(false),
     /// Thread for running the job run function
     thread: ?std.Thread = null,
@@ -175,17 +176,17 @@ pub const LocalRunner = struct {
     }
 
     /// Force runner to stop executing the job if running
-    pub fn forceStop(self: *LocalRunner) void {
+    pub fn forceStop(self: *LocalRunner) error{Canceled}!void {
         switch (self.mode) {
             .piped => self.finishJob(),
             .attached => {
                 self.running.store(false, .seq_cst);
 
                 var pid_opt: ?std.process.Child.Id = null;
-                self.mutex.lock();
+                try self.mutex.lock(self.io);
                 if (self.process) |child| pid_opt = child.id;
                 self.process = null;
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
 
                 if (pid_opt) |pid| {
                     if (builtin.os.tag == .windows) {
@@ -231,10 +232,6 @@ pub const LocalRunner = struct {
             @sizeOf(task.Step),
         );
 
-        // Create child process
-        var child = std.process.Child.init(argv.items, gpa);
-        child.cwd = self.cwd;
-
         switch (mode) {
             .attached => {
                 const is_posix = builtin.os.tag != .windows and
@@ -244,18 +241,22 @@ pub const LocalRunner = struct {
                 var tty: ?JobTty = JobTty.init();
                 defer if (tty) |*t| t.restore();
 
-                child.stdin_behavior = .Inherit;
-                child.stdout_behavior = .Inherit;
-                child.stderr_behavior = .Inherit;
+                // Create child process
+                var child = try std.process.spawn(self.io, .{
+                    .cwd = self.cwd,
+                    .stdin = .inherit,
+                    .stdout = .inherit,
+                    .stderr = .inherit,
+                    .pgid = 0, // Create a new process group
+                });
+                // TODO: needed?
+                // if (comptime is_posix) child.pgid = 0;
 
-                // Create a new process group for the child
-                if (comptime is_posix) child.pgid = 0;
-
-                try child.spawn();
-                self.mutex.lock();
+                try self.mutex.lock(self.io);
                 self.process = &child;
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
 
+                // TODO:
                 if (comptime is_posix) if (tty) |*t| {
                     const pid_i: std.posix.pid_t = @intCast(child.id);
                     std.posix.setpgid(pid_i, pid_i) catch {};
@@ -263,9 +264,9 @@ pub const LocalRunner = struct {
                 };
 
                 const term = try child.wait();
-                self.mutex.lock();
+                try self.mutex.lock(self.io);
                 self.process = null;
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return switch (term) {
                     .Exited => |code| @intCast(code),
                     .Signal => |sig| @intCast(sig),
@@ -273,32 +274,41 @@ pub const LocalRunner = struct {
                 };
             },
             .piped => {
-                child.stdout_behavior = .Pipe;
-                child.stderr_behavior = .Pipe;
-                try child.spawn();
-
-                self.mutex.lock();
-                self.process = &child;
-                self.mutex.unlock();
-
-                var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
-                    .stdout = child.stdout.?,
-                    .stderr = child.stderr.?,
+                // Create child process
+                var child = try std.process.spawn(self.io, .{
+                    .cwd = self.cwd,
+                    .stdin = .ignore,
+                    .stdout = .pipe,
+                    .stderr = .pipe,
                 });
-                defer poller.deinit();
 
-                var stdout_r = poller.reader(.stdout);
-                var stderr_r = poller.reader(.stderr);
-                stdout_r.buffer = try gpa.alloc(u8, 4096);
-                stderr_r.buffer = try gpa.alloc(u8, 4096);
+                try self.mutex.lock(self.io);
+                self.process = &child;
+                self.mutex.unlock(self.io);
+
+                var stdout_buffer = try gpa.alloc(u8, 4096);
+                var stderr_buffer = try gpa.alloc(u8, 4096);
+                var stdout_reader = child.stdout.?.reader(self.io, &stdout_buffer);
+                var stderr_reader = child.stderr.?.reader(self.io, &stderr_buffer);
+
+                // TODO: fix how to poll
+                // var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
+                //     .stdout = child.stdout.?,
+                //     .stderr = child.stderr.?,
+                // });
+                // defer poller.deinit();
+                // var stdout_r = poller.reader(.stdout);
+                // var stderr_r = poller.reader(.stderr);
+                // stdout_r.buffer = try gpa.alloc(u8, 4096);
+                // stderr_r.buffer = try gpa.alloc(u8, 4096);
 
                 // Read output
                 while (try poller.pollTimeout(std.time.ns_per_ms * 300)) {
                     if (!self.running.load(.seq_cst)) {
-                        self.mutex.lock();
+                        try self.mutex.lock(self.io);
                         const term = try child.kill();
                         self.process = null;
-                        self.mutex.unlock();
+                        self.mutex.unlock(self.io);
                         return switch (term) {
                             .Exited => |code| @intCast(code),
                             .Signal => |sig| @intCast(sig),
@@ -311,9 +321,9 @@ pub const LocalRunner = struct {
                 }
 
                 const term = try child.wait();
-                self.mutex.lock();
+                try self.mutex.lock(self.io);
                 self.process = null;
-                self.mutex.unlock();
+                self.mutex.unlock(self.io);
                 return switch (term) {
                     .Exited => |code| @intCast(code),
                     .Signal => |sig| @intCast(sig),

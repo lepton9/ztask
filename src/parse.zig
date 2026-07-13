@@ -6,8 +6,6 @@ const expectEqual = std.testing.expectEqual;
 
 const Task = task.Task;
 
-const max_size = 8192 * 128;
-
 pub const ParseError = error{
     InvalidFileFormat,
     MissingRequiredField,
@@ -144,6 +142,7 @@ fn diagSetFmt(
 }
 
 const ParseCtx = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     diag: ?*ParseDiag,
 
@@ -151,8 +150,8 @@ const ParseCtx = struct {
     parts: [16][]const u8 = undefined,
     parts_len: u8 = 0,
 
-    fn init(gpa: std.mem.Allocator, diag: ?*ParseDiag) ParseCtx {
-        return .{ .gpa = gpa, .diag = diag };
+    fn init(io: std.Io, gpa: std.mem.Allocator, diag: ?*ParseDiag) ParseCtx {
+        return .{ .io = io, .gpa = gpa, .diag = diag };
     }
 
     /// Add a path part to the context.
@@ -431,7 +430,7 @@ fn parseTaskCwd(cx: ParseCtx, map: yaml.Yaml.Map) !?[]const u8 {
     const cwd = try requireScalar(cx_cwd, nv);
     const path = try parseStringFieldDiag(cwd, cx_cwd);
 
-    const stat = std.fs.cwd().statFile(path) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(cx.io, path, .{}) catch |err| {
         if (err == error.FileNotFound) {
             const fmt = "Working directory path not found: {s}";
             return cx_cwd.failf(ParseError.CwdNotFound, null, fmt, .{path});
@@ -668,7 +667,7 @@ fn parseRunLocationString(l: []const u8) ParseError!task.RunLocation {
     if (addr_port.len == 0) return ParseError.InvalidRunnerAddr;
 
     // Validate address (IPv4)
-    _ = std.net.Address.parseIp4(addr_port, 0) catch
+    _ = std.Io.net.IpAddress.parseIp4(addr_port, 0) catch
         return ParseError.InvalidRunnerAddr;
     return .{ .remote = .{ .name = name, .addr = addr_port } };
 }
@@ -705,7 +704,7 @@ fn parseRunLocationMap(
             const a = map.get("addr") orelse break :blk null;
             const addr = try requireScalar(cx.at("addr"), a);
             // Validate address
-            _ = std.net.Address.parseIp4(addr, 0) catch {
+            _ = std.Io.net.IpAddress.parseIp4(addr, 0) catch {
                 return cx.at("addr").failf(
                     ParseError.InvalidRunnerAddr,
                     null,
@@ -744,11 +743,12 @@ fn parseStringFieldDiag(str: []const u8, cx: ParseCtx) ![]const u8 {
 /// Parse the task file buffer.
 /// Report error diagnostics using `ParseDiag` if not null.
 pub fn parseTaskBufferDiag(
+    io: std.Io,
     gpa: std.mem.Allocator,
     buf: []const u8,
     diag: ?*ParseDiag,
 ) !*Task {
-    const cx = ParseCtx.init(gpa, diag);
+    const cx = ParseCtx.init(io, gpa, diag);
     var yaml_parser: yaml.Yaml = .{ .source = buf };
     defer yaml_parser.deinit(gpa);
 
@@ -774,26 +774,31 @@ pub fn parseTaskBufferDiag(
     return parseTask(cx, map);
 }
 
-pub fn parseTaskBuffer(gpa: std.mem.Allocator, buf: []const u8) !*Task {
-    return parseTaskBufferDiag(gpa, buf, null);
+pub fn parseTaskBuffer(io: std.Io, gpa: std.mem.Allocator, buf: []const u8) !*Task {
+    return parseTaskBufferDiag(io, gpa, buf, null);
 }
 
 /// Parse a task file into a `Task`.
-pub fn loadTask(gpa: std.mem.Allocator, path: []const u8) !*Task {
-    return loadTaskDiag(gpa, path, null);
+pub fn loadTask(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !*Task {
+    return loadTaskDiag(io, gpa, path, null);
 }
 
 /// Parse a task file into a `Task`.
 /// Collect extra error info if `diag` is given.
 pub fn loadTaskDiag(
+    io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
     diag: ?*ParseDiag,
 ) !*Task {
-    const yaml_file = try std.fs.cwd().readFileAlloc(gpa, path, max_size);
+    const cwd = std.Io.Dir.cwd();
+    const yaml_file = try cwd.readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(yaml_file);
-    const t = try parseTaskBufferDiag(gpa, yaml_file, diag);
-    t.file_path = try std.fs.cwd().realpathAlloc(gpa, path);
+    const t = try parseTaskBufferDiag(io, gpa, yaml_file, diag);
+    // TODO: better path allocation. Avoid realPathFile()
+    var real_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real_n = try cwd.realPathFile(io, path, &real_path_buf);
+    t.file_path = try gpa.dupe(u8, real_path_buf[0..real_n]);
     if (t.id.str == null and t.id.value == 0)
         t.id = .fromPath(t.file_path orelse unreachable);
     return t;
@@ -807,7 +812,7 @@ pub fn isTaskFile(file: []const u8) bool {
 
 test "parse_empty" {
     try std.testing.expect(
-        parseTaskBuffer(std.testing.allocator, "") == ParseError.EmptyTaskFile,
+        parseTaskBuffer(std.testing.io, std.testing.allocator, "") == ParseError.EmptyTaskFile,
     );
 }
 
@@ -817,7 +822,7 @@ test "missing_name" {
         \\   watch: "src/main.zig"
     ;
     try std.testing.expect(
-        parseTaskBuffer(std.testing.allocator, source) ==
+        parseTaskBuffer(std.testing.io, std.testing.allocator, source) ==
             ParseError.MissingRequiredField,
     );
 }
@@ -831,7 +836,7 @@ test "empty_trigger" {
         \\     steps: []
     ;
     try std.testing.expect(
-        parseTaskBuffer(std.testing.allocator, source) == ParseError.InvalidTrigger,
+        parseTaskBuffer(std.testing.io, std.testing.allocator, source) == ParseError.InvalidTrigger,
     );
 }
 
@@ -844,19 +849,21 @@ test "duplicate_job" {
         \\   jobname:
         \\     steps: []
     ;
-    const t = parseTaskBuffer(std.testing.allocator, source);
+    const t = parseTaskBuffer(std.testing.io, std.testing.allocator, source);
     try std.testing.expect(t == ParseError.DuplicateKey);
 }
 
 test "empty_id" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source = "name: test";
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     try std.testing.expect(t.id.value == 0);
 }
 
 test "parse_task" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source =
         \\ name: test
@@ -878,7 +885,7 @@ test "parse_task" {
         \\   depend:
         \\     deps: [build, test]
     ;
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     try std.testing.expect(t.id.str != null);
     try std.testing.expect(std.mem.eql(u8, t.id.str.?, "123"));
@@ -896,6 +903,7 @@ test "parse_task" {
 }
 
 test "parse_watch_recursive" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source =
         \\ name: test
@@ -904,7 +912,7 @@ test "parse_watch_recursive" {
         \\     path: "src"
         \\     recursive: true
     ;
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     try std.testing.expect(t.trigger.? == .watch);
     try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src"));
@@ -912,6 +920,7 @@ test "parse_watch_recursive" {
 }
 
 test "parse_run_on" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source =
         \\ name: test
@@ -930,7 +939,7 @@ test "parse_run_on" {
         \\       name: runner2
         \\       addr: 192.168.0.1
     ;
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     const job1 = t.jobs.get("job1").?;
     try std.testing.expect(job1.run_on == .local);
@@ -947,13 +956,14 @@ test "parse_run_on" {
 }
 
 test "parse_trigger_time" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source =
         \\ name: time_trigger
         \\ on:
         \\   time: "17:38"
     ;
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     try std.testing.expect(t.trigger.? == .time);
     const time = t.trigger.?.time;
@@ -964,13 +974,14 @@ test "parse_trigger_time" {
 }
 
 test "parse_trigger_interval" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     const source =
         \\ name: interval_trigger
         \\ on:
         \\   interval: "00:01:15.001"
     ;
-    const t = try parseTaskBuffer(gpa, source);
+    const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
     try std.testing.expect(t.trigger.? == .interval);
     const interval = t.trigger.?.interval;

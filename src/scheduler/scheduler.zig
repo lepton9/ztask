@@ -68,6 +68,7 @@ pub const InterruptReason = enum { user_interrupt, retrigger };
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     status: enum { running, completed, waiting, inactive, interrupted },
     datastore: *data.DataStore,
@@ -101,9 +102,10 @@ pub const Scheduler = struct {
     /// Watch path list used for file watch triggers.
     /// Managed and allocated by `TaskManager`.
     /// Used to keep track of paths that are connected to this scheduler.
-    watch_paths: std.ArrayListUnmanaged([]const u8) = .{},
+    watch_paths: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(
+        io: std.Io,
         gpa: std.mem.Allocator,
         task: *Task,
         pool: *RunnerPool,
@@ -116,12 +118,13 @@ pub const Scheduler = struct {
         const node_n = task.jobs.count();
         const task_meta: data.TaskRunMetadata = .{
             .task_id = try gpa.dupe(u8, task.id.fmt()),
-            .start_time = std.time.timestamp(),
+            .start_time = std.Io.Timestamp.now(io, .real).toSeconds(),
             .jobs_total = node_n,
         };
         const tasks_path = try datastore.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
         scheduler.* = .{
+            .io = io,
             .gpa = gpa,
             .datastore = datastore,
             .task = task,
@@ -130,10 +133,10 @@ pub const Scheduler = struct {
             .nodes = try scheduler.gpa.alloc(JobNode, node_n),
             .active_runners = .{},
             .queue = try .initCapacity(gpa, node_n),
-            .result_queue = try ResultQueue.initCapacity(gpa, node_n),
-            .log_queue = try LogQueue.init(gpa),
+            .result_queue = try ResultQueue.initCapacity(io, gpa, node_n),
+            .log_queue = try LogQueue.init(io, gpa),
             .status = .inactive,
-            .logger = try .init(gpa, tasks_path, task_meta.task_id),
+            .logger = try .init(io, gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
             .job_metas = .{},
             .event_sink = event_sink,
@@ -230,7 +233,7 @@ pub const Scheduler = struct {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
         try self.logger.startTask(self.gpa, &self.task_meta, run_id);
-        self.task_start_ms = std.time.milliTimestamp();
+        self.task_start_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 
         self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
 
@@ -343,7 +346,7 @@ pub const Scheduler = struct {
         while (it.next()) |e| {
             const runner = e.value_ptr.*;
             const node = e.key_ptr.*;
-            runner.forceStop();
+            runner.forceStop() catch {};
             self.pool.release(runner);
             self.skipJob(node);
         }
@@ -392,7 +395,7 @@ pub const Scheduler = struct {
         // Log job metadata
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .interrupted;
-        job_meta.end_time_ms = std.time.timestamp();
+        job_meta.end_time_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         self.logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
@@ -519,10 +522,9 @@ pub const Scheduler = struct {
 
     /// Return the task running duration until now in milliseconds.
     fn taskDuration(self: *const Scheduler) ?i64 {
-        return if (self.task_start_ms) |st|
-            (std.time.milliTimestamp() - st)
-        else
-            null;
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const now_ms = now.toMilliseconds();
+        return if (self.task_start_ms) |st| (now_ms - st) else null;
     }
 
     /// Mark task as completed and log the final metadata

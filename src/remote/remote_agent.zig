@@ -16,6 +16,7 @@ const log = std.log.scoped(.agent);
 const HEARTBEAT_FREQ_S = 10;
 
 pub const RemoteAgent = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     running: std.atomic.Value(bool) = .init(false),
     hostname: []const u8,
@@ -41,21 +42,23 @@ pub const RemoteAgent = struct {
     const ExitError = error{NameTaken};
 
     pub fn init(
+        io: std.Io,
         gpa: std.mem.Allocator,
         name: []const u8,
         runners_n: u16,
     ) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
         agent.* = .{
+            .io = io,
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
-            .pool = try runnerpool.RunnerPool.init(gpa, runners_n),
-            .result_queue = try ResultQueue.initCapacity(gpa, runners_n),
-            .log_queue = try LogQueue.init(gpa),
+            .pool = try runnerpool.RunnerPool.init(io, gpa, runners_n),
+            .result_queue = try ResultQueue.initCapacity(io, gpa, runners_n),
+            .log_queue = try LogQueue.init(io, gpa),
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
-            .connection = try .init(gpa),
+            .connection = try .init(io, gpa),
         };
         try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
@@ -101,27 +104,30 @@ pub const RemoteAgent = struct {
     /// Stop the agent
     pub fn stop(self: *RemoteAgent) void {
         self.running.store(false, .seq_cst);
+        // self.connection.close();
     }
 
     /// Try to connect to the server at the address
-    pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
+    pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
         try self.connection.connect(addr);
         try self.register();
     }
 
     /// Try connecting until success
-    pub fn connectUntil(self: *RemoteAgent, addr: std.net.Address) void {
+    pub fn connectUntil(self: *RemoteAgent, addr: std.Io.net.IpAddress) void {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
-            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            log.info(
-                "Connecting to {d}.{d}.{d}.{d}:{d}",
-                .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
-            );
+            switch (addr) {
+                .ip4 => |a4| log.info(
+                    "Connecting to {d}.{d}.{d}.{d}:{d}",
+                    .{ a4.bytes[0], a4.bytes[1], a4.bytes[2], a4.bytes[3], a4.port },
+                ),
+                else => log.info("Connecting to remote server", .{}),
+            }
             self.connect(addr) catch |err| switch (err) {
                 error.AlreadyConnected => break,
                 else => {
-                    std.Thread.sleep(std.time.ns_per_s);
+                    std.Io.sleep(self.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
                     continue;
                 },
             };
@@ -193,7 +199,7 @@ pub const RemoteAgent = struct {
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
         const e = self.jobs.getPtr(msg.job_id) orelse return;
         if (self.active_runners.get(&e.node)) |runner| {
-            runner.forceStop();
+            runner.forceStop() catch {};
         } else {
             var it = self.queue.iterator();
             while (it.next()) |node| {
@@ -229,7 +235,7 @@ pub const RemoteAgent = struct {
 
     /// Return true if last message was long ago
     fn shouldSendHeartbeat(self: *RemoteAgent) bool {
-        const now = std.time.timestamp();
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         return (now - self.connection.last_msg > HEARTBEAT_FREQ_S);
     }
 

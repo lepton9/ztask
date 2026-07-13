@@ -6,15 +6,18 @@ const JobRunMetadata = data.JobRunMetadata;
 
 /// Logger for task and job execution logs and metadata
 pub const RunLogger = struct {
+    io: std.Io,
     task_path: []const u8,
     run_path: ?[]const u8 = null,
 
     pub fn init(
+        io: std.Io,
         gpa: std.mem.Allocator,
         base_path: []const u8,
         task_id: []const u8,
     ) !RunLogger {
         return .{
+            .io = io,
             .task_path = try std.fs.path.join(gpa, &.{ base_path, task_id, "runs" }),
         };
     }
@@ -35,7 +38,7 @@ pub const RunLogger = struct {
         defer gpa.free(file_path);
         const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try data.writeFile(file_path, json, .{ .truncate = true });
+        try data.writeFile(self.io, file_path, json, .{ .truncate = true });
     }
 
     /// Write job metadata to a JSON file
@@ -52,7 +55,7 @@ pub const RunLogger = struct {
         defer gpa.free(file_path);
         const json = try data.toJson(gpa, meta.*);
         defer gpa.free(json);
-        try data.writeFile(file_path, json, .{ .truncate = true });
+        try data.writeFile(self.io, file_path, json, .{ .truncate = true });
     }
 
     /// Record the initial state of the task in a metadata file
@@ -69,10 +72,10 @@ pub const RunLogger = struct {
             self.task_path,
             try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
         });
-        try std.fs.cwd().makePath(self.run_path.?);
+        try std.Io.Dir.cwd().createDirPath(self.io, self.run_path.?);
 
         // Set task metadata
-        meta.start_time = std.time.timestamp();
+        meta.start_time = std.Io.Timestamp.now(self.io, .real).toSeconds();
         meta.end_time = null;
         meta.status = .running;
         meta.jobs_completed = 0;
@@ -87,7 +90,7 @@ pub const RunLogger = struct {
         gpa: std.mem.Allocator,
         meta: *TaskRunMetadata,
     ) !void {
-        meta.end_time = std.time.timestamp();
+        meta.end_time = std.Io.Timestamp.now(self.io, .real).toSeconds();
         try self.logTaskRunMetadata(gpa, meta);
     }
 
@@ -99,17 +102,17 @@ pub const RunLogger = struct {
         meta: *JobRunMetadata,
     ) !void {
         const run_path = self.run_path orelse return error.NoRunDirectory;
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
         const dir = try std.fs.path.join(
             gpa,
             &.{ run_path, "jobs", meta.job_name },
         );
         defer gpa.free(dir);
-        try cwd.makePath(dir);
+        try cwd.createDirPath(self.io, dir);
         const stdout_log = try std.fs.path.join(gpa, &.{ dir, "stdout.log" });
         defer gpa.free(stdout_log);
-        var file = try cwd.createFile(stdout_log, .{ .truncate = false });
-        defer file.close();
+        var file = try cwd.createFile(self.io, stdout_log, .{ .truncate = false });
+        defer file.close(self.io);
 
         // Reset job metadata
         meta.status = .pending;
@@ -133,10 +136,9 @@ pub const RunLogger = struct {
             &.{ run_path, "jobs", meta.job_name, "stdout.log" },
         );
         defer gpa.free(file_path);
-        var file = try std.fs.cwd().openFile(file_path, .{ .mode = .write_only });
-        defer file.close();
-        var writer = file.writer(&.{});
-        try writer.seekTo(try file.getEndPos());
-        try writer.interface.writeAll(content);
+        var file = try std.Io.Dir.cwd().openFile(self.io, file_path, .{ .mode = .write_only });
+        defer file.close(self.io);
+        const end = try file.length(self.io);
+        try file.writePositionalAll(self.io, content, end);
     }
 };

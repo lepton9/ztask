@@ -33,10 +33,10 @@ vtable: struct {
     ) anyerror!void,
 },
 
-pub fn init(gpa: std.mem.Allocator) !*FileWatcher {
+pub fn init(io: std.Io, gpa: std.mem.Allocator) !*FileWatcher {
     const w = try gpa.create(FileWatcher);
     errdefer gpa.destroy(w);
-    w.* = try loadWatcherBackend(gpa);
+    w.* = try loadWatcherBackend(io, gpa);
     return w;
 }
 
@@ -71,14 +71,14 @@ pub fn pollEvents(
 }
 
 /// Get a platform-specific implementation for `FileWatcher`
-fn loadWatcherBackend(gpa: std.mem.Allocator) !@This() {
+fn loadWatcherBackend(io: std.Io, gpa: std.mem.Allocator) !@This() {
     return switch (builtin.os.tag) {
         .linux => try @import(
             "FileWatcherLinux.zig",
-        ).fileWatcher(gpa),
+        ).fileWatcher(io, gpa),
         .windows => try @import(
             "FileWatcherWindows.zig",
-        ).fileWatcher(gpa),
+        ).fileWatcher(io, gpa),
         else => error.UnsupportedPlatform,
     };
 }
@@ -86,9 +86,9 @@ fn loadWatcherBackend(gpa: std.mem.Allocator) !@This() {
 pub const PathSplit = struct { dirname: []const u8, basename: ?[]const u8 };
 
 /// Split path string to a directory name and a file basename
-pub fn splitPath(path: []const u8) !PathSplit {
+pub fn splitPath(io: std.Io, path: []const u8) !PathSplit {
     if (std.mem.eql(u8, path, "")) return .{ .dirname = ".", .basename = null };
-    const stat = try std.fs.cwd().statFile(path);
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     if (stat.kind == .directory) return .{ .dirname = path, .basename = null };
     return .{
         .dirname = std.fs.path.dirname(path) orelse if (path[0] == '/') "/" else ".",

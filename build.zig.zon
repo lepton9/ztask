@@ -2,19 +2,19 @@
     .name = .ztask,
     .version = "0.3.0",
     .fingerprint = 0x67a0b4a4055f624,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml.git#2e2bd0c0aabbca27497501f904715b87facc54fb",
-            .hash = "zig_yaml-0.2.0-C1161kqsAgAlnJFIEkGCMXUSq-QvDKF3vpqeg1XRKW-w",
+            .url = "git+https://github.com/kubkon/zig-yaml#cf7a1c178518f408cf606cdc6a76ea01a5d66798",
+            .hash = "zig_yaml-0.3.0-C1161gmsAgBMXfMGSbvs1jaocmD2KVCEZRPKBSO0x1Hc",
         },
         .zcli = .{
-            .url = "git+https://github.com/lepton9/zcli#64ee9886d1dbdb268c8c2cc2a0f56219f241d9a3",
-            .hash = "zcli-0.3.5-Of3s8eyVAQDwkmzd_2bhhx0hoxy_GMiNymJNaRg8JRSZ",
+            .url = "git+https://github.com/lepton9/zcli#5530d429f022cb34acf9fe3fcdefddac5a1c2a2b",
+            .hash = "zcli-0.3.8-Of3s8S2ZAQDkrke23o_fbiF2L1hFaOgL11sKfVAnM1RT",
         },
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#e70ca957a6bc2b62a9afab1091a57cfb00e8111c",
-            .hash = "vaxis-0.5.1-BWNV_LIyCQA41kkRpB2A6FaGPb2jblX54Flc4NpaWAty",
+            .url = "git+https://github.com/rockorager/libvaxis#a367b89da09bfe5e1b628501940de5b4f858f5f3",
+            .hash = "vaxis-0.6.0-BWNV_HHwCQB451KS7A8SMykALblPmGwHnzSfiJHjN3_9",
         },
     },
     .paths = .{

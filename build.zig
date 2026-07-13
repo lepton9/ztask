@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
     // Release
     const release_step = b.step("release", "Create release builds");
     setupRelease(b, release_step);
+
+    // Check step
+    const check_step = b.step("check", "Check for compilation errors");
+    check_step.dependOn(&run_cmd.step);
+    check_step.dependOn(&run_tests.step);
 }
 
 pub fn setupExe(
@@ -43,10 +48,12 @@ pub fn setupExe(
     const yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize });
     const yaml_mod = yaml.module("yaml");
 
-    const zcli = b.dependency("zcli", .{ .target = target, .optimize = optimize });
+    const zcli = b.dependency("zcli", .{
+        .target = target,
+        .optimize = optimize,
+        .version_tag = @import("build.zig.zon").version,
+    });
     const zcli_mod = zcli.module("zcli");
-    const version = @import("build.zig.zon").version;
-    @import("zcli").addVersionInfo(b, zcli_mod, version);
 
     const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const vaxis_mod = vaxis.module("vaxis");
@@ -116,7 +123,7 @@ pub fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
                 const zip = b.addSystemCommand(&.{ "zip", "-9", "-q", "-j" });
                 const archive = zip.addOutputFileArg(archive_name);
                 zip.addDirectoryArg(exe.getEmittedBin());
-                _ = zip.captureStdOut();
+                _ = zip.captureStdOut(.{});
 
                 step.dependOn(&b.addInstallFileWithDir(
                     archive,
@@ -136,7 +143,7 @@ pub fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
 
                 tar.addDirectoryArg(exe.getEmittedBinDirectory());
                 tar.addArg("ztask");
-                _ = tar.captureStdOut();
+                _ = tar.captureStdOut(.{});
 
                 step.dependOn(&b.addInstallFileWithDir(
                     archive,

@@ -9,6 +9,7 @@ const EventType = FileWatcher.EventType;
 const splitPath = FileWatcher.splitPath;
 const addEventFn = FileWatcher.addEventFn;
 
+io: std.Io,
 gpa: std.mem.Allocator,
 fd: i32,
 wd_map: std.AutoHashMapUnmanaged(i32, Dir),
@@ -22,9 +23,9 @@ const Dir = struct {
     file_table: std.StringHashMapUnmanaged([]const u8),
 };
 
-pub fn fileWatcher(gpa: std.mem.Allocator) !FileWatcher {
+pub fn fileWatcher(io: std.Io, gpa: std.mem.Allocator) !FileWatcher {
     return .{
-        .ptr = try FileWatcherLinux.init(gpa),
+        .ptr = try FileWatcherLinux.init(io, gpa),
         .vtable = .{
             .deinit = deinit,
             .addWatch = addWatch,
@@ -35,11 +36,12 @@ pub fn fileWatcher(gpa: std.mem.Allocator) !FileWatcher {
     };
 }
 
-fn init(gpa: std.mem.Allocator) !*FileWatcherLinux {
+fn init(io: std.Io, gpa: std.mem.Allocator) !*FileWatcherLinux {
     const w = try gpa.create(FileWatcherLinux);
     w.* = .{
+        .io = io,
         .gpa = gpa,
-        .fd = try std.posix.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC),
+        .fd = try inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC),
         .wd_map = .{},
         .dir_to_wd = .{},
     };
@@ -48,7 +50,7 @@ fn init(gpa: std.mem.Allocator) !*FileWatcherLinux {
 
 fn deinit(opq: *anyopaque, gpa: std.mem.Allocator) void {
     const self: *@This() = @ptrCast(@alignCast(opq));
-    std.posix.close(self.fd);
+    _ = std.posix.system.close(self.fd);
     var it = self.wd_map.iterator();
     while (it.next()) |e| {
         e.value_ptr.file_table.deinit(gpa);
@@ -61,13 +63,13 @@ fn deinit(opq: *anyopaque, gpa: std.mem.Allocator) void {
 /// Add a file path to watch list
 fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
     const self: *@This() = @ptrCast(@alignCast(opq));
-    const p = try splitPath(path);
+    const p = try splitPath(self.io, path);
 
     const IN = linux.IN;
     const mask = IN.CLOSE_WRITE | IN.MODIFY | IN.CREATE | IN.DELETE |
         IN.MOVED_FROM | IN.MOVED_TO | IN.ONLYDIR | IN.EXCL_UNLINK;
 
-    const wd = std.posix.inotify_add_watch(self.fd, p.dirname, mask) catch |err|
+    const wd = inotify_add_watch(self.fd, p.dirname, mask) catch |err|
         blk: {
             break :blk self.dir_to_wd.get(p.dirname) orelse return err;
         };
@@ -93,7 +95,7 @@ fn addWatch(opq: *anyopaque, gpa: std.mem.Allocator, path: []const u8) !void {
 /// Remove a path from watch list
 fn removeWatch(opq: *anyopaque, path: []const u8) void {
     const self: *@This() = @ptrCast(@alignCast(opq));
-    const p = splitPath(path) catch return;
+    const p = splitPath(self.io, path) catch return;
     const wd = self.dir_to_wd.get(p.dirname) orelse return;
 
     const dir = self.wd_map.getPtr(wd) orelse return;
@@ -114,9 +116,83 @@ fn removeWatch(opq: *anyopaque, path: []const u8) void {
             removed_dir.file_table.deinit(self.gpa);
         }
         _ = self.dir_to_wd.remove(dirname);
-        std.posix.inotify_rm_watch(self.fd, wd);
+        inotify_rm_watch(self.fd, wd);
     }
     self.watch_count -= 1;
+}
+
+pub const INotifyInitError = error{
+    ProcessFdQuotaExceeded,
+    SystemFdQuotaExceeded,
+    SystemResources,
+    Unexpected,
+};
+
+/// Initialize an inotify instance.
+fn inotify_init1(flags: u32) INotifyInitError!i32 {
+    const rc = std.c.inotify_init1(flags);
+    switch (std.c.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .INVAL => unreachable,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOMEM => return error.SystemResources,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+pub const INotifyAddWatchError = error{
+    AccessDenied,
+    NameTooLong,
+    FileNotFound,
+    SystemResources,
+    UserResourceLimitReached,
+    NotDir,
+    WatchAlreadyExists,
+    Unexpected,
+};
+
+/// Add a watch to an initialized inotify instance.
+fn inotify_add_watch(
+    inotify_fd: i32,
+    pathname: []const u8,
+    mask: u32,
+) INotifyAddWatchError!i32 {
+    const pathname_c = try std.posix.toPosixPath(pathname);
+    return inotify_add_watchZ(inotify_fd, &pathname_c, mask);
+}
+
+/// Same as `inotify_add_watch` except pathname is null-terminated.
+fn inotify_add_watchZ(
+    inotify_fd: i32,
+    pathname: [*:0]const u8,
+    mask: u32,
+) INotifyAddWatchError!i32 {
+    const rc = std.c.inotify_add_watch(inotify_fd, pathname, mask);
+    switch (std.c.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .ACCES => return error.AccessDenied,
+        .BADF => unreachable,
+        .FAULT => unreachable,
+        .INVAL => unreachable,
+        .NAMETOOLONG => return error.NameTooLong,
+        .NOENT => return error.FileNotFound,
+        .NOMEM => return error.SystemResources,
+        .NOSPC => return error.UserResourceLimitReached,
+        .NOTDIR => return error.NotDir,
+        .EXIST => return error.WatchAlreadyExists,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+/// Remove an existing watch from an inotify instance
+fn inotify_rm_watch(inotify_fd: i32, wd: i32) void {
+    switch (std.c.errno(std.c.inotify_rm_watch(inotify_fd, wd))) {
+        .SUCCESS => return,
+        .BADF => unreachable,
+        .INVAL => unreachable,
+        else => unreachable,
+    }
 }
 
 /// Get the amount of paths to watch

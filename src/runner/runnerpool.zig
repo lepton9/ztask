@@ -15,7 +15,7 @@ pub const RunnerPool = struct {
     free_idx: std.ArrayList(usize),
     waiters: std.ArrayList(Waiter(anyopaque)),
 
-    pub fn init(gpa: std.mem.Allocator, n: usize) !*RunnerPool {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, n: usize) !*RunnerPool {
         const pool = try gpa.create(RunnerPool);
         pool.* = .{
             .gpa = gpa,
@@ -25,7 +25,7 @@ pub const RunnerPool = struct {
         };
         for (pool.runners, 0..) |*runner, i| {
             pool.free_idx.appendAssumeCapacity(i);
-            runner.* = .{};
+            runner.* = .{ .io = io };
         }
         return pool;
     }

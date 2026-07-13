@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// TODO: replace with std.Io.Queue
 pub fn Queue(comptime T: type) type {
     const QueueNode = struct {
         value: T = undefined,
@@ -241,19 +242,20 @@ test "clear" {
 /// Thread safe queue
 pub fn MutexQueue(comptime T: type) type {
     return struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
         queue: Queue(T) = .{},
 
-        pub fn init(gpa: std.mem.Allocator) !*@This() {
+        pub fn init(io: std.Io, gpa: std.mem.Allocator) !*@This() {
             const queue = try gpa.create(@This());
-            queue.* = .{};
+            queue.* = .{ .io = io };
             return queue;
         }
 
-        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
+        pub fn initCapacity(io: std.Io, gpa: std.mem.Allocator, n: usize) !*@This() {
             const queue = try gpa.create(@This());
-            queue.* = .{ .queue = try .initCapacity(gpa, n) };
+            queue.* = .{ .io = io, .queue = try .initCapacity(gpa, n) };
             return queue;
         }
 
@@ -265,61 +267,61 @@ pub fn MutexQueue(comptime T: type) type {
         /// Push item to back of queue
         pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                try self.mutex.lock(self.io);
+                defer self.mutex.unlock(self.io);
                 try self.queue.append(gpa, item);
             }
-            self.cond.signal();
+            self.cond.signal(self.io);
         }
 
         /// Push item to back of queue
         /// Assumes that there is capacity for the element
         pub fn appendAssumeCapacity(self: *@This(), item: T) void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lock(self.io) catch return;
+                defer self.mutex.unlock(self.io);
                 self.queue.appendAssumeCapacity(item);
             }
-            self.cond.signal();
+            self.cond.signal(self.io);
         }
 
         /// Pop the first item from the queue if there is one
         pub fn pop(self: *@This()) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch return null;
+            defer self.mutex.unlock(self.io);
             return self.queue.pop();
         }
 
         /// Pop the first item from the queue
         /// Block the caller thread until an item gets pushed
         pub fn popBlocking(self: *@This()) ?T {
-            self.mutex.lock();
+            self.mutex.lock(self.io) catch return null;
             if (self.queue.empty()) {
-                self.cond.wait(&self.mutex);
+                self.cond.wait(self.io, &self.mutex) catch return null;
             }
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return self.pop();
         }
 
         /// Check if the queue is empty
         pub fn empty(self: *@This()) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.queue.list.first == null;
         }
 
         /// Clear all the remaining items from the queue
         pub fn clear(self: *@This()) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.queue.clear();
         }
 
         /// Iterate over all nodes, returning the count.
         /// This operation is O(N).
         pub fn len(self: *@This()) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.queue.len();
         }
     };
@@ -327,7 +329,8 @@ pub fn MutexQueue(comptime T: type) type {
 
 test "mutex_queue" {
     const gpa = std.testing.allocator;
-    var q = try MutexQueue(usize).initCapacity(gpa, 5);
+    const io = std.testing.io;
+    var q = try MutexQueue(usize).initCapacity(io, gpa, 5);
     defer q.deinit(gpa);
     try std.testing.expect(q.pop() == null);
     q.appendAssumeCapacity(1);

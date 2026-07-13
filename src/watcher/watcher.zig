@@ -19,9 +19,10 @@ const log = std.log.scoped(.watcher);
 
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
     thread: std.Thread = undefined,
     running: std.atomic.Value(bool) = .init(false),
     queue: *EventQueue,
@@ -30,13 +31,14 @@ pub const Watcher = struct {
 
     const file_poll_ns = 25 * std.time.ns_per_ms;
 
-    pub fn init(gpa: std.mem.Allocator) !*Watcher {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator) !*Watcher {
         const watcher = try gpa.create(Watcher);
         watcher.* = .{
+            .io = io,
             .gpa = gpa,
-            .queue = try EventQueue.init(gpa),
-            .file_watcher = FileWatcher.init(gpa) catch null,
-            .time_watcher = try TimeWatcher.init(gpa),
+            .queue = try EventQueue.init(io, gpa),
+            .file_watcher = FileWatcher.init(io, gpa) catch null,
+            .time_watcher = try TimeWatcher.init(io, gpa),
         };
         return watcher;
     }
@@ -55,31 +57,32 @@ pub const Watcher = struct {
     }
 
     /// Stop event watcher thread from running
-    pub fn stop(self: *Watcher) void {
+    pub fn stop(self: *Watcher) error{Canceled}!void {
         if (!self.running.load(.seq_cst)) return;
-        self.mutex.lock();
+        try self.mutex.lock(self.io);
         self.running.store(false, .seq_cst);
         // Wake the watcher thread if it's waiting
-        self.cond.broadcast();
-        self.mutex.unlock();
+        self.cond.broadcast(self.io);
+        self.mutex.unlock(self.io);
         self.thread.join();
     }
 
     /// Run watcher and poll for events
     fn runWatcher(self: *Watcher) void {
         while (true) {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch continue;
+            defer self.mutex.unlock(self.io);
 
             // Wait until there are triggers to watch for
             while (self.running.load(.seq_cst) and !self.hasWork()) {
-                self.cond.wait(&self.mutex);
+                self.cond.wait(self.io, &self.mutex) catch continue;
             }
             if (!self.running.load(.seq_cst)) break;
 
             const wait_ns = self.nextWaitNsLocked();
             if (wait_ns > 0) {
-                self.cond.timedWait(&self.mutex, wait_ns) catch {};
+                // TODO: timedWait was regressed. Fixed in 0.17.0
+                // self.cond.timedWait(&self.mutex, wait_ns) catch {};
             }
 
             if (!self.running.load(.seq_cst)) break;
@@ -122,10 +125,10 @@ pub const Watcher = struct {
 
     /// Add a file path for the `FileWatcher` to watch for changes
     pub fn addFileWatch(self: *Watcher, path: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
-        const stat = std.fs.cwd().statFile(path) catch |err| return switch (err) {
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err| return switch (err) {
             error.FileNotFound => error.WatchPathNotFound,
             else => err,
         };
@@ -134,14 +137,14 @@ pub const Watcher = struct {
 
         if (self.file_watcher) |fw| {
             try fw.addWatch(self.gpa, path);
-            self.cond.signal();
+            self.cond.signal(self.io);
         } else return error.UnsupportedPlatform;
     }
 
     /// Remove a file path from the `FileWatcher`
-    pub fn removeFileWatch(self: *Watcher, path: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn removeFileWatch(self: *Watcher, path: []const u8) error{Canceled}!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.file_watcher) |fw| {
             fw.removeWatch(path);
         }
@@ -158,8 +161,8 @@ pub const Watcher = struct {
         expected_path: []const u8,
         timeout_ns: u64,
     ) !FileWatcher.FileEvent {
-        var timer = try std.time.Timer.start();
-        while (timer.read() < timeout_ns) {
+        const timer = std.Io.Timestamp.now(w.io, .awake);
+        while (timer.untilNow(w.io, .awake).toNanoseconds() < timeout_ns) {
             if (w.getEvent()) |ev| switch (ev) {
                 .fileEvent => |fe| {
                     if (!std.mem.eql(u8, fe.path, expected_path)) continue;
@@ -167,7 +170,7 @@ pub const Watcher = struct {
                 },
                 else => {},
             };
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            std.Io.sleep(w.io, std.Io.Duration.fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
         }
         return error.Timeout;
     }
@@ -178,26 +181,26 @@ pub const Watcher = struct {
         task_id: []const u8,
         interval: date.Time,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         const ms_i64 = date.timeToMs(interval);
         if (ms_i64 <= 0) return error.InvalidInterval;
         try self.time_watcher.addIntervalWatch(self.gpa, task_id, @intCast(ms_i64));
-        self.cond.signal();
+        self.cond.signal(self.io);
     }
 
     /// Add a time of day watch for `TimeWatcher` to watch for.
     pub fn addTimeWatch(self: *Watcher, task_id: []const u8, time: date.Time) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         try self.time_watcher.addTimeOfDayWatch(self.gpa, task_id, time);
-        self.cond.signal();
+        self.cond.signal(self.io);
     }
 
     /// Remove a time watch for a task.
-    pub fn removeTimeWatch(self: *Watcher, task_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn removeTimeWatch(self: *Watcher, task_id: []const u8) error{Canceled}!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         self.time_watcher.removeWatch(self.gpa, task_id);
     }
 };
@@ -225,20 +228,22 @@ fn addTimeEvent(
 const test_timeout = 2 * std.time.ns_per_s;
 
 test "watcher_stop_no_work" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     try watcher.start();
-    watcher.stop();
+    try watcher.stop();
 }
 
 test "file_watch_add" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     if (watcher.file_watcher == null) return error.SkipZigTest;
     try watcher.start();
-    defer watcher.stop();
+    defer watcher.stop() catch {};
 
     // Add a path to watch
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
@@ -249,32 +254,34 @@ test "file_watch_add" {
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 2);
 
     // Remove from watched
-    watcher.removeFileWatch(".");
+    try watcher.removeFileWatch(".");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
-    watcher.removeFileWatch("src");
+    try watcher.removeFileWatch("src");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
 }
 
 test "file_watch_add_duplicate" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     if (watcher.file_watcher == null) return error.SkipZigTest;
     try watcher.start();
-    defer watcher.stop();
+    defer watcher.stop() catch {};
 
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
     try watcher.addFileWatch("src");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
     try watcher.addFileWatch("src");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 1);
-    watcher.removeFileWatch("src");
+    try watcher.removeFileWatch("src");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
 }
 
 test "file_events_modify_and_delete" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     if (watcher.file_watcher == null) return error.SkipZigTest;
 
@@ -282,32 +289,36 @@ test "file_events_modify_and_delete" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
-        var f = try tmp.dir.createFile("watch.txt", .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("hello");
+        var f = try tmp.dir.createFile(io, "watch.txt", .{ .truncate = true });
+        defer f.close(io);
+        var w = f.writer(io, &.{});
+        try w.interface.writeAll("hello");
+        try w.flush();
     }
-    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
     const file_path = try std.fs.path.join(gpa, &.{ dir_path, "watch.txt" });
     defer gpa.free(file_path);
 
     try watcher.start();
-    defer watcher.stop();
+    defer watcher.stop() catch {};
 
     try watcher.addFileWatch(file_path);
 
     // Modify test file
     {
-        var f = try tmp.dir.createFile("watch.txt", .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("world");
+        var f = try tmp.dir.createFile(io, "watch.txt", .{ .truncate = true });
+        defer f.close(io);
+        var w = f.writer(io, &.{});
+        try w.interface.writeAll("world");
+        try w.flush();
     }
     const fe = try watcher.waitForFileEvent(file_path, test_timeout);
     try std.testing.expect(fe.kind == .modified);
     watcher.drainEvents();
 
     // Delete file
-    try tmp.dir.deleteFile("watch.txt");
+    try tmp.dir.deleteFile(io, "watch.txt");
     const fe_del = blk: while (true) {
         const fe_del = try watcher.waitForFileEvent(file_path, test_timeout);
         if (fe_del.kind == .deleted) break :blk fe_del;
@@ -316,25 +327,28 @@ test "file_events_modify_and_delete" {
 }
 
 test "file_events_create_in_dir" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     if (watcher.file_watcher == null) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
 
     try watcher.start();
-    defer watcher.stop();
+    defer watcher.stop() catch {};
 
     try watcher.addFileWatch(dir_path);
 
     {
-        var f = try tmp.dir.createFile("new.txt", .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("test");
+        var f = try tmp.dir.createFile(io, "new.txt", .{ .truncate = true });
+        defer f.close(io);
+        var w = f.writer(io, &.{});
+        try w.interface.writeAll("test");
+        try w.flush();
     }
 
     const fe = try watcher.waitForFileEvent(dir_path, test_timeout);
@@ -342,15 +356,16 @@ test "file_events_create_in_dir" {
 }
 
 test "file_watch_remove_not_existing" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(gpa);
+    const watcher = try Watcher.init(io, gpa);
     defer watcher.deinit();
     if (watcher.file_watcher == null) return error.SkipZigTest;
 
     try watcher.start();
-    defer watcher.stop();
+    defer watcher.stop() catch {};
 
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
-    watcher.removeFileWatch("file_not_existing.txt");
+    try watcher.removeFileWatch("file_not_existing.txt");
     try std.testing.expect(watcher.file_watcher.?.watchCount() == 0);
 }

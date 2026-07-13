@@ -200,7 +200,7 @@ pub const Model = struct {
                 }
 
                 if (keyQuit(key)) {
-                    const status = self.taskmanager.getStatus();
+                    const status = try self.taskmanager.getStatus();
                     // Ask for confirmation if there are tasks running
                     if (status.active_tasks > 0) {
                         try self.beginConfirm(
@@ -301,7 +301,7 @@ pub const Model = struct {
     /// Request a snapshot of the UI from TaskManager
     fn requestSnapshot(self: *Model) !void {
         // Update status
-        self.snapshot.status = self.taskmanager.getStatus();
+        self.snapshot.status = try self.taskmanager.getStatus();
 
         // Update task list
         if (self.taskmanager.tasksModified()) {
@@ -309,7 +309,7 @@ pub const Model = struct {
             const arena = self.arena_list.allocator();
             const tasks = try self.taskmanager.buildTaskList(arena);
             self.snapshot.tasks = tasks;
-            self.snapshot.updated = std.time.timestamp();
+            self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
             try self.task_split.buildTaskList(arena);
         }
 
@@ -327,7 +327,7 @@ pub const Model = struct {
             self.snapshot.selected_task = null;
             self.task_split.setSelectedState(null);
         }
-        self.snapshot.updated = std.time.timestamp();
+        self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
 
     /// Initialize a confirmation state and change active area
@@ -486,7 +486,7 @@ pub const Model = struct {
 
     /// Stop task from running
     fn stopTask(self: *Model, task_id: []const u8) void {
-        return self.taskmanager.stopTask(task_id);
+        self.taskmanager.stopTask(task_id) catch {};
     }
 
     /// Set info text and restart the info display time
@@ -494,13 +494,13 @@ pub const Model = struct {
         if (self.confirm != null) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = try std.fmt.allocPrint(self.gpa, fmt, args);
-        self.info.timestamp = std.time.timestamp();
+        self.info.timestamp = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
 
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
         if (self.confirm != null) return;
-        if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
+        if (std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds() - self.info.timestamp < INFO_TIME_S) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = null;
     }

@@ -43,9 +43,10 @@ pub const AgentHandle = struct {
 };
 
 pub const RemoteManager = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     parser: protocol.MsgParser = .init(),
-    server: ?std.net.Server = null,
+    server: ?std.Io.net.Server = null,
 
     agents: std.AutoHashMapUnmanaged(posix.socket_t, AgentHandle),
     polls: std.ArrayList(posix.pollfd),
@@ -53,9 +54,10 @@ pub const RemoteManager = struct {
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
 
-    pub fn init(gpa: std.mem.Allocator) !*RemoteManager {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator) !*RemoteManager {
         const manager = try gpa.create(RemoteManager);
         manager.* = .{
+            .io = io,
             .gpa = gpa,
             .agents = .{},
             .polls = try .initCapacity(gpa, 5),
@@ -78,15 +80,12 @@ pub const RemoteManager = struct {
     }
 
     /// Start server and receive connections from remote agents
-    pub fn start(self: *RemoteManager, addr: std.net.Address) !void {
+    pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
         errdefer self.stop();
-        self.server = try addr.listen(.{
-            .force_nonblocking = true,
-            .reuse_address = true,
-        });
+        self.server = try addr.listen(self.io, .{ .reuse_address = true });
         self.polls.clearAndFree(self.gpa);
         try self.polls.append(self.gpa, .{
-            .fd = self.server.?.stream.handle,
+            .fd = self.server.?.socket.handle,
             .revents = 0,
             .events = posix.POLL.IN,
         });
@@ -97,7 +96,7 @@ pub const RemoteManager = struct {
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.connection.close();
 
-        if (self.server) |*s| s.deinit();
+        if (self.server) |*s| s.deinit(self.io);
         self.server = null;
         self.polls.clearAndFree(self.gpa);
     }
@@ -146,9 +145,9 @@ pub const RemoteManager = struct {
     }
 
     /// Get the address the manager server is running on
-    pub fn getAddress(self: *RemoteManager) ?std.net.Address {
+    pub fn getAddress(self: *RemoteManager) ?std.Io.net.IpAddress {
         if (self.server) |server| {
-            return server.listen_address;
+            return server.socket.address;
         }
         return null;
     }
@@ -197,7 +196,7 @@ pub const RemoteManager = struct {
                 }
                 try agent.setName(self.gpa, m.hostname);
             },
-            .heartbeat => agent.last_heartbeat = std.time.timestamp(),
+            .heartbeat => agent.last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
@@ -263,7 +262,7 @@ pub const RemoteManager = struct {
             }
             // Check for timeout
             var request = req;
-            const now = std.time.timestamp();
+            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
             if (request.first_try_ts == 0) request.first_try_ts = now;
             // Try to find the remote agent again
             if (now - request.first_try_ts < DispatchRequest.RETRY_TIMEOUT) {
@@ -347,7 +346,7 @@ pub const RemoteManager = struct {
         message: []const u8,
     ) !void {
         agent.connection.sendFrame(message) catch {
-            self.removeAgentByFd(agent.connection.conn.stream.handle);
+            self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
             return error.NotConnected;
         };
     }
@@ -369,12 +368,15 @@ pub const RemoteManager = struct {
 
         // Check if the address matches
         if (spec.addr) |want_ip| {
-            const agent_addr = agent.connection.conn.address;
-            if (agent_addr.any.family != posix.AF.INET) return false;
-            const want = std.net.Address.parseIp4(want_ip, 0) catch return false;
-            const agent_bytes: *const [4]u8 = @ptrCast(&agent_addr.in.sa.addr);
-            const want_bytes: *const [4]u8 = @ptrCast(&want.in.sa.addr);
-            if (!std.mem.eql(u8, agent_bytes[0..], want_bytes[0..])) return false;
+            const a = agent.connection.conn.address;
+            const b = std.Io.net.IpAddress.parseIp4(want_ip, 0) catch return false;
+            return switch (a) {
+                .ip4 => |a_ip4| switch (b) {
+                    .ip4 => |b_ip4| @as(u32, @bitCast(a_ip4.bytes)) == @as(u32, @bitCast(b_ip4.bytes)),
+                    else => false,
+                },
+                .ip6 => false,
+            };
         }
         return true;
     }
@@ -382,34 +384,23 @@ pub const RemoteManager = struct {
     /// Accept new connections
     fn tryAcceptAgent(self: *RemoteManager) !void {
         const server = if (self.server) |*s| s else return;
-
-        var address: std.net.Address = undefined;
-        var address_len: posix.socklen_t = @sizeOf(std.net.Address);
-        const socket = posix.accept(
-            server.stream.handle,
-            &address.any,
-            &address_len,
-            posix.SOCK.NONBLOCK,
-        ) catch |err| switch (err) {
+        const stream = server.accept(self.io) catch |err| switch (err) {
             error.WouldBlock => return,
             else => return err,
         };
-        try self.newAgent(.{
-            .address = address,
-            .stream = .{ .handle = socket },
-        });
+        try self.newAgent(.{ .stream = stream, .address = stream.socket.address });
     }
 
     /// Save new agent
-    fn newAgent(self: *RemoteManager, conn: std.net.Server.Connection) !void {
-        const res = try self.agents.getOrPut(self.gpa, conn.stream.handle);
+    fn newAgent(self: *RemoteManager, conn: connection.Connection.ConnInfo) !void {
+        const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
         if (!res.found_existing) {
             res.value_ptr.* = .{
-                .connection = try .initConn(self.gpa, conn),
-                .last_heartbeat = std.time.timestamp(),
+                .connection = try .initConn(self.io, self.gpa, conn),
+                .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             };
             try self.polls.append(self.gpa, .{
-                .fd = conn.stream.handle,
+                .fd = conn.stream.socket.handle,
                 .revents = 0,
                 .events = posix.POLL.IN,
             });
