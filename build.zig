@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+    if (b.args) |args| run_tests.addArgs(args);
 
     // CI
     const ci_step = b.step("ci", "Build for all platforms and run tests");
@@ -74,6 +75,9 @@ pub fn setupExe(
     });
     exe.root_module.addOptions("build_options", options);
 
+    // Required on Linux for inotify
+    if (target.result.os.tag == .linux) exe.root_module.link_libc = true;
+
     return exe;
 }
 
@@ -94,7 +98,12 @@ pub fn setupTests(
             .{ .name = "yaml", .module = yaml_mod },
         },
     });
-    return b.addTest(.{ .root_module = tests_mod });
+    const tests = b.addTest(.{ .root_module = tests_mod });
+
+    // Required on Linux for inotify
+    if (target.result.os.tag == .linux) tests.root_module.link_libc = true;
+
+    return tests;
 }
 
 pub fn setupCi(b: *std.Build, step: *std.Build.Step) void {
