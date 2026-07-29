@@ -82,11 +82,24 @@ pub fn readNextFrame(self: *Connection, gpa: std.mem.Allocator) !?[]u8 {
             return error.EndOfStream;
         }
 
-        try self.read_buf.appendSlice(gpa, data);
-        self.setLastAccessed();
+        try self.ingest(gpa, data);
     }
 
-    // Compress buffer
+    return try self.popFrame();
+}
+
+pub fn ingest(self: *Connection, gpa: std.mem.Allocator, data: []const u8) !void {
+    if (self.closed) return error.NotConnected;
+    try self.read_buf.appendSlice(gpa, data);
+    self.setLastAccessed();
+}
+
+/// Parse the next complete frame from the internal buffer.
+/// Returns null if not enough buffered bytes are available.
+pub fn popFrame(self: *Connection) !?[]u8 {
+    if (self.closed) return null;
+
+    // Compress buffer.
     if (self.cursor > 0 and self.cursor > self.read_buf.capacity / 2) {
         const remaining = self.read_buf.items[self.cursor..];
         std.mem.copyForwards(u8, self.read_buf.items[0..], remaining);
@@ -97,7 +110,6 @@ pub fn readNextFrame(self: *Connection, gpa: std.mem.Allocator) !?[]u8 {
     const available = self.read_buf.items.len - self.cursor;
     if (available < 4) return null;
 
-    // Payload length
     const header = self.read_buf.items[self.cursor .. self.cursor + 4];
     const payload_len = std.mem.readInt(u32, header[0..4], .little);
     if (payload_len == 0) return error.InvalidFrame;
