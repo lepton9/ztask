@@ -199,7 +199,7 @@ pub const RemoteAgent = struct {
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
         const e = self.jobs.getPtr(msg.job_id) orelse return;
         if (self.active_runners.get(&e.node)) |runner| {
-            runner.forceStop() catch {};
+            runner.forceStop();
         } else {
             var it = self.queue.iterator();
             while (it.next()) |node| {

@@ -346,7 +346,7 @@ pub const Scheduler = struct {
         while (it.next()) |e| {
             const runner = e.value_ptr.*;
             const node = e.key_ptr.*;
-            runner.forceStop() catch {};
+            runner.forceStop();
             self.pool.release(runner);
             self.skipJob(node);
         }

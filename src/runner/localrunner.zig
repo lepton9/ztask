@@ -39,15 +39,16 @@ pub const ExecResult = struct {
 
 /// Runner for one job
 pub const LocalRunner = struct {
-    io: std.Io,
+    io: std.Io = undefined,
     mutex: std.Io.Mutex = .init,
     running: std.atomic.Value(bool) = .init(false),
     /// Thread for running the job run function
     thread: ?std.Thread = null,
     /// Current running job node
     job: ?*JobNode = null,
-    /// Child process for the job commands
-    process: ?*std.process.Child = null,
+    /// Child process id for the currently running command step.
+    /// Protected by `mutex`.
+    process_id: ?std.process.Child.Id = null,
     /// Optional working directory for the current job.
     cwd: ?[]const u8 = null,
     /// Execution mode of the job
@@ -117,7 +118,7 @@ pub const LocalRunner = struct {
         logs.append(gpa, .{ .job_started = .{
             .job_id = job.id,
             .name = gpa.dupe(u8, job.ptr.name) catch null,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         } }) catch {};
 
         var exit_code: i32 = 0;
@@ -155,7 +156,7 @@ pub const LocalRunner = struct {
             .job_id = job.id,
             .name = gpa.dupe(u8, job.ptr.name) catch null,
             .exit_code = exit_code,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         } }) catch {};
         results.appendAssumeCapacity(
             .{ .node = job, .result = .{
@@ -170,42 +171,53 @@ pub const LocalRunner = struct {
         self.running.store(false, .seq_cst);
         if (self.thread) |t| t.join();
         self.thread = null;
-        self.process = null;
+        self.mutex.lockUncancelable(self.io);
+        self.process_id = null;
+        self.mutex.unlock(self.io);
         self.job = null;
         self.cwd = null;
     }
 
     /// Force runner to stop executing the job if running
-    pub fn forceStop(self: *LocalRunner) error{Canceled}!void {
+    pub fn forceStop(self: *LocalRunner) void {
         switch (self.mode) {
             .piped => self.finishJob(),
             .attached => {
                 self.running.store(false, .seq_cst);
 
                 var pid_opt: ?std.process.Child.Id = null;
-                try self.mutex.lock(self.io);
-                if (self.process) |child| pid_opt = child.id;
-                self.process = null;
+                self.mutex.lockUncancelable(self.io);
+                pid_opt = self.process_id;
+                self.process_id = null;
                 self.mutex.unlock(self.io);
 
-                if (pid_opt) |pid| {
-                    if (builtin.os.tag == .windows) {
-                        std.os.windows.TerminateProcess(pid, 1) catch {};
-                    } else {
-                        // Kill the whole process group
-                        const pid_i: std.posix.pid_t = @intCast(pid);
-                        std.posix.kill(-pid_i, std.posix.SIG.INT) catch {};
-                        std.posix.kill(-pid_i, std.posix.SIG.TERM) catch {};
+                if (pid_opt) |pid| outer: switch (builtin.os.tag) {
+                    .windows => std.os.windows.TerminateProcess(pid, 1) catch {},
+                    .wasi => {},
+                    else => {
+                        // Kill the whole process group.
+                        const pid_i: std.posix.pid_t = pid;
+                        std.posix.kill(-pid_i, std.posix.SIG.INT) catch |e| {
+                            if (e == error.ProcessNotFound) break :outer;
+                            std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch {};
+                        };
+                        std.posix.kill(-pid_i, std.posix.SIG.TERM) catch |e| {
+                            if (e == error.ProcessNotFound) break :outer;
+                            std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch {};
+                        };
                         std.posix.kill(-pid_i, std.posix.SIG.KILL) catch {};
-                    }
-                }
+                    },
+                };
 
-                const stdout = std.fs.File.stdout();
-                if (stdout.isTty()) stdout.writeAll("\r\n") catch {};
+                const stdout = std.Io.File.stdout();
+                if (stdout.isTty(self.io) catch false)
+                    stdout.writeStreamingAll(self.io, "\r\n") catch {};
 
                 if (self.thread) |t| t.join();
                 self.thread = null;
-                self.process = null;
+                self.mutex.lockUncancelable(self.io);
+                self.process_id = null;
+                self.mutex.unlock(self.io);
                 self.job = null;
                 self.cwd = null;
             },
@@ -232,103 +244,103 @@ pub const LocalRunner = struct {
             @sizeOf(task.Step),
         );
 
+        const child_cwd: std.process.Child.Cwd = if (self.cwd) |c|
+            .{ .path = c }
+        else
+            .inherit;
+
         switch (mode) {
             .attached => {
                 const is_posix = builtin.os.tag != .windows and
                     builtin.os.tag != .wasi;
 
-                // Save terminal state and restore it on exit
-                var tty: ?JobTty = JobTty.init();
-                defer if (tty) |*t| t.restore();
+                // Save terminal state and restore it on exit.
+                var tty: ?JobTty = JobTty.init(self.io);
+                defer if (tty) |*t| t.restore(self.io);
 
-                // Create child process
                 var child = try std.process.spawn(self.io, .{
-                    .cwd = self.cwd,
+                    .argv = argv.items,
+                    .cwd = child_cwd,
                     .stdin = .inherit,
                     .stdout = .inherit,
                     .stderr = .inherit,
-                    .pgid = 0, // Create a new process group
+                    .pgid = if (comptime is_posix) 0 else null,
                 });
-                // TODO: needed?
-                // if (comptime is_posix) child.pgid = 0;
+                errdefer child.kill(self.io);
 
-                try self.mutex.lock(self.io);
-                self.process = &child;
+                self.mutex.lockUncancelable(self.io);
+                self.process_id = child.id;
                 self.mutex.unlock(self.io);
+                defer {
+                    self.mutex.lockUncancelable(self.io);
+                    self.process_id = null;
+                    self.mutex.unlock(self.io);
+                }
 
-                // TODO:
                 if (comptime is_posix) if (tty) |*t| {
-                    const pid_i: std.posix.pid_t = @intCast(child.id);
-                    std.posix.setpgid(pid_i, pid_i) catch {};
-                    t.setForeground(pid_i);
+                    var tty_posix: *JobTtyPosix = t;
+                    if (child.id) |pid_i| {
+                        tty_posix.setForeground(pid_i);
+                    }
                 };
 
-                const term = try child.wait();
-                try self.mutex.lock(self.io);
-                self.process = null;
-                self.mutex.unlock(self.io);
-                return switch (term) {
-                    .Exited => |code| @intCast(code),
-                    .Signal => |sig| @intCast(sig),
-                    else => 1,
-                };
+                const term = try child.wait(self.io);
+                return termToExitCode(term);
             },
             .piped => {
-                // Create child process
                 var child = try std.process.spawn(self.io, .{
-                    .cwd = self.cwd,
+                    .argv = argv.items,
+                    .cwd = child_cwd,
                     .stdin = .ignore,
                     .stdout = .pipe,
                     .stderr = .pipe,
                 });
+                errdefer child.kill(self.io);
 
-                try self.mutex.lock(self.io);
-                self.process = &child;
+                self.mutex.lockUncancelable(self.io);
+                self.process_id = child.id;
                 self.mutex.unlock(self.io);
+                defer {
+                    self.mutex.lockUncancelable(self.io);
+                    self.process_id = null;
+                    self.mutex.unlock(self.io);
+                }
 
-                var stdout_buffer = try gpa.alloc(u8, 4096);
-                var stderr_buffer = try gpa.alloc(u8, 4096);
-                var stdout_reader = child.stdout.?.reader(self.io, &stdout_buffer);
-                var stderr_reader = child.stderr.?.reader(self.io, &stderr_buffer);
+                var mr_buf: std.Io.File.MultiReader.Buffer(2) = undefined;
+                var mr: std.Io.File.MultiReader = undefined;
+                mr.init(gpa, self.io, mr_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
+                defer mr.deinit();
 
-                // TODO: fix how to poll
-                // var poller = std.Io.poll(gpa, enum { stdout, stderr }, .{
-                //     .stdout = child.stdout.?,
-                //     .stderr = child.stderr.?,
-                // });
-                // defer poller.deinit();
-                // var stdout_r = poller.reader(.stdout);
-                // var stderr_r = poller.reader(.stderr);
-                // stdout_r.buffer = try gpa.alloc(u8, 4096);
-                // stderr_r.buffer = try gpa.alloc(u8, 4096);
+                const stdout_r = mr.reader(0);
+                const stderr_r = mr.reader(1);
+                const timeout: std.Io.Timeout = .{ .duration = .{
+                    .raw = .fromMilliseconds(300),
+                    .clock = .awake,
+                } };
 
-                // Read output
-                while (try poller.pollTimeout(std.time.ns_per_ms * 300)) {
+                while (true) {
                     if (!self.running.load(.seq_cst)) {
-                        try self.mutex.lock(self.io);
-                        const term = try child.kill();
-                        self.process = null;
-                        self.mutex.unlock(self.io);
-                        return switch (term) {
-                            .Exited => |code| @intCast(code),
-                            .Signal => |sig| @intCast(sig),
-                            else => 1,
-                        };
+                        child.kill(self.io);
+                        return 1;
                     }
+
+                    mr.fill(4096, timeout) catch |err| switch (err) {
+                        error.Timeout => {},
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
 
                     readLogs(gpa, stdout_r, step_index, job, logs);
                     readLogs(gpa, stderr_r, step_index, job, logs);
                 }
 
-                const term = try child.wait();
-                try self.mutex.lock(self.io);
-                self.process = null;
-                self.mutex.unlock(self.io);
-                return switch (term) {
-                    .Exited => |code| @intCast(code),
-                    .Signal => |sig| @intCast(sig),
-                    else => 1,
-                };
+                // Flush any remaining buffered data before reaping.
+                readLogs(gpa, stdout_r, step_index, job, logs);
+                readLogs(gpa, stderr_r, step_index, job, logs);
+                try mr.checkAnyError();
+
+                const term = try child.wait(self.io);
+                return termToExitCode(term);
             },
         }
     }
@@ -338,11 +350,11 @@ pub const LocalRunner = struct {
 const JobTty = blk: {
     const tag = builtin.os.tag;
     if (tag == .windows or tag == .wasi) break :blk struct {
-        fn init() ?@This() {
+        fn init(_: std.Io) ?@This() {
             return null;
         }
 
-        fn restore(_: *@This()) void {
+        fn restore(_: *@This(), _: std.Io) void {
             return;
         }
     };
@@ -353,21 +365,22 @@ const JobTty = blk: {
 const JobTtyPosix = struct {
     fd: std.posix.fd_t,
     saved_termios: std.posix.termios,
-    saved_fg_pgrp: std.posix.pid_t,
+    saved_fg_pgrp: ?std.posix.pid_t,
 
-    fn init() ?@This() {
-        const stdin = std.fs.File.stdin();
-        if (!stdin.isTty()) return null;
+    fn init(io: std.Io) ?@This() {
+        const stdin = std.Io.File.stdin();
+        if (!(stdin.isTty(io) catch false)) return null;
         const fd: std.posix.fd_t = stdin.handle;
 
-        const termios = std.posix.tcgetattr(fd) catch {
-            std.posix.close(fd);
-            return null;
-        };
-        const fg_pgrp = std.posix.tcgetpgrp(fd) catch {
-            std.posix.close(fd);
-            return null;
-        };
+        const termios = std.posix.tcgetattr(fd) catch return null;
+        const fg_pgrp: ?std.posix.pid_t = if (comptime builtin.os.tag == .linux) blk: {
+            var pgrp: std.posix.pid_t = 0;
+            const rc = std.os.linux.tcgetpgrp(fd, &pgrp);
+            break :blk switch (std.os.linux.errno(rc)) {
+                .SUCCESS => pgrp,
+                else => null,
+            };
+        } else null;
 
         return .{
             .fd = fd,
@@ -398,21 +411,24 @@ const JobTtyPosix = struct {
     fn setForeground(self: *@This(), pgrp: std.posix.pid_t) void {
         const old = ignoreTTOU();
         defer restoreTTOU(&old);
-        std.posix.tcsetpgrp(self.fd, pgrp) catch {};
+        if (comptime builtin.os.tag == .linux) {
+            var p = pgrp;
+            _ = std.os.linux.tcsetpgrp(self.fd, &p);
+        }
     }
 
     /// Restore the old terminal state
-    fn restore(self: *@This()) void {
+    fn restore(self: *@This(), _: std.Io) void {
         const old = ignoreTTOU();
         defer restoreTTOU(&old);
 
-        std.posix.tcsetpgrp(self.fd, self.saved_fg_pgrp) catch {};
+        if (self.saved_fg_pgrp) |pgrp| self.setForeground(pgrp);
         std.posix.tcsetattr(self.fd, .FLUSH, self.saved_termios) catch {};
     }
 };
 
-/// Read the logs from the reader
-/// Appends the data to the back of the `LogQueue`
+/// Read the logs from the reader.
+/// Appends the data to the back of the `LogQueue`.
 fn readLogs(
     gpa: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -420,13 +436,23 @@ fn readLogs(
     job: *JobNode,
     logs: *LogQueue,
 ) void {
-    const data = gpa.dupe(u8, reader.buffer[0..reader.end]) catch return;
-    reader.seek = 0;
-    reader.end = 0;
+    const buf = reader.buffered();
+    if (buf.len == 0) return;
+    const data = gpa.dupe(u8, buf) catch return;
+    reader.seek += buf.len;
 
     logs.append(gpa, .{ .job_output = .{
         .job_id = job.id,
         .step = @intCast(step_index),
         .data = data,
     } }) catch {};
+}
+
+fn termToExitCode(term: std.process.Child.Term) i32 {
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        .signal => |sig| @intCast(@intFromEnum(sig)),
+        .stopped => |sig| @intCast(@intFromEnum(sig)),
+        .unknown => 1,
+    };
 }
