@@ -3,7 +3,7 @@ const posix = std.posix;
 const localrunner = @import("../runner/localrunner.zig");
 const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
-const connection = @import("connection.zig");
+const Connection = @import("Connection.zig");
 
 const RemoteRunSpec = @import("../types/task.zig").RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
@@ -28,7 +28,7 @@ pub const DispatchRequest = struct {
 
 pub const AgentHandle = struct {
     name: ?[]const u8 = null,
-    connection: connection.Connection,
+    connection: Connection,
     last_heartbeat: i64,
 
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
@@ -392,7 +392,7 @@ pub const RemoteManager = struct {
     }
 
     /// Save new agent
-    fn newAgent(self: *RemoteManager, conn: connection.Connection.ConnInfo) !void {
+    fn newAgent(self: *RemoteManager, conn: Connection.ConnInfo) !void {
         const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
         if (!res.found_existing) {
             res.value_ptr.* = .{

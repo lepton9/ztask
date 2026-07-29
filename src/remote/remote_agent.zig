@@ -3,7 +3,7 @@ const task = @import("../types/task.zig");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
-const connection = @import("connection.zig");
+const Connection = @import("Connection.zig");
 
 const Queue = @import("../types/queue.zig").Queue;
 const LocalRunner = localrunner.LocalRunner;
@@ -34,7 +34,7 @@ pub const RemoteAgent = struct {
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
     parser: protocol.MsgParser = .init(),
-    connection: connection.Connection,
+    connection: Connection,
 
     /// Error for exiting
     exit_error: ?ExitError = null,
