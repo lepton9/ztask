@@ -1,5 +1,4 @@
 const std = @import("std");
-const posix = std.posix;
 const localrunner = @import("../runner/localrunner.zig");
 const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
@@ -14,6 +13,20 @@ const Scheduler = scheduler_zig.Scheduler;
 
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
+
+const AcceptCtx = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+};
+
+const AcceptEvent = union(enum) {
+    accept: std.Io.net.Server.AcceptError!std.Io.net.Stream,
+};
+
+fn acceptTask(ctx: AcceptCtx) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    var server = ctx.server;
+    return server.accept(ctx.io);
+}
 
 pub const DispatchRequest = struct {
     agent: RemoteRunSpec,
@@ -52,7 +65,14 @@ pub const RemoteManager = struct {
     parser: protocol.MsgParser = .init(),
     server: ?std.Io.net.Server = null,
 
-    agents: std.AutoHashMapUnmanaged(posix.socket_t, AgentHandle),
+    accept_select: std.Io.Select(AcceptEvent) = undefined,
+    /// Buffer for incoming accept events.
+    accept_buf: [1]AcceptEvent = undefined,
+    /// Is accept already running.
+    accept_inflight: bool = false,
+
+    /// Connected remote agents.
+    agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
 
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
@@ -66,6 +86,7 @@ pub const RemoteManager = struct {
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
+        manager.accept_select = .init(io, &manager.accept_buf);
         return manager;
     }
 
@@ -84,10 +105,15 @@ pub const RemoteManager = struct {
     pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
         errdefer self.stop();
         self.server = try addr.listen(self.io, .{ .reuse_address = true });
+        self.resetAcceptState();
+        self.armAccept();
     }
 
     /// Stop the server
     pub fn stop(self: *RemoteManager) void {
+        self.accept_select.cancelDiscard();
+        self.resetAcceptState();
+
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.connection.close();
 
@@ -97,9 +123,45 @@ pub const RemoteManager = struct {
 
     /// Update state
     pub fn update(self: *RemoteManager) !void {
-        try self.tryAcceptAgent();
+        try self.drainAccepted();
+        self.armAccept();
         try self.updateAgentsBatch();
         try self.dispatchJobs();
+    }
+
+    fn resetAcceptState(self: *RemoteManager) void {
+        self.accept_inflight = false;
+        self.accept_select = .init(self.io, &self.accept_buf);
+    }
+
+    /// Run accept concurrently.
+    fn armAccept(self: *RemoteManager) void {
+        if (self.accept_inflight) return;
+        const server = self.server orelse return;
+        self.accept_select.concurrent(.accept, acceptTask, .{
+            AcceptCtx{ .io = self.io, .server = server },
+        }) catch return;
+        self.accept_inflight = true;
+    }
+
+    /// Try to drain new connections from the accept queue.
+    fn drainAccepted(self: *RemoteManager) !void {
+        var buf: [1]AcceptEvent = undefined;
+        while (true) {
+            const n = self.accept_select.queue.get(self.io, &buf, 0) catch |err| switch (err) {
+                error.Canceled => return,
+                error.Closed => return,
+            };
+            if (n == 0) return;
+
+            self.accept_inflight = false;
+            const res = buf[0].accept;
+            const stream = res catch |err| switch (err) {
+                error.Canceled => return,
+                else => return,
+            };
+            try self.newAgent(.{ .stream = stream, .address = stream.socket.address });
+        }
     }
 
     /// Get the address the manager server is running on
@@ -394,24 +456,6 @@ pub const RemoteManager = struct {
         return true;
     }
 
-    /// Accept new connections
-    fn tryAcceptAgent(self: *RemoteManager) !void {
-        const server = if (self.server) |*s| s else return;
-
-        // TODO: remove poll
-        // Poll the listener before calling accept.
-        var pfd: [1]posix.pollfd = .{.{
-            .fd = server.socket.handle,
-            .events = posix.POLL.IN,
-            .revents = 0,
-        }};
-        _ = try posix.poll(&pfd, 0);
-        if (pfd[0].revents == 0) return;
-
-        const stream = try server.accept(self.io);
-        try self.newAgent(.{ .stream = stream, .address = stream.socket.address });
-    }
-
     /// Save new agent
     fn newAgent(self: *RemoteManager, conn: Connection.ConnInfo) !void {
         const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
@@ -424,7 +468,7 @@ pub const RemoteManager = struct {
     }
 
     /// Remove a connected agent using the socket
-    fn removeAgentByFd(self: *RemoteManager, fd: posix.socket_t) void {
+    fn removeAgentByFd(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
         var kv = self.agents.fetchRemove(fd);
         if (kv) |*e| e.value.deinit(self.gpa);
     }
