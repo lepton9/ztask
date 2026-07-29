@@ -293,7 +293,10 @@ pub const TaskManager = struct {
         errdefer self.running.store(false, .seq_cst);
 
         try self.watcher.start();
-        const addr = try std.Io.net.IpAddress.parseIp4(options.listen_addr, options.listen_port);
+        const addr: std.Io.net.IpAddress = try .parseIp4(
+            options.listen_addr,
+            options.listen_port,
+        );
         try self.remote_manager.start(addr);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
@@ -470,8 +473,9 @@ pub const TaskManager = struct {
 
     /// Main run loop
     fn run(self: *TaskManager) void {
+        const loop_time_ms = 100;
         while (self.running.load(.seq_cst)) {
-            // TODO: run async?
+            const start_clock = std.Io.Clock.now(.awake, self.io);
             self.checkWatcher() catch |err| {
                 self.emitError(.watcher, err);
             };
@@ -481,7 +485,8 @@ pub const TaskManager = struct {
             self.updateSchedulers() catch |err| {
                 self.emitError(.scheduler, err);
             };
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+            const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
+            std.Io.sleep(self.io, .fromMilliseconds(loop_time_ms -| took), .awake) catch {};
         }
     }
 
