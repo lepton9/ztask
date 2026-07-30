@@ -300,7 +300,7 @@ pub const RemoteManager = struct {
                     .exit_code = m.exit_code,
                     .timestamp_ms = m.timestamp,
                 } });
-                try req.scheduler.result_queue.append(self.gpa, .{
+                try req.scheduler.result_queue.putOneUncancelable(self.io, .{
                     .node = req.job_node,
                     .result = .{
                         .exit_code = m.exit_code,
@@ -346,7 +346,7 @@ pub const RemoteManager = struct {
             }
 
             // Failed to find matching agent
-            try req.scheduler.result_queue.append(self.gpa, .{
+            try req.scheduler.result_queue.putOneUncancelable(self.io, .{
                 .node = req.job_node,
                 .result = .{
                     .err = ResultError.NoRunnerFound,
@@ -382,7 +382,7 @@ pub const RemoteManager = struct {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
                 unreachable;
-            try kv.value.scheduler.result_queue.append(self.gpa, .{
+            try kv.value.scheduler.result_queue.putOneUncancelable(self.io, .{
                 .node = req.job_node,
                 .result = .{
                     .exit_code = 1,

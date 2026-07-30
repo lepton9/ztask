@@ -8,7 +8,7 @@ const Connection = @import("Connection.zig");
 const Queue = @import("../types/queue.zig").Queue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
-const ResultQueue = localrunner.ResultQueue;
+const Result = localrunner.Result;
 const LogQueue = localrunner.LogQueue;
 
 const log = std.log.scoped(.agent);
@@ -23,8 +23,9 @@ pub const RemoteAgent = struct {
     buffer: [256]u8 = undefined,
 
     pool: *runnerpool.RunnerPool,
-    result_queue: *ResultQueue,
-    log_queue: *LogQueue,
+    result_queue: std.Io.Queue(Result),
+    result_buffer: []Result,
+    log_queue: LogQueue,
 
     /// All currently loaded jobs
     jobs: std.AutoHashMapUnmanaged(u64, struct { job: task.Job, node: JobNode }),
@@ -48,13 +49,15 @@ pub const RemoteAgent = struct {
         runners_n: u16,
     ) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
+        const result_buffer = try gpa.alloc(Result, runners_n);
         agent.* = .{
             .io = io,
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
             .pool = try runnerpool.RunnerPool.init(io, gpa, runners_n),
-            .result_queue = try ResultQueue.initCapacity(io, gpa, runners_n),
-            .log_queue = try LogQueue.init(io, gpa),
+            .result_queue = .init(result_buffer),
+            .result_buffer = result_buffer,
+            .log_queue = .init(io),
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
@@ -73,7 +76,8 @@ pub const RemoteAgent = struct {
             self.gpa.free(job.steps);
         }
         self.jobs.deinit(self.gpa);
-        self.result_queue.deinit(self.gpa);
+        self.result_queue.close(self.io);
+        self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
@@ -104,7 +108,14 @@ pub const RemoteAgent = struct {
     /// Stop the agent
     pub fn stop(self: *RemoteAgent) void {
         self.running.store(false, .seq_cst);
-        // self.connection.close();
+    }
+
+    /// Check if the agent has no work.
+    pub fn isIdle(self: *RemoteAgent) bool {
+        return self.active_runners.count() == 0 and
+            self.queue.empty() and
+            self.log_queue.empty() and
+            self.jobs.count() == 0;
     }
 
     /// Try to connect to the server at the address
@@ -241,21 +252,27 @@ pub const RemoteAgent = struct {
 
     /// Handle the completed job results
     fn handleResults(self: *RemoteAgent) void {
-        while (self.result_queue.pop()) |res| {
-            // Release runner
-            if (self.active_runners.fetchRemove(res.node)) |kv| {
-                const runner = kv.value;
-                runner.finishJob();
-                self.pool.release(runner);
-            }
+        var results: [4]Result = undefined;
+        while (true) {
+            const n = self.result_queue.get(self.io, &results, 0) catch return;
+            if (n == 0) return;
 
-            // Free the job
-            if (self.jobs.fetchRemove(res.node.id)) |kv| {
-                var value = kv.value;
-                value.node.deinit(self.gpa);
-                const job = value.job;
-                self.gpa.free(job.name);
-                self.gpa.free(job.steps);
+            for (results[0..n]) |res| {
+                // Release runner
+                if (self.active_runners.fetchRemove(res.node)) |kv| {
+                    const runner = kv.value;
+                    runner.finishJob();
+                    self.pool.release(runner);
+                }
+
+                // Free the job
+                if (self.jobs.fetchRemove(res.node.id)) |kv| {
+                    var value = kv.value;
+                    value.node.deinit(self.gpa);
+                    const job = value.job;
+                    self.gpa.free(job.name);
+                    self.gpa.free(job.steps);
+                }
             }
         }
     }
@@ -331,7 +348,7 @@ pub const RemoteAgent = struct {
             return;
         };
         self.active_runners.putAssumeCapacity(node, runner);
-        runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
+        runner.runJob(self.gpa, node, &self.result_queue, &self.log_queue);
     }
 
     /// Request a runner from the pool

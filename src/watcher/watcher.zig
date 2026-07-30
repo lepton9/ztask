@@ -25,7 +25,7 @@ pub const Watcher = struct {
     cond: std.Io.Condition = .init,
     thread: std.Thread = undefined,
     running: std.atomic.Value(bool) = .init(false),
-    queue: *EventQueue,
+    queue: EventQueue,
     file_watcher: ?*FileWatcher,
     time_watcher: *TimeWatcher,
 
@@ -36,7 +36,7 @@ pub const Watcher = struct {
         watcher.* = .{
             .io = io,
             .gpa = gpa,
-            .queue = try EventQueue.init(io, gpa),
+            .queue = .init(io),
             .file_watcher = FileWatcher.init(io, gpa) catch null,
             .time_watcher = try TimeWatcher.init(io, gpa),
         };
@@ -89,12 +89,12 @@ pub const Watcher = struct {
 
             // Poll watchers for events
             if (self.file_watcher) |fw| {
-                fw.pollEvents(self.gpa, self.queue, addFileEvent) catch |err| {
+                fw.pollEvents(self.gpa, &self.queue, addFileEvent) catch |err| {
                     if (err != error.WouldBlock) log.debug("{}", .{err});
                 };
             }
             const tw = self.time_watcher;
-            tw.pollEvents(self.gpa, self.queue, addTimeEvent) catch |err| {
+            tw.pollEvents(self.gpa, &self.queue, addTimeEvent) catch |err| {
                 log.debug("{}", .{err});
             };
         }

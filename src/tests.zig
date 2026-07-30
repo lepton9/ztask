@@ -260,10 +260,7 @@ test "remote_job" {
     agent.stop();
     agent_thread.join();
 
-    try std.testing.expect(agent.queue.empty());
-    try std.testing.expect(agent.result_queue.empty());
-    try std.testing.expect(agent.log_queue.empty());
-    try std.testing.expect(agent.active_runners.count() == 0);
+    try std.testing.expect(agent.isIdle());
     try std.testing.expect(task_manager.events.len() == 1);
 }
 

@@ -22,7 +22,6 @@ pub const LogEvent = union(enum) {
     job_finished: struct { job_id: u64, name: ?[]u8, exit_code: i32, timestamp_ms: i64 },
 };
 
-pub const ResultQueue = queue.MutexQueue(Result);
 pub const LogQueue = queue.MutexQueue(LogEvent);
 
 pub const ResultError = error{
@@ -62,7 +61,7 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         job: *JobNode,
-        results: *ResultQueue,
+        results: *std.Io.Queue(Result),
         logs: *LogQueue,
     ) void {
         self.runJobWithMode(gpa, job, results, logs, .piped, null);
@@ -76,7 +75,7 @@ pub const LocalRunner = struct {
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         job: *JobNode,
-        results: *ResultQueue,
+        results: *std.Io.Queue(Result),
         logs: *LogQueue,
         mode: ExecMode,
         cwd: ?[]const u8,
@@ -93,13 +92,13 @@ pub const LocalRunner = struct {
             logs,
             mode,
         }) catch {
-            return results.appendAssumeCapacity(.{
+            return results.putOneUncancelable(self.io, .{
                 .node = job,
                 .result = .{
                     .exit_code = 1,
                     .msg = "Failed to spawn thread",
                 },
-            });
+            }) catch {};
         };
     }
 
@@ -107,7 +106,7 @@ pub const LocalRunner = struct {
     fn runFn(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
-        results: *ResultQueue,
+        results: *std.Io.Queue(Result),
         logs: *LogQueue,
         mode: ExecMode,
     ) void {
@@ -158,12 +157,13 @@ pub const LocalRunner = struct {
             .exit_code = exit_code,
             .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         } }) catch {};
-        results.appendAssumeCapacity(
-            .{ .node = job, .result = .{
+        results.putOneUncancelable(self.io, .{
+            .node = job,
+            .result = .{
                 .exit_code = exit_code,
                 .msg = err_msg,
-            } },
-        );
+            },
+        }) catch {};
     }
 
     /// Join the runner thread
@@ -347,9 +347,9 @@ pub const LocalRunner = struct {
 };
 
 /// Tty for executing a job in attached mode.
-const JobTty = blk: {
-    const tag = builtin.os.tag;
-    if (tag == .windows or tag == .wasi) break :blk struct {
+const JobTty = switch (builtin.os.tag) {
+    .linux, .freebsd, .macos => JobTtyPosix,
+    else => struct {
         fn init(_: std.Io) ?@This() {
             return null;
         }
@@ -357,9 +357,7 @@ const JobTty = blk: {
         fn restore(_: *@This(), _: std.Io) void {
             return;
         }
-    };
-
-    break :blk JobTtyPosix;
+    },
 };
 
 const JobTtyPosix = struct {

@@ -28,7 +28,6 @@ test {
 const JobNode = localrunner.JobNode;
 const Result = localrunner.Result;
 const LogEvent = localrunner.LogEvent;
-const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
 /// Scheduler -> TaskManager event sink.
@@ -86,8 +85,10 @@ pub const Scheduler = struct {
     /// Runners currently running jobs
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
-    result_queue: *ResultQueue,
-    log_queue: *LogQueue,
+    result_queue: std.Io.Queue(Result),
+    result_buffer: []Result,
+    /// Queue for job logs
+    log_queue: LogQueue,
 
     logger: logger.RunLogger,
     task_meta: data.TaskRunMetadata,
@@ -116,6 +117,12 @@ pub const Scheduler = struct {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
+
+        const nodes = try gpa.alloc(JobNode, node_n);
+        errdefer gpa.free(nodes);
+        const result_buffer = try gpa.alloc(Result, node_n);
+        errdefer gpa.free(result_buffer);
+
         const task_meta: data.TaskRunMetadata = .{
             .task_id = try gpa.dupe(u8, task.id.fmt()),
             .start_time = std.Io.Timestamp.now(io, .real).toSeconds(),
@@ -123,6 +130,7 @@ pub const Scheduler = struct {
         };
         const tasks_path = try datastore.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
+
         scheduler.* = .{
             .io = io,
             .gpa = gpa,
@@ -130,11 +138,12 @@ pub const Scheduler = struct {
             .task = task,
             .pool = pool,
             .remote_manager = remote_manager,
-            .nodes = try scheduler.gpa.alloc(JobNode, node_n),
+            .nodes = nodes,
             .active_runners = .{},
             .queue = try .initCapacity(gpa, node_n),
-            .result_queue = try ResultQueue.initCapacity(io, gpa, node_n),
-            .log_queue = try LogQueue.init(io, gpa),
+            .result_queue = .init(result_buffer),
+            .result_buffer = result_buffer,
+            .log_queue = .init(io),
             .status = .inactive,
             .logger = try .init(io, gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
@@ -166,7 +175,8 @@ pub const Scheduler = struct {
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
-        self.result_queue.deinit(self.gpa);
+        self.result_queue.close(self.io);
+        self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
         self.logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);
@@ -289,8 +299,8 @@ pub const Scheduler = struct {
         runner.runJobWithMode(
             self.gpa,
             node,
-            self.result_queue,
-            self.log_queue,
+            &self.result_queue,
+            &self.log_queue,
             exec_mode,
             self.task.cwd,
         );
@@ -339,8 +349,6 @@ pub const Scheduler = struct {
             .reason = reason,
         } });
 
-        self.handleResults();
-
         // Force stop running local runners
         var it = self.active_runners.iterator();
         while (it.next()) |e| {
@@ -350,10 +358,10 @@ pub const Scheduler = struct {
             self.pool.release(runner);
             self.skipJob(node);
         }
-        self.result_queue.clear();
         self.active_runners.clearRetainingCapacity();
 
         self.skipRemainingJobs();
+        self.handleResults();
         self.handleLogs();
 
         // Log task metadata
@@ -407,19 +415,25 @@ pub const Scheduler = struct {
 
     /// Handle the completed job results
     fn handleResults(self: *Scheduler) void {
-        while (self.result_queue.pop()) |res| switch (res.result.runner) {
-            .local => {
-                if (self.active_runners.fetchRemove(res.node)) |kv| {
-                    const runner = kv.value;
-                    runner.finishJob();
-                    self.pool.release(runner);
-                }
-                self.onJobCompleted(res.node, res.result);
-            },
-            .remote => {
-                self.onJobCompleted(res.node, res.result);
-            },
-        };
+        var results: [4]Result = undefined;
+        while (true) {
+            const n = self.result_queue.get(self.io, &results, 0) catch return;
+            if (n == 0) return;
+
+            for (results[0..n]) |res| switch (res.result.runner) {
+                .local => {
+                    if (self.active_runners.fetchRemove(res.node)) |kv| {
+                        const runner = kv.value;
+                        runner.finishJob();
+                        self.pool.release(runner);
+                    }
+                    self.onJobCompleted(res.node, res.result);
+                },
+                .remote => {
+                    self.onJobCompleted(res.node, res.result);
+                },
+            };
+        }
     }
 
     /// Handle the job log events in the queue

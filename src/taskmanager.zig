@@ -44,7 +44,7 @@ pub const TaskManager = struct {
     idle_cond: std.Io.Condition = .init,
 
     /// Queue of task events (single-consumer)
-    events: *MutexQueue(Event),
+    events: MutexQueue(Event),
     datastore: data.DataStore,
     pool: *RunnerPool,
 
