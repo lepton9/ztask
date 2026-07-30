@@ -1551,14 +1551,19 @@ const TaskListItem = struct {
         ctx: vxfw.DrawContext,
     ) AllocError!vxfw.Surface {
         var self: *@This() = @ptrCast(@alignCast(ptr));
+
+        const width_opt = ctx.max.width;
+        const width: u16 = if ((width_opt orelse 0) >= 1) width_opt.? else 20;
         return self.draw(ctx.withConstraints(
             .{ .width = 1, .height = 1 },
-            .{ .width = 20, .height = 1 },
+            .{ .width = width, .height = 1 },
         ));
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+        const w: usize = @intCast(@max(ctx.max.width orelse 0, 1));
+
+        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
         var text: vxfw.RichText = .{ .text = segments };
 
         const tag: StatusText = switch (self.task.status) {
@@ -1568,13 +1573,32 @@ const TaskListItem = struct {
             else => |s| .{ .text = @tagName(s) },
         };
 
-        segments[0] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-            self.task.meta.name,
-        }) };
-        segments[1] = .{
-            .text = try std.fmt.allocPrint(ctx.arena, "{s:>10}", .{tag.text}),
-            .style = .{ .fg = tag.color },
-        };
+        // Truncate name if there isn't enough space for the status
+        const has_tag = tag.text.len != 0;
+        const sep: []const u8 = if (has_tag) " " else "";
+
+        const status_w: usize, const sep_w: usize = if (has_tag)
+            .{ ctx.stringWidth(tag.text), 1 }
+        else
+            .{ 0, 0 };
+
+        var name_txt: []const u8 = "";
+        var status_txt: []const u8 = "";
+
+        if (!has_tag) {
+            name_txt = try truncateWithEllipsis(ctx.arena, self.task.meta.name, w);
+        } else if (status_w >= w) {
+            // No room for the name at all
+            status_txt = try truncateWithEllipsis(ctx.arena, tag.text, w);
+        } else {
+            const name_w = w - status_w - sep_w;
+            name_txt = try truncateWithEllipsis(ctx.arena, self.task.meta.name, name_w);
+            status_txt = tag.text;
+        }
+
+        segments[0] = .{ .text = name_txt };
+        segments[1] = .{ .text = sep };
+        segments[2] = .{ .text = status_txt, .style = .{ .fg = tag.color } };
 
         return text.draw(ctx);
     }
