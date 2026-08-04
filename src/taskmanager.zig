@@ -33,6 +33,11 @@ pub const BeginTaskOptions = struct {
     diagnostics: ?*GenericDiagnostics = null,
 };
 
+const WatchEntry = struct {
+    direct: std.ArrayList(*Scheduler) = .empty,
+    recursive: std.ArrayList(*Scheduler) = .empty,
+};
+
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     io: std.Io,
@@ -58,8 +63,8 @@ pub const TaskManager = struct {
     remote_manager: *remotemanager.RemoteManager,
 
     watcher: *Watcher,
-    /// Maps paths to active schedulers
-    watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
+    /// Maps paths to active schedulers by their watch scope.
+    watch_map: std.StringHashMapUnmanaged(WatchEntry),
 
     /// Epoch counter used to dedupe watcher-event bursts.
     watch_epoch: u64 = 0,
@@ -171,7 +176,8 @@ pub const TaskManager = struct {
         var w_it = self.watch_map.iterator();
         while (w_it.next()) |e| {
             self.gpa.free(e.key_ptr.*);
-            e.value_ptr.*.deinit(self.gpa);
+            e.value_ptr.direct.deinit(self.gpa);
+            e.value_ptr.recursive.deinit(self.gpa);
         }
         self.watch_map.deinit(self.gpa);
 
@@ -352,21 +358,34 @@ pub const TaskManager = struct {
                 for (paths) |path| {
                     const e = self.watch_map.getEntry(path) orelse continue;
 
-                    // Remove scheduler
-                    const list_ptr = e.value_ptr;
+                    const list_ptr = if (w.recursive)
+                        &e.value_ptr.recursive
+                    else
+                        &e.value_ptr.direct;
+
+                    // Remove scheduler.
+                    var removed_scheduler = false;
                     for (0..list_ptr.items.len) |i| {
                         if (@intFromPtr(list_ptr.items[i]) == @intFromPtr(s)) {
                             _ = list_ptr.orderedRemove(i);
+                            removed_scheduler = true;
                             break;
                         }
                     }
+                    if (!removed_scheduler) continue;
 
-                    // No more schedulers that have the same watch path
-                    if (list_ptr.items.len == 0) {
+                    try self.watcher.removeFileWatch(e.key_ptr.*, .{
+                        .recursive = w.recursive,
+                    });
+
+                    // No more schedulers that have the same watch path.
+                    if (e.value_ptr.direct.items.len == 0 and
+                        e.value_ptr.recursive.items.len == 0)
+                    {
                         if (self.watch_map.fetchRemove(path)) |kv| {
-                            try self.watcher.removeFileWatch(kv.key);
-                            var list = kv.value;
-                            list.deinit(self.gpa);
+                            var entry = kv.value;
+                            entry.direct.deinit(self.gpa);
+                            entry.recursive.deinit(self.gpa);
                             self.gpa.free(kv.key);
                         }
                     }
@@ -385,24 +404,34 @@ pub const TaskManager = struct {
         self: *TaskManager,
         s: *Scheduler,
         path: []const u8,
+        recursive: bool,
         diagnostics: ?*GenericDiagnostics,
     ) !void {
-        const gop = try self.watch_map.getOrPut(self.gpa, path);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.gpa.dupe(u8, path);
-            gop.value_ptr.* = try .initCapacity(self.gpa, 1);
-        }
+        const normalized_path = try watcher_zig.normalizeWatchPath(
+            self.io,
+            self.gpa,
+            path,
+        );
+
+        const gop = blk: {
+            errdefer self.gpa.free(normalized_path);
+            break :blk try self.watch_map.getOrPut(self.gpa, normalized_path);
+        };
+        const new_entry = !gop.found_existing;
+        if (new_entry) {
+            gop.key_ptr.* = normalized_path;
+            gop.value_ptr.* = .{};
+        } else self.gpa.free(normalized_path);
         const key = gop.key_ptr.*;
 
-        // Don't re-add a shared watch path
-        if (!gop.found_existing) self.watcher.addFileWatch(key) catch |err| {
-            if (self.watch_map.fetchRemove(key)) |kv| {
-                var list = kv.value;
-                list.deinit(self.gpa);
+        self.watcher.addFileWatch(key, .{ .recursive = recursive }) catch |err| {
+            if (new_entry) if (self.watch_map.fetchRemove(key)) |kv| {
+                var entry = kv.value;
+                entry.direct.deinit(self.gpa);
+                entry.recursive.deinit(self.gpa);
                 self.gpa.free(kv.key);
-            }
+            };
             return switch (err) {
-                error.UnsupportedPlatform => error.WatcherAddUnsupported,
                 error.InvalidWatchPath => {
                     var d = diagnostics orelse return err;
                     const fmt = "Watch path must be a file or directory: {s}";
@@ -416,59 +445,17 @@ pub const TaskManager = struct {
                 else => err,
             };
         };
+        errdefer self.watcher.removeFileWatch(key, .{
+            .recursive = recursive,
+        }) catch {};
 
-        try gop.value_ptr.*.append(self.gpa, s);
+        const list = if (recursive)
+            &gop.value_ptr.recursive
+        else
+            &gop.value_ptr.direct;
+        try list.append(self.gpa, s);
+        errdefer _ = list.pop();
         try s.watch_paths.append(self.gpa, key);
-    }
-
-    /// Add all the directories recursively to the file watch list.
-    fn addWatchDirRecursive(
-        self: *TaskManager,
-        s: *Scheduler,
-        dir_path: []const u8,
-        diagnostics: ?*GenericDiagnostics,
-        fatal_open: bool,
-    ) !void {
-        var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{
-            .iterate = true,
-        }) catch |err| {
-            if (fatal_open) return err;
-            self.emitErrorFmt(
-                .task_manager,
-                err,
-                "skip watch dir (open failed): path={s} err={any}",
-                .{ dir_path, err },
-            );
-            return;
-        };
-        defer dir.close(self.io);
-
-        var it = dir.iterate();
-        while (it.next(self.io) catch null) |entry| switch (entry.kind) {
-            .directory => {
-                const name = entry.name;
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, ".."))
-                    continue;
-
-                const sub_path = try std.fs.path.join(self.gpa, &.{
-                    dir_path,
-                    entry.name,
-                });
-                defer self.gpa.free(sub_path);
-
-                self.addWatchPath(s, sub_path, diagnostics) catch |err| {
-                    self.emitErrorFmt(
-                        .task_manager,
-                        err,
-                        "skip watch dir (addWatch failed): path={s} err={any}",
-                        .{ dir_path, err },
-                    );
-                    continue;
-                };
-                try self.addWatchDirRecursive(s, sub_path, diagnostics, false);
-            },
-            else => continue,
-        };
     }
 
     /// Main run loop
@@ -544,8 +531,14 @@ pub const TaskManager = struct {
         const epoch = self.watch_epoch;
 
         while (self.watcher.getEvent()) |event| switch (event) {
-            .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
-                for (l.items) |s| try self.handleFileTriggerEvent(s, epoch);
+            .fileEvent => |fe| {
+                defer fe.deinit(self.gpa);
+                const entry = self.watch_map.get(fe.watched_path) orelse continue;
+                const schedulers = switch (fe.scope) {
+                    .direct => entry.direct.items,
+                    .recursive => entry.recursive.items,
+                };
+                for (schedulers) |s| try self.handleFileTriggerEvent(s, epoch);
             },
             .timeEvent => |te| if (self.getScheduler(te.task_id)) |s| {
                 try self.handleTimeTriggerEvent(s);
@@ -685,30 +678,15 @@ pub const TaskManager = struct {
                     try task.resolveWatchPath(self.io, self.gpa);
                     task_scheduler.watch_paths.clearRetainingCapacity();
 
-                    const stat = std.Io.Dir.cwd().statFile(self.io, watch.path, .{}) catch |err| {
-                        const d = diagnostics orelse return err;
-                        return switch (err) {
-                            error.FileNotFound => d.failf(
-                                self.gpa,
-                                err,
-                                "Watch path not found: {s}",
-                                .{watch.path},
-                            ),
-                            else => err,
-                        };
-                    };
-
-                    self.addWatchPath(task_scheduler, watch.path, diagnostics) catch |err| {
+                    self.addWatchPath(
+                        task_scheduler,
+                        watch.path,
+                        watch.recursive,
+                        diagnostics,
+                    ) catch |err| {
                         self.removeFromWatchList(task_scheduler) catch {};
                         return err;
                     };
-
-                    if (stat.kind == .directory and watch.recursive) {
-                        self.addWatchDirRecursive(task_scheduler, watch.path, diagnostics, true) catch |err| {
-                            self.removeFromWatchList(task_scheduler) catch {};
-                            return err;
-                        };
-                    }
                 },
                 .interval => |interval| {
                     try self.watcher.addIntervalWatch(task.id.fmt(), interval);

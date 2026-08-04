@@ -46,7 +46,10 @@ pub fn setupExe(
     const options = b.addOptions();
     options.addOption([]const u8, "PROGRAM_NAME", @tagName(zon.name));
 
-    const yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize });
+    const yaml = b.dependency("yaml", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const yaml_mod = yaml.module("yaml");
 
     const zcli = b.dependency("zcli", .{
@@ -56,8 +59,17 @@ pub fn setupExe(
     });
     const zcli_mod = zcli.module("zcli");
 
-    const vaxis = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const vaxis = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const vaxis_mod = vaxis.module("vaxis");
+
+    const nightwatch = b.dependency("nightwatch", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const nightwatch_mod = nightwatch.module("nightwatch");
 
     // Main executable
     const exe = b.addExecutable(.{
@@ -70,14 +82,11 @@ pub fn setupExe(
                 .{ .name = "yaml", .module = yaml_mod },
                 .{ .name = "zcli", .module = zcli_mod },
                 .{ .name = "vaxis", .module = vaxis_mod },
+                .{ .name = "nightwatch", .module = nightwatch_mod },
             },
         }),
     });
     exe.root_module.addOptions("build_options", options);
-
-    // Required on Linux for inotify
-    if (target.result.os.tag == .linux) exe.root_module.link_libc = true;
-
     return exe;
 }
 
@@ -88,6 +97,8 @@ pub fn setupTests(
 ) *std.Build.Step.Compile {
     const yaml = b.dependency("yaml", .{ .target = target, .optimize = optimize });
     const yaml_mod = yaml.module("yaml");
+    const nightwatch = b.dependency("nightwatch", .{ .target = target, .optimize = optimize });
+    const nightwatch_mod = nightwatch.module("nightwatch");
 
     // Test module
     const tests_mod = b.createModule(.{
@@ -96,13 +107,10 @@ pub fn setupTests(
         .optimize = optimize,
         .imports = &.{
             .{ .name = "yaml", .module = yaml_mod },
+            .{ .name = "nightwatch", .module = nightwatch_mod },
         },
     });
     const tests = b.addTest(.{ .root_module = tests_mod });
-
-    // Required on Linux for inotify
-    if (target.result.os.tag == .linux) tests.root_module.link_libc = true;
-
     return tests;
 }
 
