@@ -248,7 +248,7 @@ pub const DataStore = struct {
 
         return .{
             .data_dir = path,
-            .global_data_dir = try DataStore.getAppDataDir(gpa, APP_DATA_SUBDIR),
+            .global_data_dir = try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR),
             .env = .{
                 .ZTASK_DATA_DIR = env_data_dir,
             },
@@ -270,7 +270,7 @@ pub const DataStore = struct {
                 defer gpa.free(cwd);
                 return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
             },
-            .global => return try DataStore.getAppDataDir(gpa, APP_DATA_SUBDIR),
+            .global => return try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR),
             .auto => {},
         }
 
@@ -285,7 +285,7 @@ pub const DataStore = struct {
         const env_data_dir = env.get(DATA_DIR_ENV_VAR);
         if (env_data_dir) |p| if (p.len != 0) return try gpa.dupe(u8, p);
 
-        return try DataStore.getAppDataDir(gpa, APP_DATA_SUBDIR);
+        return try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR);
     }
 
     /// Deinitialize a slice of `JobRunMetadata`
@@ -294,11 +294,40 @@ pub const DataStore = struct {
         gpa.free(metas);
     }
 
-    fn getAppDataDir(gpa: std.mem.Allocator, sub_path: []const u8) ![]u8 {
-        _ = gpa;
-        _ = sub_path;
-        if (true) @panic("TODO: implement DataStore.getAppDataDir()");
-        // TODO: implement try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR),
+    /// Get the app data directory for the current OS.
+    fn getAppDataDir(
+        gpa: std.mem.Allocator,
+        env: *std.process.Environ.Map,
+        appname: []const u8,
+    ) error{ OutOfMemory, AppDataDirUnavailable }![]u8 {
+        switch (@import("builtin").os.tag) {
+            .windows => {
+                const local_app_data_dir = env.get("LOCALAPPDATA") orelse
+                    return error.AppDataDirUnavailable;
+                return std.fs.path.join(gpa, &.{ local_app_data_dir, appname });
+            },
+            .macos => {
+                const home_dir = env.get("HOME") orelse
+                    return error.AppDataDirUnavailable;
+                return std.fs.path.join(
+                    gpa,
+                    &.{ home_dir, "Library", "Application Support", appname },
+                );
+            },
+            .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .illumos, .serenity => {
+                if (env.get("XDG_DATA_HOME")) |xdg| if (xdg.len > 0) {
+                    return std.fs.path.join(gpa, &.{ xdg, appname });
+                };
+
+                const home_dir = env.get("HOME") orelse
+                    return error.AppDataDirUnavailable;
+                return std.fs.path.join(
+                    gpa,
+                    &.{ home_dir, ".local", "share", appname },
+                );
+            },
+            else => @compileError("Unsupported OS"),
+        }
     }
 
     /// Get and allocate the tasks data directory path
@@ -747,8 +776,6 @@ pub const DataStore = struct {
         const tasks_path = try self.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
         const cwd = std.Io.Dir.cwd();
-        // TODO: io from where. Self?
-        // Put gpa into datastore aswell?
         try cwd.createDirPath(self.io, tasks_path);
         var dir = try openDir(self.io, tasks_path, .{ .iterate = true, .create = true });
         defer dir.close(self.io);
