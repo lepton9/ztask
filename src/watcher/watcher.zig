@@ -364,6 +364,56 @@ test "file_events_modify_and_delete" {
     try std.testing.expect(fe_del.kind == .deleted);
 }
 
+test "file_watch_survives_atomic_replacement" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const watcher = try Watcher.init(io, gpa);
+    defer watcher.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        var file = try tmp.dir.createFile(io, "watch.txt", .{});
+        file.close(io);
+    }
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
+    const file_path = try std.fs.path.join(gpa, &.{ dir_path, "watch.txt" });
+    defer gpa.free(file_path);
+
+    try watcher.start();
+    defer watcher.stop() catch {};
+    try watcher.addFileWatch(file_path, .{});
+
+    {
+        var replacement = try tmp.dir.createFile(io, "replacement.txt", .{});
+        defer replacement.close(io);
+        var writer = replacement.writer(io, &.{});
+        try writer.interface.writeAll("replacement");
+        try writer.flush();
+    }
+    try tmp.dir.rename("replacement.txt", tmp.dir, "watch.txt", io);
+
+    const replaced = try watcher.waitForFileEvent(file_path, test_timeout);
+    replaced.deinit(gpa);
+    watcher.drainEvents();
+
+    {
+        var file = try tmp.dir.createFile(io, "watch.txt", .{ .truncate = true });
+        defer file.close(io);
+        var writer = file.writer(io, &.{});
+        try writer.interface.writeAll("updated");
+        try writer.flush();
+    }
+    const modified = blk: while (true) {
+        const event = try watcher.waitForFileEvent(file_path, test_timeout);
+        if (event.kind == .modified) break :blk event;
+        event.deinit(gpa);
+    };
+    defer modified.deinit(gpa);
+    try std.testing.expectEqual(FileWatcher.EventType.modified, modified.kind);
+}
+
 test "file_events_create_in_dir" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

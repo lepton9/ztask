@@ -100,6 +100,14 @@ const FileWatchEntry = struct {
     kind: WatchKind,
 };
 
+/// Return a stable directory to watch with nightwatch for the given path.
+fn backendWatchPath(path: []const u8, kind: WatchKind) []const u8 {
+    return switch (kind) {
+        .file => std.fs.path.dirname(path) orelse unreachable,
+        .directory => path,
+    };
+}
+
 pub fn init(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -265,7 +273,7 @@ fn rebuildWatcher(self: *FileWatcher) !void {
 
     var it = self.watch_map.iterator();
     while (it.next()) |entry| {
-        try watcher.watch(entry.key_ptr.*);
+        try watcher.watch(backendWatchPath(entry.key_ptr.*, entry.value_ptr.kind));
     }
 }
 
@@ -303,7 +311,7 @@ pub fn addWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) !vo
     errdefer if (self.watch_map.fetchRemove(normalized_path)) |removed|
         self.gpa.free(removed.key);
 
-    try (try self.getWatcher()).watch(normalized_path);
+    try (try self.getWatcher()).watch(backendWatchPath(normalized_path, kind));
 }
 
 /// Remove a file or directory path from the logical watch list.
@@ -324,15 +332,11 @@ pub fn removeWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) 
     const removed = self.watch_map.fetchRemove(normalized_path) orelse return;
     defer self.gpa.free(removed.key);
 
-    switch (removed.value.kind) {
-        // File watches have no recursively-added descendants.
-        .file => if (self.watcher) |*watcher| {
-            watcher.unwatch(removed.key) catch |err|
-                std.log.err("nightwatch: unwatch failed for {s}: {s}", .{ removed.key, @errorName(err) });
-        },
-        .directory => self.rebuildWatcher() catch |err|
-            std.log.err("nightwatch: rebuild failed after removing {s}: {s}", .{ removed.key, @errorName(err) }),
-    }
+    self.rebuildWatcher() catch |err|
+        std.log.err(
+            "nightwatch: rebuild failed after removing {s}: {s}",
+            .{ removed.key, @errorName(err) },
+        );
 }
 
 /// Get the amount of paths currently watched.
