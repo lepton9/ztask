@@ -6,6 +6,7 @@ const protocol = @import("protocol.zig");
 const Connection = @import("Connection.zig");
 
 const Queue = @import("../types/queue.zig").Queue;
+const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
 const Result = localrunner.Result;
@@ -36,6 +37,10 @@ pub const RemoteAgent = struct {
 
     parser: protocol.MsgParser = .init(),
     connection: Connection,
+    /// Incoming frames from the server.
+    incoming_frames: MutexQueue([]u8),
+    /// Worker thread for reading incoming frames from the server.
+    reader_thread: ?std.Thread = null,
 
     /// Error for exiting
     exit_error: ?ExitError = null,
@@ -61,13 +66,15 @@ pub const RemoteAgent = struct {
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
-            .connection = try .init(io, gpa),
+            .connection = try .init(io),
+            .incoming_frames = .init(io),
         };
         try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
     }
 
     pub fn deinit(self: *RemoteAgent) void {
+        self.stopReader();
         var it = self.jobs.iterator();
         while (it.next()) |e| {
             e.value_ptr.node.deinit(self.gpa);
@@ -82,7 +89,9 @@ pub const RemoteAgent = struct {
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
         self.pool.deinit();
-        self.connection.deinit(self.gpa);
+        self.connection.deinit();
+        while (self.incoming_frames.pop()) |frame| self.gpa.free(frame);
+        self.incoming_frames.deinit(self.gpa);
         self.gpa.free(self.hostname);
         self.gpa.destroy(self);
     }
@@ -103,11 +112,13 @@ pub const RemoteAgent = struct {
 
         self.handleLogs() catch {};
         self.handleResults();
+        self.stopReader();
     }
 
     /// Stop the agent
     pub fn stop(self: *RemoteAgent) void {
         self.running.store(false, .seq_cst);
+        self.connection.shutdown();
     }
 
     /// Check if the agent has no work.
@@ -120,7 +131,9 @@ pub const RemoteAgent = struct {
 
     /// Try to connect to the server at the address
     pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
+        self.stopReader();
         try self.connection.connect(addr);
+        self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
         try self.register();
     }
 
@@ -153,10 +166,39 @@ pub const RemoteAgent = struct {
 
     /// Listen for incoming messages
     fn listen(self: *RemoteAgent) !void {
-        while (self.connection.readNextFrame(self.gpa) catch null) |msg| {
+        while (self.incoming_frames.pop()) |msg| {
+            defer self.gpa.free(msg);
             const parsed = try self.parser.parse(msg);
             try self.handleMessage(parsed);
         }
+    }
+
+    /// Loop for reading incoming frames from the server.
+    fn readLoop(self: *RemoteAgent) void {
+        var reader = Connection.Reader.init(
+            self.io,
+            self.gpa,
+            self.connection.conn.stream,
+        ) catch return;
+        defer reader.deinit();
+
+        while (true) {
+            const frame = reader.readNextFrame() catch break;
+            const owned = self.gpa.dupe(u8, frame) catch break;
+            self.incoming_frames.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                break;
+            };
+        }
+        self.connection.close();
+    }
+
+    /// Stop the read worker thread.
+    fn stopReader(self: *RemoteAgent) void {
+        self.connection.shutdown();
+        if (self.reader_thread) |thread| thread.join();
+        self.reader_thread = null;
+        self.connection.close();
     }
 
     /// Handle parsed message

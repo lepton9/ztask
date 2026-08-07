@@ -6,6 +6,7 @@ const Connection = @import("Connection.zig");
 
 const RemoteRunSpec = @import("../types/task.zig").RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
+const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
@@ -21,6 +22,66 @@ const AcceptCtx = struct {
 
 const AcceptEvent = union(enum) {
     accept: std.Io.net.Server.AcceptError!std.Io.net.Stream,
+};
+
+const InboundFrame = union(enum) {
+    frame: struct { socket_handle: std.Io.net.Socket.Handle, data: []u8 },
+    closed: std.Io.net.Socket.Handle,
+};
+
+const AgentReader = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    incoming_frames: *MutexQueue(InboundFrame),
+    thread: std.Thread,
+
+    fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+        incoming_frames: *MutexQueue(InboundFrame),
+    ) !*AgentReader {
+        const reader = try gpa.create(AgentReader);
+        reader.* = .{
+            .io = io,
+            .gpa = gpa,
+            .stream = stream,
+            .incoming_frames = incoming_frames,
+            .thread = undefined,
+        };
+        reader.thread = try std.Thread.spawn(.{}, run, .{reader});
+        return reader;
+    }
+
+    /// Stop and join the reader thread.
+    fn deinit(self: *AgentReader) void {
+        self.thread.join();
+        self.gpa.destroy(self);
+    }
+
+    fn run(self: *AgentReader) void {
+        var reader = Connection.Reader.init(
+            self.io,
+            self.gpa,
+            self.stream,
+        ) catch return;
+        defer reader.deinit();
+        while (true) {
+            const frame = reader.readNextFrame() catch break;
+            const owned = self.gpa.dupe(u8, frame) catch break;
+            self.incoming_frames.append(self.gpa, .{ .frame = .{
+                .socket_handle = self.stream.socket.handle,
+                .data = owned,
+            } }) catch {
+                self.gpa.free(owned);
+                break;
+            };
+        }
+        self.incoming_frames.append(self.gpa, .{
+            .closed = self.stream.socket.handle,
+        }) catch {};
+    }
 };
 
 fn acceptTask(ctx: AcceptCtx) std.Io.net.Server.AcceptError!std.Io.net.Stream {
@@ -42,11 +103,8 @@ pub const DispatchRequest = struct {
 pub const AgentHandle = struct {
     name: ?[]const u8 = null,
     connection: Connection,
+    reader: *AgentReader,
     last_heartbeat: i64,
-
-    /// Scratch buffer for `net_receive`.
-    rx_buf: [4096]u8 = undefined,
-    rx_msg: std.Io.net.IncomingMessage = .init,
 
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
         if (self.name) |n| gpa.free(n);
@@ -54,8 +112,11 @@ pub const AgentHandle = struct {
     }
 
     fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
+        self.connection.shutdown();
+        self.reader.deinit();
+        self.connection.close();
         if (self.name) |name| gpa.free(name);
-        self.connection.deinit(gpa);
+        self.connection.deinit();
     }
 };
 
@@ -73,6 +134,7 @@ pub const RemoteManager = struct {
 
     /// Connected remote agents.
     agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
+    incoming_frames: MutexQueue(InboundFrame),
 
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
@@ -83,6 +145,7 @@ pub const RemoteManager = struct {
             .io = io,
             .gpa = gpa,
             .agents = .{},
+            .incoming_frames = .init(io),
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
@@ -98,6 +161,11 @@ pub const RemoteManager = struct {
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
+        while (self.incoming_frames.pop()) |item| switch (item) {
+            .frame => |frame| self.gpa.free(frame.data),
+            .closed => {},
+        };
+        self.incoming_frames.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -115,7 +183,7 @@ pub const RemoteManager = struct {
         self.resetAcceptState();
 
         var it = self.agents.valueIterator();
-        while (it.next()) |a| a.connection.close();
+        while (it.next()) |a| a.connection.shutdown();
 
         if (self.server) |*s| s.deinit(self.io);
         self.server = null;
@@ -125,7 +193,7 @@ pub const RemoteManager = struct {
     pub fn update(self: *RemoteManager) !void {
         try self.drainAccepted();
         self.armAccept();
-        try self.updateAgentsBatch();
+        try self.drainAgentInbox();
         try self.dispatchJobs();
     }
 
@@ -177,73 +245,23 @@ pub const RemoteManager = struct {
         try self.dispatch_queue.append(self.gpa, req);
     }
 
-    /// Read from all connected agents in a batch.
-    fn updateAgentsBatch(self: *RemoteManager) !void {
-        const total: usize = self.agents.count();
-        if (total == 0) return;
-
-        const storage = try self.gpa.alloc(std.Io.Operation.Storage, total);
-        defer self.gpa.free(storage);
-        const agent_ptrs = try self.gpa.alloc(*AgentHandle, total);
-        defer self.gpa.free(agent_ptrs);
-
-        // Initialize the net_receive batch
-        var batch: std.Io.Batch = .init(storage);
-        var n: usize = 0;
-        var it = self.agents.iterator();
-        while (it.next()) |e| {
-            const agent = e.value_ptr;
-            if (agent.connection.closed) continue;
-            agent.rx_msg = .init;
-            agent_ptrs[n] = agent;
-            batch.addAt(@intCast(n), .{ .net_receive = .{
-                .socket_handle = agent.connection.conn.stream.socket.handle,
-                .message_buffer = (&agent.rx_msg)[0..1],
-                .data_buffer = agent.rx_buf[0..],
-                .flags = .{},
-            } });
-            n += 1;
-        }
-        if (n == 0) return;
-
-        const timeout: std.Io.Timeout = .{
-            .duration = .{ .raw = std.Io.Duration.zero, .clock = .awake },
-        };
-        batch.awaitConcurrent(self.io, timeout) catch |err| switch (err) {
-            error.Timeout => return,
-            else => return err,
-        };
-
-        // Handle the batch completions
-        while (batch.next()) |completion| {
-            const agent = agent_ptrs[completion.index];
-            const maybe_err, const count = completion.result.net_receive;
-            if (maybe_err) |_| {
-                self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
-                continue;
-            }
-            if (count == 0) continue;
-
-            const data = agent.rx_msg.data;
-            if (data.len == 0) {
-                self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
-                continue;
-            }
-
-            try agent.connection.ingest(self.gpa, data);
-
-            // Try to handle incoming message frame
-            while (try agent.connection.popFrame()) |frame| {
-                const parsed = try self.parser.parse(frame);
+    /// Process frames read by the blocking per-agent reader workers.
+    fn drainAgentInbox(self: *RemoteManager) !void {
+        while (self.incoming_frames.pop()) |item| switch (item) {
+            .closed => |socket_handle| self.removeAgentByFd(socket_handle),
+            .frame => |frame| {
+                defer self.gpa.free(frame.data);
+                const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
+                const parsed = self.parser.parse(frame.data) catch {
+                    self.removeAgentByFd(frame.socket_handle);
+                    continue;
+                };
                 self.handleMessage(agent, parsed) catch |err| switch (err) {
-                    error.ConnectionError => {
-                        self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
-                        break;
-                    },
+                    error.ConnectionError => self.removeAgentByFd(frame.socket_handle),
                     else => return err,
                 };
-            }
-        }
+            },
+        };
     }
 
     /// Handle a parsed message sent to the manager
@@ -461,7 +479,13 @@ pub const RemoteManager = struct {
         const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
         if (!res.found_existing) {
             res.value_ptr.* = .{
-                .connection = try .initConn(self.io, self.gpa, conn),
+                .connection = try .initConn(self.io, conn),
+                .reader = try AgentReader.start(
+                    self.io,
+                    self.gpa,
+                    conn.stream,
+                    &self.incoming_frames,
+                ),
                 .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             };
         }

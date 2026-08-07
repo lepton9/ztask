@@ -234,11 +234,11 @@ test "remote_job" {
         \\ jobs:
         \\   jobremote1:
         \\     steps:
-        \\       - command: "ls"
+        \\       - command: "zig version"
         \\     run_on: remote:runner1
         \\   jobremote2:
         \\     steps:
-        \\       - command: "ls"
+        \\       - command: "zig version"
         \\     run_on: remote:runner1
     ;
     const task_manager = try manager.TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
