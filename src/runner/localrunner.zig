@@ -192,7 +192,7 @@ pub const LocalRunner = struct {
                 self.mutex.unlock(self.io);
 
                 if (pid_opt) |pid| outer: switch (builtin.os.tag) {
-                    .windows => std.os.windows.TerminateProcess(pid, 1) catch {},
+                    .windows => _ = std.os.windows.ntdll.NtTerminateProcess(pid, @enumFromInt(1)),
                     .wasi => {},
                     else => {
                         // Kill the whole process group.
