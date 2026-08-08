@@ -14,8 +14,7 @@ pub const AppStatus = struct {
     connected_remote_runners: usize,
 };
 
-// TODO: unify the task status enums
-pub const TaskStatus = enum(u8) {
+pub const UiTaskStatus = enum(u8) {
     inactive,
     waiting,
     running,
@@ -30,7 +29,7 @@ pub const TaskStateOptions = struct {
 
 pub const UiTaskSnap = struct {
     meta: data.TaskMetadata,
-    status: TaskStatus,
+    status: UiTaskStatus,
 };
 
 pub const UiTaskDetail = struct {

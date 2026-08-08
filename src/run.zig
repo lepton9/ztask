@@ -60,7 +60,7 @@ pub const TuiOptions = struct {
 pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
     const io = ctx.io;
     const gpa = ctx.gpa;
-    // TODO: change buffer size?
+
     var buffer: [1024]u8 = undefined;
     var app = try vxfw.App.init(io, gpa, ctx.env, &buffer);
     defer app.deinit();
@@ -1038,15 +1038,12 @@ fn editFile(
     }
 
     // Try to find and use a default editor
-    var candidates = try std.ArrayList(EditorCmd).initCapacity(gpa, 8);
-    defer {
-        for (candidates.items) |c| c.deinit(gpa);
-        candidates.deinit(gpa);
-    }
+    var candidates = try std.ArrayList([]const u8).initCapacity(gpa, 4);
+    defer candidates.deinit(gpa);
     try collectDefaultEditors(gpa, env, &candidates);
 
-    for (candidates.items) |c| {
-        const res = runEditorCommand(io, gpa, c.cmd, path) catch |err| switch (err) {
+    for (candidates.items) |cmd| {
+        const res = runEditorCommand(io, gpa, cmd, path) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -1096,41 +1093,30 @@ fn runEditorCommand(
     }
 }
 
-// TODO: needed?
-/// Return the default editor
-const EditorCmd = struct {
-    cmd: []const u8,
-    owned: bool = false,
-
-    fn deinit(self: @This(), gpa: std.mem.Allocator) void {
-        if (self.owned) gpa.free(self.cmd);
-    }
-};
-
 /// Get the possible default editors in preference order.
 fn collectDefaultEditors(
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
-    out: *std.ArrayList(EditorCmd),
+    out: *std.ArrayList([]const u8),
 ) !void {
-    if (env.get("VISUAL")) |v| if (v.len != 0) try out.append(gpa, .{ .cmd = v });
-    if (env.get("EDITOR")) |v| if (v.len != 0) try out.append(gpa, .{ .cmd = v });
+    if (env.get("VISUAL")) |v| if (v.len != 0) try out.append(gpa, v);
+    if (env.get("EDITOR")) |v| if (v.len != 0) try out.append(gpa, v);
 
     switch (builtin.os.tag) {
         .linux => {
-            try out.append(gpa, .{ .cmd = "nano" });
-            try out.append(gpa, .{ .cmd = "vim" });
-            try out.append(gpa, .{ .cmd = "vi" });
+            try out.append(gpa, "nano");
+            try out.append(gpa, "vim");
+            try out.append(gpa, "vi");
         },
         .macos => {
-            try out.append(gpa, .{ .cmd = "vim" });
-            try out.append(gpa, .{ .cmd = "vi" });
+            try out.append(gpa, "vim");
+            try out.append(gpa, "vi");
         },
         .windows => {
-            try out.append(gpa, .{ .cmd = "notepad" });
+            try out.append(gpa, "notepad");
         },
         else => {
-            try out.append(gpa, .{ .cmd = "vi" });
+            try out.append(gpa, "vi");
         },
     }
 }

@@ -9,14 +9,14 @@ const TimeWatcher = @import("TimeWatcher.zig");
 
 pub const normalizeWatchPath = FileWatcher.normalizeWatchPath;
 
+const log = std.log.scoped(.watcher);
+
 pub const WatchEvent = union(enum) {
     fileEvent: FileWatcher.FileEvent,
     timeEvent: TimeWatcher.TimeEvent,
 };
 
 const EventQueue = queue_zig.MutexQueue(WatchEvent);
-
-const log = std.log.scoped(.watcher);
 
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
@@ -26,33 +26,33 @@ pub const Watcher = struct {
     cond: std.Io.Condition = .init,
     thread: std.Thread = undefined,
     running: std.atomic.Value(bool) = .init(false),
+    /// Event queue for all the watcher events.
     queue: EventQueue,
+    /// Watcher for file events.
     file_watcher: FileWatcher,
-    time_watcher: *TimeWatcher,
+    /// Watcher for time events.
+    time_watcher: TimeWatcher,
 
     const FILE_POLL_NS = 25 * std.time.ns_per_ms;
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator) !*Watcher {
         const watcher = try gpa.create(Watcher);
         errdefer gpa.destroy(watcher);
-        const time_watcher = try TimeWatcher.init(io, gpa);
-        errdefer time_watcher.deinit(gpa);
         watcher.* = .{
             .io = io,
             .gpa = gpa,
             .queue = .init(io),
-            .file_watcher = undefined,
-            .time_watcher = time_watcher,
+            .file_watcher = .init(io, gpa, &watcher.queue, addFileEvent),
+            .time_watcher = .init(io),
         };
-        watcher.file_watcher = try .init(io, gpa, &watcher.queue, addFileEvent);
         return watcher;
     }
 
     pub fn deinit(self: *Watcher) void {
         self.file_watcher.deinit();
+        self.time_watcher.deinit(self.gpa);
         self.drainEvents();
         self.queue.deinit(self.gpa);
-        self.time_watcher.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -96,10 +96,11 @@ pub const Watcher = struct {
 
             if (!self.running.load(.seq_cst)) break;
 
-            const tw = self.time_watcher;
-            tw.pollEvents(self.gpa, &self.queue, addTimeEvent) catch |err| {
-                log.debug("{}", .{err});
-            };
+            self.time_watcher.pollEvents(
+                self.gpa,
+                &self.queue,
+                addTimeEvent,
+            ) catch |err| log.err("{}: time watcher poll failed", .{err});
         }
     }
 

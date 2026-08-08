@@ -795,7 +795,6 @@ pub fn loadTaskDiag(
     const yaml_file = try cwd.readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(yaml_file);
     const t = try parseTaskBufferDiag(io, gpa, yaml_file, diag);
-    // TODO: better path allocation. Avoid realPathFile()
     var real_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const real_n = try cwd.realPathFile(io, path, &real_path_buf);
     t.file_path = try gpa.dupe(u8, real_path_buf[0..real_n]);

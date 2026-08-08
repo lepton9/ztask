@@ -25,12 +25,10 @@ pub const addEventFn = *const fn (
 ) anyerror!void;
 
 io: std.Io,
-watch_list: std.StringHashMapUnmanaged(WatchType) = .{},
+watch_list: std.StringHashMapUnmanaged(WatchType) = .empty,
 
-pub fn init(io: std.Io, gpa: std.mem.Allocator) !*TimeWatcher {
-    const tw = try gpa.create(TimeWatcher);
-    tw.* = .{ .io = io };
-    return tw;
+pub fn init(io: std.Io) TimeWatcher {
+    return .{ .io = io };
 }
 
 pub fn deinit(self: *TimeWatcher, gpa: std.mem.Allocator) void {
@@ -39,7 +37,6 @@ pub fn deinit(self: *TimeWatcher, gpa: std.mem.Allocator) void {
         gpa.free(e.key_ptr.*);
     }
     self.watch_list.deinit(gpa);
-    gpa.destroy(self);
 }
 
 /// Return the watch count of the `TimeWatcher`.
@@ -183,7 +180,7 @@ pub fn nextDueInNs(self: *TimeWatcher) ?u64 {
 test "interval_watch" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const tw = try TimeWatcher.init(io, gpa);
+    var tw: TimeWatcher = .init(io);
     defer tw.deinit(gpa);
 
     var events: std.ArrayList(TimeEvent) = .empty;

@@ -113,7 +113,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     queue: *anyopaque,
     addEvent: addEventFn,
-) !FileWatcher {
+) FileWatcher {
     return .{
         .io = io,
         .gpa = gpa,
@@ -121,6 +121,14 @@ pub fn init(
         .addEvent = addEvent,
         .handler = .{},
     };
+}
+
+/// Stop the file watcher and remove all watch entries.
+pub fn deinit(self: *FileWatcher) void {
+    self.stopWatcher();
+    var it = self.watch_map.iterator();
+    while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
+    self.watch_map.deinit(self.gpa);
 }
 
 /// Load and start the nightwatch file watcher if not loaded yet.
@@ -133,14 +141,6 @@ fn lazyLoadWatcher(self: *FileWatcher) !*nightwatch.Default {
     );
     self.watcher = watcher;
     return &self.watcher.?;
-}
-
-/// Stop the file watcher and remove all watch entries.
-pub fn deinit(self: *FileWatcher) void {
-    self.stopWatcher();
-    var it = self.watch_map.iterator();
-    while (it.next()) |entry| self.gpa.free(entry.key_ptr.*);
-    self.watch_map.deinit(self.gpa);
 }
 
 fn getWatcher(self: *FileWatcher) !*nightwatch.Default {

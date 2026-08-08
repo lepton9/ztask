@@ -69,11 +69,17 @@ pub const InterruptReason = enum { user_interrupt, retrigger };
 pub const Scheduler = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    status: enum { running, completed, waiting, inactive, interrupted },
-    datastore: *data.DataStore,
+    /// The current status of the scheduler.
+    status: SchedulerTaskStatus,
+    /// The task the scheduler is executing.
     task: *Task,
+    /// Shared runner pool for running task jobs.
     pool: *RunnerPool,
+    /// Referenced datastore to write task metadata.
+    datastore: *data.DataStore,
+    /// Referenced remote manager to dispatch remote jobs.
     remote_manager: *remote.RemoteManager,
+    /// The DAG nodes in order.
     nodes: []JobNode = undefined,
     /// Job to run in attached mode
     attach_job: ?[]const u8 = null,
@@ -86,12 +92,16 @@ pub const Scheduler = struct {
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
     result_queue: std.Io.Queue(Result),
+    /// Buffer for the `result_queue`.
     result_buffer: []Result,
     /// Queue for job logs
     log_queue: LogQueue,
 
+    /// Logger to write metadata files and job logs.
     logger: logger.RunLogger,
+    /// Metadata for the current task run.
     task_meta: data.TaskRunMetadata,
+    /// Metadatas for the jobs of the current task run.
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
     /// Task starting timestamp in milliseconds.
@@ -104,6 +114,14 @@ pub const Scheduler = struct {
     /// Managed and allocated by `TaskManager`.
     /// Used to keep track of paths that are connected to this scheduler.
     watch_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    const SchedulerTaskStatus = enum {
+        running,
+        completed,
+        waiting,
+        inactive,
+        interrupted,
+    };
 
     pub fn init(
         io: std.Io,
@@ -366,7 +384,7 @@ pub const Scheduler = struct {
 
         // Log task metadata
         self.task_meta.status = .interrupted;
-        self.task_meta.jobs_completed = self.completedJobs();
+        self.task_meta.jobs_completed = self.successfulJobs();
 
         self.emitEvent(.{ .task_completed = .{
             .task_id = self.task.id.value,
@@ -544,7 +562,7 @@ pub const Scheduler = struct {
     /// Mark task as completed and log the final metadata
     fn completeTask(self: *Scheduler) void {
         self.task_meta.status = self.taskStatus();
-        self.task_meta.jobs_completed = self.completedJobs();
+        self.task_meta.jobs_completed = self.successfulJobs();
 
         self.emitEvent(.{ .task_completed = .{
             .task_id = self.task.id.value,
@@ -567,8 +585,8 @@ pub const Scheduler = struct {
         self.task_meta.run_id = null;
     }
 
-    /// Get total number of completed jobs
-    fn completedJobs(self: *Scheduler) usize {
+    /// Get total number of successfully completed jobs.
+    fn successfulJobs(self: *Scheduler) usize {
         var completed: usize = 0;
         for (self.nodes) |node| {
             if (node.status == .success) completed += 1;

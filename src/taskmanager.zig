@@ -923,7 +923,9 @@ pub const TaskManager = struct {
                             .interrupted => .interrupted,
                             .completed => switch (s.taskStatus()) {
                                 .success => .success,
-                                else => .failed,
+                                .failed => .failed,
+                                .interrupted => .interrupted,
+                                .running => unreachable,
                             },
                         };
                     },
