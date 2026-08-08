@@ -30,7 +30,7 @@ pub const Watcher = struct {
     file_watcher: FileWatcher,
     time_watcher: *TimeWatcher,
 
-    const file_poll_ns = 25 * std.time.ns_per_ms;
+    const FILE_POLL_NS = 25 * std.time.ns_per_ms;
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator) !*Watcher {
         const watcher = try gpa.create(Watcher);
@@ -76,7 +76,7 @@ pub const Watcher = struct {
     /// Run watcher and poll for events
     fn runWatcher(self: *Watcher) void {
         while (true) {
-            self.mutex.lock(self.io) catch continue;
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             // Wait until there are triggers to watch for
@@ -85,10 +85,13 @@ pub const Watcher = struct {
             }
             if (!self.running.load(.seq_cst)) break;
 
-            const wait_ns = self.nextWaitNsLocked();
+            const wait_ns = self.waitTimeNs();
             if (wait_ns > 0) {
                 // TODO: timedWait was regressed. Fixed in 0.17.0
                 // self.cond.timedWait(&self.mutex, wait_ns) catch {};
+                self.mutex.unlock(self.io);
+                std.Io.sleep(self.io, .fromNanoseconds(wait_ns), .awake) catch {};
+                self.mutex.lockUncancelable(self.io);
             }
 
             if (!self.running.load(.seq_cst)) break;
@@ -105,14 +108,14 @@ pub const Watcher = struct {
         return self.file_watcher.watchCount() > 0 or self.time_watcher.watchCount() > 0;
     }
 
-    /// Sleep for a bit while holding the mutex.
-    fn nextWaitNsLocked(self: *Watcher) u64 {
+    /// Return the time to sleep between loop cycles.
+    fn waitTimeNs(self: *Watcher) u64 {
         var best: ?u64 = null;
-        if (self.file_watcher.watchCount() > 0) best = file_poll_ns;
+        if (self.file_watcher.watchCount() > 0) best = FILE_POLL_NS;
         if (self.time_watcher.nextDueInNs()) |t_ns| {
             best = if (best) |b| @min(b, t_ns) else t_ns;
         }
-        return best orelse file_poll_ns;
+        return best orelse FILE_POLL_NS;
     }
 
     /// Pop an event from the event queue if there is one
@@ -128,15 +131,6 @@ pub const Watcher = struct {
     ) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
-
-        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err|
-            return switch (err) {
-                error.FileNotFound => error.WatchPathNotFound,
-                else => err,
-            };
-        if (stat.kind != .file and stat.kind != .directory)
-            return error.InvalidWatchPath;
-
         try self.file_watcher.addWatch(path, options);
         self.cond.signal(self.io);
     }
@@ -149,7 +143,7 @@ pub const Watcher = struct {
     ) error{Canceled}!void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
-        self.file_watcher.removeWatch(path, options);
+        self.file_watcher.removeWatch(path, options) catch {};
     }
 
     /// Drain all the remaining events.
@@ -317,8 +311,6 @@ test "file_watch_add_duplicate" {
 test "file_events_modify_and_delete" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
 
     // Create test dir and file
     var tmp = std.testing.tmpDir(.{});
@@ -330,13 +322,16 @@ test "file_events_modify_and_delete" {
         try w.interface.writeAll("hello");
         try w.flush();
     }
+
+    const watcher = try Watcher.init(io, gpa);
+    defer watcher.deinit();
+    try watcher.start();
+    defer watcher.stop() catch {};
+
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
     const file_path = try std.fs.path.join(gpa, &.{ dir_path, "watch.txt" });
     defer gpa.free(file_path);
-
-    try watcher.start();
-    defer watcher.stop() catch {};
 
     try watcher.addFileWatch(file_path, .{});
 
@@ -367,11 +362,15 @@ test "file_events_modify_and_delete" {
 test "file_watch_survives_atomic_replacement" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    const watcher = try Watcher.init(io, gpa);
+    defer watcher.deinit();
+    try watcher.start();
+    defer watcher.stop() catch {};
+
     {
         var file = try tmp.dir.createFile(io, "watch.txt", .{});
         file.close(io);
@@ -381,8 +380,6 @@ test "file_watch_survives_atomic_replacement" {
     const file_path = try std.fs.path.join(gpa, &.{ dir_path, "watch.txt" });
     defer gpa.free(file_path);
 
-    try watcher.start();
-    defer watcher.stop() catch {};
     try watcher.addFileWatch(file_path, .{});
 
     {
@@ -417,16 +414,17 @@ test "file_watch_survives_atomic_replacement" {
 test "file_events_create_in_dir" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(dir_path);
 
+    const watcher = try Watcher.init(io, gpa);
+    defer watcher.deinit();
     try watcher.start();
     defer watcher.stop() catch {};
+
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
 
     try watcher.addFileWatch(dir_path, .{});
 
@@ -446,19 +444,21 @@ test "file_events_create_in_dir" {
 test "recursive_directory_events" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+
+    const watcher = try Watcher.init(io, gpa);
+    defer watcher.deinit();
+    try watcher.start();
+    defer watcher.stop() catch {};
+
     try tmp.dir.createDirPath(io, "nested/deep");
     const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(dir_path);
     const changed_path = try std.fs.path.join(gpa, &.{ dir_path, "nested", "deep", "new.txt" });
     defer gpa.free(changed_path);
 
-    try watcher.start();
-    defer watcher.stop() catch {};
     try watcher.addFileWatch(dir_path, .{});
     try watcher.addFileWatch(dir_path, .{ .recursive = true });
 

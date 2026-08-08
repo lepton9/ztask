@@ -292,7 +292,13 @@ pub fn addWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) !vo
         return;
     }
 
-    const stat = try std.Io.Dir.cwd().statFile(self.io, normalized_path, .{});
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(self.io, normalized_path, .{}) catch |err| {
+        return switch (err) {
+            error.FileNotFound => error.WatchPathNotFound,
+            else => err,
+        };
+    };
     const kind: WatchKind = switch (stat.kind) {
         .file => .file,
         .directory => .directory,
@@ -315,8 +321,8 @@ pub fn addWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) !vo
 }
 
 /// Remove a file or directory path from the logical watch list.
-pub fn removeWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) void {
-    const normalized_path = self.normalizePath(path) catch return;
+pub fn removeWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) !void {
+    const normalized_path = try self.normalizePath(path);
     defer self.gpa.free(normalized_path);
 
     const watch = self.watch_map.getPtr(normalized_path) orelse return;
@@ -332,11 +338,13 @@ pub fn removeWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) 
     const removed = self.watch_map.fetchRemove(normalized_path) orelse return;
     defer self.gpa.free(removed.key);
 
-    self.rebuildWatcher() catch |err|
+    self.rebuildWatcher() catch |err| {
         std.log.err(
             "nightwatch: rebuild failed after removing {s}: {s}",
             .{ removed.key, @errorName(err) },
         );
+        return err;
+    };
 }
 
 /// Get the amount of paths currently watched.
