@@ -2,10 +2,10 @@ const std = @import("std");
 const data = @import("../data.zig");
 const task_zig = @import("../types/task.zig");
 const dag = @import("dag.zig");
-const logger = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const remote = @import("../remote/remote_manager.zig");
 const queue_zig = @import("../types/queue.zig");
+const RunLogger = @import("../RunLogger.zig");
 
 const Queue = queue_zig.Queue;
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
@@ -98,7 +98,7 @@ pub const Scheduler = struct {
     log_queue: LogQueue,
 
     /// Logger to write metadata files and job logs.
-    logger: logger.RunLogger,
+    run_logger: RunLogger,
     /// Metadata for the current task run.
     task_meta: data.TaskRunMetadata,
     /// Metadatas for the jobs of the current task run.
@@ -163,7 +163,7 @@ pub const Scheduler = struct {
             .result_buffer = result_buffer,
             .log_queue = .init(io),
             .status = .inactive,
-            .logger = try .init(io, gpa, tasks_path, task_meta.task_id),
+            .run_logger = try .init(io, gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
             .job_metas = .{},
             .event_sink = event_sink,
@@ -196,7 +196,7 @@ pub const Scheduler = struct {
         self.result_queue.close(self.io);
         self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
-        self.logger.deinit(self.gpa);
+        self.run_logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);
         self.job_metas.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -260,7 +260,7 @@ pub const Scheduler = struct {
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
-        try self.logger.startTask(self.gpa, &self.task_meta, run_id);
+        try self.run_logger.startTask(self.gpa, &self.task_meta, run_id);
         self.task_start_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 
         self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
@@ -276,7 +276,7 @@ pub const Scheduler = struct {
         for (self.nodes) |*node| {
             node.reset();
             const job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
-            self.logger.initJobMeta(self.gpa, job_meta) catch {};
+            self.run_logger.initJobMeta(self.gpa, job_meta) catch {};
         }
 
         // Find nodes without dependencies
@@ -309,7 +309,7 @@ pub const Scheduler = struct {
         self.active_runners.putAssumeCapacity(node, runner);
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
         const exec_mode: ExecMode = if (self.attach_job) |attach_name|
             (if (std.mem.eql(u8, attach_name, node.ptr.name)) .attached else .piped)
         else
@@ -331,7 +331,7 @@ pub const Scheduler = struct {
 
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
         self.remote_manager.pushDispatch(.{
             .agent = node.ptr.run_on.remote,
@@ -422,7 +422,7 @@ pub const Scheduler = struct {
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .interrupted;
         job_meta.end_time_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
     /// Update the scheduler and handle pending events
@@ -461,7 +461,7 @@ pub const Scheduler = struct {
                 defer if (e.name) |name| self.gpa.free(name);
                 var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 job_meta.start_time_ms = e.timestamp_ms;
-                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
                 self.emitEvent(.{ .job_started = .{
                     .task_id = self.task.id.value,
@@ -471,7 +471,7 @@ pub const Scheduler = struct {
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 defer self.gpa.free(e.data); // Allocated by runner or remote manager
-                self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
+                self.run_logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
                 defer if (e.name) |name| self.gpa.free(name);
@@ -479,7 +479,7 @@ pub const Scheduler = struct {
                 job_meta.end_time_ms = e.timestamp_ms;
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;
-                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
                 self.emitEvent(.{ .job_finished = .{
                     .task_id = self.task.id.value,
@@ -496,7 +496,7 @@ pub const Scheduler = struct {
         var status: dag.Status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |err| {
             status = .failed;
-            log.debug("{}", .{err});
+            log.info("job '{s}' failed with error {}", .{ node.ptr.name, err });
 
             self.emitEvent(.{ .job_error = .{
                 .task_id = self.task.id.value,
@@ -579,7 +579,7 @@ pub const Scheduler = struct {
 
     /// Log the end of task and add the new task run to datastore
     fn endTask(self: *Scheduler) !void {
-        try self.logger.endTask(self.gpa, &self.task_meta);
+        try self.run_logger.endTask(self.gpa, &self.task_meta);
         try self.datastore.addNewTaskRun(self.gpa, self.task_meta);
         // Reset run id
         self.task_meta.run_id = null;

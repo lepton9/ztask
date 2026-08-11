@@ -91,11 +91,16 @@ pub const TaskManager = struct {
             msg: ?[]const u8 = null,
         },
 
-        const ErrorScope = enum { task_manager, watcher, remote_manager, scheduler };
+        const ErrorScope = enum {
+            task_manager,
+            watcher,
+            remote_manager,
+            scheduler,
+        };
     };
 
     pub const InitOptions = struct {
-        data: data.DataStore.InitOptions = .{},
+        data: data.DataStore.InitOptions,
     };
 
     pub const StartOptions = struct {
@@ -106,24 +111,22 @@ pub const TaskManager = struct {
     pub fn init(
         io: std.Io,
         gpa: std.mem.Allocator,
-        env: *std.process.Environ.Map,
         runners_n: u16,
     ) !*TaskManager {
-        return initWithOptions(io, gpa, env, runners_n, .{});
+        return initWithOptions(io, gpa, runners_n, .{});
     }
 
     /// Initialize `TaskManager` with init options.
     pub fn initWithOptions(
         io: std.Io,
         gpa: std.mem.Allocator,
-        env: *std.process.Environ.Map,
         runners_n: u16,
         options: InitOptions,
     ) !*TaskManager {
         var data_opts = options.data;
         data_opts.load.tasks = true;
 
-        var datastore = try data.DataStore.init(io, gpa, env, data_opts);
+        var datastore = try data.DataStore.init(io, gpa, data_opts);
         errdefer datastore.deinit(gpa);
 
         var events = try MutexQueue(Event).initCapacity(io, gpa, 64);
@@ -205,7 +208,6 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        log.debug("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .msg = custom_msg,
@@ -213,6 +215,7 @@ pub const TaskManager = struct {
         } }) catch {
             self.gpa.free(custom_msg);
         };
+        log.err("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
     }
 
     /// Handle error and push it to the event queue.
@@ -221,11 +224,11 @@ pub const TaskManager = struct {
         scope: Event.ErrorScope,
         err: anyerror,
     ) void {
-        log.debug("{any}: error: {any}", .{ scope, err });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .err = err,
         } }) catch {};
+        log.err("{any}: error: {any}", .{ scope, err });
     }
 
     /// Add an info event to the event queue.
@@ -241,6 +244,7 @@ pub const TaskManager = struct {
         }) catch {
             self.gpa.free(msg);
         };
+        log.info("task={d} {s}", .{ task_id, msg });
     }
 
     /// Callback for the scheduler for adding info events.
@@ -281,19 +285,19 @@ pub const TaskManager = struct {
         }
     }
 
-    /// Amount of tasks currently running
+    /// Amount of tasks currently running.
     pub fn tasksRunning(self: *TaskManager) u32 {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         return self.schedulers.count();
     }
 
-    /// Start task manager thread
+    /// Start task manager thread.
     pub fn start(self: *TaskManager) !void {
         return self.startWithOptions(.{});
     }
 
-    /// Start task manager thread with configured options
+    /// Start task manager thread with configured options.
     pub fn startWithOptions(self: *TaskManager, options: StartOptions) !void {
         self.running.store(true, .seq_cst);
         errdefer self.running.store(false, .seq_cst);
@@ -307,7 +311,26 @@ pub const TaskManager = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Stop the task manager thread
+    /// Main run loop.
+    fn run(self: *TaskManager) void {
+        const loop_time_ms = 100;
+        while (self.running.load(.seq_cst)) {
+            const start_clock = std.Io.Clock.now(.awake, self.io);
+            self.checkWatcher() catch |err| {
+                self.emitError(.watcher, err);
+            };
+            self.updateRemoteManager() catch |err| {
+                self.emitError(.remote_manager, err);
+            };
+            self.updateSchedulers() catch |err| {
+                self.emitError(.scheduler, err);
+            };
+            const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
+            std.Io.sleep(self.io, .fromMilliseconds(loop_time_ms -| took), .awake) catch {};
+        }
+    }
+
+    /// Stop the task manager thread.
     pub fn stop(self: *TaskManager) error{Canceled}!void {
         _ = self.running.swap(false, .seq_cst);
         try self.watcher.stop();
@@ -456,25 +479,6 @@ pub const TaskManager = struct {
         try list.append(self.gpa, s);
         errdefer _ = list.pop();
         try s.watch_paths.append(self.gpa, key);
-    }
-
-    /// Main run loop
-    fn run(self: *TaskManager) void {
-        const loop_time_ms = 100;
-        while (self.running.load(.seq_cst)) {
-            const start_clock = std.Io.Clock.now(.awake, self.io);
-            self.checkWatcher() catch |err| {
-                self.emitError(.watcher, err);
-            };
-            self.updateRemoteManager() catch |err| {
-                self.emitError(.remote_manager, err);
-            };
-            self.updateSchedulers() catch |err| {
-                self.emitError(.scheduler, err);
-            };
-            const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
-            std.Io.sleep(self.io, .fromMilliseconds(loop_time_ms -| took), .awake) catch {};
-        }
     }
 
     /// Handle events in remote manager

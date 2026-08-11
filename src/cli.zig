@@ -5,9 +5,11 @@ const options = @import("build_options");
 const remote_man = @import("remote/remote_manager.zig");
 const builtin = @import("builtin");
 
+const AppLogger = @import("AppLogger.zig");
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 const ParseError = @import("parse.zig").ParseError;
-const DataDirMode = @import("data.zig").DataStore.DataDirMode;
+const data = @import("data.zig");
+const DataDirMode = data.DataDirMode;
 const ListenOptions = run.ListenOptions;
 const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
 const DEFAULT_PORT = remote_man.DEFAULT_PORT;
@@ -741,8 +743,8 @@ inline fn getListenPort(ctx: *Ctx) u16 {
     return @intCast(port_i64);
 }
 
-/// Handle parsed cli and call the command function
-pub fn handleArgs(
+/// Handle parsed cli and call the command function.
+pub fn runCmd(
     io: std.Io,
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
@@ -752,19 +754,38 @@ pub fn handleArgs(
         .run_ctx = .{ .io = io, .gpa = gpa, .env = env },
         .cli = cli,
     };
-    ctx.run_ctx.data_dir = getDataDirMode(&ctx);
+    const root_data_dir = try data.resolveRootDir(io, gpa, env, .{
+        .dir = getDataDirMode(&ctx),
+    });
+    defer gpa.free(root_data_dir);
+    ctx.run_ctx.data_dir = root_data_dir;
+
+    var logger: AppLogger = try .init(io, gpa, root_data_dir);
+    logger.activate();
+    defer {
+        logger.deactivate();
+        logger.deinit();
+    }
+
     ctx.run_ctx.listen = .{
         .addr = getListenAddr(&ctx),
         .port = getListenPort(&ctx),
     };
 
     // TODO: make tui as a command
-    const cmd = cli.cmd orelse return try cmdTuiFn(&ctx);
+    const cmd = cli.cmd orelse {
+        std.log.debug("Run tui", .{});
+        try cmdTuiFn(&ctx);
+        return;
+    };
+    std.log.debug("Run command {s}", .{cmd.name});
+
     const cmdFn = cmd.exec orelse return;
     cmdFn(&ctx) catch |err| {
         if (builtin.mode == .Debug) {
             std.debug.dumpCurrentStackTrace(.{});
         }
+        std.log.err("Unexpected error: {any}", .{err});
         ctx.fatal("Unexpected error: {any}", .{err});
     };
 }

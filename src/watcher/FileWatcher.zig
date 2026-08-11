@@ -1,6 +1,8 @@
 const std = @import("std");
 const nightwatch = @import("nightwatch");
 
+const log = std.log.scoped(.file_watcher);
+
 pub const FileWatcher = @This();
 
 pub const EventType = enum { modified, created, deleted };
@@ -339,8 +341,8 @@ pub fn removeWatch(self: *FileWatcher, path: []const u8, options: WatchOptions) 
     defer self.gpa.free(removed.key);
 
     self.rebuildWatcher() catch |err| {
-        std.log.err(
-            "nightwatch: rebuild failed after removing {s}: {s}",
+        log.err(
+            "rebuild failed after removing {s}: {s}",
             .{ removed.key, @errorName(err) },
         );
         return err;

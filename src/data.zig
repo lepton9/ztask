@@ -116,21 +116,9 @@ pub const DataStore = struct {
         jobs: ?[]JobRunMetadata = null,
     };
 
-    pub const DataDirMode = union(enum) {
-        /// Resolve data dir using project dir -> env var -> global.
-        auto,
-        /// Force using the global app data dir.
-        global,
-        /// Explicit data directory.
-        path: []const u8,
-    };
-
     pub const InitOptions = struct {
-        /// Data directory selection.
-        data_dir: DataDirMode = .auto,
-        /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
-        /// Defaults to current working directory.
-        start_dir: ?[]const u8 = null,
+        /// Root data directory.
+        data_dir: []const u8,
         /// Options to load metadata on init.
         load: LoadOptions = .{},
     };
@@ -143,10 +131,9 @@ pub const DataStore = struct {
     pub fn init(
         io: std.Io,
         gpa: std.mem.Allocator,
-        env: *std.process.Environ.Map,
         options: InitOptions,
     ) !DataStore {
-        const root_dir = try resolveRootDir(io, gpa, env, options);
+        const root_dir = try gpa.dupe(u8, options.data_dir);
         errdefer gpa.free(root_dir);
 
         var datastore: DataStore = .{
@@ -196,30 +183,6 @@ pub const DataStore = struct {
         gpa.free(self.root_dir);
     }
 
-    /// Find a project-local data directory by walking up from `start_dir`.
-    fn findProjectDataDir(io: std.Io, gpa: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
-        const cwd = std.Io.Dir.cwd();
-
-        const abs = try cwd.realPathFileAlloc(io, start_dir, gpa);
-        defer gpa.free(abs);
-        var cur: []const u8 = abs;
-        while (true) {
-            const marker = try std.fs.path.join(gpa, &.{ cur, PROJECT_MARKER_DIR });
-            var dir = cwd.openDir(io, marker, .{}) catch {
-                gpa.free(marker);
-
-                const parent = std.fs.path.dirname(cur) orelse break;
-                if (std.mem.eql(u8, parent, cur)) break;
-                cur = parent;
-                continue;
-            };
-            dir.close(io);
-            return marker;
-        }
-
-        return null;
-    }
-
     pub const DataEnv = struct {
         data_dir: []const u8,
         global_data_dir: []const u8,
@@ -236,98 +199,25 @@ pub const DataStore = struct {
 
     /// Get environment info.
     pub fn getEnv(
-        io: std.Io,
         gpa: std.mem.Allocator,
         env: *std.process.Environ.Map,
-        options: InitOptions,
+        data_dir: []const u8,
     ) !DataEnv {
-        const path = try DataStore.resolveRootDir(io, gpa, env, .{
-            .data_dir = options.data_dir,
-        });
         const env_data_dir = env.get(DATA_DIR_ENV_VAR);
 
         return .{
-            .data_dir = path,
-            .global_data_dir = try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR),
+            .data_dir = data_dir,
+            .global_data_dir = try getAppDataDir(gpa, env, APP_DATA_SUBDIR),
             .env = .{
                 .ZTASK_DATA_DIR = env_data_dir,
             },
         };
     }
 
-    /// Get the root directory to use for saving and fetching data.
-    fn resolveRootDir(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        env: *std.process.Environ.Map,
-        options: InitOptions,
-    ) ![]u8 {
-        // Check the data dir mode
-        switch (options.data_dir) {
-            .path => |explicit| {
-                if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
-                const cwd = try std.process.currentPathAlloc(io, gpa);
-                defer gpa.free(cwd);
-                return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
-            },
-            .global => return try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR),
-            .auto => {},
-        }
-
-        // Try to find project-local data directory
-        const start_dir_alloc = blk: {
-            if (options.start_dir) |s| break :blk s;
-            break :blk ".";
-        };
-        if (try findProjectDataDir(io, gpa, start_dir_alloc)) |proj| return proj;
-
-        // Override global path with env variable
-        const env_data_dir = env.get(DATA_DIR_ENV_VAR);
-        if (env_data_dir) |p| if (p.len != 0) return try gpa.dupe(u8, p);
-
-        return try DataStore.getAppDataDir(gpa, env, APP_DATA_SUBDIR);
-    }
-
     /// Deinitialize a slice of `JobRunMetadata`
     fn deinitJobMetaSlice(gpa: std.mem.Allocator, metas: []JobRunMetadata) void {
         for (metas) |*m| m.deinit(gpa);
         gpa.free(metas);
-    }
-
-    /// Get the app data directory for the current OS.
-    fn getAppDataDir(
-        gpa: std.mem.Allocator,
-        env: *std.process.Environ.Map,
-        appname: []const u8,
-    ) error{ OutOfMemory, AppDataDirUnavailable }![]u8 {
-        switch (@import("builtin").os.tag) {
-            .windows => {
-                const local_app_data_dir = env.get("LOCALAPPDATA") orelse
-                    return error.AppDataDirUnavailable;
-                return std.fs.path.join(gpa, &.{ local_app_data_dir, appname });
-            },
-            .macos => {
-                const home_dir = env.get("HOME") orelse
-                    return error.AppDataDirUnavailable;
-                return std.fs.path.join(
-                    gpa,
-                    &.{ home_dir, "Library", "Application Support", appname },
-                );
-            },
-            .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .illumos, .serenity => {
-                if (env.get("XDG_DATA_HOME")) |xdg| if (xdg.len > 0) {
-                    return std.fs.path.join(gpa, &.{ xdg, appname });
-                };
-
-                const home_dir = env.get("HOME") orelse
-                    return error.AppDataDirUnavailable;
-                return std.fs.path.join(
-                    gpa,
-                    &.{ home_dir, ".local", "share", appname },
-                );
-            },
-            else => @compileError("Unsupported OS"),
-        }
     }
 
     /// Get and allocate the tasks data directory path
@@ -1728,6 +1618,120 @@ pub fn fileExists(io: std.Io, path: []const u8) bool {
     return stat.kind == .file;
 }
 
+pub const DataDirMode = union(enum) {
+    /// Resolve data dir using project dir -> env var -> global.
+    auto,
+    /// Force using the global app data dir.
+    global,
+    /// Explicit data directory.
+    path: []const u8,
+};
+
+pub const RootDirOptions = struct {
+    /// Data directory selection.
+    dir: DataDirMode = .auto,
+    /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
+    /// Defaults to current working directory.
+    start_dir: ?[]const u8 = null,
+};
+
+/// Get and allocate the root directory to use for saving and fetching data.
+pub fn resolveRootDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    options: RootDirOptions,
+) ![]u8 {
+    // Check the data dir mode
+    switch (options.dir) {
+        .path => |explicit| {
+            if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
+            const cwd = try std.process.currentPathAlloc(io, gpa);
+            defer gpa.free(cwd);
+            return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
+        },
+        .global => return try getAppDataDir(gpa, env, APP_DATA_SUBDIR),
+        .auto => {},
+    }
+
+    // Try to find project-local data directory
+    const start_dir_alloc = blk: {
+        if (options.start_dir) |s| break :blk s;
+        break :blk ".";
+    };
+    if (try findProjectDataDir(io, gpa, start_dir_alloc)) |proj| return proj;
+
+    // Override global path with env variable
+    const env_data_dir = env.get(DATA_DIR_ENV_VAR);
+    if (env_data_dir) |p| if (p.len != 0) return try gpa.dupe(u8, p);
+
+    return try getAppDataDir(gpa, env, APP_DATA_SUBDIR);
+}
+
+/// Find a project-local data directory by walking up from `start_dir`.
+fn findProjectDataDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    start_dir: []const u8,
+) !?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+
+    const abs = try cwd.realPathFileAlloc(io, start_dir, gpa);
+    defer gpa.free(abs);
+    var cur: []const u8 = abs;
+    while (true) {
+        const marker = try std.fs.path.join(gpa, &.{ cur, PROJECT_MARKER_DIR });
+        var dir = cwd.openDir(io, marker, .{}) catch {
+            gpa.free(marker);
+
+            const parent = std.fs.path.dirname(cur) orelse break;
+            if (std.mem.eql(u8, parent, cur)) break;
+            cur = parent;
+            continue;
+        };
+        dir.close(io);
+        return marker;
+    }
+
+    return null;
+}
+
+/// Get the app data directory for the current OS.
+fn getAppDataDir(
+    gpa: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    appname: []const u8,
+) error{ OutOfMemory, AppDataDirUnavailable }![]u8 {
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            const local_app_data_dir = env.get("LOCALAPPDATA") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(gpa, &.{ local_app_data_dir, appname });
+        },
+        .macos => {
+            const home_dir = env.get("HOME") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(
+                gpa,
+                &.{ home_dir, "Library", "Application Support", appname },
+            );
+        },
+        .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .illumos, .serenity => {
+            if (env.get("XDG_DATA_HOME")) |xdg| if (xdg.len > 0) {
+                return std.fs.path.join(gpa, &.{ xdg, appname });
+            };
+
+            const home_dir = env.get("HOME") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(
+                gpa,
+                &.{ home_dir, ".local", "share", appname },
+            );
+        },
+        else => @compileError("Unsupported OS"),
+    }
+}
+
 test "move_task" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1743,8 +1747,8 @@ test "move_task" {
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(io, gpa, &env, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -1797,8 +1801,8 @@ test "move_task_repair" {
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(io, gpa, &env, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -1865,8 +1869,8 @@ test "edit_task_updates_id" {
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(io, gpa, &env, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);

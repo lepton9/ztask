@@ -25,7 +25,7 @@ pub const RunCtx = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
-    data_dir: data.DataStore.DataDirMode = .auto,
+    data_dir: []const u8 = "",
     listen: ListenOptions = .{},
 };
 
@@ -68,7 +68,6 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
     const task_manager: *TaskManager = try .initWithOptions(
         io,
         gpa,
-        ctx.env,
         options.runners_n,
         .{ .data = .{ .data_dir = ctx.data_dir } },
     );
@@ -159,7 +158,6 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     const task_manager: *TaskManager = try .initWithOptions(
         io,
         gpa,
-        ctx.env,
         options.runners_n,
         .{ .data = .{ .data_dir = ctx.data_dir } },
     );
@@ -288,7 +286,7 @@ pub const ListOptions = struct {
 pub fn listTasks(ctx: RunCtx, options: ListOptions) !void {
     const gpa = ctx.gpa;
     const pre_load_runs = options.sort.len > 0;
-    var datastore = try data.DataStore.init(ctx.io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true, .runs = pre_load_runs },
     });
@@ -411,7 +409,7 @@ pub const AddOptions = struct {
 /// Add one task or a directory
 pub fn addTasks(ctx: RunCtx, options: AddOptions) !void {
     const gpa = ctx.gpa;
-    var datastore = try data.DataStore.init(ctx.io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });
@@ -451,7 +449,7 @@ pub const DeleteOptions = TaskOptions;
 /// Delete a task with the given path or ID
 pub fn deleteTask(ctx: RunCtx, options: DeleteOptions) !void {
     const gpa = ctx.gpa;
-    var datastore = try data.DataStore.init(ctx.io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });
@@ -512,7 +510,7 @@ pub fn createNewTask(ctx: RunCtx, options: CreateOptions) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const env = ctx.env;
-    var datastore = try data.DataStore.init(io, gpa, env, .{
+    var datastore = try data.DataStore.init(io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });
@@ -537,9 +535,7 @@ pub fn createNewTask(ctx: RunCtx, options: CreateOptions) !void {
 /// Show the currently used data directory path and other environment info.
 pub fn showEnv(ctx: RunCtx) !void {
     const gpa = ctx.gpa;
-    var env = try data.DataStore.getEnv(ctx.io, gpa, ctx.env, .{
-        .data_dir = ctx.data_dir,
-    });
+    var env = try data.DataStore.getEnv(gpa, ctx.env, ctx.data_dir);
     defer env.deinit(gpa);
 
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -558,7 +554,7 @@ pub fn moveTask(
     options: data.DataStore.MoveTaskOptions,
 ) !void {
     const gpa = ctx.gpa;
-    var datastore = try data.DataStore.init(ctx.io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });
@@ -712,7 +708,7 @@ const SyncAction = struct {
 pub fn syncTasks(ctx: RunCtx, dry_run: bool) !void {
     const io = ctx.io;
     const gpa = ctx.gpa;
-    var datastore = try data.DataStore.init(io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });
@@ -846,7 +842,7 @@ pub const EditOptions = struct {
 /// Edit the YAML file of the task
 pub fn editTask(ctx: RunCtx, options: EditOptions) !void {
     const gpa = ctx.gpa;
-    var datastore = try data.DataStore.init(ctx.io, gpa, ctx.env, .{
+    var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
         .load = .{ .tasks = true },
     });

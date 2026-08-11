@@ -56,8 +56,8 @@ test "manager_simple" {
         \\ name: task2
         \\ id: 2
     ;
-    const task_manager = try TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
@@ -97,8 +97,8 @@ test "begin_task_while_running" {
         \\       - command: "sleep 1"
     ;
 
-    const task_manager = try manager.TaskManager.initWithOptions(io, gpa, &env.env, 2, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 2, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
 
@@ -135,8 +135,8 @@ test "force_interrupt" {
         \\     steps:
         \\       - command: "cat README.md"
     ;
-    const task_manager = try TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -183,8 +183,8 @@ test "complete_tasks" {
         \\     steps:
         \\       - command: "zig help"
     ;
-    const task_manager = try TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
@@ -241,8 +241,8 @@ test "remote_job" {
         \\       - command: "zig version"
         \\     run_on: remote:runner1
     ;
-    const task_manager = try manager.TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -281,8 +281,8 @@ test "remote_job_addr" {
         \\       name: agent
         \\       addr: 127.0.0.1
     ;
-    const task_manager = try manager.TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -324,9 +324,7 @@ test "sync_tasks_id_change" {
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
 
-    var store = try data.DataStore.init(io, gpa, &env.env, .{
-        .data_dir = .{ .path = env.data_dir },
-    });
+    var store = try data.DataStore.init(io, gpa, .{ .data_dir = env.data_dir });
     defer store.deinit(gpa);
 
     const a_meta = try store.newTask(gpa, .{ .name = "task-a", .id = "a" });
@@ -336,12 +334,12 @@ test "sync_tasks_id_change" {
     try overwriteTaskFile(io, b_meta.file_path, "task-b-new", null);
 
     try run.syncTasks(
-        .{ .io = io, .gpa = gpa, .env = &env.env, .data_dir = .{ .path = env.data_dir } },
+        .{ .io = io, .gpa = gpa, .env = &env.env, .data_dir = env.data_dir },
         false,
     );
 
-    var repaired = try data.DataStore.init(io, gpa, &env.env, .{
-        .data_dir = .{ .path = env.data_dir },
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true },
     });
     defer repaired.deinit(gpa);
@@ -384,8 +382,8 @@ test "sync_dedup_same_task_file_path" {
     defer env.deinit(gpa);
     const cwd = env.cwd;
 
-    var store = try data.DataStore.init(io, gpa, &env.env, .{
-        .data_dir = .{ .path = env.data_dir },
+    var store = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -495,10 +493,10 @@ test "sync_dedup_same_task_file_path" {
         .io = io,
         .gpa = gpa,
         .env = &env.env,
-        .data_dir = .{ .path = env.data_dir },
+        .data_dir = env.data_dir,
     }, false);
-    var repaired = try data.DataStore.init(io, gpa, &env.env, .{
-        .data_dir = .{ .path = env.data_dir },
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true, .runs = true },
     });
     defer repaired.deinit(gpa);
@@ -523,8 +521,8 @@ test "examples" {
     defer env.deinit(gpa);
     const cwd = std.Io.Dir.cwd();
 
-    const task_manager = try TaskManager.initWithOptions(io, gpa, &env.env, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data = .{ .data_dir = env.data_dir },
     });
     defer task_manager.deinit();
 
