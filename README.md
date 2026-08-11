@@ -170,7 +170,7 @@ directly using the `--editor` option.
 
 ### Requirements
 
-- Zig 0.15.2 (see `build.zig.zon`)
+- Zig 0.16.0 (see `build.zig.zon`)
 
 ### Build
 

@@ -304,24 +304,6 @@ const runner_n_option: zcli.Opt = .{
     .arg = .{ .name = "INT", .type = .Int },
 };
 
-/// Generate shell completions
-fn generate_completion(
-    io: std.Io,
-    cli: *zcli.Cli,
-    comptime spec: *const zcli.CliApp,
-) !noreturn {
-    var buf: [8096]u8 = undefined;
-    const shell = cli.findPositional("shell") orelse unreachable;
-    const script = try zcli.complete.getCompletion(
-        &buf,
-        spec,
-        spec.config.name.?,
-        shell.value,
-    );
-    try run.write(io, script);
-    std.process.exit(0);
-}
-
 /// Context given to command functions
 const Ctx = struct {
     run_ctx: run.RunCtx,
@@ -618,7 +600,17 @@ fn cmdSyncFn(ptr: *anyopaque) !void {
 /// Handle completion command
 fn cmdCompletionFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    return try generate_completion(ctx.run_ctx.io, ctx.cli, &cli_spec);
+    const cli = ctx.cli;
+    const shell_pos = cli.findPositional("shell") orelse unreachable;
+    const shell = std.meta.stringToEnum(zcli.complete.Shell, shell_pos.value) orelse
+        ctx.fatal("Invalid shell argument '{s}'", .{shell_pos.value});
+    const script = try zcli.complete.getCompletionOwned(
+        ctx.run_ctx.gpa,
+        &cli_spec,
+        shell,
+    );
+    try run.write(ctx.run_ctx.io, script);
+    std.process.exit(0);
 }
 
 /// Handle add command
