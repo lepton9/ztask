@@ -57,7 +57,7 @@ test "manager_simple" {
         \\ id: 2
     ;
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
@@ -98,7 +98,7 @@ test "begin_task_while_running" {
     ;
 
     const task_manager = try TaskManager.initWithOptions(io, gpa, 2, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
 
@@ -136,7 +136,7 @@ test "force_interrupt" {
         \\       - command: "cat README.md"
     ;
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -184,7 +184,7 @@ test "complete_tasks" {
         \\       - command: "zig help"
     ;
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
     const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
@@ -242,7 +242,7 @@ test "remote_job" {
         \\     run_on: remote:runner1
     ;
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -282,7 +282,7 @@ test "remote_job_addr" {
         \\       addr: 127.0.0.1
     ;
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
@@ -522,7 +522,7 @@ test "examples" {
     const cwd = std.Io.Dir.cwd();
 
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
-        .data = .{ .data_dir = env.data_dir },
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
 

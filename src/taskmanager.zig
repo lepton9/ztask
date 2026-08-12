@@ -50,8 +50,10 @@ pub const TaskManager = struct {
 
     /// Queue of task events (single-consumer)
     events: MutexQueue(Event),
+    /// Emit additional events into the event queue.
+    verbose_events: bool = false,
     datastore: data.DataStore,
-    pool: *RunnerPool,
+    pool: RunnerPool,
 
     /// Active schedulers
     schedulers: std.AutoHashMapUnmanaged(*Task, *Scheduler),
@@ -71,6 +73,9 @@ pub const TaskManager = struct {
 
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
+
+    /// Total minimum loop frequency of the main run loop.
+    const LOOP_TIME_MS = 50;
 
     pub const Event = union(enum) {
         /// Event for informing that the run finished.
@@ -99,20 +104,13 @@ pub const TaskManager = struct {
         };
     };
 
-    pub const InitOptions = struct {
-        data: data.DataStore.InitOptions,
-    };
-
     pub const StartOptions = struct {
         listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
         listen_port: u16 = remotemanager.DEFAULT_PORT,
+        verbose_events: bool = false,
     };
 
-    pub fn init(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        runners_n: u16,
-    ) !*TaskManager {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
         return initWithOptions(io, gpa, runners_n, .{});
     }
 
@@ -121,18 +119,18 @@ pub const TaskManager = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         runners_n: u16,
-        options: InitOptions,
+        options: data.DataStore.InitOptions,
     ) !*TaskManager {
-        var data_opts = options.data;
+        // Always load tasks
+        var data_opts = options;
         data_opts.load.tasks = true;
-
         var datastore = try data.DataStore.init(io, gpa, data_opts);
         errdefer datastore.deinit(gpa);
 
         var events = try MutexQueue(Event).initCapacity(io, gpa, 64);
         errdefer events.deinit(gpa);
 
-        const pool = try RunnerPool.init(io, gpa, runners_n);
+        var pool = try RunnerPool.init(io, gpa, runners_n);
         errdefer pool.deinit();
 
         var to_unload = try std.ArrayList(*Task).initCapacity(gpa, 1);
@@ -164,6 +162,7 @@ pub const TaskManager = struct {
 
     pub fn deinit(self: *TaskManager) void {
         self.stop() catch {};
+        self.drainEvents();
         self.events.deinit(self.gpa);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
@@ -196,6 +195,17 @@ pub const TaskManager = struct {
     /// Pop the next task event (blocking)
     pub fn nextEvent(self: *TaskManager) ?Event {
         return self.events.popBlocking();
+    }
+
+    /// Drain all the remaining events.
+    fn drainEvents(self: *TaskManager) void {
+        while (self.tryPopEvent()) |event| {
+            switch (event) {
+                .run_finished => {},
+                .info => |e| self.gpa.free(e.msg),
+                .err => |e| if (e.msg) |m| self.gpa.free(m),
+            }
+        }
     }
 
     /// Handle error and push it to the event queue.
@@ -302,6 +312,8 @@ pub const TaskManager = struct {
         self.running.store(true, .seq_cst);
         errdefer self.running.store(false, .seq_cst);
 
+        self.verbose_events = options.verbose_events;
+
         try self.watcher.start();
         const addr: std.Io.net.IpAddress = try .parseIp4(
             options.listen_addr,
@@ -313,7 +325,6 @@ pub const TaskManager = struct {
 
     /// Main run loop.
     fn run(self: *TaskManager) void {
-        const loop_time_ms = 100;
         while (self.running.load(.seq_cst)) {
             const start_clock = std.Io.Clock.now(.awake, self.io);
             self.checkWatcher() catch |err| {
@@ -326,7 +337,7 @@ pub const TaskManager = struct {
                 self.emitError(.scheduler, err);
             };
             const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
-            std.Io.sleep(self.io, .fromMilliseconds(loop_time_ms -| took), .awake) catch {};
+            std.Io.sleep(self.io, .fromMilliseconds(LOOP_TIME_MS -| took), .awake) catch {};
         }
     }
 
@@ -642,10 +653,10 @@ pub const TaskManager = struct {
                 self.io,
                 self.gpa,
                 task,
-                self.pool,
+                &self.pool,
                 self.remote_manager,
                 &self.datastore,
-                if (options.verbose_events)
+                if (options.verbose_events or self.verbose_events)
                     .{ .ptr = self, .emit = TaskManager.onSchedulerEvent }
                 else
                     null,

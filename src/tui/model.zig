@@ -11,6 +11,8 @@ const AllocError = std.mem.Allocator.Error;
 const UiSnapshot = snap.UiSnapshot;
 const GenericDiagnostics = @import("../diagnostics.zig").GenericDiagnostics;
 
+const log = std.log.scoped(.tui);
+
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
 
@@ -184,7 +186,9 @@ pub const Model = struct {
             },
             .tick => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
-                try self.onTick(ctx);
+                self.onTick(ctx) catch |err| {
+                    log.err("Error on update tick {}", .{err});
+                };
             },
             .mouse => {
                 if (self.confirm != null) {
@@ -287,7 +291,10 @@ pub const Model = struct {
                 "Finished task {x} ({s})",
                 .{ r.task_id, @tagName(r.status) },
             ),
-            .info => |e| self.gpa.free(e.msg),
+            .info => |e| {
+                defer self.gpa.free(e.msg);
+                try self.setInfo("Info: task {x} {s}", .{ e.task_id, e.msg });
+            },
             .err => |e| {
                 defer if (e.msg) |m| self.gpa.free(m);
                 try self.setInfo("Error {s}: '{s}'", .{

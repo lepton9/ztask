@@ -26,7 +26,6 @@ pub const RunCtx = struct {
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
     data_dir: []const u8 = "",
-    listen: ListenOptions = .{},
 };
 
 // Signal handler
@@ -48,13 +47,15 @@ const Sig = struct {
     }
 };
 
-pub const ListenOptions = struct {
+pub const ConnectOptions = struct {
     addr: []const u8 = DEFAULT_ADDR,
     port: u16 = DEFAULT_PORT,
 };
 
 pub const TuiOptions = struct {
+    listen: ConnectOptions = .{},
     runners_n: u8 = BASE_RUNNERS_N,
+    verbose: bool = false,
 };
 
 pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
@@ -65,16 +66,15 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
     var app = try vxfw.App.init(io, gpa, ctx.env, &buffer);
     defer app.deinit();
 
-    const task_manager: *TaskManager = try .initWithOptions(
-        io,
-        gpa,
-        options.runners_n,
-        .{ .data = .{ .data_dir = ctx.data_dir } },
-    );
+    const task_manager: *TaskManager =
+        try .initWithOptions(io, gpa, options.runners_n, .{
+            .data_dir = ctx.data_dir,
+        });
     defer task_manager.deinit();
     try task_manager.startWithOptions(.{
-        .listen_addr = ctx.listen.addr,
-        .listen_port = ctx.listen.port,
+        .listen_addr = options.listen.addr,
+        .listen_port = options.listen.port,
+        .verbose_events = options.verbose,
     });
 
     const model = try Model.init(gpa, task_manager);
@@ -86,8 +86,7 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
 
 pub const AgentOptions = struct {
     name: []const u8,
-    addr: []const u8 = DEFAULT_ADDR,
-    port: u16 = DEFAULT_PORT,
+    connect: ConnectOptions = .{},
     runners_n: u8 = BASE_RUNNERS_N,
 };
 
@@ -97,7 +96,10 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
     const gpa = ctx.gpa;
     var agent: *RemoteAgent = try .init(ctx.io, gpa, options.name, options.runners_n);
     defer agent.deinit();
-    const address: std.Io.net.IpAddress = try .parseIp4(options.addr, options.port);
+    const address: std.Io.net.IpAddress = try .parseIp4(
+        options.connect.addr,
+        options.connect.port,
+    );
 
     const Event = union(enum) {
         key_press: vaxis.Key,
@@ -140,6 +142,7 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
 }
 
 pub const RunOptions = struct {
+    listen: ConnectOptions = .{},
     path: ?[]const u8 = null,
     id: ?[]const u8 = null,
     attach_job: ?manager.AttachJob = null,
@@ -155,12 +158,10 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
 
-    const task_manager: *TaskManager = try .initWithOptions(
-        io,
-        gpa,
-        options.runners_n,
-        .{ .data = .{ .data_dir = ctx.data_dir } },
-    );
+    const task_manager: *TaskManager =
+        try .initWithOptions(io, gpa, options.runners_n, .{
+            .data_dir = ctx.data_dir,
+        });
     defer task_manager.deinit();
 
     const task = blk: {
@@ -200,8 +201,8 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
 
     // Start task run
     try task_manager.startWithOptions(.{
-        .listen_addr = ctx.listen.addr,
-        .listen_port = ctx.listen.port,
+        .listen_addr = options.listen.addr,
+        .listen_port = options.listen.port,
     });
     try task_manager.beginTask(task_id, .{
         .attach_job = options.attach_job,

@@ -90,7 +90,8 @@ pub const Watcher = struct {
                 // TODO: timedWait was regressed. Fixed in 0.17.0
                 // self.cond.timedWait(&self.mutex, wait_ns) catch {};
                 self.mutex.unlock(self.io);
-                std.Io.sleep(self.io, .fromNanoseconds(wait_ns), .awake) catch {};
+                // FIX: temporary sleep
+                std.Io.sleep(self.io, .fromNanoseconds(FILE_POLL_NS), .awake) catch {};
                 self.mutex.lockUncancelable(self.io);
             }
 

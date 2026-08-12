@@ -1,18 +1,17 @@
 const std = @import("std");
 const zcli = @import("zcli");
 const run = @import("run.zig");
+const data = @import("data.zig");
 const options = @import("build_options");
-const remote_man = @import("remote/remote_manager.zig");
 const builtin = @import("builtin");
 
 const AppLogger = @import("AppLogger.zig");
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 const ParseError = @import("parse.zig").ParseError;
-const data = @import("data.zig");
-const DataDirMode = data.DataDirMode;
-const ListenOptions = run.ListenOptions;
-const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
-const DEFAULT_PORT = remote_man.DEFAULT_PORT;
+
+const rm = @import("remote/remote_manager.zig");
+const DEFAULT_ADDR = rm.DEFAULT_ADDR;
+const DEFAULT_PORT = rm.DEFAULT_PORT;
 
 const inErrorSet = run.inErrorSet;
 
@@ -38,22 +37,7 @@ pub const cli_spec: zcli.CliApp = .{
             .short_name = "g",
             .desc = "Force global data dir (ignore project + env)",
         },
-        runner_n_option,
-        .{
-            .long_name = "listen-addr",
-            .desc = "Address the remote manager binds to",
-            .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
-        },
-        .{
-            .long_name = "listen-port",
-            .desc = "Port the remote manager binds to",
-            .arg = .{
-                .name = "PORT",
-                .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
-                .type = .Int,
-            },
-        },
-        .{ .long_name = "version", .short_name = "v", .desc = "Print version" },
+        .{ .long_name = "version", .short_name = "V", .desc = "Print version" },
         .{ .long_name = "help", .short_name = "h", .desc = "Print help" },
     },
     .positionals = &[_]zcli.PosArg{},
@@ -67,9 +51,18 @@ const commands = &[_]zcli.Cmd{
         .action = cmdInitFn,
     },
     .{
+        .name = "tui",
+        .desc = "Run the text user interface (TUI)",
+        .action = cmdTuiFn,
+        .options = task_options ++ listen_options ++ &[_]zcli.Opt{
+            runner_n_option,
+            verbose_option,
+        },
+    },
+    .{
         .name = "run",
         .desc = "Run a single task",
-        .options = task_options ++ &[_]zcli.Opt{
+        .options = task_options ++ listen_options ++ &[_]zcli.Opt{
             .{
                 .long_name = "attach",
                 .short_name = "a",
@@ -81,7 +74,8 @@ const commands = &[_]zcli.Cmd{
                 .short_name = "t",
                 .desc = "Restart task if a trigger occurs while running",
             },
-            .{ .long_name = "verbose", .desc = "Print extra status messages" },
+            runner_n_option,
+            verbose_option,
         },
         .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdRunFn,
@@ -113,6 +107,7 @@ const commands = &[_]zcli.Cmd{
                     .type = .Int,
                 },
             },
+            runner_n_option,
         },
         .action = cmdRunnerFn,
     },
@@ -256,9 +251,9 @@ const commands = &[_]zcli.Cmd{
     },
     .{
         .name = "sync",
-        .desc = "Handle modified tasks and sync ID and name changes",
+        .desc = "Handle modified tasks, sync ID and name changes",
         .options = &[_]zcli.Opt{
-            .{ .long_name = "dry", .desc = "Enable dry run" },
+            .{ .long_name = "dry", .short_name = "D", .desc = "Enable dry run" },
         },
         .action = cmdSyncFn,
     },
@@ -290,6 +285,25 @@ const task_options = &[_]zcli.Opt{
     },
 };
 
+const listen_options = &[_]zcli.Opt{
+    .{
+        .long_name = "listen-addr",
+        .short_name = "A",
+        .desc = "Address to listen to for remote runners",
+        .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
+    },
+    .{
+        .long_name = "listen-port",
+        .short_name = "P",
+        .desc = "Port to listen to for remote runners",
+        .arg = .{
+            .name = "PORT",
+            .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
+            .type = .Int,
+        },
+    },
+};
+
 const path_positional: zcli.PosArg = .{
     .name = "path",
     .desc = "Path of the task file",
@@ -302,6 +316,12 @@ const runner_n_option: zcli.Opt = .{
     .short_name = "r",
     .desc = "Maximum amount of runners active",
     .arg = .{ .name = "INT", .type = .Int },
+};
+
+const verbose_option: zcli.Opt = .{
+    .long_name = "verbose",
+    .short_name = "v",
+    .desc = "Emit extra status messages",
 };
 
 /// Context given to command functions
@@ -320,18 +340,24 @@ const Ctx = struct {
     }
 };
 
-/// Handle tui command
-fn cmdTuiFn(ptr: *anyopaque) !void {
-    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    return try run.runTui(ctx.run_ctx, .{
-        .runners_n = if (getRunnerAmount(ctx)) |n| n else run.BASE_RUNNERS_N,
-    });
-}
-
 /// Handle init command
 fn cmdInitFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     try run.initProjectDataDir(ctx.run_ctx);
+}
+
+/// Handle tui command
+fn cmdTuiFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    const cli = ctx.cli;
+
+    var opts: run.TuiOptions = .{
+        .listen = getListenOptions(ctx),
+        .verbose = cli.findOption("verbose") != null,
+    };
+    if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
+
+    return try run.runTui(ctx.run_ctx, opts);
 }
 
 /// Handle new command
@@ -455,6 +481,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     defer diagnostics.deinit(ctx.run_ctx.gpa);
 
     var opts: run.RunOptions = .{
+        .listen = getListenOptions(ctx),
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
             const value = o.value orelse break :blk .first;
@@ -529,8 +556,8 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
     };
     var opts: run.AgentOptions = .{ .name = name };
 
-    if (addr) |a| opts.addr = a.value.?.string;
-    if (port) |p| opts.port = p;
+    if (addr) |a| opts.connect.addr = a.value.?.string;
+    if (port) |p| opts.connect.port = p;
 
     if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
@@ -538,7 +565,7 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
         error.NameTaken => ctx.fatal(
             "Another remote runner with name '{s}' already connected to {s}:{d}",
             .{
-                opts.name, opts.addr, opts.port,
+                opts.name, opts.connect.addr, opts.connect.port,
             },
         ),
         else => {},
@@ -697,7 +724,7 @@ inline fn getRunnerAmount(ctx: *const Ctx) ?u8 {
 }
 
 /// Get the used data directory selection.
-inline fn getDataDirMode(ctx: *const Ctx) DataDirMode {
+inline fn getDataDirMode(ctx: *const Ctx) data.DataDirMode {
     const cli = ctx.cli;
     const use_global = cli.findOption("global") != null;
     const data_dir_opt = cli.findOption("data-dir");
@@ -724,7 +751,7 @@ inline fn getListenAddr(ctx: *const Ctx) []const u8 {
 }
 
 /// Get the remote manager port
-inline fn getListenPort(ctx: *Ctx) u16 {
+inline fn getListenPort(ctx: *const Ctx) u16 {
     const cli = ctx.cli;
     const opt = cli.findOption("listen-port") orelse return DEFAULT_PORT;
     const port_i64 = opt.value.?.int;
@@ -733,6 +760,22 @@ inline fn getListenPort(ctx: *Ctx) u16 {
         .{port_i64},
     );
     return @intCast(port_i64);
+}
+
+fn getListenOptions(ctx: *const Ctx) run.ConnectOptions {
+    return .{ .addr = getListenAddr(ctx), .port = getListenPort(ctx) };
+}
+
+/// Print the help text to stdout.
+inline fn printHelp(ctx: *Ctx) !void {
+    const io = ctx.run_ctx.io;
+    const gpa = ctx.run_ctx.gpa;
+    const stdout = std.Io.File.stdout();
+    var w = stdout.writer(io, &.{});
+    const help = try zcli.generateHelp(gpa, ctx.cli, &cli_spec);
+    defer gpa.free(help);
+    try w.interface.writeAll(help);
+    try w.interface.flush();
 }
 
 /// Handle parsed cli and call the command function.
@@ -759,17 +802,7 @@ pub fn runCmd(
         logger.deinit();
     }
 
-    ctx.run_ctx.listen = .{
-        .addr = getListenAddr(&ctx),
-        .port = getListenPort(&ctx),
-    };
-
-    // TODO: make tui as a command
-    const cmd = cli.cmd orelse {
-        std.log.debug("Run tui", .{});
-        try cmdTuiFn(&ctx);
-        return;
-    };
+    const cmd = cli.cmd orelse return try printHelp(&ctx);
     std.log.debug("Run command {s}", .{cmd.name});
 
     const cmdFn = cmd.exec orelse return;

@@ -15,9 +15,8 @@ pub const RunnerPool = struct {
     free_idx: std.ArrayList(usize),
     waiters: std.ArrayList(Waiter(anyopaque)),
 
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, n: usize) !*RunnerPool {
-        const pool = try gpa.create(RunnerPool);
-        pool.* = .{
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, n: usize) !RunnerPool {
+        var pool: RunnerPool = .{
             .gpa = gpa,
             .runners = try gpa.alloc(LocalRunner, n),
             .free_idx = try .initCapacity(gpa, n),
@@ -34,7 +33,6 @@ pub const RunnerPool = struct {
         self.gpa.free(self.runners);
         self.free_idx.deinit(self.gpa);
         self.waiters.deinit(self.gpa);
-        self.gpa.destroy(self);
     }
 
     /// Get a runner if one is available

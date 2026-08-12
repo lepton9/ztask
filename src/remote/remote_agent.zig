@@ -23,7 +23,7 @@ pub const RemoteAgent = struct {
     hostname: []const u8,
     buffer: [256]u8 = undefined,
 
-    pool: *runnerpool.RunnerPool,
+    pool: runnerpool.RunnerPool,
     result_queue: std.Io.Queue(Result),
     result_buffer: []Result,
     log_queue: LogQueue,
@@ -59,7 +59,7 @@ pub const RemoteAgent = struct {
             .io = io,
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
-            .pool = try runnerpool.RunnerPool.init(io, gpa, runners_n),
+            .pool = try .init(io, gpa, runners_n),
             .result_queue = .init(result_buffer),
             .result_buffer = result_buffer,
             .log_queue = .init(io),
