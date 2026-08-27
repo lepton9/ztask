@@ -17,16 +17,20 @@ test {
 /// Only used for testing.
 const TestEnv = struct {
     dir: std.testing.TmpDir,
-    path: []u8,
+    path: [:0]u8,
     data_dir: []u8,
+    env: std.process.Environ.Map,
+    cwd: std.Io.Dir,
 
     fn init(gpa: std.mem.Allocator) !TestEnv {
         var tmp = std.testing.tmpDir(.{});
-        const dir_path = try tmp.dir.realpathAlloc(gpa, ".");
+        const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
         return .{
             .dir = tmp,
             .path = dir_path,
             .data_dir = try std.fs.path.join(gpa, &.{ dir_path, "ztask-data" }),
+            .env = try std.testing.environ.createMap(gpa),
+            .cwd = tmp.dir,
         };
     }
 
@@ -34,10 +38,12 @@ const TestEnv = struct {
         self.dir.cleanup();
         gpa.free(self.path);
         gpa.free(self.data_dir);
+        self.env.deinit();
     }
 };
 
 test "manager_simple" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -50,12 +56,12 @@ test "manager_simple" {
         \\ name: task2
         \\ id: 2
     ;
-    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
-    const task1 = try parse.parseTaskBuffer(gpa, task1_file);
-    const task2 = try parse.parseTaskBuffer(gpa, task2_file);
+    const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
+    const task2 = try parse.parseTaskBuffer(io, gpa, task2_file);
 
     try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
     try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
@@ -77,6 +83,7 @@ test "manager_simple" {
 }
 
 test "begin_task_while_running" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -90,12 +97,12 @@ test "begin_task_while_running" {
         \\       - command: "sleep 1"
     ;
 
-    const task_manager = try manager.TaskManager.initWithOptions(gpa, 2, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 2, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
 
-    const task = try parse.parseTaskBuffer(gpa, task_file);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
 
     try task_manager.start();
@@ -107,10 +114,11 @@ test "begin_task_while_running" {
     );
     try std.testing.expect(task_manager.schedulers.count() == 1);
 
-    task_manager.waitUntilIdle();
+    try task_manager.waitUntilIdle();
 }
 
 test "force_interrupt" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -127,15 +135,15 @@ test "force_interrupt" {
         \\     steps:
         \\       - command: "cat README.md"
     ;
-    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
-    const task = try parse.parseTaskBuffer(gpa, task_file);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.beginTask(task.id.fmt(), .{});
     // Interrupt while running
-    task_manager.stop();
+    try task_manager.stop();
 
     var it = task_manager.schedulers.valueIterator();
     while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
@@ -147,6 +155,7 @@ test "force_interrupt" {
 }
 
 test "complete_tasks" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -174,12 +183,12 @@ test "complete_tasks" {
         \\     steps:
         \\       - command: "zig help"
     ;
-    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
-    const task1 = try parse.parseTaskBuffer(gpa, task1_file);
-    const task2 = try parse.parseTaskBuffer(gpa, task2_file);
+    const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
+    const task2 = try parse.parseTaskBuffer(io, gpa, task2_file);
 
     const task1_id_value = task1.id.value;
     const task2_id_value = task2.id.value;
@@ -195,7 +204,7 @@ test "complete_tasks" {
         try task_manager.beginTask(key, .{});
     }
     // Wait for completion
-    task_manager.waitUntilIdle();
+    try task_manager.waitUntilIdle();
 
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
     try std.testing.expect(task_manager.schedulers.count() == 0);
@@ -214,6 +223,7 @@ test "complete_tasks" {
 }
 
 test "remote_job" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -224,40 +234,38 @@ test "remote_job" {
         \\ jobs:
         \\   jobremote1:
         \\     steps:
-        \\       - command: "ls"
+        \\       - command: "zig version"
         \\     run_on: remote:runner1
         \\   jobremote2:
         \\     steps:
-        \\       - command: "ls"
+        \\       - command: "zig version"
         \\     run_on: remote:runner1
     ;
-    const task_manager = try manager.TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
-    const task = try parse.parseTaskBuffer(gpa, task_file);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
-    var agent = try remote_agent.RemoteAgent.init(gpa, "runner1", 5);
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
-    var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
 
     try task_manager.beginTask(task.id.fmt(), .{});
-    task_manager.waitUntilIdle();
+    try task_manager.waitUntilIdle();
 
     agent.stop();
-    t.join();
+    agent_thread.join();
 
-    try std.testing.expect(agent.queue.empty());
-    try std.testing.expect(agent.result_queue.empty());
-    try std.testing.expect(agent.log_queue.empty());
-    try std.testing.expect(agent.active_runners.count() == 0);
+    try std.testing.expect(agent.isIdle());
     try std.testing.expect(task_manager.events.len() == 1);
 }
 
 test "remote_job_addr" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
@@ -273,21 +281,21 @@ test "remote_job_addr" {
         \\       name: agent
         \\       addr: 127.0.0.1
     ;
-    const task_manager = try manager.TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
-    const task = try parse.parseTaskBuffer(gpa, task_file);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
-    var agent = try remote_agent.RemoteAgent.init(gpa, "agent", 5);
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "agent", 5);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
 
     try task_manager.beginTask(task.id.fmt(), .{});
-    task_manager.waitUntilIdle();
+    try task_manager.waitUntilIdle();
 
     agent.stop();
     t.join();
@@ -297,37 +305,41 @@ test "remote_job_addr" {
     try std.testing.expect(finished.status == .success);
 }
 
-fn overwriteTaskFile(path: []const u8, name: []const u8, id: ?[]const u8) !void {
-    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
-    defer file.close();
+fn overwriteTaskFile(io: std.Io, abs_path: []const u8, name: []const u8, id: ?[]const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(io, abs_path, .{ .truncate = true });
+    defer file.close(io);
     var buf: [256]u8 = undefined;
     const content = if (id) |new_id|
         try std.fmt.bufPrint(&buf, "name: {s}\nid: \"{s}\"\n", .{ name, new_id })
     else
         try std.fmt.bufPrint(&buf, "name: {s}\n", .{name});
-    try file.writeAll(content);
+    var writer = file.writer(io, &.{});
+    try writer.interface.writeAll(content);
+    try writer.flush();
 }
 
 test "sync_tasks_id_change" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
 
-    var store = try data.DataStore.init(gpa, .{
-        .data_dir = .{ .path = env.data_dir },
-    });
+    var store = try data.DataStore.init(io, gpa, .{ .data_dir = env.data_dir });
     defer store.deinit(gpa);
 
     const a_meta = try store.newTask(gpa, .{ .name = "task-a", .id = "a" });
     const b_meta = try store.newTask(gpa, .{ .name = "task-b", .id = "b" });
 
-    try overwriteTaskFile(a_meta.file_path, "task-a-new", "a-new");
-    try overwriteTaskFile(b_meta.file_path, "task-b-new", null);
+    try overwriteTaskFile(io, a_meta.file_path, "task-a-new", "a-new");
+    try overwriteTaskFile(io, b_meta.file_path, "task-b-new", null);
 
-    try run.syncTasks(gpa, .{ .path = env.data_dir }, false);
+    try run.syncTasks(
+        .{ .io = io, .gpa = gpa, .env = &env.env, .data_dir = env.data_dir },
+        false,
+    );
 
-    var repaired = try data.DataStore.init(gpa, .{
-        .data_dir = .{ .path = env.data_dir },
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true },
     });
     defer repaired.deinit(gpa);
@@ -357,20 +369,21 @@ test "sync_tasks_id_change" {
     const new_meta_path_b = try repaired.taskMetaPath(gpa, meta_b_new.id);
     defer gpa.free(new_meta_path_b);
 
-    try expect(!(data.fileExists(old_meta_path_a)));
-    try expect(data.fileExists(new_meta_path_a));
-    try expect(!(data.fileExists(old_meta_path_b)));
-    try expect(data.fileExists(new_meta_path_b));
+    try expect(!(data.fileExists(io, old_meta_path_a)));
+    try expect(data.fileExists(io, new_meta_path_a));
+    try expect(!(data.fileExists(io, old_meta_path_b)));
+    try expect(data.fileExists(io, new_meta_path_b));
 }
 
 test "sync_dedup_same_task_file_path" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const cwd = std.fs.cwd();
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
+    const cwd = env.cwd;
 
-    var store = try data.DataStore.init(gpa, .{
-        .data_dir = .{ .path = env.data_dir },
+    var store = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -383,11 +396,12 @@ test "sync_dedup_same_task_file_path" {
     defer gpa.free(task_path);
     const task_id = "task-a-id";
     try data.writeFile(
+        io,
         task_path,
         "name: taskA\nid: " ++ task_id ++ "\n",
         .{ .make_path = true, .truncate = true },
     );
-    const real_task_path = try cwd.realpathAlloc(gpa, task_path);
+    const real_task_path = try cwd.realPathFileAlloc(io, task_path, gpa);
     defer gpa.free(real_task_path);
     _ = try store.addTask(gpa, task_path, .{});
     try std.testing.expect(store.getTaskMetadata(task_id) != null);
@@ -396,7 +410,7 @@ test "sync_dedup_same_task_file_path" {
     const dup_id = "duplicate-task-id";
     const dup_task_dir = try store.taskDataPath(gpa, dup_id);
     defer gpa.free(dup_task_dir);
-    try cwd.makePath(dup_task_dir);
+    try cwd.createDirPath(io, dup_task_dir);
     const dup_meta_path = try store.taskMetaPath(gpa, dup_id);
     defer gpa.free(dup_meta_path);
     const dup_meta_json = try data.toJson(gpa, data.TaskMetadata{
@@ -405,7 +419,7 @@ test "sync_dedup_same_task_file_path" {
         .name = "taskB",
     });
     defer gpa.free(dup_meta_json);
-    try data.writeFile(dup_meta_path, dup_meta_json, .{
+    try data.writeFile(io, dup_meta_path, dup_meta_json, .{
         .truncate = true,
         .make_path = true,
     });
@@ -416,7 +430,7 @@ test "sync_dedup_same_task_file_path" {
         &.{ env.data_dir, "data", task_id, "runs", "1" },
     );
     defer gpa.free(run1_dir);
-    try cwd.makePath(run1_dir);
+    try cwd.createDirPath(io, run1_dir);
     const run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
         .task_id = task_id,
         .run_id = 1,
@@ -429,7 +443,7 @@ test "sync_dedup_same_task_file_path" {
     defer gpa.free(run1_meta);
     const run1_meta_path = try std.fs.path.join(gpa, &.{ run1_dir, "meta.json" });
     defer gpa.free(run1_meta_path);
-    try data.writeFile(run1_meta_path, run1_meta, .{
+    try data.writeFile(io, run1_meta_path, run1_meta, .{
         .truncate = true,
         .make_path = true,
     });
@@ -440,7 +454,7 @@ test "sync_dedup_same_task_file_path" {
         &.{ env.data_dir, "data", dup_id, "runs", "1" },
     );
     defer gpa.free(dup_run1_dir);
-    try cwd.makePath(dup_run1_dir);
+    try cwd.createDirPath(io, dup_run1_dir);
     const dup_run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
         .task_id = dup_id,
         .run_id = 1,
@@ -456,7 +470,7 @@ test "sync_dedup_same_task_file_path" {
         "meta.json",
     });
     defer gpa.free(dup_run1_meta_path);
-    try data.writeFile(dup_run1_meta_path, dup_run1_meta, .{
+    try data.writeFile(io, dup_run1_meta_path, dup_run1_meta, .{
         .truncate = true,
         .make_path = true,
     });
@@ -469,15 +483,20 @@ test "sync_dedup_same_task_file_path" {
     defer gpa.free(counter_path);
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, 1, .little);
-    try data.writeFile(counter_path, buf[0..], .{
+    try data.writeFile(io, counter_path, buf[0..], .{
         .truncate = true,
         .make_path = true,
     });
 
     // Run sync
-    try run.syncTasks(gpa, .{ .path = env.data_dir }, false);
-    var repaired = try data.DataStore.init(gpa, .{
-        .data_dir = .{ .path = env.data_dir },
+    try run.syncTasks(.{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    }, false);
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
         .load = .{ .tasks = true, .runs = true },
     });
     defer repaired.deinit(gpa);
@@ -496,23 +515,24 @@ test "sync_dedup_same_task_file_path" {
 }
 
 test "examples" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const cwd = std.fs.cwd();
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
+    const cwd = std.Io.Dir.cwd();
 
-    const task_manager = try TaskManager.initWithOptions(gpa, 5, .{
-        .data = .{ .data_dir = .{ .path = env.data_dir } },
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
 
     const examples_dir = "examples";
-    var dir = try cwd.openDir(examples_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try cwd.openDir(io, examples_dir, .{ .iterate = true });
+    defer dir.close(io);
 
     var it = dir.iterate();
 
-    while (it.next() catch null) |entry| {
+    while (it.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
         const task_path = try std.fs.path.join(gpa, &.{
             examples_dir,

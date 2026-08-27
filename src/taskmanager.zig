@@ -33,19 +33,27 @@ pub const BeginTaskOptions = struct {
     diagnostics: ?*GenericDiagnostics = null,
 };
 
+const WatchEntry = struct {
+    direct: std.ArrayList(*Scheduler) = .empty,
+    recursive: std.ArrayList(*Scheduler) = .empty,
+};
+
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     /// Condition for tasks currently running
-    idle_cond: std.Thread.Condition = .{},
+    idle_cond: std.Io.Condition = .init,
 
     /// Queue of task events (single-consumer)
-    events: *MutexQueue(Event),
+    events: MutexQueue(Event),
+    /// Emit additional events into the event queue.
+    verbose_events: bool = false,
     datastore: data.DataStore,
-    pool: *RunnerPool,
+    pool: RunnerPool,
 
     /// Active schedulers
     schedulers: std.AutoHashMapUnmanaged(*Task, *Scheduler),
@@ -57,14 +65,17 @@ pub const TaskManager = struct {
     remote_manager: *remotemanager.RemoteManager,
 
     watcher: *Watcher,
-    /// Maps paths to active schedulers
-    watch_map: std.StringHashMapUnmanaged(std.ArrayList(*Scheduler)),
+    /// Maps paths to active schedulers by their watch scope.
+    watch_map: std.StringHashMapUnmanaged(WatchEntry),
 
     /// Epoch counter used to dedupe watcher-event bursts.
     watch_epoch: u64 = 0,
 
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
+
+    /// Total minimum loop frequency of the main run loop.
+    const LOOP_TIME_MS = 50;
 
     pub const Event = union(enum) {
         /// Event for informing that the run finished.
@@ -85,52 +96,56 @@ pub const TaskManager = struct {
             msg: ?[]const u8 = null,
         },
 
-        const ErrorScope = enum { task_manager, watcher, remote_manager, scheduler };
-    };
-
-    pub const InitOptions = struct {
-        data: data.DataStore.InitOptions = .{},
+        const ErrorScope = enum {
+            task_manager,
+            watcher,
+            remote_manager,
+            scheduler,
+        };
     };
 
     pub const StartOptions = struct {
         listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
         listen_port: u16 = remotemanager.DEFAULT_PORT,
+        verbose_events: bool = false,
     };
 
-    pub fn init(gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
-        return initWithOptions(gpa, runners_n, .{});
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
+        return initWithOptions(io, gpa, runners_n, .{});
     }
 
     /// Initialize `TaskManager` with init options.
     pub fn initWithOptions(
+        io: std.Io,
         gpa: std.mem.Allocator,
         runners_n: u16,
-        options: InitOptions,
+        options: data.DataStore.InitOptions,
     ) !*TaskManager {
-        var data_opts = options.data;
+        // Always load tasks
+        var data_opts = options;
         data_opts.load.tasks = true;
-
-        var datastore = try data.DataStore.init(gpa, data_opts);
+        var datastore = try data.DataStore.init(io, gpa, data_opts);
         errdefer datastore.deinit(gpa);
 
-        var events = try MutexQueue(Event).initCapacity(gpa, 64);
+        var events = try MutexQueue(Event).initCapacity(io, gpa, 64);
         errdefer events.deinit(gpa);
 
-        const pool = try RunnerPool.init(gpa, runners_n);
+        var pool = try RunnerPool.init(io, gpa, runners_n);
         errdefer pool.deinit();
 
         var to_unload = try std.ArrayList(*Task).initCapacity(gpa, 1);
         errdefer to_unload.deinit(gpa);
 
-        const remote_manager = try remotemanager.RemoteManager.init(gpa);
+        const remote_manager = try remotemanager.RemoteManager.init(io, gpa);
         errdefer remote_manager.deinit();
 
-        const watcher = try Watcher.init(gpa);
+        const watcher = try Watcher.init(io, gpa);
         errdefer watcher.deinit();
 
         const self = try gpa.create(TaskManager);
         errdefer gpa.destroy(self);
         self.* = .{
+            .io = io,
             .gpa = gpa,
             .events = events,
             .datastore = datastore,
@@ -146,7 +161,8 @@ pub const TaskManager = struct {
     }
 
     pub fn deinit(self: *TaskManager) void {
-        self.stop();
+        self.stop() catch {};
+        self.drainEvents();
         self.events.deinit(self.gpa);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
@@ -162,7 +178,8 @@ pub const TaskManager = struct {
         var w_it = self.watch_map.iterator();
         while (w_it.next()) |e| {
             self.gpa.free(e.key_ptr.*);
-            e.value_ptr.*.deinit(self.gpa);
+            e.value_ptr.direct.deinit(self.gpa);
+            e.value_ptr.recursive.deinit(self.gpa);
         }
         self.watch_map.deinit(self.gpa);
 
@@ -180,6 +197,17 @@ pub const TaskManager = struct {
         return self.events.popBlocking();
     }
 
+    /// Drain all the remaining events.
+    fn drainEvents(self: *TaskManager) void {
+        while (self.tryPopEvent()) |event| {
+            switch (event) {
+                .run_finished => {},
+                .info => |e| self.gpa.free(e.msg),
+                .err => |e| if (e.msg) |m| self.gpa.free(m),
+            }
+        }
+    }
+
     /// Handle error and push it to the event queue.
     /// Allocate a custom error message to the event.
     fn emitErrorFmt(
@@ -190,7 +218,6 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        log.debug("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .msg = custom_msg,
@@ -198,6 +225,7 @@ pub const TaskManager = struct {
         } }) catch {
             self.gpa.free(custom_msg);
         };
+        log.err("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
     }
 
     /// Handle error and push it to the event queue.
@@ -206,11 +234,11 @@ pub const TaskManager = struct {
         scope: Event.ErrorScope,
         err: anyerror,
     ) void {
-        log.debug("{any}: error: {any}", .{ scope, err });
         self.events.append(self.gpa, .{ .err = .{
             .scope = scope,
             .err = err,
         } }) catch {};
+        log.err("{any}: error: {any}", .{ scope, err });
     }
 
     /// Add an info event to the event queue.
@@ -226,6 +254,7 @@ pub const TaskManager = struct {
         }) catch {
             self.gpa.free(msg);
         };
+        log.info("task={d} {s}", .{ task_id, msg });
     }
 
     /// Callback for the scheduler for adding info events.
@@ -266,63 +295,82 @@ pub const TaskManager = struct {
         }
     }
 
-    /// Amount of tasks currently running
+    /// Amount of tasks currently running.
     pub fn tasksRunning(self: *TaskManager) u32 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         return self.schedulers.count();
     }
 
-    /// Start task manager thread
+    /// Start task manager thread.
     pub fn start(self: *TaskManager) !void {
         return self.startWithOptions(.{});
     }
 
-    /// Start task manager thread with configured options
+    /// Start task manager thread with configured options.
     pub fn startWithOptions(self: *TaskManager, options: StartOptions) !void {
         self.running.store(true, .seq_cst);
         errdefer self.running.store(false, .seq_cst);
 
+        self.verbose_events = options.verbose_events;
+
         try self.watcher.start();
-        try self.remote_manager.start(
-            try std.net.Address.parseIp4(
-                options.listen_addr,
-                options.listen_port,
-            ),
+        const addr: std.Io.net.IpAddress = try .parseIp4(
+            options.listen_addr,
+            options.listen_port,
         );
+        try self.remote_manager.start(addr);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Stop the task manager thread
-    pub fn stop(self: *TaskManager) void {
+    /// Main run loop.
+    fn run(self: *TaskManager) void {
+        while (self.running.load(.seq_cst)) {
+            const start_clock = std.Io.Clock.now(.awake, self.io);
+            self.checkWatcher() catch |err| {
+                self.emitError(.watcher, err);
+            };
+            self.updateRemoteManager() catch |err| {
+                self.emitError(.remote_manager, err);
+            };
+            self.updateSchedulers() catch |err| {
+                self.emitError(.scheduler, err);
+            };
+            const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
+            std.Io.sleep(self.io, .fromMilliseconds(LOOP_TIME_MS -| took), .awake) catch {};
+        }
+    }
+
+    /// Stop the task manager thread.
+    pub fn stop(self: *TaskManager) error{Canceled}!void {
         _ = self.running.swap(false, .seq_cst);
-        self.watcher.stop();
+        try self.watcher.stop();
         self.remote_manager.stop();
-        self.stopSchedulers();
+        try self.stopSchedulers();
         if (self.thread) |t| t.join();
         self.thread = null;
     }
 
     /// End all running schedulers
-    fn stopSchedulers(self: *TaskManager) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn stopSchedulers(self: *TaskManager) error{Canceled}!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| {
-            self.stopScheduler(s.*);
+            try self.stopScheduler(s.*);
         }
     }
 
     /// Set scheduler to inactive
-    fn stopScheduler(self: *TaskManager, s: *Scheduler) void {
+    fn stopScheduler(self: *TaskManager, s: *Scheduler) error{Canceled}!void {
         switch (s.*.status) {
             .running => {
                 s.*.forceStop(.user_interrupt);
-                self.removeFromWatchList(s);
+                try self.removeFromWatchList(s);
             },
             .waiting, .completed => {
                 s.*.status = .inactive;
-                self.removeFromWatchList(s);
+                try self.removeFromWatchList(s);
                 s.update();
                 self.tasks_changed.store(true, .seq_cst);
             },
@@ -331,7 +379,7 @@ pub const TaskManager = struct {
     }
 
     /// Remove scheduler from watch list if the task trigger is being watched
-    fn removeFromWatchList(self: *TaskManager, s: *Scheduler) void {
+    fn removeFromWatchList(self: *TaskManager, s: *Scheduler) error{Canceled}!void {
         const t = s.task.trigger orelse return;
         switch (t) {
             .watch => |w| {
@@ -344,21 +392,34 @@ pub const TaskManager = struct {
                 for (paths) |path| {
                     const e = self.watch_map.getEntry(path) orelse continue;
 
-                    // Remove scheduler
-                    const list_ptr = e.value_ptr;
+                    const list_ptr = if (w.recursive)
+                        &e.value_ptr.recursive
+                    else
+                        &e.value_ptr.direct;
+
+                    // Remove scheduler.
+                    var removed_scheduler = false;
                     for (0..list_ptr.items.len) |i| {
                         if (@intFromPtr(list_ptr.items[i]) == @intFromPtr(s)) {
                             _ = list_ptr.orderedRemove(i);
+                            removed_scheduler = true;
                             break;
                         }
                     }
+                    if (!removed_scheduler) continue;
 
-                    // No more schedulers that have the same watch path
-                    if (list_ptr.items.len == 0) {
+                    try self.watcher.removeFileWatch(e.key_ptr.*, .{
+                        .recursive = w.recursive,
+                    });
+
+                    // No more schedulers that have the same watch path.
+                    if (e.value_ptr.direct.items.len == 0 and
+                        e.value_ptr.recursive.items.len == 0)
+                    {
                         if (self.watch_map.fetchRemove(path)) |kv| {
-                            self.watcher.removeFileWatch(kv.key);
-                            var list = kv.value;
-                            list.deinit(self.gpa);
+                            var entry = kv.value;
+                            entry.direct.deinit(self.gpa);
+                            entry.recursive.deinit(self.gpa);
                             self.gpa.free(kv.key);
                         }
                     }
@@ -366,7 +427,7 @@ pub const TaskManager = struct {
                 s.watch_paths.clearRetainingCapacity();
             },
             .interval, .time => {
-                self.watcher.removeTimeWatch(s.task.id.fmt());
+                try self.watcher.removeTimeWatch(s.task.id.fmt());
             },
         }
     }
@@ -377,24 +438,34 @@ pub const TaskManager = struct {
         self: *TaskManager,
         s: *Scheduler,
         path: []const u8,
+        recursive: bool,
         diagnostics: ?*GenericDiagnostics,
     ) !void {
-        const gop = try self.watch_map.getOrPut(self.gpa, path);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.gpa.dupe(u8, path);
-            gop.value_ptr.* = try .initCapacity(self.gpa, 1);
-        }
+        const normalized_path = try watcher_zig.normalizeWatchPath(
+            self.io,
+            self.gpa,
+            path,
+        );
+
+        const gop = blk: {
+            errdefer self.gpa.free(normalized_path);
+            break :blk try self.watch_map.getOrPut(self.gpa, normalized_path);
+        };
+        const new_entry = !gop.found_existing;
+        if (new_entry) {
+            gop.key_ptr.* = normalized_path;
+            gop.value_ptr.* = .{};
+        } else self.gpa.free(normalized_path);
         const key = gop.key_ptr.*;
 
-        // Don't re-add a shared watch path
-        if (!gop.found_existing) self.watcher.addFileWatch(key) catch |err| {
-            if (self.watch_map.fetchRemove(key)) |kv| {
-                var list = kv.value;
-                list.deinit(self.gpa);
+        self.watcher.addFileWatch(key, .{ .recursive = recursive }) catch |err| {
+            if (new_entry) if (self.watch_map.fetchRemove(key)) |kv| {
+                var entry = kv.value;
+                entry.direct.deinit(self.gpa);
+                entry.recursive.deinit(self.gpa);
                 self.gpa.free(kv.key);
-            }
+            };
             return switch (err) {
-                error.UnsupportedPlatform => error.WatcherAddUnsupported,
                 error.InvalidWatchPath => {
                     var d = diagnostics orelse return err;
                     const fmt = "Watch path must be a file or directory: {s}";
@@ -408,88 +479,34 @@ pub const TaskManager = struct {
                 else => err,
             };
         };
+        errdefer self.watcher.removeFileWatch(key, .{
+            .recursive = recursive,
+        }) catch {};
 
-        try gop.value_ptr.*.append(self.gpa, s);
+        const list = if (recursive)
+            &gop.value_ptr.recursive
+        else
+            &gop.value_ptr.direct;
+        try list.append(self.gpa, s);
+        errdefer _ = list.pop();
         try s.watch_paths.append(self.gpa, key);
-    }
-
-    /// Add all the directories recursively to the file watch list.
-    fn addWatchDirRecursive(
-        self: *TaskManager,
-        s: *Scheduler,
-        dir_path: []const u8,
-        diagnostics: ?*GenericDiagnostics,
-        fatal_open: bool,
-    ) !void {
-        var dir = std.fs.cwd().openDir(dir_path, .{
-            .iterate = true,
-        }) catch |err| {
-            if (fatal_open) return err;
-            self.emitErrorFmt(
-                .task_manager,
-                err,
-                "skip watch dir (open failed): path={s} err={any}",
-                .{ dir_path, err },
-            );
-            return;
-        };
-        defer dir.close();
-
-        var it = dir.iterate();
-        while (it.next() catch null) |entry| switch (entry.kind) {
-            .directory => {
-                const name = entry.name;
-                if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, ".."))
-                    continue;
-
-                const sub_path = try std.fs.path.join(self.gpa, &.{
-                    dir_path,
-                    entry.name,
-                });
-                defer self.gpa.free(sub_path);
-
-                self.addWatchPath(s, sub_path, diagnostics) catch |err| {
-                    self.emitErrorFmt(
-                        .task_manager,
-                        err,
-                        "skip watch dir (addWatch failed): path={s} err={any}",
-                        .{ dir_path, err },
-                    );
-                    continue;
-                };
-                try self.addWatchDirRecursive(s, sub_path, diagnostics, false);
-            },
-            else => continue,
-        };
-    }
-
-    /// Main run loop
-    fn run(self: *TaskManager) void {
-        while (self.running.load(.seq_cst)) {
-            self.checkWatcher() catch |err| {
-                self.emitError(.watcher, err);
-            };
-            self.updateRemoteManager() catch |err| {
-                self.emitError(.remote_manager, err);
-            };
-            self.updateSchedulers() catch |err| {
-                self.emitError(.scheduler, err);
-            };
-            std.Thread.sleep(std.time.ns_per_ms * 100);
-        }
     }
 
     /// Handle events in remote manager
     fn updateRemoteManager(self: *TaskManager) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.remote_manager.update();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        try self.remote_manager.update();
     }
 
     /// Handle a file-watch event for a scheduler.
-    fn handleFileTriggerEvent(self: *TaskManager, s: *Scheduler, epoch: u64) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn handleFileTriggerEvent(
+        self: *TaskManager,
+        s: *Scheduler,
+        epoch: u64,
+    ) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Combine multiple fs events into one to avoid constant retriggering
         if (s.last_watch_epoch == epoch) return;
@@ -509,12 +526,10 @@ pub const TaskManager = struct {
 
     /// Handle a time trigger event for a scheduler.
     fn handleTimeTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         switch (s.status) {
-            .waiting => {
-                try s.trigger();
-            },
+            .waiting => try s.trigger(),
             else => {
                 if (!s.retrigger) return;
                 s.forceStop(.retrigger);
@@ -531,8 +546,14 @@ pub const TaskManager = struct {
         const epoch = self.watch_epoch;
 
         while (self.watcher.getEvent()) |event| switch (event) {
-            .fileEvent => |fe| if (self.watch_map.get(fe.path)) |l| {
-                for (l.items) |s| try self.handleFileTriggerEvent(s, epoch);
+            .fileEvent => |fe| {
+                defer fe.deinit(self.gpa);
+                const entry = self.watch_map.get(fe.watched_path) orelse continue;
+                const schedulers = switch (fe.scope) {
+                    .direct => entry.direct.items,
+                    .recursive => entry.recursive.items,
+                };
+                for (schedulers) |s| try self.handleFileTriggerEvent(s, epoch);
             },
             .timeEvent => |te| if (self.getScheduler(te.task_id)) |s| {
                 try self.handleTimeTriggerEvent(s);
@@ -542,12 +563,12 @@ pub const TaskManager = struct {
 
     /// Advance the schedulers
     fn updateSchedulers(self: *TaskManager) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         // No tasks running or waiting
         if (self.schedulers.count() == 0) {
-            self.idle_cond.broadcast();
+            self.idle_cond.broadcast(self.io);
             return;
         }
 
@@ -580,28 +601,28 @@ pub const TaskManager = struct {
         };
 
         // Unload any tasks
-        for (self.to_unload.items) |task| self.unloadTask(task);
+        for (self.to_unload.items) |task| self.unloadTask(task) catch {};
         self.to_unload.clearRetainingCapacity();
     }
 
     /// Unload a task and its scheduler from memory
-    fn unloadTask(self: *TaskManager, t: *Task) void {
+    fn unloadTask(self: *TaskManager, t: *Task) error{Canceled}!void {
         _ = self.loaded_tasks.swapRemove(t.id.fmt());
         if (self.schedulers.fetchRemove(t)) |kv| {
             var s = kv.value;
-            self.removeFromWatchList(s);
+            self.removeFromWatchList(s) catch {};
             s.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
     }
 
     /// Wait until the idle condition is signaled
-    pub fn waitUntilIdle(self: *TaskManager) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn waitUntilIdle(self: *TaskManager) error{Canceled}!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         while (self.schedulers.count() > 0) {
-            self.idle_cond.wait(&self.mutex);
+            try self.idle_cond.wait(self.io, &self.mutex);
         }
     }
 
@@ -611,14 +632,14 @@ pub const TaskManager = struct {
         task_id: []const u8,
         options: BeginTaskOptions,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         const diagnostics = options.diagnostics;
 
         const task = try self.loadTask(task_id, diagnostics);
         var unload_on_error = true;
-        errdefer if (unload_on_error) self.unloadTask(task);
+        errdefer if (unload_on_error) self.unloadTask(task) catch {};
 
         const task_scheduler = blk: {
             if (self.schedulers.get(task)) |s| switch (s.status) {
@@ -629,12 +650,13 @@ pub const TaskManager = struct {
                 else => break :blk s,
             };
             const s = try Scheduler.init(
+                self.io,
                 self.gpa,
                 task,
-                self.pool,
+                &self.pool,
                 self.remote_manager,
                 &self.datastore,
-                if (options.verbose_events)
+                if (options.verbose_events or self.verbose_events)
                     .{ .ptr = self, .emit = TaskManager.onSchedulerEvent }
                 else
                     null,
@@ -668,33 +690,18 @@ pub const TaskManager = struct {
             task_scheduler.status = .waiting;
             switch (t.*) {
                 .watch => |*watch| {
-                    try task.resolveWatchPath(self.gpa);
+                    try task.resolveWatchPath(self.io, self.gpa);
                     task_scheduler.watch_paths.clearRetainingCapacity();
 
-                    const stat = std.fs.cwd().statFile(watch.path) catch |err| {
-                        const d = diagnostics orelse return err;
-                        return switch (err) {
-                            error.FileNotFound => d.failf(
-                                self.gpa,
-                                err,
-                                "Watch path not found: {s}",
-                                .{watch.path},
-                            ),
-                            else => err,
-                        };
-                    };
-
-                    self.addWatchPath(task_scheduler, watch.path, diagnostics) catch |err| {
-                        self.removeFromWatchList(task_scheduler);
+                    self.addWatchPath(
+                        task_scheduler,
+                        watch.path,
+                        watch.recursive,
+                        diagnostics,
+                    ) catch |err| {
+                        self.removeFromWatchList(task_scheduler) catch {};
                         return err;
                     };
-
-                    if (stat.kind == .directory and watch.recursive) {
-                        self.addWatchDirRecursive(task_scheduler, watch.path, diagnostics, true) catch |err| {
-                            self.removeFromWatchList(task_scheduler);
-                            return err;
-                        };
-                    }
                 },
                 .interval => |interval| {
                     try self.watcher.addIntervalWatch(task.id.fmt(), interval);
@@ -711,16 +718,16 @@ pub const TaskManager = struct {
 
     /// Stop task.
     /// Interrupts the task if currently running.
-    pub fn stopTask(self: *TaskManager, task_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn stopTask(self: *TaskManager, task_id: []const u8) error{Canceled}!void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         const sched = self.getScheduler(task_id) orelse return;
-        self.stopScheduler(sched);
+        try self.stopScheduler(sched);
     }
 
     /// Force stop all active tasks
     pub fn stopAllTasks(self: *TaskManager) void {
-        self.stopSchedulers();
+        self.stopSchedulers() catch {};
     }
 
     /// Load a task from file path or create the meta file
@@ -729,9 +736,10 @@ pub const TaskManager = struct {
         file_path: []const u8,
         diagnostics: ?*GenericDiagnostics,
     ) !*Task {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const real_path = try std.fs.cwd().realpathAlloc(self.gpa, file_path);
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const cwd = std.Io.Dir.cwd();
+        const real_path = try cwd.realPathFileAlloc(self.io, file_path, self.gpa);
         defer self.gpa.free(real_path);
         const meta = self.datastore.findTaskMetaPath(real_path) orelse
             try self.datastore.addTask(self.gpa, real_path, .{
@@ -746,8 +754,8 @@ pub const TaskManager = struct {
         task_id: []const u8,
         diagnostics: ?*GenericDiagnostics,
     ) !*Task {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         return self.loadTask(task_id, diagnostics);
     }
 
@@ -785,8 +793,8 @@ pub const TaskManager = struct {
 
     /// Delete a task with the given `task_id`.
     pub fn deleteTask(self: *TaskManager, task_id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Prevent deleting if task is active
         if (self.loaded_tasks.get(task_id)) |task| {
@@ -794,7 +802,7 @@ pub const TaskManager = struct {
                 .running, .waiting => return error.TaskActive,
                 else => {},
             };
-            self.unloadTask(task);
+            self.unloadTask(task) catch {};
         }
 
         try self.datastore.deleteTask(self.gpa, task_id);
@@ -820,8 +828,8 @@ pub const TaskManager = struct {
         task_id: []const u8,
         options: snap.TaskStateOptions,
     ) !snap.UiTaskDetail {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
 
         var selected_run: ?*const snap.UiTaskRunSnap = null;
 
@@ -905,8 +913,8 @@ pub const TaskManager = struct {
         self: *TaskManager,
         arena: std.mem.Allocator,
     ) ![]snap.UiTaskSnap {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         self.tasks_changed.store(false, .seq_cst);
 
         const tasks = blk: {
@@ -930,7 +938,9 @@ pub const TaskManager = struct {
                             .interrupted => .interrupted,
                             .completed => switch (s.taskStatus()) {
                                 .success => .success,
-                                else => .failed,
+                                .failed => .failed,
+                                .interrupted => .interrupted,
+                                .running => unreachable,
                             },
                         };
                     },
@@ -943,9 +953,9 @@ pub const TaskManager = struct {
         return tasks;
     }
 
-    pub fn getStatus(self: *TaskManager) snap.AppStatus {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn getStatus(self: *TaskManager) error{Canceled}!snap.AppStatus {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
         return .{
             .active_tasks = self.schedulers.count(),
             .connected_remote_runners = self.remote_manager.agents.count(),

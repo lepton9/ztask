@@ -3,12 +3,13 @@ const task = @import("../types/task.zig");
 const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
-const connection = @import("connection.zig");
+const Connection = @import("Connection.zig");
 
 const Queue = @import("../types/queue.zig").Queue;
+const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
-const ResultQueue = localrunner.ResultQueue;
+const Result = localrunner.Result;
 const LogQueue = localrunner.LogQueue;
 
 const log = std.log.scoped(.agent);
@@ -16,14 +17,16 @@ const log = std.log.scoped(.agent);
 const HEARTBEAT_FREQ_S = 10;
 
 pub const RemoteAgent = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     running: std.atomic.Value(bool) = .init(false),
     hostname: []const u8,
     buffer: [256]u8 = undefined,
 
-    pool: *runnerpool.RunnerPool,
-    result_queue: *ResultQueue,
-    log_queue: *LogQueue,
+    pool: runnerpool.RunnerPool,
+    result_queue: std.Io.Queue(Result),
+    result_buffer: []Result,
+    log_queue: LogQueue,
 
     /// All currently loaded jobs
     jobs: std.AutoHashMapUnmanaged(u64, struct { job: task.Job, node: JobNode }),
@@ -33,7 +36,11 @@ pub const RemoteAgent = struct {
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
     parser: protocol.MsgParser = .init(),
-    connection: connection.Connection,
+    connection: Connection,
+    /// Incoming frames from the server.
+    incoming_frames: MutexQueue([]u8),
+    /// Worker thread for reading incoming frames from the server.
+    reader_thread: ?std.Thread = null,
 
     /// Error for exiting
     exit_error: ?ExitError = null,
@@ -41,27 +48,33 @@ pub const RemoteAgent = struct {
     const ExitError = error{NameTaken};
 
     pub fn init(
+        io: std.Io,
         gpa: std.mem.Allocator,
         name: []const u8,
         runners_n: u16,
     ) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
+        const result_buffer = try gpa.alloc(Result, runners_n);
         agent.* = .{
+            .io = io,
             .gpa = gpa,
             .hostname = try gpa.dupe(u8, name),
-            .pool = try runnerpool.RunnerPool.init(gpa, runners_n),
-            .result_queue = try ResultQueue.initCapacity(gpa, runners_n),
-            .log_queue = try LogQueue.init(gpa),
+            .pool = try .init(io, gpa, runners_n),
+            .result_queue = .init(result_buffer),
+            .result_buffer = result_buffer,
+            .log_queue = .init(io),
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
-            .connection = try .init(gpa),
+            .connection = try .init(io),
+            .incoming_frames = .init(io),
         };
         try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
     }
 
     pub fn deinit(self: *RemoteAgent) void {
+        self.stopReader();
         var it = self.jobs.iterator();
         while (it.next()) |e| {
             e.value_ptr.node.deinit(self.gpa);
@@ -70,12 +83,15 @@ pub const RemoteAgent = struct {
             self.gpa.free(job.steps);
         }
         self.jobs.deinit(self.gpa);
-        self.result_queue.deinit(self.gpa);
+        self.result_queue.close(self.io);
+        self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
         self.pool.deinit();
-        self.connection.deinit(self.gpa);
+        self.connection.deinit();
+        while (self.incoming_frames.pop()) |frame| self.gpa.free(frame);
+        self.incoming_frames.deinit(self.gpa);
         self.gpa.free(self.hostname);
         self.gpa.destroy(self);
     }
@@ -96,32 +112,46 @@ pub const RemoteAgent = struct {
 
         self.handleLogs() catch {};
         self.handleResults();
+        self.stopReader();
     }
 
     /// Stop the agent
     pub fn stop(self: *RemoteAgent) void {
         self.running.store(false, .seq_cst);
+        self.connection.shutdown();
+    }
+
+    /// Check if the agent has no work.
+    pub fn isIdle(self: *RemoteAgent) bool {
+        return self.active_runners.count() == 0 and
+            self.queue.empty() and
+            self.log_queue.empty() and
+            self.jobs.count() == 0;
     }
 
     /// Try to connect to the server at the address
-    pub fn connect(self: *RemoteAgent, addr: std.net.Address) !void {
+    pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
+        self.stopReader();
         try self.connection.connect(addr);
+        self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
         try self.register();
     }
 
     /// Try connecting until success
-    pub fn connectUntil(self: *RemoteAgent, addr: std.net.Address) void {
+    pub fn connectUntil(self: *RemoteAgent, addr: std.Io.net.IpAddress) void {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
-            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
-            log.info(
-                "Connecting to {d}.{d}.{d}.{d}:{d}",
-                .{ bytes[0], bytes[1], bytes[2], bytes[3], addr.getPort() },
-            );
+            switch (addr) {
+                .ip4 => |a4| log.info(
+                    "Connecting to {d}.{d}.{d}.{d}:{d}",
+                    .{ a4.bytes[0], a4.bytes[1], a4.bytes[2], a4.bytes[3], a4.port },
+                ),
+                else => log.info("Connecting to remote server", .{}),
+            }
             self.connect(addr) catch |err| switch (err) {
                 error.AlreadyConnected => break,
                 else => {
-                    std.Thread.sleep(std.time.ns_per_s);
+                    std.Io.sleep(self.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
                     continue;
                 },
             };
@@ -136,10 +166,39 @@ pub const RemoteAgent = struct {
 
     /// Listen for incoming messages
     fn listen(self: *RemoteAgent) !void {
-        while (self.connection.readNextFrame(self.gpa) catch null) |msg| {
+        while (self.incoming_frames.pop()) |msg| {
+            defer self.gpa.free(msg);
             const parsed = try self.parser.parse(msg);
             try self.handleMessage(parsed);
         }
+    }
+
+    /// Loop for reading incoming frames from the server.
+    fn readLoop(self: *RemoteAgent) void {
+        var reader = Connection.Reader.init(
+            self.io,
+            self.gpa,
+            self.connection.conn.stream,
+        ) catch return;
+        defer reader.deinit();
+
+        while (true) {
+            const frame = reader.readNextFrame() catch break;
+            const owned = self.gpa.dupe(u8, frame) catch break;
+            self.incoming_frames.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                break;
+            };
+        }
+        self.connection.close();
+    }
+
+    /// Stop the read worker thread.
+    fn stopReader(self: *RemoteAgent) void {
+        self.connection.shutdown();
+        if (self.reader_thread) |thread| thread.join();
+        self.reader_thread = null;
+        self.connection.close();
     }
 
     /// Handle parsed message
@@ -229,27 +288,33 @@ pub const RemoteAgent = struct {
 
     /// Return true if last message was long ago
     fn shouldSendHeartbeat(self: *RemoteAgent) bool {
-        const now = std.time.timestamp();
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         return (now - self.connection.last_msg > HEARTBEAT_FREQ_S);
     }
 
     /// Handle the completed job results
     fn handleResults(self: *RemoteAgent) void {
-        while (self.result_queue.pop()) |res| {
-            // Release runner
-            if (self.active_runners.fetchRemove(res.node)) |kv| {
-                const runner = kv.value;
-                runner.finishJob();
-                self.pool.release(runner);
-            }
+        var results: [4]Result = undefined;
+        while (true) {
+            const n = self.result_queue.get(self.io, &results, 0) catch return;
+            if (n == 0) return;
 
-            // Free the job
-            if (self.jobs.fetchRemove(res.node.id)) |kv| {
-                var value = kv.value;
-                value.node.deinit(self.gpa);
-                const job = value.job;
-                self.gpa.free(job.name);
-                self.gpa.free(job.steps);
+            for (results[0..n]) |res| {
+                // Release runner
+                if (self.active_runners.fetchRemove(res.node)) |kv| {
+                    const runner = kv.value;
+                    runner.finishJob();
+                    self.pool.release(runner);
+                }
+
+                // Free the job
+                if (self.jobs.fetchRemove(res.node.id)) |kv| {
+                    var value = kv.value;
+                    value.node.deinit(self.gpa);
+                    const job = value.job;
+                    self.gpa.free(job.name);
+                    self.gpa.free(job.steps);
+                }
             }
         }
     }
@@ -325,7 +390,7 @@ pub const RemoteAgent = struct {
             return;
         };
         self.active_runners.putAssumeCapacity(node, runner);
-        runner.runJob(self.gpa, node, self.result_queue, self.log_queue);
+        runner.runJob(self.gpa, node, &self.result_queue, &self.log_queue);
     }
 
     /// Request a runner from the pool

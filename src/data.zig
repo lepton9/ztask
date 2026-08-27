@@ -100,6 +100,7 @@ pub const JobRunMetadata = struct {
 };
 
 pub const DataStore = struct {
+    io: std.Io,
     /// Root directory for saving the data.
     root_dir: []u8,
     /// Map of task_id -> TaskMetadata
@@ -115,21 +116,9 @@ pub const DataStore = struct {
         jobs: ?[]JobRunMetadata = null,
     };
 
-    pub const DataDirMode = union(enum) {
-        /// Resolve data dir using project dir -> env var -> global.
-        auto,
-        /// Force using the global app data dir.
-        global,
-        /// Explicit data directory.
-        path: []const u8,
-    };
-
     pub const InitOptions = struct {
-        /// Data directory selection.
-        data_dir: DataDirMode = .auto,
-        /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
-        /// Defaults to current working directory.
-        start_dir: ?[]const u8 = null,
+        /// Root data directory.
+        data_dir: []const u8,
         /// Options to load metadata on init.
         load: LoadOptions = .{},
     };
@@ -139,24 +128,29 @@ pub const DataStore = struct {
         runs: bool = false,
     };
 
-    pub fn init(gpa: std.mem.Allocator, options: InitOptions) !DataStore {
-        const root_dir = try resolveRootDir(gpa, options);
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        options: InitOptions,
+    ) !DataStore {
+        const root_dir = try gpa.dupe(u8, options.data_dir);
         errdefer gpa.free(root_dir);
 
         var datastore: DataStore = .{
+            .io = io,
             .root_dir = root_dir,
             .tasks = .{},
             .task_runs = .{},
         };
 
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
         const data_path = try datastore.tasksDataPath(gpa);
         defer gpa.free(data_path);
         const tasks_path = try datastore.tasksPath(gpa);
         defer gpa.free(tasks_path);
-        try cwd.makePath(root_dir);
-        try cwd.makePath(data_path);
-        try cwd.makePath(tasks_path);
+        try cwd.createDirPath(io, root_dir);
+        try cwd.createDirPath(io, data_path);
+        try cwd.createDirPath(io, tasks_path);
 
         if (options.load.tasks) {
             try datastore.loadTaskMetas(gpa, .{ .load_runs = options.load.runs });
@@ -189,30 +183,6 @@ pub const DataStore = struct {
         gpa.free(self.root_dir);
     }
 
-    /// Find a project-local data directory by walking up from `start_dir`.
-    fn findProjectDataDir(gpa: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
-        const cwd = std.fs.cwd();
-
-        const abs = try cwd.realpathAlloc(gpa, start_dir);
-        defer gpa.free(abs);
-        var cur: []const u8 = abs;
-        while (true) {
-            const marker = try std.fs.path.join(gpa, &.{ cur, PROJECT_MARKER_DIR });
-            var dir = cwd.openDir(marker, .{}) catch {
-                gpa.free(marker);
-
-                const parent = std.fs.path.dirname(cur) orelse break;
-                if (std.mem.eql(u8, parent, cur)) break;
-                cur = parent;
-                continue;
-            };
-            dir.close();
-            return marker;
-        }
-
-        return null;
-    }
-
     pub const DataEnv = struct {
         data_dir: []const u8,
         global_data_dir: []const u8,
@@ -223,65 +193,25 @@ pub const DataStore = struct {
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             gpa.free(self.data_dir);
             gpa.free(self.global_data_dir);
-            if (self.env.ZTASK_DATA_DIR) |e| gpa.free(e);
+            // if (self.env.ZTASK_DATA_DIR) |e| gpa.free(e);
         }
     };
 
     /// Get environment info.
-    pub fn getEnv(gpa: std.mem.Allocator, options: InitOptions) !DataEnv {
-        const path = try DataStore.resolveRootDir(gpa, .{
-            .data_dir = options.data_dir,
-        });
-        const env_data_dir: ?[]const u8 = std.process.getEnvVarOwned(
-            gpa,
-            DATA_DIR_ENV_VAR,
-        ) catch null;
+    pub fn getEnv(
+        gpa: std.mem.Allocator,
+        env: *std.process.Environ.Map,
+        data_dir: []const u8,
+    ) !DataEnv {
+        const env_data_dir = env.get(DATA_DIR_ENV_VAR);
 
         return .{
-            .data_dir = path,
-            .global_data_dir = try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR),
+            .data_dir = data_dir,
+            .global_data_dir = try getAppDataDir(gpa, env, APP_DATA_SUBDIR),
             .env = .{
                 .ZTASK_DATA_DIR = env_data_dir,
             },
         };
-    }
-
-    /// Get the root directory to use for saving and fetching data.
-    fn resolveRootDir(gpa: std.mem.Allocator, options: InitOptions) ![]u8 {
-        // Check the data dir mode
-        switch (options.data_dir) {
-            .path => |explicit| {
-                if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
-                const cwd = try std.process.getCwdAlloc(gpa);
-                defer gpa.free(cwd);
-                return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
-            },
-            .global => return try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR),
-            .auto => {},
-        }
-
-        // Try to find project-local data directory
-        const start_dir_alloc = blk: {
-            if (options.start_dir) |s| break :blk try gpa.dupe(u8, s);
-            break :blk try std.process.getCwdAlloc(gpa);
-        };
-        defer gpa.free(start_dir_alloc);
-        if (try findProjectDataDir(gpa, start_dir_alloc)) |proj| return proj;
-
-        // Override global path with env variable
-        const env_data_dir = std.process.getEnvVarOwned(
-            gpa,
-            DATA_DIR_ENV_VAR,
-        ) catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-        if (env_data_dir) |p| {
-            if (p.len != 0) return p;
-            gpa.free(p);
-        }
-
-        return try std.fs.getAppDataDir(gpa, APP_DATA_SUBDIR);
     }
 
     /// Deinitialize a slice of `JobRunMetadata`
@@ -356,11 +286,13 @@ pub const DataStore = struct {
         defer gpa.free(runs_path);
 
         var last: u64 = 0;
-        var dir = openDir(runs_path, .{ .iterate = true, .create = false }) catch
-            return 0;
-        defer dir.close();
+        var dir = openDir(self.io, runs_path, .{
+            .iterate = true,
+            .create = false,
+        }) catch return 0;
+        defer dir.close(self.io);
         var it = dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const run_id_str = std.fs.path.basename(e.name);
                 const id = std.fmt.parseInt(u64, run_id_str, 10) catch continue;
@@ -383,11 +315,12 @@ pub const DataStore = struct {
         const meta_path = try self.taskRunMetaPath(gpa, task_id, run_id_str);
         defer gpa.free(meta_path);
 
-        var file = std.fs.cwd().openFile(meta_path, .{ .mode = .read_only }) catch
+        var file = std.Io.Dir.cwd().openFile(self.io, meta_path, .{ .mode = .read_only }) catch
             return;
-        defer file.close();
+        defer file.close(self.io);
 
-        const bytes = try file.readToEndAlloc(gpa, 128 * 1024);
+        var reader = file.reader(self.io, &.{});
+        const bytes = try reader.interface.allocRemaining(gpa, .unlimited);
         defer gpa.free(bytes);
 
         var parsed = try std.json.parseFromSlice(TaskRunMetadata, gpa, bytes, .{});
@@ -399,7 +332,7 @@ pub const DataStore = struct {
 
         const json = try toJson(gpa, meta);
         defer gpa.free(json);
-        try writeFile(meta_path, json, .{ .truncate = true, .make_path = true });
+        try writeFile(self.io, meta_path, json, .{ .truncate = true, .make_path = true });
     }
 
     /// Move run history from `from_id` to `to_id`, renumbering runs if needed.
@@ -410,26 +343,26 @@ pub const DataStore = struct {
         to_id: []const u8,
     ) !void {
         if (std.mem.eql(u8, from_id, to_id)) return;
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
 
         const from_runs_path = try self.taskRunsPath(gpa, from_id);
         defer gpa.free(from_runs_path);
         const to_runs_path = try self.taskRunsPath(gpa, to_id);
         defer gpa.free(to_runs_path);
 
-        var from_dir = openDir(from_runs_path, .{
+        var from_dir = openDir(self.io, from_runs_path, .{
             .iterate = true,
             .create = false,
         }) catch return;
-        defer from_dir.close();
-        try cwd.makePath(to_runs_path);
+        defer from_dir.close(self.io);
+        try cwd.createDirPath(self.io, to_runs_path);
 
         // Collect and sort run IDs from the source task.
-        var ids: std.ArrayList(u64) = .{};
+        var ids: std.ArrayList(u64) = .empty;
         defer ids.deinit(gpa);
 
         var it = from_dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const run_id_str = std.fs.path.basename(e.name);
                 const id = std.fmt.parseInt(u64, run_id_str, 10) catch continue;
@@ -464,7 +397,7 @@ pub const DataStore = struct {
                 // Check if a run exist with the same run ID.
                 const dst_path = try std.fs.path.join(gpa, &.{ to_runs_path, target_str });
                 defer gpa.free(dst_path);
-                _ = cwd.statFile(dst_path) catch |err| switch (err) {
+                _ = cwd.statFile(self.io, dst_path, .{}) catch |err| switch (err) {
                     error.FileNotFound => break,
                     else => return err,
                 };
@@ -486,7 +419,7 @@ pub const DataStore = struct {
             const dst_dir = try std.fs.path.join(gpa, &.{ to_runs_path, dst_id_str });
             defer gpa.free(dst_dir);
 
-            try std.fs.renameAbsolute(src_dir, dst_dir);
+            try std.Io.Dir.renameAbsolute(src_dir, dst_dir, self.io);
             try self.rewriteRunMetaIds(gpa, to_id, target_id);
         }
 
@@ -552,7 +485,7 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         task_id: []const u8,
     ) !u64 {
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
         const task_dir = try self.taskDataPath(gpa, task_id);
         defer gpa.free(task_dir);
         const counter_file_path = try std.fs.path.join(gpa, &.{
@@ -563,18 +496,19 @@ pub const DataStore = struct {
 
         var buf: [8]u8 = undefined;
         const next_id: u64 = blk: {
-            const file = cwd.openFile(counter_file_path, .{}) catch |err| {
+            const file = cwd.openFile(self.io, counter_file_path, .{}) catch |err| {
                 if (err != error.FileNotFound) return err;
                 break :blk try self.findLastRun(gpa, task_id) + 1;
             };
-            defer file.close();
-            var reader = file.reader(&.{});
+            defer file.close(self.io);
+            var reader_buf: [32]u8 = undefined;
+            var reader = file.reader(self.io, &reader_buf);
             const read = reader.interface.readSliceShort(&buf) catch break :blk 1;
             break :blk if (read == 8) std.mem.readInt(u64, &buf, .little) else 1;
         };
 
         std.mem.writeInt(u64, &buf, next_id + 1, .little);
-        try writeFile(counter_file_path, &buf, .{
+        try writeFile(self.io, counter_file_path, &buf, .{
             .truncate = true,
             .make_path = true,
         });
@@ -598,7 +532,7 @@ pub const DataStore = struct {
 
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, next_id, .little);
-        try writeFile(counter_path, &buf, .{
+        try writeFile(self.io, counter_path, &buf, .{
             .truncate = true,
             .make_path = true,
         });
@@ -614,11 +548,11 @@ pub const DataStore = struct {
         defer gpa.free(runs_path);
 
         var last_id: u64 = 0;
-        var dir = openDir(runs_path, .{ .iterate = true }) catch
+        var dir = openDir(self.io, runs_path, .{ .iterate = true }) catch
             return last_id;
-        defer dir.close();
+        defer dir.close(self.io);
         var it = dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const run_id = std.fs.path.basename(e.name);
                 const id = std.fmt.parseInt(u64, run_id, 10) catch
@@ -644,7 +578,7 @@ pub const DataStore = struct {
             try std.fmt.bufPrint(&buf, "{d}", .{run_id}),
         );
         defer gpa.free(task_path);
-        return parseMetaFile(TaskRunMetadata, gpa, task_path);
+        return parseMetaFile(TaskRunMetadata, self.io, gpa, task_path);
     }
 
     /// Load and parse a task run job metadata file
@@ -657,7 +591,7 @@ pub const DataStore = struct {
     ) !?JobRunMetadata {
         const job_path = try self.jobRunMetaPath(gpa, task_id, run_id, job_name);
         defer gpa.free(job_path);
-        return parseMetaFile(JobRunMetadata, gpa, job_path);
+        return parseMetaFile(JobRunMetadata, self.io, gpa, job_path);
     }
 
     /// Get metafiles for all task run jobs.
@@ -696,11 +630,11 @@ pub const DataStore = struct {
             jobs.deinit(gpa);
         }
 
-        var dir = openDir(jobs_path, .{ .iterate = true }) catch
+        var dir = openDir(self.io, jobs_path, .{ .iterate = true }) catch
             return try jobs.toOwnedSlice(gpa);
-        defer dir.close();
+        defer dir.close(self.io);
         var it = dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const job_name = std.fs.path.basename(e.name);
                 const meta = self.loadJobMeta(gpa, task_id, run_id_str, job_name) catch
@@ -720,7 +654,7 @@ pub const DataStore = struct {
     ) !?TaskMetadata {
         const meta_path = try self.taskMetaPath(gpa, task_id);
         defer gpa.free(meta_path);
-        return parseMetaFile(TaskMetadata, gpa, meta_path);
+        return parseMetaFile(TaskMetadata, self.io, gpa, meta_path);
     }
 
     /// Load all the task metafiles
@@ -731,12 +665,12 @@ pub const DataStore = struct {
     ) !void {
         const tasks_path = try self.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
-        const cwd = std.fs.cwd();
-        try cwd.makePath(tasks_path);
-        var dir = try openDir(tasks_path, .{ .iterate = true, .create = true });
-        defer dir.close();
+        const cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(self.io, tasks_path);
+        var dir = try openDir(self.io, tasks_path, .{ .iterate = true, .create = true });
+        defer dir.close(self.io);
         var it = dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const task_id = std.fs.path.basename(e.name);
                 var meta = self.loadTaskMeta(gpa, task_id) catch null orelse
@@ -744,12 +678,16 @@ pub const DataStore = struct {
 
                 // Set the task file path to realpath if not already.
                 var changed: bool = false;
-                if (cwd.realpathAlloc(gpa, meta.file_path) catch null) |rp| {
+                var rp_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+                const rp_n = cwd.realPathFile(self.io, meta.file_path, &rp_buf) catch null;
+                if (rp_n) |n| {
+                    const rp = rp_buf[0..n];
                     if (!std.mem.eql(u8, rp, meta.file_path)) {
+                        const rp_copy = try gpa.dupe(u8, rp);
                         gpa.free(meta.file_path);
-                        meta.file_path = rp;
+                        meta.file_path = rp_copy;
                         changed = true;
-                    } else gpa.free(rp);
+                    }
                 }
 
                 // User probably made a manual copy or moved the task data dir.
@@ -786,10 +724,10 @@ pub const DataStore = struct {
 
         const runs_path = try self.taskRunsPath(gpa, task_id);
         defer gpa.free(runs_path);
-        var dir = try openDir(runs_path, .{ .iterate = true, .create = true });
-        defer dir.close();
+        var dir = try openDir(self.io, runs_path, .{ .iterate = true, .create = true });
+        defer dir.close(self.io);
         var it = dir.iterate();
-        while (it.next() catch null) |e| switch (e.kind) {
+        while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
                 const run_id: u64 = blk: {
                     const run_id = std.fs.path.basename(e.name);
@@ -866,7 +804,7 @@ pub const DataStore = struct {
         diagnostics: ?*parse.ParseDiag,
     ) !?*task.Task {
         const meta = self.tasks.get(task_id) orelse return null;
-        return parse.loadTaskDiag(gpa, meta.file_path, diagnostics);
+        return parse.loadTaskDiag(self.io, gpa, meta.file_path, diagnostics);
     }
 
     const TaskCreateOptions = struct {
@@ -910,7 +848,7 @@ pub const DataStore = struct {
                 const path = try std.fs.path.join(gpa, &.{ tasks_path, file_name });
 
                 const exists: bool = e: {
-                    _ = std.fs.cwd().statFile(path) catch |err| switch (err) {
+                    _ = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch |err| switch (err) {
                         error.FileNotFound => break :e false,
                         else => return err,
                     };
@@ -946,11 +884,11 @@ pub const DataStore = struct {
 
         const file = try new_task.toText(gpa);
         defer gpa.free(file);
-        try writeFile(new_task.file_path.?, file, .{
+        try writeFile(self.io, new_task.file_path.?, file, .{
             .make_path = true,
             .truncate = true,
         });
-        errdefer std.fs.deleteFileAbsolute(file_path) catch {};
+        errdefer std.Io.Dir.deleteFileAbsolute(self.io, file_path) catch {};
         return try self.addTask(gpa, file_path, .{
             .diagnostics = options.diagnostics,
         });
@@ -973,16 +911,16 @@ pub const DataStore = struct {
         path: []const u8,
         options: TaskAddOptions,
     ) !*TaskMetadata {
-        const cwd = std.fs.cwd();
-        var file = cwd.openFile(path, .{}) catch return error.ErrorOpenFile;
-        defer file.close();
+        const cwd = std.Io.Dir.cwd();
+        var file = cwd.openFile(self.io, path, .{}) catch return error.ErrorOpenFile;
+        defer file.close(self.io);
         if (!parse.isTaskFile(path)) return error.InvalidTaskFile;
 
         var parse_diag: ?ParseDiag = if (options.diagnostics != null) .{} else null;
         defer if (parse_diag) |*d| d.deinit(gpa);
         const pd: ?*ParseDiag = if (parse_diag) |*pd| pd else null;
 
-        const parsed = parse.loadTaskDiag(gpa, path, pd) catch |err| {
+        const parsed = parse.loadTaskDiag(self.io, gpa, path, pd) catch |err| {
             const d = options.diagnostics orelse return err;
             try d.extractParseErrorPrefix(gpa, pd, "{s}", .{path});
             return err;
@@ -1011,13 +949,12 @@ pub const DataStore = struct {
         dir_path: []const u8,
         options: TaskAddOptions,
     ) !void {
-        const cwd = std.fs.cwd();
-        var dir = cwd.openDir(dir_path, .{ .iterate = true }) catch
+        var dir = openDir(self.io, dir_path, .{ .iterate = true }) catch
             return error.ErrorOpenDir;
-        defer dir.close();
+        defer dir.close(self.io);
 
         var it = dir.iterate();
-        while (it.next() catch null) |entry| switch (entry.kind) {
+        while (it.next(self.io) catch null) |entry| switch (entry.kind) {
             .file => {
                 if (std.mem.startsWith(u8, entry.name, EDIT_TASK_BASE_NAME) or
                     std.mem.startsWith(u8, entry.name, TMP_TASK_BASE_NAME))
@@ -1067,7 +1004,7 @@ pub const DataStore = struct {
 
         const meta_path = try self.taskMetaPath(gpa, task_id);
         defer gpa.free(meta_path);
-        std.fs.cwd().deleteFile(meta_path) catch |err| switch (err) {
+        std.Io.Dir.cwd().deleteFile(self.io, meta_path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -1124,7 +1061,7 @@ pub const DataStore = struct {
         defer gpa.free(old_data_dir);
         const new_data_dir = try self.taskDataPath(gpa, new_id_str);
         defer gpa.free(new_data_dir);
-        std.fs.renameAbsolute(old_data_dir, new_data_dir) catch |err| switch (err) {
+        std.Io.Dir.renameAbsolute(old_data_dir, new_data_dir, self.io) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
@@ -1180,15 +1117,15 @@ pub const DataStore = struct {
         to: []const u8,
         options: MoveTaskOptions,
     ) !void {
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
         if (to.len == 0) return error.InvalidTaskFile;
 
-        const from_real = try realpathAllocOrNull(gpa, from);
+        const from_real = try realpathAllocOrNull(self.io, gpa, from);
         defer if (from_real) |p| gpa.free(p);
         if (from_real == null and !options.repair) return error.FileNotFound;
         const needs_move: bool = from_real != null;
 
-        const to_stat = cwd.statFile(to) catch |err| switch (err) {
+        const to_stat = cwd.statFile(self.io, to, .{}) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -1210,9 +1147,9 @@ pub const DataStore = struct {
 
         if (needs_move) {
             // Make path for the file to move
-            if (std.fs.path.dirname(resolved_dest)) |dir| try cwd.makePath(dir);
+            if (std.fs.path.dirname(resolved_dest)) |dir| try cwd.createDirPath(self.io, dir);
         }
-        const real_path_to = try realPathFromParent(gpa, resolved_dest);
+        const real_path_to = try realPathFromParent(self.io, gpa, resolved_dest);
         defer gpa.free(real_path_to);
 
         const meta_old: *TaskMetadata = if (from_real) |real_from|
@@ -1225,7 +1162,7 @@ pub const DataStore = struct {
 
         // Ensure that the file in need of repair is already in target path
         if (!needs_move and options.repair) {
-            _ = cwd.statFile(real_path_to) catch |err| switch (err) {
+            _ = cwd.statFile(self.io, real_path_to, .{}) catch |err| switch (err) {
                 error.FileNotFound => return error.FileNotFound,
                 else => return err,
             };
@@ -1236,9 +1173,9 @@ pub const DataStore = struct {
         if (id_derived) try self.ensureIdAvailable(meta_old, real_path_to);
 
         // Move task file
-        if (needs_move) try std.fs.renameAbsolute(from_real.?, real_path_to);
+        if (needs_move) try std.Io.Dir.renameAbsolute(from_real.?, real_path_to, self.io);
 
-        const real_path_dest = cwd.realpathAlloc(gpa, resolved_dest) catch |err| switch (err) {
+        const real_path_dest = cwd.realPathFileAlloc(self.io, resolved_dest, gpa) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -1262,13 +1199,13 @@ pub const DataStore = struct {
         gpa: std.mem.Allocator,
         from: []const u8,
     ) !?*TaskMetadata {
-        const cwd = std.fs.cwd();
+        const cwd = std.Io.Dir.cwd();
 
         const parent = std.fs.path.dirname(from) orelse ".";
         const base = std.fs.path.basename(from);
 
         const parent_real: ?[]u8 = blk: {
-            const real = cwd.realpathAlloc(gpa, parent) catch break :blk null;
+            const real = cwd.realPathFileAlloc(self.io, parent, gpa) catch break :blk null;
             defer gpa.free(real);
             break :blk try std.fs.path.join(gpa, &.{ real, base });
         };
@@ -1277,7 +1214,7 @@ pub const DataStore = struct {
         // Fallback if no parent_real
         const resolved_path = blk: {
             if (std.fs.path.isAbsolute(from)) break :blk try std.fs.path.resolve(gpa, &.{from});
-            const cwd_path = try std.process.getCwdAlloc(gpa);
+            const cwd_path = try std.process.currentPathAlloc(self.io, gpa);
             defer gpa.free(cwd_path);
             break :blk try std.fs.path.resolve(gpa, &.{ cwd_path, from });
         };
@@ -1344,16 +1281,17 @@ pub const DataStore = struct {
         );
         defer allocator.free(log_path);
 
-        var file = std.fs.cwd().openFile(
+        var file = std.Io.Dir.cwd().openFile(
+            self.io,
             log_path,
             .{ .mode = .read_only },
         ) catch |err| switch (err) {
             error.FileNotFound => return .{ &.{}, 0, 0, 0 },
             else => return err,
         };
-        defer file.close();
+        defer file.close(self.io);
 
-        const stat = try file.stat();
+        const stat = try file.stat(self.io);
         if (stat.size == 0) return .{ &.{}, stat.size, 0, 0 };
 
         // Set EOF position
@@ -1371,13 +1309,12 @@ pub const DataStore = struct {
         {
             var remaining_lines: usize = opts.advance_end_by_lines;
 
-            try file.seekTo(file_end);
             var pos_fwd: u64 = file_end;
             while (pos_fwd < stat.size) {
                 const max_read: usize = @intCast(
                     @min(@as(u64, scratch.len), stat.size - pos_fwd),
                 );
-                const nread = try file.read(scratch[0..max_read]);
+                const nread = try file.readPositionalAll(self.io, scratch[0..max_read], pos_fwd);
                 if (nread == 0) break;
 
                 var i: usize = 0;
@@ -1408,11 +1345,14 @@ pub const DataStore = struct {
             if (to_read == 0) break;
 
             pos -= @as(u64, @intCast(to_read));
-            try file.seekTo(pos);
 
             var nread: usize = 0;
             while (nread < to_read) {
-                const n = try file.read(scratch[nread..to_read]);
+                const n = try file.readPositionalAll(
+                    self.io,
+                    scratch[nread..to_read],
+                    pos + @as(u64, @intCast(nread)),
+                );
                 if (n == 0) break;
                 nread += n;
             }
@@ -1429,10 +1369,13 @@ pub const DataStore = struct {
         var bytes_all = try allocator.alloc(u8, read_len);
         defer allocator.free(bytes_all);
 
-        try file.seekTo(pos);
         var filled: usize = 0;
         while (filled < read_len) {
-            const n = try file.read(bytes_all[filled..]);
+            const n = try file.readPositionalAll(
+                self.io,
+                bytes_all[filled..],
+                pos + @as(u64, @intCast(filled)),
+            );
             if (n == 0) break;
             filled += n;
         }
@@ -1504,27 +1447,29 @@ pub const DataStore = struct {
         defer gpa.free(path);
         const content = try toJson(gpa, meta);
         defer gpa.free(content);
-        try writeFile(path, content, .{ .make_path = true, .truncate = true });
+        try writeFile(self.io, path, content, .{ .make_path = true, .truncate = true });
     }
 };
 
 pub fn loadTaskFile(
+    io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
     diagnostics: ?*parse.ParseDiag,
 ) !*task.Task {
-    return parse.loadTaskDiag(gpa, path, diagnostics);
+    return parse.loadTaskDiag(io, gpa, path, diagnostics);
 }
 
 /// Parse a file from JSON to type `T`
 fn parseMetaFile(
     comptime T: type,
+    io: std.Io,
     gpa: std.mem.Allocator,
     path: []const u8,
 ) !?T {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-    var reader = file.reader(&.{});
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
     var buffer: [1024]u8 = undefined;
     const read = try reader.interface.readSliceShort(&buffer);
     const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{}) catch
@@ -1547,41 +1492,43 @@ pub const WriteOptions = struct {
 
 /// Write all the content to the file
 pub fn writeFile(
+    io: std.Io,
     path: []const u8,
     content: []const u8,
     options: WriteOptions,
 ) !void {
-    const cwd = std.fs.cwd();
+    const cwd = std.Io.Dir.cwd();
     if (options.make_path) if (std.fs.path.dirname(path)) |dir| {
-        try cwd.makePath(dir);
+        try cwd.createDirPath(io, dir);
     };
-    var file = cwd.createFile(path, .{ .truncate = options.truncate }) catch |err|
+    var file = cwd.createFile(io, path, .{ .truncate = options.truncate }) catch |err|
         blk: {
-            if (err != std.fs.File.OpenError.FileNotFound or !options.make_path)
+            if (err != std.Io.File.OpenError.FileNotFound or !options.make_path)
                 return err;
-            if (std.fs.path.dirname(path)) |dir| try cwd.makePath(dir);
-            break :blk try cwd.createFile(path, .{ .truncate = options.truncate });
+            if (std.fs.path.dirname(path)) |dir| try cwd.createDirPath(io, dir);
+            break :blk try cwd.createFile(io, path, .{ .truncate = options.truncate });
         };
-    defer file.close();
+    defer file.close(io);
 
     var buffer: [1024]u8 = undefined;
-    var writer = file.writer(&buffer);
+    var writer = file.writer(io, &buffer);
     try writer.interface.writeAll(content);
     try writer.interface.flush();
 }
 
 /// Open a directory
 pub fn openDir(
+    io: std.Io,
     path: []const u8,
     options: struct { iterate: bool = false, create: bool = false },
-) !std.fs.Dir {
-    const cwd = std.fs.cwd();
-    const open_options: std.fs.Dir.OpenOptions = .{ .iterate = options.iterate };
-    return cwd.openDir(path, open_options) catch |err| switch (err) {
-        std.fs.Dir.OpenError.FileNotFound => {
+) !std.Io.Dir {
+    const cwd = std.Io.Dir.cwd();
+    const open_options: std.Io.Dir.OpenOptions = .{ .iterate = options.iterate };
+    return cwd.openDir(io, path, open_options) catch |err| switch (err) {
+        std.Io.Dir.OpenError.FileNotFound => {
             if (!options.create) return err;
-            try cwd.makePath(path);
-            return try cwd.openDir(path, open_options);
+            try cwd.createDirPath(io, path);
+            return try cwd.openDir(io, path, open_options);
         },
         else => return err,
     };
@@ -1598,9 +1545,9 @@ fn splitPath(
 }
 
 /// Return allocated realpath for path or null if not found.
-fn realpathAllocOrNull(gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const cwd = std.fs.cwd();
-    return cwd.realpathAlloc(gpa, path) catch |err| switch (err) {
+fn realpathAllocOrNull(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !?[:0]u8 {
+    const cwd = std.Io.Dir.cwd();
+    return cwd.realPathFileAlloc(io, path, gpa) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
     };
@@ -1608,17 +1555,21 @@ fn realpathAllocOrNull(gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
 
 /// Resolve the real path based on the parent directory.
 /// Assumes that the parent directory exists.
-fn realPathFromParent(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const cwd = std.fs.cwd();
+fn realPathFromParent(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const cwd = std.Io.Dir.cwd();
     const parent = std.fs.path.dirname(path) orelse ".";
-    const parent_real = try cwd.realpathAlloc(gpa, parent);
+    const parent_real = try cwd.realPathFileAlloc(io, parent, gpa);
     defer gpa.free(parent_real);
     const base = std.fs.path.basename(path);
     return try std.fs.path.join(gpa, &.{ parent_real, base });
 }
 
 /// Allocate a unique temporary task file path.
-pub fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 {
+pub fn allocUniqueTempPath(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    file_path: []const u8,
+) ![]u8 {
     const p = splitPath(file_path);
     const ext = p.ext;
     const is_yaml = std.mem.eql(u8, ext, ".yml") or std.mem.eql(u8, ext, ".yaml");
@@ -1627,7 +1578,7 @@ pub fn allocUniqueTempPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 
     const name = try std.fmt.allocPrint(gpa, "{s}.{s}.{d}{s}", .{
         TMP_TASK_BASE_NAME,
         p.stem,
-        std.time.nanoTimestamp(),
+        std.Io.Timestamp.now(io, .real).toNanoseconds(),
         out_ext,
     });
     defer gpa.free(name);
@@ -1651,35 +1602,153 @@ pub fn allocResumeEditPath(gpa: std.mem.Allocator, file_path: []const u8) ![]u8 
 }
 
 /// Return the hash of the file contents
-pub fn fileHash(gpa: std.mem.Allocator, file_path: []const u8) !u64 {
-    const max_read_bytes = 1024 * 1024;
-    var file = try std.fs.openFileAbsolute(file_path, .{});
-    defer file.close();
-    const bytes = try file.readToEndAlloc(gpa, max_read_bytes);
+pub fn fileHash(io: std.Io, gpa: std.mem.Allocator, file_path: []const u8) !u64 {
+    var file = try std.Io.Dir.openFileAbsolute(io, file_path, .{});
+    defer file.close(io);
+    var reader = file.reader(io, &.{});
+    const bytes = try reader.interface.allocRemaining(gpa, .unlimited);
     defer gpa.free(bytes);
     return std.hash.Wyhash.hash(0, bytes);
 }
 
 /// Check if a file exists at the path
-pub fn fileExists(path: []const u8) bool {
-    const cwd = std.fs.cwd();
-    const stat = cwd.statFile(path) catch return false;
+pub fn fileExists(io: std.Io, path: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    const stat = cwd.statFile(io, path, .{}) catch return false;
     return stat.kind == .file;
+}
+
+pub const DataDirMode = union(enum) {
+    /// Resolve data dir using project dir -> env var -> global.
+    auto,
+    /// Force using the global app data dir.
+    global,
+    /// Explicit data directory.
+    path: []const u8,
+};
+
+pub const RootDirOptions = struct {
+    /// Data directory selection.
+    dir: DataDirMode = .auto,
+    /// Directory to start searching upwards for `PROJECT_MARKER_DIR`.
+    /// Defaults to current working directory.
+    start_dir: ?[]const u8 = null,
+};
+
+/// Get and allocate the root directory to use for saving and fetching data.
+pub fn resolveRootDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    options: RootDirOptions,
+) ![]u8 {
+    // Check the data dir mode
+    switch (options.dir) {
+        .path => |explicit| {
+            if (std.fs.path.isAbsolute(explicit)) return try gpa.dupe(u8, explicit);
+            const cwd = try std.process.currentPathAlloc(io, gpa);
+            defer gpa.free(cwd);
+            return try std.fs.path.resolve(gpa, &.{ cwd, explicit });
+        },
+        .global => return try getAppDataDir(gpa, env, APP_DATA_SUBDIR),
+        .auto => {},
+    }
+
+    // Try to find project-local data directory
+    const start_dir_alloc = blk: {
+        if (options.start_dir) |s| break :blk s;
+        break :blk ".";
+    };
+    if (try findProjectDataDir(io, gpa, start_dir_alloc)) |proj| return proj;
+
+    // Override global path with env variable
+    const env_data_dir = env.get(DATA_DIR_ENV_VAR);
+    if (env_data_dir) |p| if (p.len != 0) return try gpa.dupe(u8, p);
+
+    return try getAppDataDir(gpa, env, APP_DATA_SUBDIR);
+}
+
+/// Find a project-local data directory by walking up from `start_dir`.
+fn findProjectDataDir(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    start_dir: []const u8,
+) !?[]u8 {
+    const cwd = std.Io.Dir.cwd();
+
+    const abs = try cwd.realPathFileAlloc(io, start_dir, gpa);
+    defer gpa.free(abs);
+    var cur: []const u8 = abs;
+    while (true) {
+        const marker = try std.fs.path.join(gpa, &.{ cur, PROJECT_MARKER_DIR });
+        var dir = cwd.openDir(io, marker, .{}) catch {
+            gpa.free(marker);
+
+            const parent = std.fs.path.dirname(cur) orelse break;
+            if (std.mem.eql(u8, parent, cur)) break;
+            cur = parent;
+            continue;
+        };
+        dir.close(io);
+        return marker;
+    }
+
+    return null;
+}
+
+/// Get the app data directory for the current OS.
+fn getAppDataDir(
+    gpa: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    appname: []const u8,
+) error{ OutOfMemory, AppDataDirUnavailable }![]u8 {
+    switch (@import("builtin").os.tag) {
+        .windows => {
+            const local_app_data_dir = env.get("LOCALAPPDATA") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(gpa, &.{ local_app_data_dir, appname });
+        },
+        .macos => {
+            const home_dir = env.get("HOME") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(
+                gpa,
+                &.{ home_dir, "Library", "Application Support", appname },
+            );
+        },
+        .linux, .freebsd, .netbsd, .dragonfly, .openbsd, .illumos, .serenity => {
+            if (env.get("XDG_DATA_HOME")) |xdg| if (xdg.len > 0) {
+                return std.fs.path.join(gpa, &.{ xdg, appname });
+            };
+
+            const home_dir = env.get("HOME") orelse
+                return error.AppDataDirUnavailable;
+            return std.fs.path.join(
+                gpa,
+                &.{ home_dir, ".local", "share", appname },
+            );
+        },
+        else => @compileError("Unsupported OS"),
+    }
 }
 
 test "move_task" {
     const gpa = std.testing.allocator;
-    const cwd = std.fs.cwd();
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(gpa, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -1689,11 +1758,11 @@ test "move_task" {
 
     const old_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
     defer gpa.free(old_path);
-    try writeFile(old_path, "name: a\n", .{
+    try writeFile(io, old_path, "name: a\n", .{
         .make_path = true,
         .truncate = true,
     });
-    const old_real = try cwd.realpathAlloc(gpa, old_path);
+    const old_real = try tmp.dir.realPathFileAlloc(io, old_path, gpa);
     defer gpa.free(old_real);
 
     const new_path = try std.fs.path.join(gpa, &.{ tasks_dir, "moved", "a.yml" });
@@ -1703,7 +1772,7 @@ test "move_task" {
     try std.testing.expect(store.tasks.count() == 1);
 
     try store.moveTask(gpa, old_path, new_path, .{ .repair = false });
-    const new_real = try cwd.realpathAlloc(gpa, new_path);
+    const new_real = try tmp.dir.realPathFileAlloc(io, new_path, gpa);
     defer gpa.free(new_real);
 
     var new_id = task.Id.fromPath(new_real);
@@ -1719,17 +1788,21 @@ test "move_task" {
 
 test "move_task_repair" {
     const gpa = std.testing.allocator;
-    const cwd = std.fs.cwd();
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(gpa, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -1739,7 +1812,7 @@ test "move_task_repair" {
 
     const old_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
     defer gpa.free(old_path);
-    try writeFile(old_path, "name: a\n", .{
+    try writeFile(io, old_path, "name: a\n", .{
         .make_path = true,
         .truncate = true,
     });
@@ -1755,17 +1828,17 @@ test "move_task_repair" {
 
     const new_dir = try std.fs.path.join(gpa, &.{ root, "moved" });
     defer gpa.free(new_dir);
-    try cwd.makePath(new_dir);
+    try tmp.dir.createDirPath(io, new_dir);
     const new_path = try std.fs.path.join(gpa, &.{ new_dir, "a.yml" });
     defer gpa.free(new_path);
 
     // Move file
-    try std.fs.renameAbsolute(old_file_path, new_path);
+    try std.Io.Dir.renameAbsolute(old_file_path, new_path, io);
 
     // Repair moved task file
     try store.moveTask(gpa, old_file_path, new_dir, .{ .repair = true });
 
-    const new_real = try cwd.realpathAlloc(gpa, new_path);
+    const new_real = try tmp.dir.realPathFileAlloc(io, new_path, gpa);
     defer gpa.free(new_real);
     var new_id_from_path = task.Id.fromPath(new_real);
     const new_id = new_id_from_path.fmt();
@@ -1778,22 +1851,26 @@ test "move_task_repair" {
 
     const old_meta_path = try store.taskMetaPath(gpa, old_id);
     defer gpa.free(old_meta_path);
-    try std.testing.expectError(error.FileNotFound, cwd.statFile(old_meta_path));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old_meta_path, .{}));
 }
 
 test "edit_task_updates_id" {
     const gpa = std.testing.allocator;
-    const cwd = std.fs.cwd();
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const root = try tmp.dir.realpathAlloc(gpa, ".");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
     defer gpa.free(root);
     const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
     defer gpa.free(data_dir);
 
-    var store = try DataStore.init(gpa, .{
-        .data_dir = .{ .path = data_dir },
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
         .load = .{ .tasks = true },
     });
     defer store.deinit(gpa);
@@ -1803,7 +1880,7 @@ test "edit_task_updates_id" {
 
     const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
     defer gpa.free(task_path);
-    try writeFile(task_path, "name: a\n", .{ .make_path = true, .truncate = true });
+    try writeFile(io, task_path, "name: a\n", .{ .make_path = true, .truncate = true });
 
     const meta = try store.addTask(gpa, task_path, .{});
     const old_id = try gpa.dupe(u8, meta.id);
@@ -1814,6 +1891,7 @@ test "edit_task_updates_id" {
 
     // Edit task name and ID
     try writeFile(
+        io,
         task_path,
         "name: " ++ new_name ++ "\nid: \"" ++ new_id ++ "\"\n",
         .{ .truncate = true },
@@ -1831,6 +1909,6 @@ test "edit_task_updates_id" {
     const new_data_dir = try store.taskDataPath(gpa, new_id);
     defer gpa.free(new_data_dir);
 
-    try std.testing.expectError(error.FileNotFound, cwd.statFile(old_data_dir));
-    _ = try cwd.statFile(new_data_dir);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old_data_dir, .{}));
+    _ = try tmp.dir.statFile(io, new_data_dir, .{});
 }

@@ -44,15 +44,17 @@ pub const Task = struct {
 
     /// Resolve the watch trigger path if a working directory is set.
     /// Does nothing if the trigger is not of type `watch`.
-    pub fn resolveWatchPath(self: *Task, gpa: std.mem.Allocator) !void {
+    pub fn resolveWatchPath(self: *Task, io: std.Io, gpa: std.mem.Allocator) !void {
         const t = if (self.trigger) |*t| t else return;
         if (t.* != .watch) return;
         const watch = &t.watch;
         const cwd = self.cwd orelse return;
         if (std.fs.path.isAbsolute(watch.path)) return;
         var path = try std.fs.path.join(gpa, &.{ cwd, watch.path });
-        const abs = std.fs.cwd().realpathAlloc(gpa, path) catch null;
-        if (abs) |a| {
+        var abs_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const abs_n = std.Io.Dir.cwd().realPathFile(io, path, &abs_buf) catch null;
+        if (abs_n) |n| {
+            const a = try gpa.dupe(u8, abs_buf[0..n]);
             gpa.free(path);
             path = a;
         }

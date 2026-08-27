@@ -1,12 +1,12 @@
 const std = @import("std");
-const posix = std.posix;
 const localrunner = @import("../runner/localrunner.zig");
 const scheduler_zig = @import("../scheduler/scheduler.zig");
 const protocol = @import("protocol.zig");
-const connection = @import("connection.zig");
+const Connection = @import("Connection.zig");
 
 const RemoteRunSpec = @import("../types/task.zig").RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
+const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
@@ -14,6 +14,80 @@ const Scheduler = scheduler_zig.Scheduler;
 
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
+
+const AcceptCtx = struct {
+    io: std.Io,
+    server: std.Io.net.Server,
+};
+
+const AcceptEvent = union(enum) {
+    accept: std.Io.net.Server.AcceptError!std.Io.net.Stream,
+};
+
+const InboundFrame = union(enum) {
+    frame: struct { socket_handle: std.Io.net.Socket.Handle, data: []u8 },
+    closed: std.Io.net.Socket.Handle,
+};
+
+const AgentReader = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    stream: std.Io.net.Stream,
+    incoming_frames: *MutexQueue(InboundFrame),
+    thread: std.Thread,
+
+    fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+        incoming_frames: *MutexQueue(InboundFrame),
+    ) !*AgentReader {
+        const reader = try gpa.create(AgentReader);
+        reader.* = .{
+            .io = io,
+            .gpa = gpa,
+            .stream = stream,
+            .incoming_frames = incoming_frames,
+            .thread = undefined,
+        };
+        reader.thread = try std.Thread.spawn(.{}, run, .{reader});
+        return reader;
+    }
+
+    /// Stop and join the reader thread.
+    fn deinit(self: *AgentReader) void {
+        self.thread.join();
+        self.gpa.destroy(self);
+    }
+
+    fn run(self: *AgentReader) void {
+        var reader = Connection.Reader.init(
+            self.io,
+            self.gpa,
+            self.stream,
+        ) catch return;
+        defer reader.deinit();
+        while (true) {
+            const frame = reader.readNextFrame() catch break;
+            const owned = self.gpa.dupe(u8, frame) catch break;
+            self.incoming_frames.append(self.gpa, .{ .frame = .{
+                .socket_handle = self.stream.socket.handle,
+                .data = owned,
+            } }) catch {
+                self.gpa.free(owned);
+                break;
+            };
+        }
+        self.incoming_frames.append(self.gpa, .{
+            .closed = self.stream.socket.handle,
+        }) catch {};
+    }
+};
+
+fn acceptTask(ctx: AcceptCtx) std.Io.net.Server.AcceptError!std.Io.net.Stream {
+    var server = ctx.server;
+    return server.accept(ctx.io);
+}
 
 pub const DispatchRequest = struct {
     agent: RemoteRunSpec,
@@ -28,7 +102,8 @@ pub const DispatchRequest = struct {
 
 pub const AgentHandle = struct {
     name: ?[]const u8 = null,
-    connection: connection.Connection,
+    connection: Connection,
+    reader: *AgentReader,
     last_heartbeat: i64,
 
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
@@ -37,31 +112,44 @@ pub const AgentHandle = struct {
     }
 
     fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
+        self.connection.shutdown();
+        self.reader.deinit();
+        self.connection.close();
         if (self.name) |name| gpa.free(name);
-        self.connection.deinit(gpa);
+        self.connection.deinit();
     }
 };
 
 pub const RemoteManager = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     parser: protocol.MsgParser = .init(),
-    server: ?std.net.Server = null,
+    server: ?std.Io.net.Server = null,
 
-    agents: std.AutoHashMapUnmanaged(posix.socket_t, AgentHandle),
-    polls: std.ArrayList(posix.pollfd),
+    accept_select: std.Io.Select(AcceptEvent) = undefined,
+    /// Buffer for incoming accept events.
+    accept_buf: [1]AcceptEvent = undefined,
+    /// Is accept already running.
+    accept_inflight: bool = false,
+
+    /// Connected remote agents.
+    agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
+    incoming_frames: MutexQueue(InboundFrame),
 
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
 
-    pub fn init(gpa: std.mem.Allocator) !*RemoteManager {
+    pub fn init(io: std.Io, gpa: std.mem.Allocator) !*RemoteManager {
         const manager = try gpa.create(RemoteManager);
         manager.* = .{
+            .io = io,
             .gpa = gpa,
             .agents = .{},
-            .polls = try .initCapacity(gpa, 5),
+            .incoming_frames = .init(io),
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
+        manager.accept_select = .init(io, &manager.accept_buf);
         return manager;
     }
 
@@ -73,82 +161,81 @@ pub const RemoteManager = struct {
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
-        self.polls.deinit(self.gpa);
+        while (self.incoming_frames.pop()) |item| switch (item) {
+            .frame => |frame| self.gpa.free(frame.data),
+            .closed => {},
+        };
+        self.incoming_frames.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
     /// Start server and receive connections from remote agents
-    pub fn start(self: *RemoteManager, addr: std.net.Address) !void {
+    pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
         errdefer self.stop();
-        self.server = try addr.listen(.{
-            .force_nonblocking = true,
-            .reuse_address = true,
-        });
-        self.polls.clearAndFree(self.gpa);
-        try self.polls.append(self.gpa, .{
-            .fd = self.server.?.stream.handle,
-            .revents = 0,
-            .events = posix.POLL.IN,
-        });
+        self.server = try addr.listen(self.io, .{ .reuse_address = true });
+        self.resetAcceptState();
+        self.armAccept();
     }
 
     /// Stop the server
     pub fn stop(self: *RemoteManager) void {
-        var it = self.agents.valueIterator();
-        while (it.next()) |a| a.connection.close();
+        self.accept_select.cancelDiscard();
+        self.resetAcceptState();
 
-        if (self.server) |*s| s.deinit();
+        var it = self.agents.valueIterator();
+        while (it.next()) |a| a.connection.shutdown();
+
+        if (self.server) |*s| s.deinit(self.io);
         self.server = null;
-        self.polls.clearAndFree(self.gpa);
     }
 
     /// Update state
     pub fn update(self: *RemoteManager) !void {
-        try self.poll();
+        try self.drainAccepted();
+        self.armAccept();
+        try self.drainAgentInbox();
         try self.dispatchJobs();
     }
 
-    /// Poll the sockets for events
-    fn poll(self: *RemoteManager) !void {
-        if (self.polls.items.len == 0) return;
-        _ = try posix.poll(self.polls.items[0..self.polls.items.len], 0);
+    fn resetAcceptState(self: *RemoteManager) void {
+        self.accept_inflight = false;
+        self.accept_select = .init(self.io, &self.accept_buf);
+    }
 
-        // Listener socket
-        if (self.polls.items[0].revents != 0) {
-            try self.tryAcceptAgent();
-        }
-        if (self.polls.items.len < 2) return;
+    /// Run accept concurrently.
+    fn armAccept(self: *RemoteManager) void {
+        if (self.accept_inflight) return;
+        const server = self.server orelse return;
+        self.accept_select.concurrent(.accept, acceptTask, .{
+            AcceptCtx{ .io = self.io, .server = server },
+        }) catch return;
+        self.accept_inflight = true;
+    }
 
-        // Agents
-        var i: usize = 1;
-        while (i < self.polls.items.len) {
-            const p = self.polls.items[i];
-            if (p.revents == 0) {
-                i += 1;
-                continue;
-            }
-
-            // Remove the socket if not connected
-            if ((p.revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0) {
-                self.removeAgentByFd(p.fd);
-                continue;
-            }
-
-            self.updateAgentByFd(p.fd) catch |err| switch (err) {
-                error.ConnectionError => {
-                    self.removeAgentByFd(p.fd);
-                    continue;
-                },
-                else => return err,
+    /// Try to drain new connections from the accept queue.
+    fn drainAccepted(self: *RemoteManager) !void {
+        var buf: [1]AcceptEvent = undefined;
+        while (true) {
+            const n = self.accept_select.queue.get(self.io, &buf, 0) catch |err| switch (err) {
+                error.Canceled => return,
+                error.Closed => return,
             };
-            i += 1;
+            if (n == 0) return;
+
+            self.accept_inflight = false;
+            const res = buf[0].accept;
+            const stream = res catch |err| switch (err) {
+                error.Canceled => return,
+                else => return,
+            };
+            try self.newAgent(.{ .stream = stream, .address = stream.socket.address });
         }
     }
 
     /// Get the address the manager server is running on
-    pub fn getAddress(self: *RemoteManager) ?std.net.Address {
+    pub fn getAddress(self: *RemoteManager) ?std.Io.net.IpAddress {
         if (self.server) |server| {
-            return server.listen_address;
+            return server.socket.address;
         }
         return null;
     }
@@ -158,18 +245,23 @@ pub const RemoteManager = struct {
         try self.dispatch_queue.append(self.gpa, req);
     }
 
-    /// Update the agent and handle incoming messages
-    fn updateAgentByFd(self: *RemoteManager, fd: posix.socket_t) !void {
-        const agent = self.agents.getPtr(fd) orelse return;
-        while (true) {
-            const msg = agent.connection.readNextFrame(self.gpa) catch {
-                return error.ConnectionError;
-            };
-            const frame = msg orelse break;
-            const parsed = try self.parser.parse(frame);
-            try self.handleMessage(agent, parsed);
-        }
-        if (agent.connection.closed) return error.ConnectionError;
+    /// Process frames read by the blocking per-agent reader workers.
+    fn drainAgentInbox(self: *RemoteManager) !void {
+        while (self.incoming_frames.pop()) |item| switch (item) {
+            .closed => |socket_handle| self.removeAgentByFd(socket_handle),
+            .frame => |frame| {
+                defer self.gpa.free(frame.data);
+                const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
+                const parsed = self.parser.parse(frame.data) catch {
+                    self.removeAgentByFd(frame.socket_handle);
+                    continue;
+                };
+                self.handleMessage(agent, parsed) catch |err| switch (err) {
+                    error.ConnectionError => self.removeAgentByFd(frame.socket_handle),
+                    else => return err,
+                };
+            },
+        };
     }
 
     /// Handle a parsed message sent to the manager
@@ -197,7 +289,7 @@ pub const RemoteManager = struct {
                 }
                 try agent.setName(self.gpa, m.hostname);
             },
-            .heartbeat => agent.last_heartbeat = std.time.timestamp(),
+            .heartbeat => agent.last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse
                     return error.NoDispatchedJob;
@@ -226,7 +318,7 @@ pub const RemoteManager = struct {
                     .exit_code = m.exit_code,
                     .timestamp_ms = m.timestamp,
                 } });
-                try req.scheduler.result_queue.append(self.gpa, .{
+                try req.scheduler.result_queue.putOneUncancelable(self.io, .{
                     .node = req.job_node,
                     .result = .{
                         .exit_code = m.exit_code,
@@ -263,7 +355,7 @@ pub const RemoteManager = struct {
             }
             // Check for timeout
             var request = req;
-            const now = std.time.timestamp();
+            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
             if (request.first_try_ts == 0) request.first_try_ts = now;
             // Try to find the remote agent again
             if (now - request.first_try_ts < DispatchRequest.RETRY_TIMEOUT) {
@@ -272,7 +364,7 @@ pub const RemoteManager = struct {
             }
 
             // Failed to find matching agent
-            try req.scheduler.result_queue.append(self.gpa, .{
+            try req.scheduler.result_queue.putOneUncancelable(self.io, .{
                 .node = req.job_node,
                 .result = .{
                     .err = ResultError.NoRunnerFound,
@@ -308,7 +400,7 @@ pub const RemoteManager = struct {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
                 unreachable;
-            try kv.value.scheduler.result_queue.append(self.gpa, .{
+            try kv.value.scheduler.result_queue.putOneUncancelable(self.io, .{
                 .node = req.job_node,
                 .result = .{
                     .exit_code = 1,
@@ -347,7 +439,7 @@ pub const RemoteManager = struct {
         message: []const u8,
     ) !void {
         agent.connection.sendFrame(message) catch {
-            self.removeAgentByFd(agent.connection.conn.stream.handle);
+            self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
             return error.NotConnected;
         };
     }
@@ -369,76 +461,51 @@ pub const RemoteManager = struct {
 
         // Check if the address matches
         if (spec.addr) |want_ip| {
-            const agent_addr = agent.connection.conn.address;
-            if (agent_addr.any.family != posix.AF.INET) return false;
-            const want = std.net.Address.parseIp4(want_ip, 0) catch return false;
-            const agent_bytes: *const [4]u8 = @ptrCast(&agent_addr.in.sa.addr);
-            const want_bytes: *const [4]u8 = @ptrCast(&want.in.sa.addr);
-            if (!std.mem.eql(u8, agent_bytes[0..], want_bytes[0..])) return false;
+            const a = agent.connection.conn.address;
+            const b = std.Io.net.IpAddress.parseIp4(want_ip, 0) catch return false;
+            return switch (a) {
+                .ip4 => |a_ip4| switch (b) {
+                    .ip4 => |b_ip4| @as(u32, @bitCast(a_ip4.bytes)) == @as(u32, @bitCast(b_ip4.bytes)),
+                    else => false,
+                },
+                .ip6 => false,
+            };
         }
         return true;
     }
 
-    /// Accept new connections
-    fn tryAcceptAgent(self: *RemoteManager) !void {
-        const server = if (self.server) |*s| s else return;
-
-        var address: std.net.Address = undefined;
-        var address_len: posix.socklen_t = @sizeOf(std.net.Address);
-        const socket = posix.accept(
-            server.stream.handle,
-            &address.any,
-            &address_len,
-            posix.SOCK.NONBLOCK,
-        ) catch |err| switch (err) {
-            error.WouldBlock => return,
-            else => return err,
-        };
-        try self.newAgent(.{
-            .address = address,
-            .stream = .{ .handle = socket },
-        });
-    }
-
     /// Save new agent
-    fn newAgent(self: *RemoteManager, conn: std.net.Server.Connection) !void {
-        const res = try self.agents.getOrPut(self.gpa, conn.stream.handle);
+    fn newAgent(self: *RemoteManager, conn: Connection.ConnInfo) !void {
+        const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
         if (!res.found_existing) {
             res.value_ptr.* = .{
-                .connection = try .initConn(self.gpa, conn),
-                .last_heartbeat = std.time.timestamp(),
+                .connection = try .initConn(self.io, conn),
+                .reader = try AgentReader.start(
+                    self.io,
+                    self.gpa,
+                    conn.stream,
+                    &self.incoming_frames,
+                ),
+                .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             };
-            try self.polls.append(self.gpa, .{
-                .fd = conn.stream.handle,
-                .revents = 0,
-                .events = posix.POLL.IN,
-            });
         }
     }
 
     /// Remove a connected agent using the socket
-    fn removeAgentByFd(self: *RemoteManager, fd: posix.socket_t) void {
+    fn removeAgentByFd(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
         var kv = self.agents.fetchRemove(fd);
         if (kv) |*e| e.value.deinit(self.gpa);
-
-        if (self.polls.items.len < 2) return;
-        for (self.polls.items[1..], 1..) |pfd, i| {
-            if (pfd.fd != fd) continue;
-            _ = self.polls.swapRemove(i);
-            break;
-        }
     }
 
     /// Remove a connected agent based on the name
-    fn removeAgentByName(self: *RemoteManager, name: []const u8) !void {
-        if (self.polls.items.len < 2) return error.NoConnectedAgents;
-        for (self.polls.items[1..], 1..) |pfd, i| {
-            const agent = self.agents.get(pfd.fd) orelse continue;
+    fn removeAgentByName(self: *RemoteManager, name: []const u8) void {
+        var it = self.agents.iterator();
+        while (it.next()) |e| {
+            const agent = e.value_ptr;
             if (!std.mem.eql(u8, agent.name orelse continue, name)) continue;
-            var kv = self.agents.fetchRemove(pfd.fd) orelse unreachable;
+            var kv = self.agents.fetchRemove(e.key_ptr.*) orelse unreachable;
             kv.value.deinit(self.gpa);
-            _ = self.polls.swapRemove(i);
-            break;
+            return;
         }
     }
 };

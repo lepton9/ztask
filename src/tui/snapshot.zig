@@ -1,5 +1,4 @@
 const data = @import("../data.zig");
-const std = @import("std");
 
 /// Snapshot of the current state
 pub const UiSnapshot = struct {
@@ -15,10 +14,14 @@ pub const AppStatus = struct {
     connected_remote_runners: usize,
 };
 
-pub const TaskStatus = mergeEnums(
-    enum { inactive, waiting },
-    data.TaskRunStatus,
-);
+pub const UiTaskStatus = enum(u8) {
+    inactive,
+    waiting,
+    running,
+    success,
+    failed,
+    interrupted,
+};
 
 pub const TaskStateOptions = struct {
     selected_run_id: ?u64 = null,
@@ -26,7 +29,7 @@ pub const TaskStateOptions = struct {
 
 pub const UiTaskSnap = struct {
     meta: data.TaskMetadata,
-    status: TaskStatus,
+    status: UiTaskStatus,
 };
 
 pub const UiTaskDetail = struct {
@@ -53,38 +56,3 @@ pub const UiTaskRunSnap = struct {
 };
 
 pub const UiJobSnap = data.JobRunMetadata;
-
-/// Merge two enums into one
-fn mergeEnums(comptime A: type, comptime B: type) type {
-    const a_info = @typeInfo(A).@"enum";
-    const b_info = @typeInfo(B).@"enum";
-
-    comptime var fields: []const std.builtin.Type.EnumField =
-        &[_]std.builtin.Type.EnumField{};
-    var i: u32 = 0;
-
-    // Append fields from A
-    inline for (a_info.fields) |f| {
-        fields = fields ++ [_]std.builtin.Type.EnumField{
-            .{ .name = f.name, .value = i },
-        };
-        i += 1;
-    }
-
-    // Append fields from B
-    inline for (b_info.fields) |f| {
-        fields = fields ++ [_]std.builtin.Type.EnumField{
-            .{ .name = f.name, .value = i },
-        };
-        i += 1;
-    }
-
-    return @Type(.{
-        .@"enum" = .{
-            .tag_type = u8,
-            .fields = fields,
-            .decls = &.{},
-            .is_exhaustive = true,
-        },
-    });
-}

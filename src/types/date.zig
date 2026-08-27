@@ -13,6 +13,11 @@ pub const DateTime = struct {
             .{ d.year, d.month, d.day, t.h, t.min, t.sec },
         );
     }
+
+    pub fn now(io: std.Io, clock: std.Io.Clock) DateTime {
+        const ts = std.Io.Timestamp.now(io, clock);
+        return milliTsToDateTime(@intCast(ts.toMilliseconds()));
+    }
 };
 
 pub const Date = struct {

@@ -24,12 +24,11 @@ pub const addEventFn = *const fn (
     TimeEvent,
 ) anyerror!void;
 
-watch_list: std.StringHashMapUnmanaged(WatchType) = .{},
+io: std.Io,
+watch_list: std.StringHashMapUnmanaged(WatchType) = .empty,
 
-pub fn init(gpa: std.mem.Allocator) !*TimeWatcher {
-    const tw = try gpa.create(TimeWatcher);
-    tw.* = .{};
-    return tw;
+pub fn init(io: std.Io) TimeWatcher {
+    return .{ .io = io };
 }
 
 pub fn deinit(self: *TimeWatcher, gpa: std.mem.Allocator) void {
@@ -38,7 +37,6 @@ pub fn deinit(self: *TimeWatcher, gpa: std.mem.Allocator) void {
         gpa.free(e.key_ptr.*);
     }
     self.watch_list.deinit(gpa);
-    gpa.destroy(self);
 }
 
 /// Return the watch count of the `TimeWatcher`.
@@ -68,7 +66,7 @@ pub fn addIntervalWatch(
     interval_ms: u64,
 ) !void {
     if (interval_ms == 0) return error.InvalidInterval;
-    const now = std.time.milliTimestamp();
+    const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
     return self.addWatch(gpa, task_id, .{ .interval = .{
         .interval_ms = interval_ms,
         .next_due_ms = now + @as(i64, @intCast(interval_ms)),
@@ -83,7 +81,7 @@ pub fn addTimeOfDayWatch(
     time: date.Time,
 ) !void {
     var last_triggered: i64 = -1;
-    const now = std.time.milliTimestamp();
+    const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
     if (now >= 0) {
         const ms_per_day = std.time.ms_per_day;
         const today: i64 = @divTrunc(now, ms_per_day);
@@ -117,13 +115,15 @@ pub fn pollEvents(
     var it = self.watch_list.iterator();
     while (it.next()) |e| switch (e.value_ptr.*) {
         .interval => |*i| {
-            const now = std.time.milliTimestamp();
-            if (now < i.next_due_ms) continue;
-            i.next_due_ms = now + @as(i64, @intCast(i.interval_ms));
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            const now_ms = now.toMilliseconds();
+            if (now_ms < i.next_due_ms) continue;
+            i.next_due_ms = now_ms + @as(i64, @intCast(i.interval_ms));
             try addEvent(gpa, queue, .{ .task_id = e.key_ptr.* });
         },
         .time => |*t| {
-            const now_ms_i64 = std.time.milliTimestamp();
+            const now = std.Io.Timestamp.now(self.io, .awake);
+            const now_ms_i64 = now.toMilliseconds();
             if (now_ms_i64 < 0) continue;
 
             const ms_per_day_i64: i64 = @intCast(std.time.ms_per_day);
@@ -145,23 +145,21 @@ pub fn pollEvents(
 pub fn nextDueInNs(self: *TimeWatcher) ?u64 {
     if (self.watch_list.count() == 0) return null;
 
-    const now = std.time.milliTimestamp();
-    const wall_ok = now >= 0;
+    const now = std.Io.Timestamp.now(self.io, .awake);
+    const now_ms = now.toMilliseconds();
 
     const ms_per_day: i64 = @intCast(std.time.ms_per_day);
-    const today: i64 = if (wall_ok) @divTrunc(now, ms_per_day) else 0;
-    const ms_since_midnight: i64 = if (wall_ok) @rem(now, ms_per_day) else 0;
+    const today: i64 = @divTrunc(now_ms, ms_per_day);
+    const ms_since_midnight: i64 = @rem(now_ms, ms_per_day);
 
     var best_ms: ?u64 = null;
     var it = self.watch_list.iterator();
     while (it.next()) |e| switch (e.value_ptr.*) {
         .interval => |i| {
-            const delta_ms: u64 = @max(i.next_due_ms - now, 0);
+            const delta_ms: u64 = @max(i.next_due_ms - now_ms, 0);
             best_ms = if (best_ms) |b| @min(b, delta_ms) else delta_ms;
         },
         .time => |t| {
-            if (!wall_ok) continue;
-
             const target_ms: i64 = date.timeToMs(t.time);
             const due_ms: i64 = if (ms_since_midnight < target_ms)
                 target_ms - ms_since_midnight
@@ -180,11 +178,12 @@ pub fn nextDueInNs(self: *TimeWatcher) ?u64 {
 }
 
 test "interval_watch" {
+    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const tw = try TimeWatcher.init(gpa);
+    var tw: TimeWatcher = .init(io);
     defer tw.deinit(gpa);
 
-    var events = std.ArrayList(TimeEvent){};
+    var events: std.ArrayList(TimeEvent) = .empty;
     defer events.deinit(gpa);
 
     const add = struct {
@@ -198,7 +197,7 @@ test "interval_watch" {
     try tw.pollEvents(gpa, &events, add);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
 
-    std.Thread.sleep(40 * std.time.ns_per_ms);
+    std.Io.sleep(std.testing.io, std.Io.Duration.fromNanoseconds(40 * std.time.ns_per_ms), .awake) catch {};
     try tw.pollEvents(gpa, &events, add);
     try std.testing.expect(events.items.len >= 1);
 }

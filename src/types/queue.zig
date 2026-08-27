@@ -8,10 +8,12 @@ pub fn Queue(comptime T: type) type {
     };
 
     return struct {
+        /// List holding the nodes that are currently in the queue.
         list: std.DoublyLinkedList = .{},
+        /// List holding the allocated nodes that are not currently used.
         free: std.DoublyLinkedList = .{},
 
-        /// Initialize with capacity to hold `n` elements
+        /// Initialize with capacity to hold `n` elements.
         pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !@This() {
             var queue: @This() = .{};
             for (0..n) |_| {
@@ -22,12 +24,13 @@ pub fn Queue(comptime T: type) type {
             return queue;
         }
 
+        /// Clear all allocated memory for the nodes.
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
             while (self.list.pop()) |item| gpa.destroy(getNode(item));
             while (self.free.pop()) |item| gpa.destroy(getNode(item));
         }
 
-        /// Append an item to the back of the queue
+        /// Append an item to the back of the queue.
         pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
             const node: *QueueNode = if (self.free.pop()) |n|
                 getNode(n)
@@ -37,15 +40,15 @@ pub fn Queue(comptime T: type) type {
             self.list.append(&node.link);
         }
 
-        /// Append an item to the back of the queue
-        /// Assumes that there is capacity for the item
+        /// Append an item to the back of the queue.
+        /// Assumes that there is capacity for the item.
         pub fn appendAssumeCapacity(self: *@This(), item: T) void {
             const node: *QueueNode = getNode(self.free.pop() orelse unreachable);
             node.* = .{ .value = item };
             self.list.append(&node.link);
         }
 
-        /// Pop the first item from the queue if there is one
+        /// Pop the first item from the queue if there is one.
         pub fn pop(self: *@This()) ?T {
             const link = self.list.popFirst() orelse return null;
             const node: *QueueNode = getNode(link);
@@ -55,51 +58,51 @@ pub fn Queue(comptime T: type) type {
             return value;
         }
 
-        /// Peek at the first item of the queue
+        /// Peek at the first item of the queue.
         pub fn peek(self: *@This()) ?T {
             const link = self.list.first orelse return null;
             const node: *QueueNode = getNode(link);
             return node.value;
         }
 
-        /// Check if the queue is empty
-        pub fn empty(self: *@This()) bool {
+        /// Check if the queue is empty.
+        pub fn empty(self: *const @This()) bool {
             return self.list.first == null;
         }
 
-        /// Return the parent queue node of the link node
+        /// Return the parent queue node of the link node.
         fn getNode(link: *std.DoublyLinkedList.Node) *QueueNode {
             return @fieldParentPtr("link", link);
         }
 
-        /// Remove an element from the queue
+        /// Remove an element from the queue.
         pub fn remove(self: *@This(), node: *QueueNode) void {
             self.list.remove(&node.link);
             self.free.append(&node.link);
         }
 
-        /// Remove an element from the queue by the value ptr
+        /// Remove an element from the queue by the value ptr.
         pub fn removeValue(self: *@This(), value: *T) void {
             const node: *QueueNode = @fieldParentPtr("value", value);
             self.list.remove(&node.link);
             self.free.append(&node.link);
         }
 
-        /// Clear all the remaining items from the queue
+        /// Clear all the remaining items from the queue.
         pub fn clear(self: *@This()) void {
             while (self.pop()) |_| {}
         }
 
         /// Iterate over all nodes, returning the count.
         /// This operation is O(N).
-        pub fn len(self: *@This()) usize {
+        pub fn len(self: *const @This()) usize {
             if (builtin.mode != .Debug)
                 @panic("Don't use `len` outside of debug build");
             return self.list.len();
         }
 
-        /// Get an iterator for the queue
-        /// Starts iterating from the first node
+        /// Get an iterator for the queue.
+        /// Starts iterating from the first node.
         pub fn iterator(self: *const @This()) Iterator {
             return .{ .current = self.list.first };
         }
@@ -238,88 +241,88 @@ test "clear" {
     try std.testing.expect(q.empty());
 }
 
-/// Thread safe queue
+/// Thread safe queue.
 pub fn MutexQueue(comptime T: type) type {
     return struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        io: std.Io,
+        mutex: std.Io.Mutex = .init,
+        cond: std.Io.Condition = .init,
         queue: Queue(T) = .{},
 
-        pub fn init(gpa: std.mem.Allocator) !*@This() {
-            const queue = try gpa.create(@This());
-            queue.* = .{};
-            return queue;
+        pub fn init(io: std.Io) @This() {
+            return .{ .io = io };
         }
 
-        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !*@This() {
-            const queue = try gpa.create(@This());
-            queue.* = .{ .queue = try .initCapacity(gpa, n) };
-            return queue;
+        /// Initialize with capacity to hold `n` elements.
+        pub fn initCapacity(io: std.Io, gpa: std.mem.Allocator, n: usize) !@This() {
+            return .{ .io = io, .queue = try .initCapacity(gpa, n) };
         }
 
+        /// Clear all allocated memory for the nodes.
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.queue.deinit(gpa);
-            gpa.destroy(self);
         }
 
-        /// Push item to back of queue
+        /// Push item to back of queue.
         pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 try self.queue.append(gpa, item);
             }
-            self.cond.signal();
+            self.cond.signal(self.io);
         }
 
-        /// Push item to back of queue
-        /// Assumes that there is capacity for the element
+        /// Push item to back of queue.
+        /// Assumes that there is capacity for the element.
         pub fn appendAssumeCapacity(self: *@This(), item: T) void {
             {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
                 self.queue.appendAssumeCapacity(item);
             }
-            self.cond.signal();
+            self.cond.signal(self.io);
         }
 
-        /// Pop the first item from the queue if there is one
+        /// Pop the first item from the queue if there is one.
         pub fn pop(self: *@This()) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lock(self.io) catch return null;
+            defer self.mutex.unlock(self.io);
             return self.queue.pop();
         }
 
-        /// Pop the first item from the queue
-        /// Block the caller thread until an item gets pushed
+        /// Pop the first item from the queue.
+        /// Block the caller thread until an item gets pushed.
         pub fn popBlocking(self: *@This()) ?T {
-            self.mutex.lock();
-            if (self.queue.empty()) {
-                self.cond.wait(&self.mutex);
+            self.mutex.lockUncancelable(self.io);
+            while (self.queue.empty()) {
+                self.cond.wait(self.io, &self.mutex) catch return null;
             }
-            self.mutex.unlock();
+            self.mutex.unlock(self.io);
             return self.pop();
         }
 
-        /// Check if the queue is empty
+        /// Check if the queue is empty.
         pub fn empty(self: *@This()) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.queue.list.first == null;
         }
 
-        /// Clear all the remaining items from the queue
+        /// Clear all the remaining items from the queue.
         pub fn clear(self: *@This()) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             self.queue.clear();
         }
 
         /// Iterate over all nodes, returning the count.
         /// This operation is O(N).
         pub fn len(self: *@This()) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.queue.len();
         }
     };
@@ -327,7 +330,8 @@ pub fn MutexQueue(comptime T: type) type {
 
 test "mutex_queue" {
     const gpa = std.testing.allocator;
-    var q = try MutexQueue(usize).initCapacity(gpa, 5);
+    const io = std.testing.io;
+    var q = try MutexQueue(usize).initCapacity(io, gpa, 5);
     defer q.deinit(gpa);
     try std.testing.expect(q.pop() == null);
     q.appendAssumeCapacity(1);
@@ -346,7 +350,7 @@ test "mutex_queue" {
         }
     }.f;
 
-    const thread = try std.Thread.spawn(.{}, push_items, .{ q, gpa });
+    const thread = try std.Thread.spawn(.{}, push_items, .{ &q, gpa });
     try std.testing.expect(q.popBlocking() == 9);
     try std.testing.expect(q.popBlocking() == 8);
     try std.testing.expect(q.popBlocking() == 7);

@@ -366,7 +366,7 @@ test "register" {
 test "job_start" {
     const alloc = std.testing.allocator;
     var parser = MsgParser.init();
-    const msg: JobStartMsg = .{ .job_id = 1, .timestamp = std.time.timestamp() };
+    const msg: JobStartMsg = .{ .job_id = 1, .timestamp = 0 };
     const serialized = try parser.serialize(alloc, .{ .job_start = msg });
     defer alloc.free(serialized);
     const parsed_msg = try parser.parse(serialized);
@@ -389,11 +389,12 @@ test "job_log" {
 }
 
 test "job_end" {
+    const io = std.testing.io;
     const alloc = std.testing.allocator;
     var parser = MsgParser.init();
     const msg: JobEndMsg = .{
         .job_id = 1337,
-        .timestamp = std.time.timestamp(),
+        .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
         .exit_code = 0,
     };
     const serialized = try parser.serialize(alloc, .{ .job_finish = msg });

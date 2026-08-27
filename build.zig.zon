@@ -1,20 +1,24 @@
 .{
     .name = .ztask,
-    .version = "0.3.0",
+    .version = "0.3.1",
     .fingerprint = 0x67a0b4a4055f624,
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml.git#2e2bd0c0aabbca27497501f904715b87facc54fb",
-            .hash = "zig_yaml-0.2.0-C1161kqsAgAlnJFIEkGCMXUSq-QvDKF3vpqeg1XRKW-w",
+            .url = "git+https://github.com/kubkon/zig-yaml.git#b55d8f74624284b3f691cbfb59e0a9b239a37d3c",
+            .hash = "zig_yaml-0.3.0-C1161rqsAgDnPWSLcmv6Hpiw4ZD1UVNDx0Y7HHLsskWk",
         },
         .zcli = .{
-            .url = "git+https://github.com/lepton9/zcli#64ee9886d1dbdb268c8c2cc2a0f56219f241d9a3",
-            .hash = "zcli-0.3.5-Of3s8eyVAQDwkmzd_2bhhx0hoxy_GMiNymJNaRg8JRSZ",
+            .url = "git+https://github.com/lepton9/zcli#5e076479c7933ad68107e889d81a597af7237ab8",
+            .hash = "zcli-0.4.1-Of3s8WoiAgDG31fjhVzXnqvgzDrlCIP3u5oXoCZKtNpE",
         },
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#e70ca957a6bc2b62a9afab1091a57cfb00e8111c",
-            .hash = "vaxis-0.5.1-BWNV_LIyCQA41kkRpB2A6FaGPb2jblX54Flc4NpaWAty",
+            .url = "git+https://github.com/rockorager/libvaxis#a367b89da09bfe5e1b628501940de5b4f858f5f3",
+            .hash = "vaxis-0.6.0-BWNV_HHwCQB451KS7A8SMykALblPmGwHnzSfiJHjN3_9",
+        },
+        .nightwatch = .{
+            .url = "git+https://github.com/neurocyte/nightwatch#cac3b9edb3a59f5b3a290cf3b76044ad9b09ef28",
+            .hash = "nightwatch-1.0.0-uXzeHyOgAgCvaBhschfx3LA48n01bLYOVBQUXYjvrREM",
         },
     },
     .paths = .{

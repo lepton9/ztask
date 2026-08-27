@@ -11,6 +11,8 @@ const AllocError = std.mem.Allocator.Error;
 const UiSnapshot = snap.UiSnapshot;
 const GenericDiagnostics = @import("../diagnostics.zig").GenericDiagnostics;
 
+const log = std.log.scoped(.tui);
+
 const UPDATE_TICK_MS = 300;
 const INFO_TIME_S = 3;
 
@@ -184,7 +186,9 @@ pub const Model = struct {
             },
             .tick => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
-                try self.onTick(ctx);
+                self.onTick(ctx) catch |err| {
+                    log.err("Error on update tick {}", .{err});
+                };
             },
             .mouse => {
                 if (self.confirm != null) {
@@ -200,7 +204,7 @@ pub const Model = struct {
                 }
 
                 if (keyQuit(key)) {
-                    const status = self.taskmanager.getStatus();
+                    const status = try self.taskmanager.getStatus();
                     // Ask for confirmation if there are tasks running
                     if (status.active_tasks > 0) {
                         try self.beginConfirm(
@@ -287,7 +291,10 @@ pub const Model = struct {
                 "Finished task {x} ({s})",
                 .{ r.task_id, @tagName(r.status) },
             ),
-            .info => |e| self.gpa.free(e.msg),
+            .info => |e| {
+                defer self.gpa.free(e.msg);
+                try self.setInfo("Info: task {x} {s}", .{ e.task_id, e.msg });
+            },
             .err => |e| {
                 defer if (e.msg) |m| self.gpa.free(m);
                 try self.setInfo("Error {s}: '{s}'", .{
@@ -301,7 +308,7 @@ pub const Model = struct {
     /// Request a snapshot of the UI from TaskManager
     fn requestSnapshot(self: *Model) !void {
         // Update status
-        self.snapshot.status = self.taskmanager.getStatus();
+        self.snapshot.status = try self.taskmanager.getStatus();
 
         // Update task list
         if (self.taskmanager.tasksModified()) {
@@ -309,7 +316,7 @@ pub const Model = struct {
             const arena = self.arena_list.allocator();
             const tasks = try self.taskmanager.buildTaskList(arena);
             self.snapshot.tasks = tasks;
-            self.snapshot.updated = std.time.timestamp();
+            self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
             try self.task_split.buildTaskList(arena);
         }
 
@@ -327,7 +334,7 @@ pub const Model = struct {
             self.snapshot.selected_task = null;
             self.task_split.setSelectedState(null);
         }
-        self.snapshot.updated = std.time.timestamp();
+        self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
 
     /// Initialize a confirmation state and change active area
@@ -486,7 +493,7 @@ pub const Model = struct {
 
     /// Stop task from running
     fn stopTask(self: *Model, task_id: []const u8) void {
-        return self.taskmanager.stopTask(task_id);
+        self.taskmanager.stopTask(task_id) catch {};
     }
 
     /// Set info text and restart the info display time
@@ -494,13 +501,13 @@ pub const Model = struct {
         if (self.confirm != null) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = try std.fmt.allocPrint(self.gpa, fmt, args);
-        self.info.timestamp = std.time.timestamp();
+        self.info.timestamp = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
 
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
         if (self.confirm != null) return;
-        if (std.time.timestamp() - self.info.timestamp < INFO_TIME_S) return;
+        if (std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds() - self.info.timestamp < INFO_TIME_S) return;
         if (self.info.text) |t| self.gpa.free(t);
         self.info.text = null;
     }
@@ -1551,14 +1558,19 @@ const TaskListItem = struct {
         ctx: vxfw.DrawContext,
     ) AllocError!vxfw.Surface {
         var self: *@This() = @ptrCast(@alignCast(ptr));
+
+        const width_opt = ctx.max.width;
+        const width: u16 = if ((width_opt orelse 0) >= 1) width_opt.? else 20;
         return self.draw(ctx.withConstraints(
             .{ .width = 1, .height = 1 },
-            .{ .width = 20, .height = 1 },
+            .{ .width = width, .height = 1 },
         ));
     }
 
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
-        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 2);
+        const w: usize = @intCast(@max(ctx.max.width orelse 0, 1));
+
+        var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
         var text: vxfw.RichText = .{ .text = segments };
 
         const tag: StatusText = switch (self.task.status) {
@@ -1568,13 +1580,32 @@ const TaskListItem = struct {
             else => |s| .{ .text = @tagName(s) },
         };
 
-        segments[0] = .{ .text = try std.fmt.allocPrint(ctx.arena, "{s}", .{
-            self.task.meta.name,
-        }) };
-        segments[1] = .{
-            .text = try std.fmt.allocPrint(ctx.arena, "{s:>10}", .{tag.text}),
-            .style = .{ .fg = tag.color },
-        };
+        // Truncate name if there isn't enough space for the status
+        const has_tag = tag.text.len != 0;
+        const sep: []const u8 = if (has_tag) " " else "";
+
+        const status_w: usize, const sep_w: usize = if (has_tag)
+            .{ ctx.stringWidth(tag.text), 1 }
+        else
+            .{ 0, 0 };
+
+        var name_txt: []const u8 = "";
+        var status_txt: []const u8 = "";
+
+        if (!has_tag) {
+            name_txt = try truncateWithEllipsis(ctx.arena, self.task.meta.name, w);
+        } else if (status_w >= w) {
+            // No room for the name at all
+            status_txt = try truncateWithEllipsis(ctx.arena, tag.text, w);
+        } else {
+            const name_w = w - status_w - sep_w;
+            name_txt = try truncateWithEllipsis(ctx.arena, self.task.meta.name, name_w);
+            status_txt = tag.text;
+        }
+
+        segments[0] = .{ .text = name_txt };
+        segments[1] = .{ .text = sep };
+        segments[2] = .{ .text = status_txt, .style = .{ .fg = tag.color } };
 
         return text.draw(ctx);
     }

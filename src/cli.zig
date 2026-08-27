@@ -1,16 +1,17 @@
 const std = @import("std");
 const zcli = @import("zcli");
 const run = @import("run.zig");
+const data = @import("data.zig");
 const options = @import("build_options");
-const remote_man = @import("remote/remote_manager.zig");
 const builtin = @import("builtin");
 
+const AppLogger = @import("AppLogger.zig");
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 const ParseError = @import("parse.zig").ParseError;
-const DataDirMode = @import("data.zig").DataStore.DataDirMode;
-const ListenOptions = run.ListenOptions;
-const DEFAULT_ADDR = remote_man.DEFAULT_ADDR;
-const DEFAULT_PORT = remote_man.DEFAULT_PORT;
+
+const rm = @import("remote/remote_manager.zig");
+const DEFAULT_ADDR = rm.DEFAULT_ADDR;
+const DEFAULT_PORT = rm.DEFAULT_PORT;
 
 const inErrorSet = run.inErrorSet;
 
@@ -36,22 +37,7 @@ pub const cli_spec: zcli.CliApp = .{
             .short_name = "g",
             .desc = "Force global data dir (ignore project + env)",
         },
-        runner_n_option,
-        .{
-            .long_name = "listen-addr",
-            .desc = "Address the remote manager binds to",
-            .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
-        },
-        .{
-            .long_name = "listen-port",
-            .desc = "Port the remote manager binds to",
-            .arg = .{
-                .name = "PORT",
-                .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
-                .type = .Int,
-            },
-        },
-        .{ .long_name = "version", .short_name = "v", .desc = "Print version" },
+        .{ .long_name = "version", .short_name = "V", .desc = "Print version" },
         .{ .long_name = "help", .short_name = "h", .desc = "Print help" },
     },
     .positionals = &[_]zcli.PosArg{},
@@ -65,9 +51,18 @@ const commands = &[_]zcli.Cmd{
         .action = cmdInitFn,
     },
     .{
+        .name = "tui",
+        .desc = "Run the text user interface (TUI)",
+        .action = cmdTuiFn,
+        .options = task_options ++ listen_options ++ &[_]zcli.Opt{
+            runner_n_option,
+            verbose_option,
+        },
+    },
+    .{
         .name = "run",
         .desc = "Run a single task",
-        .options = task_options ++ &[_]zcli.Opt{
+        .options = task_options ++ listen_options ++ &[_]zcli.Opt{
             .{
                 .long_name = "attach",
                 .short_name = "a",
@@ -79,7 +74,8 @@ const commands = &[_]zcli.Cmd{
                 .short_name = "t",
                 .desc = "Restart task if a trigger occurs while running",
             },
-            .{ .long_name = "verbose", .desc = "Print extra status messages" },
+            runner_n_option,
+            verbose_option,
         },
         .positionals = &[_]zcli.PosArg{path_positional},
         .action = cmdRunFn,
@@ -111,6 +107,7 @@ const commands = &[_]zcli.Cmd{
                     .type = .Int,
                 },
             },
+            runner_n_option,
         },
         .action = cmdRunnerFn,
     },
@@ -254,9 +251,9 @@ const commands = &[_]zcli.Cmd{
     },
     .{
         .name = "sync",
-        .desc = "Handle modified tasks and sync ID and name changes",
+        .desc = "Handle modified tasks, sync ID and name changes",
         .options = &[_]zcli.Opt{
-            .{ .long_name = "dry", .desc = "Enable dry run" },
+            .{ .long_name = "dry", .short_name = "D", .desc = "Enable dry run" },
         },
         .action = cmdSyncFn,
     },
@@ -288,6 +285,25 @@ const task_options = &[_]zcli.Opt{
     },
 };
 
+const listen_options = &[_]zcli.Opt{
+    .{
+        .long_name = "listen-addr",
+        .short_name = "A",
+        .desc = "Address to listen to for remote runners",
+        .arg = .{ .name = "ADDR", .default = DEFAULT_ADDR, .type = .Text },
+    },
+    .{
+        .long_name = "listen-port",
+        .short_name = "P",
+        .desc = "Port to listen to for remote runners",
+        .arg = .{
+            .name = "PORT",
+            .default = std.fmt.comptimePrint("{d}", .{DEFAULT_PORT}),
+            .type = .Int,
+        },
+    },
+};
+
 const path_positional: zcli.PosArg = .{
     .name = "path",
     .desc = "Path of the task file",
@@ -302,45 +318,46 @@ const runner_n_option: zcli.Opt = .{
     .arg = .{ .name = "INT", .type = .Int },
 };
 
-/// Write error message and exit the program.
-fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
-    const fmt_nl = comptime blk: {
-        if (std.mem.endsWith(u8, fmt, "\n")) break :blk fmt;
-        break :blk fmt ++ "\n";
-    };
-    run.fmtWriteErr(fmt_nl, args) catch {};
-    std.process.exit(1);
-}
-
-/// Generate shell completions
-fn generate_completion(
-    cli: *zcli.Cli,
-    comptime spec: *const zcli.CliApp,
-) !noreturn {
-    var buf: [8096]u8 = undefined;
-    const shell = cli.findPositional("shell") orelse unreachable;
-    const script = try zcli.complete.getCompletion(
-        &buf,
-        spec,
-        spec.config.name.?,
-        shell.value,
-    );
-    try run.write(script);
-    std.process.exit(0);
-}
+const verbose_option: zcli.Opt = .{
+    .long_name = "verbose",
+    .short_name = "v",
+    .desc = "Emit extra status messages",
+};
 
 /// Context given to command functions
 const Ctx = struct {
-    gpa: std.mem.Allocator,
+    run_ctx: run.RunCtx,
     cli: *zcli.Cli,
-    data_dir: DataDirMode,
-    listen: ListenOptions,
+
+    /// Write error message and exit the program.
+    fn fatal(ctx: *const Ctx, comptime fmt: []const u8, args: anytype) noreturn {
+        const fmt_nl = comptime blk: {
+            if (std.mem.endsWith(u8, fmt, "\n")) break :blk fmt;
+            break :blk fmt ++ "\n";
+        };
+        run.fmtWriteErr(ctx.run_ctx.io, fmt_nl, args) catch {};
+        std.process.exit(1);
+    }
 };
 
 /// Handle init command
 fn cmdInitFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    try run.initProjectDataDir(ctx.gpa);
+    try run.initProjectDataDir(ctx.run_ctx);
+}
+
+/// Handle tui command
+fn cmdTuiFn(ptr: *anyopaque) !void {
+    const ctx: *Ctx = @ptrCast(@alignCast(ptr));
+    const cli = ctx.cli;
+
+    var opts: run.TuiOptions = .{
+        .listen = getListenOptions(ctx),
+        .verbose = cli.findOption("verbose") != null,
+    };
+    if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
+
+    return try run.runTui(ctx.run_ctx, opts);
 }
 
 /// Handle new command
@@ -351,10 +368,9 @@ fn cmdNewFn(ptr: *anyopaque) !void {
     const name = name_opt.value.?.string;
 
     var diagnostics: GenericDiagnostics = .{};
-    defer diagnostics.deinit(ctx.gpa);
+    defer diagnostics.deinit(ctx.run_ctx.gpa);
 
     var opts: run.CreateOptions = .{
-        .data_dir = ctx.data_dir,
         .name = name,
         .edit = cli.findOption("edit") != null,
         .diagnostics = &diagnostics,
@@ -366,23 +382,23 @@ fn cmdNewFn(ptr: *anyopaque) !void {
         opts.id = opt.value.?.string;
     }
 
-    run.createNewTask(ctx.gpa, opts) catch |err| {
-        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+    run.createNewTask(ctx.run_ctx, opts) catch |err| {
+        if (diagnostics.message) |msg| ctx.fatal("{s}", .{msg});
         switch (err) {
             error.EditorNotFound => if (opts.editor) |e|
-                fatal("Editor not found: '{s}'", .{e})
+                ctx.fatal("Editor not found: '{s}'", .{e})
             else
-                fatal("No default editor found", .{}),
+                ctx.fatal("No default editor found", .{}),
             error.TaskExists => if (opts.id) |e|
-                fatal("Task exists with ID: {s}", .{e})
+                ctx.fatal("Task exists with ID: {s}", .{e})
             else
-                fatal("Task already exists with the given ID", .{}),
+                ctx.fatal("Task already exists with the given ID", .{}),
             else => {
                 if (inErrorSet(err, ParseError)) {
-                    fatal("Invalid task file: {any}", .{err});
+                    ctx.fatal("Invalid task file: {any}", .{err});
                     return;
                 }
-                fatal("Error: {any}", .{err});
+                ctx.fatal("Error: {any}", .{err});
             },
         }
     };
@@ -391,7 +407,7 @@ fn cmdNewFn(ptr: *anyopaque) !void {
 /// Handle env command
 fn cmdEnvFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    try run.showEnv(ctx.gpa, ctx.data_dir);
+    try run.showEnv(ctx.run_ctx);
 }
 
 /// Handle move command
@@ -403,14 +419,14 @@ fn cmdMoveFn(ptr: *anyopaque) !void {
     const from = from_arg.value;
     const to = to_arg.value;
     const repair = cli.findOption("repair") != null;
-    run.moveTask(ctx.gpa, from, to, ctx.data_dir, .{
+    run.moveTask(ctx.run_ctx, from, to, .{
         .repair = repair,
     }) catch |err| switch (err) {
-        error.FileNotFound => fatal("File not found: '{s}'", .{from}),
-        error.TaskNotFound => fatal("Task file not found: '{s}'", .{from}),
-        error.TaskExists => fatal("Task already exists at: '{s}'", .{to}),
-        error.InvalidTaskFile => fatal("Moved file is not a task file: '{s}'", .{to}),
-        else => fatal("Error: {any}", .{err}),
+        error.FileNotFound => ctx.fatal("File not found: '{s}'", .{from}),
+        error.TaskNotFound => ctx.fatal("Task file not found: '{s}'", .{from}),
+        error.TaskExists => ctx.fatal("Task already exists at: '{s}'", .{to}),
+        error.InvalidTaskFile => ctx.fatal("Moved file is not a task file: '{s}'", .{to}),
+        else => ctx.fatal("Error: {any}", .{err}),
     };
 }
 
@@ -420,7 +436,7 @@ fn cmdEditFn(ptr: *anyopaque) !void {
     var cli = ctx.cli;
 
     const task_arg = getTaskInput(cli) orelse
-        fatal("No task given to edit", .{});
+        ctx.fatal("No task given to edit", .{});
 
     const task_opts: run.TaskOptions = switch (task_arg) {
         .id => |id| .{ .task = .{ .id = id } },
@@ -434,21 +450,21 @@ fn cmdEditFn(ptr: *anyopaque) !void {
     }
     opts.continue_failed = cli.findOption("continue") != null;
 
-    run.editTask(ctx.gpa, ctx.data_dir, opts) catch |err| switch (err) {
+    run.editTask(ctx.run_ctx, opts) catch |err| switch (err) {
         error.FileNotFound, error.TaskNotFound => switch (task_opts.task) {
-            .path => |p| fatal("Task file not found: '{s}'", .{p}),
-            .id => |i| fatal("Task not found with ID: '{s}'", .{i}),
+            .path => |p| ctx.fatal("Task file not found: '{s}'", .{p}),
+            .id => |i| ctx.fatal("Task not found with ID: '{s}'", .{i}),
         },
         error.EditorNotFound => if (opts.editor) |e|
-            fatal("Editor not found: '{s}'", .{e})
+            ctx.fatal("Editor not found: '{s}'", .{e})
         else
-            fatal("No default editor found", .{}),
+            ctx.fatal("No default editor found", .{}),
         else => {
             if (inErrorSet(err, ParseError)) {
-                fatal("Invalid task file: {any}", .{err});
+                ctx.fatal("Invalid task file: {any}", .{err});
                 return;
             }
-            fatal("Error: {any}", .{err});
+            ctx.fatal("Error: {any}", .{err});
         },
     };
 }
@@ -456,23 +472,22 @@ fn cmdEditFn(ptr: *anyopaque) !void {
 /// Handle run command
 fn cmdRunFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    var cli = ctx.cli;
+    const cli = ctx.cli;
 
     const task_arg = getTaskInput(cli) orelse
-        fatal("No task given to run", .{});
+        ctx.fatal("No task given to run", .{});
 
     var diagnostics: GenericDiagnostics = .{};
-    defer diagnostics.deinit(ctx.gpa);
+    defer diagnostics.deinit(ctx.run_ctx.gpa);
 
     var opts: run.RunOptions = .{
+        .listen = getListenOptions(ctx),
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
             const value = o.value orelse break :blk .first;
             break :blk .{ .name = value.string };
         },
         .retrigger = cli.findOption("retrigger") != null,
-        .data_dir = ctx.data_dir,
-        .listen = ctx.listen,
         .verbose = cli.findOption("verbose") != null,
         .diagnostics = &diagnostics,
     };
@@ -482,36 +497,36 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .path => |path| opts.path = path,
     }
 
-    if (getRunnerAmount(cli)) |n| opts.runners_n = n;
+    if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
-    return run.runTask(ctx.gpa, opts) catch |err| {
-        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+    return run.runTask(ctx.run_ctx, opts) catch |err| {
+        if (diagnostics.message) |msg| ctx.fatal("{s}", .{msg});
 
         // Handle other errors
         switch (err) {
-            error.TaskNotFoundId => fatal(
+            error.TaskNotFoundId => ctx.fatal(
                 "Task not found with ID: {s}",
                 .{opts.id orelse ""},
             ),
             error.TaskNotFoundPath => if (opts.path) |p|
-                fatal("Task file not found: '{s}'", .{p})
+                ctx.fatal("Task file not found: '{s}'", .{p})
             else
-                fatal("Task not found", .{}),
-            error.ErrorOpenFilePath => fatal(
+                ctx.fatal("Task not found", .{}),
+            error.ErrorOpenFilePath => ctx.fatal(
                 "Error opening file: '{s}'",
                 .{opts.path orelse ""},
             ),
-            error.TaskExists => fatal("Another task exists with the same ID", .{}),
+            error.TaskExists => ctx.fatal("Another task exists with the same ID", .{}),
             error.UnknownAttachJob => {
                 const attach_name = if (opts.attach_job) |a| a.name else "";
-                fatal("Unknown job to attach to '{s}'", .{attach_name});
+                ctx.fatal("Unknown job to attach to '{s}'", .{attach_name});
             },
-            error.InvalidTaskFile => fatal("Invalid task file format", .{}),
-            error.InvalidWatchPath => fatal("Invalid file path for watch trigger", .{}),
-            error.WatchPathNotFound => fatal("File path for watch trigger not found", .{}),
-            error.NoTaskFileGiven => fatal("No task file given", .{}),
+            error.InvalidTaskFile => ctx.fatal("Invalid task file format", .{}),
+            error.InvalidWatchPath => ctx.fatal("Invalid file path for watch trigger", .{}),
+            error.WatchPathNotFound => ctx.fatal("File path for watch trigger not found", .{}),
+            error.NoTaskFileGiven => ctx.fatal("No task file given", .{}),
             else => {
-                if (inErrorSet(err, ParseError)) fatal(
+                if (inErrorSet(err, ParseError)) ctx.fatal(
                     "Invalid task file: {any}",
                     .{err},
                 );
@@ -524,12 +539,12 @@ fn cmdRunFn(ptr: *anyopaque) !void {
 /// Handle runner command
 fn cmdRunnerFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    var cli = ctx.cli;
+    const cli = ctx.cli;
 
     const name_opt = cli.findOption("name") orelse unreachable;
     const name = name_opt.value.?.string;
     const trimmed = std.mem.trim(u8, name, " \t");
-    if (std.mem.eql(u8, trimmed, "")) fatal("Invalid runner name '{s}'", .{name});
+    if (std.mem.eql(u8, trimmed, "")) ctx.fatal("Invalid runner name '{s}'", .{name});
 
     const addr = cli.findOption("address");
     const port: ?u16 = blk: {
@@ -541,16 +556,16 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
     };
     var opts: run.AgentOptions = .{ .name = name };
 
-    if (addr) |a| opts.addr = a.value.?.string;
-    if (port) |p| opts.port = p;
+    if (addr) |a| opts.connect.addr = a.value.?.string;
+    if (port) |p| opts.connect.port = p;
 
-    if (getRunnerAmount(cli)) |n| opts.runners_n = n;
+    if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
-    return run.runAgent(ctx.gpa, opts) catch |err| switch (err) {
-        error.NameTaken => fatal(
+    return run.runAgent(ctx.run_ctx, opts) catch |err| switch (err) {
+        error.NameTaken => ctx.fatal(
             "Another remote runner with name '{s}' already connected to {s}:{d}",
             .{
-                opts.name, opts.addr, opts.port,
+                opts.name, opts.connect.addr, opts.connect.port,
             },
         ),
         else => {},
@@ -588,14 +603,13 @@ fn cmdListFn(ptr: *anyopaque) !void {
                 break :blk .asc;
             if (std.mem.eql(u8, value_upper, "DESC"))
                 break :blk .desc;
-            fatal("Invalid sort order '{s}'", .{value});
+            ctx.fatal("Invalid sort order '{s}'", .{value});
         };
         sorters[sort_count] = .{ sort, order };
         sort_count += 1;
     }
-    return try run.listTasks(ctx.gpa, .{
+    return try run.listTasks(ctx.run_ctx, .{
         .sort = sorters[0..sort_count],
-        .data_dir = ctx.data_dir,
     });
 }
 
@@ -603,20 +617,27 @@ fn cmdListFn(ptr: *anyopaque) !void {
 fn cmdSyncFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const dry_run = ctx.cli.findOption("dry") != null;
-    return run.syncTasks(
-        ctx.gpa,
-        ctx.data_dir,
-        dry_run,
-    ) catch |err| switch (err) {
-        error.UnresolvedConflict => fatal("Unresolved conflicts", .{}),
-        else => fatal("Failed to sync some of the tasks", .{}),
-    };
+    return run.syncTasks(ctx.run_ctx, dry_run) catch |err|
+        switch (err) {
+            error.UnresolvedConflict => ctx.fatal("Unresolved conflicts", .{}),
+            else => ctx.fatal("Failed to sync some of the tasks", .{}),
+        };
 }
 
 /// Handle completion command
 fn cmdCompletionFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
-    return try generate_completion(ctx.cli, &cli_spec);
+    const cli = ctx.cli;
+    const shell_pos = cli.findPositional("shell") orelse unreachable;
+    const shell = std.meta.stringToEnum(zcli.complete.Shell, shell_pos.value) orelse
+        ctx.fatal("Invalid shell argument '{s}'", .{shell_pos.value});
+    const script = try zcli.complete.getCompletionOwned(
+        ctx.run_ctx.gpa,
+        &cli_spec,
+        shell,
+    );
+    try run.write(ctx.run_ctx.io, script);
+    std.process.exit(0);
 }
 
 /// Handle add command
@@ -625,7 +646,7 @@ fn cmdAddFn(ptr: *anyopaque) !void {
     const cli = ctx.cli;
 
     const task_arg = getTaskInput(cli) orelse
-        fatal("No path argument given", .{});
+        ctx.fatal("No path argument given", .{});
 
     const path: []const u8 = switch (task_arg) {
         .path => |p| p,
@@ -633,22 +654,21 @@ fn cmdAddFn(ptr: *anyopaque) !void {
     };
 
     var diagnostics: GenericDiagnostics = .{};
-    defer diagnostics.deinit(ctx.gpa);
+    defer diagnostics.deinit(ctx.run_ctx.gpa);
 
-    return run.addTasks(ctx.gpa, .{
+    return run.addTasks(ctx.run_ctx, .{
         .path = path,
         .recursive = cli.findOption("recursive") != null,
         .skip = cli.findOption("skip") != null,
-        .data_dir = ctx.data_dir,
         .diagnostics = &diagnostics,
     }) catch |err| {
-        if (diagnostics.message) |msg| fatal("{s}", .{msg});
+        if (diagnostics.message) |msg| ctx.fatal("{s}", .{msg});
         switch (err) {
-            error.ErrorOpenFile => fatal("Failed to open file: {s}", .{path}),
-            error.NotFileOrDir => fatal("Not a file or a directory: '{s}'", .{path}),
-            error.InvalidTaskFile => fatal("Not a task file", .{}),
-            error.TaskExists => fatal("Task already exists", .{}),
-            else => fatal("Error: {any}", .{err}),
+            error.ErrorOpenFile => ctx.fatal("Failed to open file: {s}", .{path}),
+            error.NotFileOrDir => ctx.fatal("Not a file or a directory: '{s}'", .{path}),
+            error.InvalidTaskFile => ctx.fatal("Not a task file", .{}),
+            error.TaskExists => ctx.fatal("Task already exists", .{}),
+            else => ctx.fatal("Error: {any}", .{err}),
         }
     };
 }
@@ -659,29 +679,26 @@ fn cmdDeleteFn(ptr: *anyopaque) !void {
     const cli = ctx.cli;
 
     const task_arg = getTaskInput(cli) orelse
-        fatal("No task given to delete", .{});
+        ctx.fatal("No task given to delete", .{});
 
-    const opts: run.DeleteOptions = .{
-        .task = task_arg,
-        .data_dir = ctx.data_dir,
-    };
+    const opts: run.DeleteOptions = .{ .task = task_arg };
 
-    return run.deleteTask(ctx.gpa, opts) catch |err| switch (err) {
+    return run.deleteTask(ctx.run_ctx, opts) catch |err| switch (err) {
         error.TaskNotFound => {
             switch (opts.task) {
-                .path => |path| fatal("Task not found with path: '{s}'", .{path}),
-                .id => |id| fatal("Task not found with ID: '{s}'", .{id}),
+                .path => |path| ctx.fatal("Task not found with path: '{s}'", .{path}),
+                .id => |id| ctx.fatal("Task not found with ID: '{s}'", .{id}),
             }
         },
-        error.FileNotFound => fatal("File not found: '{s}'", .{opts.task.path}),
-        else => fatal("Error: {any}", .{err}),
+        error.FileNotFound => ctx.fatal("File not found: '{s}'", .{opts.task.path}),
+        else => ctx.fatal("Error: {any}", .{err}),
     };
 }
 
 /// Get the task input either from a path or id argument.
 ///
 /// The task input must be in the 'TASK_SELECT_TAG' group.
-inline fn getTaskInput(cli: *zcli.Cli) ?run.TaskSelect {
+inline fn getTaskInput(cli: *const zcli.Cli) ?run.TaskSelect {
     const task_arg = cli.findGroupArg(TASK_SELECT_TAG) orelse return null;
     return switch (task_arg) {
         .option => |o| if (std.mem.eql(u8, o.name, "id"))
@@ -693,10 +710,11 @@ inline fn getTaskInput(cli: *zcli.Cli) ?run.TaskSelect {
 }
 
 /// Get the amount of runners if the option is given.
-inline fn getRunnerAmount(cli: *zcli.Cli) ?u8 {
+inline fn getRunnerAmount(ctx: *const Ctx) ?u8 {
+    const cli = ctx.cli;
     if (cli.findOption("runners")) |opt| {
         const n = opt.value.?.int;
-        if (n < 1 or n > run.MAX_RUNNERS_N) fatal(
+        if (n < 1 or n > run.MAX_RUNNERS_N) ctx.fatal(
             "Invalid amount of runners '{d}'. (1 <= n <= {d})",
             .{ n, run.MAX_RUNNERS_N },
         );
@@ -706,10 +724,11 @@ inline fn getRunnerAmount(cli: *zcli.Cli) ?u8 {
 }
 
 /// Get the used data directory selection.
-inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
+inline fn getDataDirMode(ctx: *const Ctx) data.DataDirMode {
+    const cli = ctx.cli;
     const use_global = cli.findOption("global") != null;
     const data_dir_opt = cli.findOption("data-dir");
-    if (use_global and data_dir_opt != null) fatal(
+    if (use_global and data_dir_opt != null) ctx.fatal(
         "Options '--global' and '--data-dir' are mutually exclusive.",
         .{},
     );
@@ -719,10 +738,12 @@ inline fn getDataDirMode(cli: *zcli.Cli) DataDirMode {
 }
 
 /// Get the remote manager address
-inline fn getListenAddr(cli: *zcli.Cli) []const u8 {
+inline fn getListenAddr(ctx: *const Ctx) []const u8 {
+    const cli = ctx.cli;
     const opt = cli.findOption("listen-addr") orelse return DEFAULT_ADDR;
     const addr = opt.value.?.string;
-    _ = std.net.Address.parseIp4(addr, 0) catch fatal(
+
+    _ = std.Io.net.IpAddress.parseIp4(addr, 0) catch ctx.fatal(
         "Invalid listen address '{s}' (expected IPv4)",
         .{addr},
     );
@@ -730,40 +751,66 @@ inline fn getListenAddr(cli: *zcli.Cli) []const u8 {
 }
 
 /// Get the remote manager port
-inline fn getListenPort(cli: *zcli.Cli) u16 {
+inline fn getListenPort(ctx: *const Ctx) u16 {
+    const cli = ctx.cli;
     const opt = cli.findOption("listen-port") orelse return DEFAULT_PORT;
     const port_i64 = opt.value.?.int;
-    if (port_i64 <= 0 or port_i64 > std.math.maxInt(u16)) fatal(
+    if (port_i64 <= 0 or port_i64 > std.math.maxInt(u16)) ctx.fatal(
         "Invalid listen port '{d}' (expected 1-65535)",
         .{port_i64},
     );
     return @intCast(port_i64);
 }
 
-/// Handle parsed cli and call the command function
-pub fn handleArgs(gpa: std.mem.Allocator, cli: *zcli.Cli) !void {
-    const data_dir_mode = getDataDirMode(cli);
-    const listen_opts: ListenOptions = .{
-        .addr = getListenAddr(cli),
-        .port = getListenPort(cli),
-    };
+fn getListenOptions(ctx: *const Ctx) run.ConnectOptions {
+    return .{ .addr = getListenAddr(ctx), .port = getListenPort(ctx) };
+}
 
-    const cmd = cli.cmd orelse return try run.runTui(gpa, .{
-        .data_dir = data_dir_mode,
-        .listen = listen_opts,
-        .runners_n = if (getRunnerAmount(cli)) |n| n else run.BASE_RUNNERS_N,
-    });
-    const cmdFn = cmd.exec orelse return;
+/// Print the help text to stdout.
+inline fn printHelp(ctx: *Ctx) !void {
+    const io = ctx.run_ctx.io;
+    const gpa = ctx.run_ctx.gpa;
+    const stdout = std.Io.File.stdout();
+    var w = stdout.writer(io, &.{});
+    const help = try zcli.generateHelp(gpa, ctx.cli, &cli_spec);
+    defer gpa.free(help);
+    try w.interface.writeAll(help);
+    try w.interface.flush();
+}
+
+/// Handle parsed cli and call the command function.
+pub fn runCmd(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    env: *std.process.Environ.Map,
+    cli: *zcli.Cli,
+) !void {
     var ctx: Ctx = .{
-        .gpa = gpa,
+        .run_ctx = .{ .io = io, .gpa = gpa, .env = env },
         .cli = cli,
-        .data_dir = data_dir_mode,
-        .listen = listen_opts,
     };
+    const root_data_dir = try data.resolveRootDir(io, gpa, env, .{
+        .dir = getDataDirMode(&ctx),
+    });
+    defer gpa.free(root_data_dir);
+    ctx.run_ctx.data_dir = root_data_dir;
+
+    var logger: AppLogger = try .init(io, gpa, root_data_dir);
+    logger.activate();
+    defer {
+        logger.deactivate();
+        logger.deinit();
+    }
+
+    const cmd = cli.cmd orelse return try printHelp(&ctx);
+    std.log.debug("Run command {s}", .{cmd.name});
+
+    const cmdFn = cmd.exec orelse return;
     cmdFn(&ctx) catch |err| {
         if (builtin.mode == .Debug) {
-            std.debug.dumpStackTrace(@errorReturnTrace().?.*);
+            std.debug.dumpCurrentStackTrace(.{});
         }
-        fatal("Unexpected error: {any}", .{err});
+        std.log.err("Unexpected error: {any}", .{err});
+        ctx.fatal("Unexpected error: {any}", .{err});
     };
 }

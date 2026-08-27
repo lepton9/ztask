@@ -2,10 +2,10 @@ const std = @import("std");
 const data = @import("../data.zig");
 const task_zig = @import("../types/task.zig");
 const dag = @import("dag.zig");
-const logger = @import("../logger.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const remote = @import("../remote/remote_manager.zig");
 const queue_zig = @import("../types/queue.zig");
+const RunLogger = @import("../RunLogger.zig");
 
 const Queue = queue_zig.Queue;
 const RunnerPool = @import("../runner/runnerpool.zig").RunnerPool;
@@ -28,7 +28,6 @@ test {
 const JobNode = localrunner.JobNode;
 const Result = localrunner.Result;
 const LogEvent = localrunner.LogEvent;
-const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 
 /// Scheduler -> TaskManager event sink.
@@ -68,12 +67,19 @@ pub const InterruptReason = enum { user_interrupt, retrigger };
 
 /// Scheduler for executing one task
 pub const Scheduler = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
-    status: enum { running, completed, waiting, inactive, interrupted },
-    datastore: *data.DataStore,
+    /// The current status of the scheduler.
+    status: SchedulerTaskStatus,
+    /// The task the scheduler is executing.
     task: *Task,
+    /// Shared runner pool for running task jobs.
     pool: *RunnerPool,
+    /// Referenced datastore to write task metadata.
+    datastore: *data.DataStore,
+    /// Referenced remote manager to dispatch remote jobs.
     remote_manager: *remote.RemoteManager,
+    /// The DAG nodes in order.
     nodes: []JobNode = undefined,
     /// Job to run in attached mode
     attach_job: ?[]const u8 = null,
@@ -85,11 +91,17 @@ pub const Scheduler = struct {
     /// Runners currently running jobs
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Queue for completed jobs
-    result_queue: *ResultQueue,
-    log_queue: *LogQueue,
+    result_queue: std.Io.Queue(Result),
+    /// Buffer for the `result_queue`.
+    result_buffer: []Result,
+    /// Queue for job logs
+    log_queue: LogQueue,
 
-    logger: logger.RunLogger,
+    /// Logger to write metadata files and job logs.
+    run_logger: RunLogger,
+    /// Metadata for the current task run.
     task_meta: data.TaskRunMetadata,
+    /// Metadatas for the jobs of the current task run.
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
     /// Task starting timestamp in milliseconds.
@@ -101,9 +113,18 @@ pub const Scheduler = struct {
     /// Watch path list used for file watch triggers.
     /// Managed and allocated by `TaskManager`.
     /// Used to keep track of paths that are connected to this scheduler.
-    watch_paths: std.ArrayListUnmanaged([]const u8) = .{},
+    watch_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+
+    const SchedulerTaskStatus = enum {
+        running,
+        completed,
+        waiting,
+        inactive,
+        interrupted,
+    };
 
     pub fn init(
+        io: std.Io,
         gpa: std.mem.Allocator,
         task: *Task,
         pool: *RunnerPool,
@@ -114,26 +135,35 @@ pub const Scheduler = struct {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
         const node_n = task.jobs.count();
+
+        const nodes = try gpa.alloc(JobNode, node_n);
+        errdefer gpa.free(nodes);
+        const result_buffer = try gpa.alloc(Result, node_n);
+        errdefer gpa.free(result_buffer);
+
         const task_meta: data.TaskRunMetadata = .{
             .task_id = try gpa.dupe(u8, task.id.fmt()),
-            .start_time = std.time.timestamp(),
+            .start_time = std.Io.Timestamp.now(io, .real).toSeconds(),
             .jobs_total = node_n,
         };
         const tasks_path = try datastore.tasksDataPath(gpa);
         defer gpa.free(tasks_path);
+
         scheduler.* = .{
+            .io = io,
             .gpa = gpa,
             .datastore = datastore,
             .task = task,
             .pool = pool,
             .remote_manager = remote_manager,
-            .nodes = try scheduler.gpa.alloc(JobNode, node_n),
+            .nodes = nodes,
             .active_runners = .{},
             .queue = try .initCapacity(gpa, node_n),
-            .result_queue = try ResultQueue.initCapacity(gpa, node_n),
-            .log_queue = try LogQueue.init(gpa),
+            .result_queue = .init(result_buffer),
+            .result_buffer = result_buffer,
+            .log_queue = .init(io),
             .status = .inactive,
-            .logger = try .init(gpa, tasks_path, task_meta.task_id),
+            .run_logger = try .init(io, gpa, tasks_path, task_meta.task_id),
             .task_meta = task_meta,
             .job_metas = .{},
             .event_sink = event_sink,
@@ -163,9 +193,10 @@ pub const Scheduler = struct {
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
-        self.result_queue.deinit(self.gpa);
+        self.result_queue.close(self.io);
+        self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
-        self.logger.deinit(self.gpa);
+        self.run_logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);
         self.job_metas.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -229,8 +260,8 @@ pub const Scheduler = struct {
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
-        try self.logger.startTask(self.gpa, &self.task_meta, run_id);
-        self.task_start_ms = std.time.milliTimestamp();
+        try self.run_logger.startTask(self.gpa, &self.task_meta, run_id);
+        self.task_start_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 
         self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
 
@@ -245,7 +276,7 @@ pub const Scheduler = struct {
         for (self.nodes) |*node| {
             node.reset();
             const job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
-            self.logger.initJobMeta(self.gpa, job_meta) catch {};
+            self.run_logger.initJobMeta(self.gpa, job_meta) catch {};
         }
 
         // Find nodes without dependencies
@@ -278,7 +309,7 @@ pub const Scheduler = struct {
         self.active_runners.putAssumeCapacity(node, runner);
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
         const exec_mode: ExecMode = if (self.attach_job) |attach_name|
             (if (std.mem.eql(u8, attach_name, node.ptr.name)) .attached else .piped)
         else
@@ -286,8 +317,8 @@ pub const Scheduler = struct {
         runner.runJobWithMode(
             self.gpa,
             node,
-            self.result_queue,
-            self.log_queue,
+            &self.result_queue,
+            &self.log_queue,
             exec_mode,
             self.task.cwd,
         );
@@ -300,7 +331,7 @@ pub const Scheduler = struct {
 
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .running;
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
         self.remote_manager.pushDispatch(.{
             .agent = node.ptr.run_on.remote,
@@ -336,8 +367,6 @@ pub const Scheduler = struct {
             .reason = reason,
         } });
 
-        self.handleResults();
-
         // Force stop running local runners
         var it = self.active_runners.iterator();
         while (it.next()) |e| {
@@ -347,15 +376,15 @@ pub const Scheduler = struct {
             self.pool.release(runner);
             self.skipJob(node);
         }
-        self.result_queue.clear();
         self.active_runners.clearRetainingCapacity();
 
         self.skipRemainingJobs();
+        self.handleResults();
         self.handleLogs();
 
         // Log task metadata
         self.task_meta.status = .interrupted;
-        self.task_meta.jobs_completed = self.completedJobs();
+        self.task_meta.jobs_completed = self.successfulJobs();
 
         self.emitEvent(.{ .task_completed = .{
             .task_id = self.task.id.value,
@@ -392,8 +421,8 @@ pub const Scheduler = struct {
         // Log job metadata
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .interrupted;
-        job_meta.end_time_ms = std.time.timestamp();
-        self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+        job_meta.end_time_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
     /// Update the scheduler and handle pending events
@@ -404,19 +433,25 @@ pub const Scheduler = struct {
 
     /// Handle the completed job results
     fn handleResults(self: *Scheduler) void {
-        while (self.result_queue.pop()) |res| switch (res.result.runner) {
-            .local => {
-                if (self.active_runners.fetchRemove(res.node)) |kv| {
-                    const runner = kv.value;
-                    runner.finishJob();
-                    self.pool.release(runner);
-                }
-                self.onJobCompleted(res.node, res.result);
-            },
-            .remote => {
-                self.onJobCompleted(res.node, res.result);
-            },
-        };
+        var results: [4]Result = undefined;
+        while (true) {
+            const n = self.result_queue.get(self.io, &results, 0) catch return;
+            if (n == 0) return;
+
+            for (results[0..n]) |res| switch (res.result.runner) {
+                .local => {
+                    if (self.active_runners.fetchRemove(res.node)) |kv| {
+                        const runner = kv.value;
+                        runner.finishJob();
+                        self.pool.release(runner);
+                    }
+                    self.onJobCompleted(res.node, res.result);
+                },
+                .remote => {
+                    self.onJobCompleted(res.node, res.result);
+                },
+            };
+        }
     }
 
     /// Handle the job log events in the queue
@@ -426,7 +461,7 @@ pub const Scheduler = struct {
                 defer if (e.name) |name| self.gpa.free(name);
                 var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 job_meta.start_time_ms = e.timestamp_ms;
-                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
                 self.emitEvent(.{ .job_started = .{
                     .task_id = self.task.id.value,
@@ -436,7 +471,7 @@ pub const Scheduler = struct {
             .job_output => |e| {
                 const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
                 defer self.gpa.free(e.data); // Allocated by runner or remote manager
-                self.logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
+                self.run_logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
             },
             .job_finished => |e| {
                 defer if (e.name) |name| self.gpa.free(name);
@@ -444,7 +479,7 @@ pub const Scheduler = struct {
                 job_meta.end_time_ms = e.timestamp_ms;
                 job_meta.exit_code = e.exit_code;
                 job_meta.status = if (e.exit_code == 0) .success else .failed;
-                self.logger.logJobMetadata(self.gpa, job_meta) catch {};
+                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
                 self.emitEvent(.{ .job_finished = .{
                     .task_id = self.task.id.value,
@@ -461,7 +496,7 @@ pub const Scheduler = struct {
         var status: dag.Status = if (result.exit_code == 0) .success else .failed;
         if (result.err) |err| {
             status = .failed;
-            log.debug("{}", .{err});
+            log.info("job '{s}' failed with error {}", .{ node.ptr.name, err });
 
             self.emitEvent(.{ .job_error = .{
                 .task_id = self.task.id.value,
@@ -519,16 +554,15 @@ pub const Scheduler = struct {
 
     /// Return the task running duration until now in milliseconds.
     fn taskDuration(self: *const Scheduler) ?i64 {
-        return if (self.task_start_ms) |st|
-            (std.time.milliTimestamp() - st)
-        else
-            null;
+        const now = std.Io.Timestamp.now(self.io, .awake);
+        const now_ms = now.toMilliseconds();
+        return if (self.task_start_ms) |st| (now_ms - st) else null;
     }
 
     /// Mark task as completed and log the final metadata
     fn completeTask(self: *Scheduler) void {
         self.task_meta.status = self.taskStatus();
-        self.task_meta.jobs_completed = self.completedJobs();
+        self.task_meta.jobs_completed = self.successfulJobs();
 
         self.emitEvent(.{ .task_completed = .{
             .task_id = self.task.id.value,
@@ -545,14 +579,14 @@ pub const Scheduler = struct {
 
     /// Log the end of task and add the new task run to datastore
     fn endTask(self: *Scheduler) !void {
-        try self.logger.endTask(self.gpa, &self.task_meta);
+        try self.run_logger.endTask(self.gpa, &self.task_meta);
         try self.datastore.addNewTaskRun(self.gpa, self.task_meta);
         // Reset run id
         self.task_meta.run_id = null;
     }
 
-    /// Get total number of completed jobs
-    fn completedJobs(self: *Scheduler) usize {
+    /// Get total number of successfully completed jobs.
+    fn successfulJobs(self: *Scheduler) usize {
         var completed: usize = 0;
         for (self.nodes) |node| {
             if (node.status == .success) completed += 1;
