@@ -43,6 +43,10 @@ pub const TaskManager = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     mutex: std.Io.Mutex = .init,
+    /// Protects the work condition predicate independently from task state.
+    work_mutex: std.Io.Mutex = .init,
+    work_cond: std.Io.Condition = .init,
+    work_pending: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
     /// Condition for tasks currently running
@@ -73,9 +77,6 @@ pub const TaskManager = struct {
 
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
-
-    /// Total minimum loop frequency of the main run loop.
-    const LOOP_TIME_MS = 50;
 
     pub const Event = union(enum) {
         /// Event for informing that the run finished.
@@ -157,6 +158,8 @@ pub const TaskManager = struct {
             .remote_manager = remote_manager,
             .watcher = watcher,
         };
+        self.remote_manager.setEventNotify(.{ .ptr = self, .callback = notifyWork });
+        self.watcher.setEventNotify(.{ .ptr = self, .callback = notifyWork });
         return self;
     }
 
@@ -295,6 +298,18 @@ pub const TaskManager = struct {
         }
     }
 
+    fn notifyWork(opq: *anyopaque) void {
+        const self: *TaskManager = @ptrCast(@alignCast(opq));
+        self.signalWork();
+    }
+
+    fn signalWork(self: *TaskManager) void {
+        self.work_mutex.lockUncancelable(self.io);
+        defer self.work_mutex.unlock(self.io);
+        self.work_pending.store(true, .seq_cst);
+        self.work_cond.signal(self.io);
+    }
+
     /// Amount of tasks currently running.
     pub fn tasksRunning(self: *TaskManager) u32 {
         try self.mutex.lock(self.io);
@@ -326,7 +341,6 @@ pub const TaskManager = struct {
     /// Main run loop.
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
-            const start_clock = std.Io.Clock.now(.awake, self.io);
             self.checkWatcher() catch |err| {
                 self.emitError(.watcher, err);
             };
@@ -336,17 +350,24 @@ pub const TaskManager = struct {
             self.updateSchedulers() catch |err| {
                 self.emitError(.scheduler, err);
             };
-            const took = start_clock.untilNow(self.io, .awake).toMilliseconds();
-            std.Io.sleep(self.io, .fromMilliseconds(LOOP_TIME_MS -| took), .awake) catch {};
+
+            self.work_mutex.lockUncancelable(self.io);
+            while (self.running.load(.seq_cst) and !self.work_pending.swap(false, .seq_cst)) {
+                self.work_cond.wait(self.io, &self.work_mutex) catch {};
+            }
+            self.work_mutex.unlock(self.io);
         }
     }
 
     /// Stop the task manager thread.
     pub fn stop(self: *TaskManager) error{Canceled}!void {
         _ = self.running.swap(false, .seq_cst);
+        self.mutex.lockUncancelable(self.io);
+        self.signalWork();
+        self.mutex.unlock(self.io);
         try self.watcher.stop();
-        self.remote_manager.stop();
         try self.stopSchedulers();
+        self.remote_manager.stop();
         if (self.thread) |t| t.join();
         self.thread = null;
     }
@@ -492,11 +513,35 @@ pub const TaskManager = struct {
         try s.watch_paths.append(self.gpa, key);
     }
 
-    /// Handle events in remote manager
+    /// Move remote thread events into scheduler-owned queues.
     fn updateRemoteManager(self: *TaskManager) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
-        try self.remote_manager.update();
+        while (self.remote_manager.events.pop()) |event| switch (event) {
+            .agent_changed => self.tasks_changed.store(true, .seq_cst),
+            .job_started => |e| try e.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
+                .job_id = e.job_id,
+                .name = e.name,
+                .timestamp_ms = e.timestamp_ms,
+            } }),
+            .job_output => |e| try e.scheduler.log_queue.append(self.gpa, .{ .job_output = .{
+                .job_id = e.job_id,
+                .step = e.step,
+                .data = e.data,
+            } }),
+            .job_finished => |e| {
+                try e.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
+                    .job_id = e.job_id,
+                    .name = e.name,
+                    .exit_code = e.exit_code,
+                    .timestamp_ms = e.timestamp_ms,
+                } });
+                try e.scheduler.result_queue.putOneUncancelable(self.io, .{
+                    .node = e.node,
+                    .result = e.result,
+                });
+            },
+        };
     }
 
     /// Handle a file-watch event for a scheduler.
@@ -572,9 +617,13 @@ pub const TaskManager = struct {
             return;
         }
 
+        var needs_followup = false;
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
-            .running => s.*.update(),
+            .running => {
+                s.*.update();
+                if (s.*.status != .running) needs_followup = true;
+            },
             .completed => {
                 s.*.update();
                 if (s.*.task.trigger) |_| {
@@ -586,6 +635,7 @@ pub const TaskManager = struct {
                     .status = s.*.task_meta.status,
                 } });
                 self.tasks_changed.store(true, .seq_cst);
+                needs_followup = true;
             },
             .inactive => try self.to_unload.append(self.gpa, s.*.task),
             .interrupted => {
@@ -596,6 +646,7 @@ pub const TaskManager = struct {
                     .status = .interrupted,
                 } });
                 self.tasks_changed.store(true, .seq_cst);
+                needs_followup = true;
             },
             .waiting => {},
         };
@@ -603,6 +654,9 @@ pub const TaskManager = struct {
         // Unload any tasks
         for (self.to_unload.items) |task| self.unloadTask(task) catch {};
         self.to_unload.clearRetainingCapacity();
+        if (self.schedulers.count() == 0) {
+            self.idle_cond.broadcast(self.io);
+        } else if (needs_followup) self.signalWork();
     }
 
     /// Unload a task and its scheduler from memory
@@ -660,6 +714,7 @@ pub const TaskManager = struct {
                     .{ .ptr = self, .emit = TaskManager.onSchedulerEvent }
                 else
                     null,
+                .{ .ptr = self, .callback = TaskManager.notifyWork },
             );
             s.attach_job = attach: {
                 const a = options.attach_job orelse break :attach null;
@@ -714,6 +769,7 @@ pub const TaskManager = struct {
 
         unload_on_error = false;
         self.tasks_changed.store(true, .seq_cst);
+        self.signalWork();
     }
 
     /// Stop task.
@@ -723,6 +779,7 @@ pub const TaskManager = struct {
         defer self.mutex.unlock(self.io);
         const sched = self.getScheduler(task_id) orelse return;
         try self.stopScheduler(sched);
+        self.signalWork();
     }
 
     /// Force stop all active tasks
@@ -958,7 +1015,7 @@ pub const TaskManager = struct {
         defer self.mutex.unlock(self.io);
         return .{
             .active_tasks = self.schedulers.count(),
-            .connected_remote_runners = self.remote_manager.agents.count(),
+            .connected_remote_runners = self.remote_manager.agent_count.load(.seq_cst),
             .free_local_runners = self.pool.free_idx.items.len,
         };
     }

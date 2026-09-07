@@ -184,14 +184,15 @@ pub const DataStore = struct {
     }
 
     pub const DataEnv = struct {
+        /// Borrowed slice of the current data directory.
         data_dir: []const u8,
+        /// Owned path of the global data directory.
         global_data_dir: []const u8,
         env: struct {
             ZTASK_DATA_DIR: ?[]const u8,
         },
 
         pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-            gpa.free(self.data_dir);
             gpa.free(self.global_data_dir);
             // if (self.env.ZTASK_DATA_DIR) |e| gpa.free(e);
         }

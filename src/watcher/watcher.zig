@@ -48,6 +48,10 @@ pub const Watcher = struct {
         return watcher;
     }
 
+    pub fn setEventNotify(self: *Watcher, notify: ?queue_zig.Notify) void {
+        self.queue.setNotify(notify);
+    }
+
     pub fn deinit(self: *Watcher) void {
         self.file_watcher.deinit();
         self.time_watcher.deinit(self.gpa);

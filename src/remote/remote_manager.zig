@@ -7,26 +7,80 @@ const Connection = @import("Connection.zig");
 const RemoteRunSpec = @import("../types/task.zig").RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
 const MutexQueue = @import("../types/queue.zig").MutexQueue;
+const Notify = @import("../types/queue.zig").Notify;
 const ResultQueue = localrunner.ResultQueue;
 const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
 const Scheduler = scheduler_zig.Scheduler;
+const JobNode = localrunner.JobNode;
+const ExecResult = localrunner.ExecResult;
 
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
 
-const AcceptCtx = struct {
-    io: std.Io,
-    server: std.Io.net.Server,
-};
-
-const AcceptEvent = union(enum) {
-    accept: std.Io.net.Server.AcceptError!std.Io.net.Stream,
-};
-
 const InboundFrame = union(enum) {
+    accepted: Connection.ConnInfo,
     frame: struct { socket_handle: std.Io.net.Socket.Handle, data: []u8 },
     closed: std.Io.net.Socket.Handle,
+};
+
+const DeadlineEvent = union(enum) { elapsed: u8 };
+
+const DeadlineTimer = struct {
+    io: std.Io,
+    notify: Notify,
+    select: std.Io.Select(DeadlineEvent) = undefined,
+    buffer: [1]DeadlineEvent = undefined,
+    thread: ?std.Thread = null,
+    deadline_ms: ?i64 = null,
+
+    const SleepContext = struct {
+        io: std.Io,
+        deadline_ms: i64,
+    };
+
+    fn init(self: *DeadlineTimer, io: std.Io, notify: Notify) void {
+        self.* = .{ .io = io, .notify = notify };
+        self.select = .init(io, &self.buffer);
+    }
+
+    fn setDeadline(self: *DeadlineTimer, deadline_ms: ?i64) void {
+        if (self.deadline_ms == deadline_ms) return;
+        self.cancel();
+        const deadline = deadline_ms orelse return;
+        self.select.concurrent(.elapsed, sleepUntil, .{SleepContext{
+            .io = self.io,
+            .deadline_ms = deadline,
+        }}) catch return;
+        self.deadline_ms = deadline;
+        self.thread = std.Thread.spawn(.{}, wait, .{self}) catch {
+            self.select.cancelDiscard();
+            self.deadline_ms = null;
+            return;
+        };
+    }
+
+    fn cancel(self: *DeadlineTimer) void {
+        if (self.thread) |thread| {
+            self.select.cancelDiscard();
+            thread.join();
+            self.thread = null;
+        }
+        self.deadline_ms = null;
+    }
+
+    fn sleepUntil(ctx: SleepContext) u8 {
+        const now_ms = std.Io.Timestamp.now(ctx.io, .real).toMilliseconds();
+        const wait_ms = @max(0, ctx.deadline_ms - now_ms);
+        std.Io.sleep(ctx.io, .fromMilliseconds(wait_ms), .awake) catch {};
+        return 0;
+    }
+
+    fn wait(self: *DeadlineTimer) void {
+        var events: [1]DeadlineEvent = undefined;
+        const n = self.select.queue.get(self.io, &events, 1) catch return;
+        if (n == 1) self.notify.callback(self.notify.ptr);
+    }
 };
 
 const AgentReader = struct {
@@ -84,20 +138,36 @@ const AgentReader = struct {
     }
 };
 
-fn acceptTask(ctx: AcceptCtx) std.Io.net.Server.AcceptError!std.Io.net.Stream {
-    var server = ctx.server;
-    return server.accept(ctx.io);
-}
-
 pub const DispatchRequest = struct {
     agent: RemoteRunSpec,
     job_node: *localrunner.JobNode,
     scheduler: *Scheduler,
-    /// Timestamp of the first attempt to find an agent after failure
-    first_try_ts: i64 = 0,
+    /// Absolute time after which an unavailable dispatch fails.
+    deadline_ms: ?i64 = null,
 
-    /// Try to run job again within time limit (seconds)
-    const RETRY_TIMEOUT = 5;
+    const RETRY_TIMEOUT_MS = 5 * std.time.ms_per_s;
+};
+
+pub const RemoteCommand = union(enum) {
+    dispatch: DispatchRequest,
+    cancel: struct { job_id: usize },
+    shutdown,
+};
+
+/// Events are consumed by TaskManager, which remains the sole owner of schedulers.
+pub const RemoteEvent = union(enum) {
+    agent_changed,
+    job_started: struct { scheduler: *Scheduler, job_id: u64, name: []u8, timestamp_ms: i64 },
+    job_output: struct { scheduler: *Scheduler, job_id: u64, step: u32, data: []u8 },
+    job_finished: struct {
+        scheduler: *Scheduler,
+        node: *JobNode,
+        job_id: u64,
+        name: []u8,
+        exit_code: i32,
+        timestamp_ms: i64,
+        result: ExecResult,
+    },
 };
 
 pub const AgentHandle = struct {
@@ -126,15 +196,20 @@ pub const RemoteManager = struct {
     parser: protocol.MsgParser = .init(),
     server: ?std.Io.net.Server = null,
 
-    accept_select: std.Io.Select(AcceptEvent) = undefined,
-    /// Buffer for incoming accept events.
-    accept_buf: [1]AcceptEvent = undefined,
-    /// Is accept already running.
-    accept_inflight: bool = false,
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    work_pending: std.atomic.Value(bool) = .init(false),
+    running: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    accept_thread: ?std.Thread = null,
+    dispatch_timer: DeadlineTimer,
 
     /// Connected remote agents.
     agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
     incoming_frames: MutexQueue(InboundFrame),
+    commands: MutexQueue(RemoteCommand),
+    events: MutexQueue(RemoteEvent),
+    agent_count: std.atomic.Value(usize) = .init(0),
 
     dispatch_queue: Queue(DispatchRequest),
     dispatched_jobs: std.AutoHashMapUnmanaged(usize, DispatchRequest),
@@ -146,10 +221,15 @@ pub const RemoteManager = struct {
             .gpa = gpa,
             .agents = .{},
             .incoming_frames = .init(io),
+            .commands = .init(io),
+            .events = .init(io),
+            .dispatch_timer = undefined,
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
         };
-        manager.accept_select = .init(io, &manager.accept_buf);
+        manager.incoming_frames.setNotify(.{ .ptr = manager, .callback = notify });
+        manager.commands.setNotify(.{ .ptr = manager, .callback = notify });
+        manager.dispatch_timer.init(io, .{ .ptr = manager, .callback = notify });
         return manager;
     }
 
@@ -162,10 +242,19 @@ pub const RemoteManager = struct {
         while (it.next()) |a| a.deinit(self.gpa);
         self.agents.deinit(self.gpa);
         while (self.incoming_frames.pop()) |item| switch (item) {
+            .accepted => |conn| conn.stream.close(self.io),
             .frame => |frame| self.gpa.free(frame.data),
             .closed => {},
         };
         self.incoming_frames.deinit(self.gpa);
+        self.commands.deinit(self.gpa);
+        while (self.events.pop()) |event| switch (event) {
+            .agent_changed => {},
+            .job_started => |e| self.gpa.free(e.name),
+            .job_output => |e| self.gpa.free(e.data),
+            .job_finished => |e| self.gpa.free(e.name),
+        };
+        self.events.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -173,62 +262,69 @@ pub const RemoteManager = struct {
     pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
         errdefer self.stop();
         self.server = try addr.listen(self.io, .{ .reuse_address = true });
-        self.resetAcceptState();
-        self.armAccept();
+        self.running.store(true, .seq_cst);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
     }
 
     /// Stop the server
     pub fn stop(self: *RemoteManager) void {
-        self.accept_select.cancelDiscard();
-        self.resetAcceptState();
+        if (self.thread == null) return;
+        self.commands.append(self.gpa, .shutdown) catch {};
+        self.thread.?.join();
+        self.thread = null;
+    }
+
+    pub fn setEventNotify(self: *RemoteManager, event_notify: ?Notify) void {
+        self.events.setNotify(event_notify);
+    }
+
+    fn notify(opq: *anyopaque) void {
+        const self: *RemoteManager = @ptrCast(@alignCast(opq));
+        self.mutex.lockUncancelable(self.io);
+        self.work_pending.store(true, .seq_cst);
+        self.cond.signal(self.io);
+        self.mutex.unlock(self.io);
+    }
+
+    fn run(self: *RemoteManager) void {
+        while (self.running.load(.seq_cst)) {
+            self.drainCommands() catch {};
+            self.drainAgentInbox() catch {};
+            self.dispatchJobs() catch {};
+
+            self.mutex.lockUncancelable(self.io);
+            while (self.running.load(.seq_cst) and !self.work_pending.swap(false, .seq_cst)) {
+                self.cond.wait(self.io, &self.mutex) catch break;
+            }
+            self.mutex.unlock(self.io);
+        }
+
+        if (self.server) |*server| {
+            const listener: std.Io.net.Stream = .{ .socket = server.socket };
+            listener.shutdown(self.io, .both) catch {};
+        }
+        if (self.accept_thread) |thread| thread.join();
+        self.accept_thread = null;
+        if (self.server) |*server| server.deinit(self.io);
+        self.server = null;
 
         var it = self.agents.valueIterator();
-        while (it.next()) |a| a.connection.shutdown();
-
-        if (self.server) |*s| s.deinit(self.io);
-        self.server = null;
+        while (it.next()) |agent| agent.connection.shutdown();
     }
 
-    /// Update state
-    pub fn update(self: *RemoteManager) !void {
-        try self.drainAccepted();
-        self.armAccept();
-        try self.drainAgentInbox();
-        try self.dispatchJobs();
-    }
-
-    fn resetAcceptState(self: *RemoteManager) void {
-        self.accept_inflight = false;
-        self.accept_select = .init(self.io, &self.accept_buf);
-    }
-
-    /// Run accept concurrently.
-    fn armAccept(self: *RemoteManager) void {
-        if (self.accept_inflight) return;
-        const server = self.server orelse return;
-        self.accept_select.concurrent(.accept, acceptTask, .{
-            AcceptCtx{ .io = self.io, .server = server },
-        }) catch return;
-        self.accept_inflight = true;
-    }
-
-    /// Try to drain new connections from the accept queue.
-    fn drainAccepted(self: *RemoteManager) !void {
-        var buf: [1]AcceptEvent = undefined;
-        while (true) {
-            const n = self.accept_select.queue.get(self.io, &buf, 0) catch |err| switch (err) {
-                error.Canceled => return,
-                error.Closed => return,
+    /// Main loop for the accept thread.
+    fn acceptLoop(self: *RemoteManager) void {
+        var server = self.server orelse return;
+        while (self.running.load(.seq_cst)) {
+            const stream = server.accept(self.io) catch break;
+            self.incoming_frames.append(self.gpa, .{ .accepted = .{
+                .stream = stream,
+                .address = stream.socket.address,
+            } }) catch {
+                stream.close(self.io);
+                break;
             };
-            if (n == 0) return;
-
-            self.accept_inflight = false;
-            const res = buf[0].accept;
-            const stream = res catch |err| switch (err) {
-                error.Canceled => return,
-                else => return,
-            };
-            try self.newAgent(.{ .stream = stream, .address = stream.socket.address });
         }
     }
 
@@ -242,12 +338,26 @@ pub const RemoteManager = struct {
 
     /// Push a dispatch request to the queue
     pub fn pushDispatch(self: *RemoteManager, req: DispatchRequest) !void {
-        try self.dispatch_queue.append(self.gpa, req);
+        try self.commands.append(self.gpa, .{ .dispatch = req });
+    }
+
+    fn drainCommands(self: *RemoteManager) !void {
+        while (self.commands.pop()) |command| switch (command) {
+            .dispatch => |request| {
+                try self.dispatch_queue.append(self.gpa, request);
+            },
+            .cancel => |request| try self.cancelJobNow(request.job_id),
+            .shutdown => {
+                self.dispatch_timer.cancel();
+                self.running.store(false, .seq_cst);
+            },
+        };
     }
 
     /// Process frames read by the blocking per-agent reader workers.
     fn drainAgentInbox(self: *RemoteManager) !void {
         while (self.incoming_frames.pop()) |item| switch (item) {
+            .accepted => |conn| try self.newAgent(conn),
             .closed => |socket_handle| self.removeAgentByFd(socket_handle),
             .frame => |frame| {
                 defer self.gpa.free(frame.data);
@@ -288,43 +398,42 @@ pub const RemoteManager = struct {
                     return error.ConnectionError;
                 }
                 try agent.setName(self.gpa, m.hostname);
+                try self.events.append(self.gpa, .agent_changed);
             },
             .heartbeat => agent.last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             .job_start => |m| {
-                const req = self.dispatched_jobs.get(m.job_id) orelse
-                    return error.NoDispatchedJob;
-                try req.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
+                const req = self.dispatched_jobs.get(m.job_id) orelse return;
+                try self.events.append(self.gpa, .{ .job_started = .{
+                    .scheduler = req.scheduler,
                     .job_id = req.job_node.id,
                     .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
                     .timestamp_ms = m.timestamp,
                 } });
             },
             .job_log => |m| {
-                const req = self.dispatched_jobs.get(m.job_id) orelse
-                    return error.NoDispatchedJob;
-                try req.scheduler.log_queue.append(self.gpa, .{ .job_output = .{
+                const req = self.dispatched_jobs.get(m.job_id) orelse return;
+                try self.events.append(self.gpa, .{ .job_output = .{
+                    .scheduler = req.scheduler,
                     .job_id = req.job_node.id,
                     .step = m.step,
                     .data = try self.gpa.dupe(u8, m.data),
                 } });
             },
             .job_finish => |m| {
-                const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse
-                    return error.NoDispatchedJob;
+                const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse return;
                 const req = kv.value;
-                try req.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
+                try self.events.append(self.gpa, .{ .job_finished = .{
+                    .scheduler = req.scheduler,
+                    .node = req.job_node,
                     .job_id = req.job_node.id,
                     .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
                     .exit_code = m.exit_code,
                     .timestamp_ms = m.timestamp,
-                } });
-                try req.scheduler.result_queue.putOneUncancelable(self.io, .{
-                    .node = req.job_node,
                     .result = .{
                         .exit_code = m.exit_code,
                         .runner = .remote,
                     },
-                });
+                } });
             },
             else => {},
         }
@@ -348,32 +457,49 @@ pub const RemoteManager = struct {
 
     /// Dispatch all jobs in the queue to agents
     fn dispatchJobs(self: *RemoteManager) !void {
-        while (self.dispatch_queue.pop()) |req| {
+        const count = self.dispatch_queue.len();
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        var earliest_deadline_ms: ?i64 = null;
+
+        for (0..count) |_| {
+            const req = self.dispatch_queue.pop() orelse unreachable;
             if (self.findAgent(req.agent)) |agent| {
                 try self.dispatchJob(agent, req);
                 continue;
             }
-            // Check for timeout
+
             var request = req;
-            const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-            if (request.first_try_ts == 0) request.first_try_ts = now;
-            // Try to find the remote agent again
-            if (now - request.first_try_ts < DispatchRequest.RETRY_TIMEOUT) {
+            const deadline_ms = request.deadline_ms orelse blk: {
+                const deadline = now_ms + DispatchRequest.RETRY_TIMEOUT_MS;
+                request.deadline_ms = deadline;
+                break :blk deadline;
+            };
+            if (now_ms < deadline_ms) {
                 try self.dispatch_queue.append(self.gpa, request);
-                return;
+                earliest_deadline_ms = if (earliest_deadline_ms) |earliest|
+                    @min(earliest, deadline_ms)
+                else
+                    deadline_ms;
+                continue;
             }
 
             // Failed to find matching agent
-            try req.scheduler.result_queue.putOneUncancelable(self.io, .{
+            try self.events.append(self.gpa, .{ .job_finished = .{
+                .scheduler = req.scheduler,
                 .node = req.job_node,
+                .job_id = req.job_node.id,
+                .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
+                .exit_code = 1,
+                .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
                 .result = .{
                     .err = ResultError.NoRunnerFound,
                     .exit_code = 1,
                     .runner = .remote,
                     .msg = "No matching remote runner found",
                 },
-            });
+            } });
         }
+        self.dispatch_timer.setDeadline(earliest_deadline_ms);
     }
 
     /// Dispatch job to agent
@@ -400,20 +526,29 @@ pub const RemoteManager = struct {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
                 unreachable;
-            try kv.value.scheduler.result_queue.putOneUncancelable(self.io, .{
+            try self.events.append(self.gpa, .{ .job_finished = .{
+                .scheduler = kv.value.scheduler,
                 .node = req.job_node,
+                .job_id = req.job_node.id,
+                .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
+                .exit_code = 1,
+                .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
                 .result = .{
                     .exit_code = 1,
                     .err = ResultError.RunnerNotConnected,
                     .runner = .remote,
                 },
-            });
+            } });
         };
     }
 
     /// Cancel a job from running.
     /// Send a cancel request to the remote agent if currently running.
     pub fn cancelJob(self: *RemoteManager, job_id: usize) !void {
+        try self.commands.append(self.gpa, .{ .cancel = .{ .job_id = job_id } });
+    }
+
+    fn cancelJobNow(self: *RemoteManager, job_id: usize) !void {
         const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return {
             var it = self.dispatch_queue.iterator();
             while (it.next()) |node| if (node.value.job_node.id == job_id) {
@@ -488,13 +623,19 @@ pub const RemoteManager = struct {
                 ),
                 .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             };
+            self.agent_count.store(self.agents.count(), .seq_cst);
+            try self.events.append(self.gpa, .agent_changed);
         }
     }
 
     /// Remove a connected agent using the socket
     fn removeAgentByFd(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
         var kv = self.agents.fetchRemove(fd);
-        if (kv) |*e| e.value.deinit(self.gpa);
+        if (kv) |*e| {
+            e.value.deinit(self.gpa);
+            self.agent_count.store(self.agents.count(), .seq_cst);
+            self.events.append(self.gpa, .agent_changed) catch {};
+        }
     }
 
     /// Remove a connected agent based on the name

@@ -1,5 +1,9 @@
 const std = @import("std");
-const builtin = @import("builtin");
+
+pub const Notify = struct {
+    ptr: *anyopaque,
+    callback: *const fn (ptr: *anyopaque) void,
+};
 
 pub fn Queue(comptime T: type) type {
     const QueueNode = struct {
@@ -12,6 +16,7 @@ pub fn Queue(comptime T: type) type {
         list: std.DoublyLinkedList = .{},
         /// List holding the allocated nodes that are not currently used.
         free: std.DoublyLinkedList = .{},
+        count: usize = 0,
 
         /// Initialize with capacity to hold `n` elements.
         pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !@This() {
@@ -38,6 +43,7 @@ pub fn Queue(comptime T: type) type {
                 try gpa.create(QueueNode);
             node.* = .{ .value = item };
             self.list.append(&node.link);
+            self.count += 1;
         }
 
         /// Append an item to the back of the queue.
@@ -46,6 +52,7 @@ pub fn Queue(comptime T: type) type {
             const node: *QueueNode = getNode(self.free.pop() orelse unreachable);
             node.* = .{ .value = item };
             self.list.append(&node.link);
+            self.count += 1;
         }
 
         /// Pop the first item from the queue if there is one.
@@ -55,6 +62,7 @@ pub fn Queue(comptime T: type) type {
             const value = node.value;
             node.value = undefined;
             self.free.append(&node.link);
+            self.count -= 1;
             return value;
         }
 
@@ -67,7 +75,7 @@ pub fn Queue(comptime T: type) type {
 
         /// Check if the queue is empty.
         pub fn empty(self: *const @This()) bool {
-            return self.list.first == null;
+            return self.count == 0;
         }
 
         /// Return the parent queue node of the link node.
@@ -79,6 +87,7 @@ pub fn Queue(comptime T: type) type {
         pub fn remove(self: *@This(), node: *QueueNode) void {
             self.list.remove(&node.link);
             self.free.append(&node.link);
+            self.count -= 1;
         }
 
         /// Remove an element from the queue by the value ptr.
@@ -86,6 +95,7 @@ pub fn Queue(comptime T: type) type {
             const node: *QueueNode = @fieldParentPtr("value", value);
             self.list.remove(&node.link);
             self.free.append(&node.link);
+            self.count -= 1;
         }
 
         /// Clear all the remaining items from the queue.
@@ -93,12 +103,9 @@ pub fn Queue(comptime T: type) type {
             while (self.pop()) |_| {}
         }
 
-        /// Iterate over all nodes, returning the count.
-        /// This operation is O(N).
+        /// Return the amount of elements in the queue.
         pub fn len(self: *const @This()) usize {
-            if (builtin.mode != .Debug)
-                @panic("Don't use `len` outside of debug build");
-            return self.list.len();
+            return self.count;
         }
 
         /// Get an iterator for the queue.
@@ -248,9 +255,14 @@ pub fn MutexQueue(comptime T: type) type {
         mutex: std.Io.Mutex = .init,
         cond: std.Io.Condition = .init,
         queue: Queue(T) = .{},
+        notify: ?Notify = null,
 
         pub fn init(io: std.Io) @This() {
             return .{ .io = io };
+        }
+
+        pub fn setNotify(self: *@This(), notify: ?Notify) void {
+            self.notify = notify;
         }
 
         /// Initialize with capacity to hold `n` elements.
@@ -272,7 +284,7 @@ pub fn MutexQueue(comptime T: type) type {
                 defer self.mutex.unlock(self.io);
                 try self.queue.append(gpa, item);
             }
-            self.cond.signal(self.io);
+            self.signal();
         }
 
         /// Push item to back of queue.
@@ -283,7 +295,7 @@ pub fn MutexQueue(comptime T: type) type {
                 defer self.mutex.unlock(self.io);
                 self.queue.appendAssumeCapacity(item);
             }
-            self.cond.signal(self.io);
+            self.signal();
         }
 
         /// Pop the first item from the queue if there is one.
@@ -318,12 +330,16 @@ pub fn MutexQueue(comptime T: type) type {
             self.queue.clear();
         }
 
-        /// Iterate over all nodes, returning the count.
-        /// This operation is O(N).
+        /// Return the amount of elements in the queue.
         pub fn len(self: *@This()) usize {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.queue.len();
+        }
+
+        fn signal(self: *@This()) void {
+            self.cond.signal(self.io);
+            if (self.notify) |notify| notify.callback(notify.ptr);
         }
     };
 }

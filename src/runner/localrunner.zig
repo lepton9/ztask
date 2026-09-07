@@ -36,6 +36,11 @@ pub const ExecResult = struct {
     msg: ?[]const u8 = null,
 };
 
+pub const WorkNotify = struct {
+    ptr: *anyopaque,
+    callback: *const fn (ptr: *anyopaque) void,
+};
+
 /// Runner for one job
 pub const LocalRunner = struct {
     io: std.Io = undefined,
@@ -56,7 +61,7 @@ pub const LocalRunner = struct {
     /// Map job nodes to their child processes
     pub const ExecMode = enum { piped, attached };
 
-    /// Run a job in the background
+    /// Run a job in the background.
     pub fn runJob(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
@@ -64,10 +69,10 @@ pub const LocalRunner = struct {
         results: *std.Io.Queue(Result),
         logs: *LogQueue,
     ) void {
-        self.runJobWithMode(gpa, job, results, logs, .piped, null);
+        self.runJobWithMode(gpa, job, results, logs, .piped, null, null);
     }
 
-    /// Run a job with an execution mode
+    /// Run a job with an execution mode.
     ///
     /// - `.piped` background execution
     /// - `.attached` runs in the foreground with inherited stdio
@@ -79,6 +84,7 @@ pub const LocalRunner = struct {
         logs: *LogQueue,
         mode: ExecMode,
         cwd: ?[]const u8,
+        notify: ?WorkNotify,
     ) void {
         self.running.store(true, .seq_cst);
         self.job = job;
@@ -91,24 +97,28 @@ pub const LocalRunner = struct {
             results,
             logs,
             mode,
+            notify,
         }) catch {
-            return results.putOneUncancelable(self.io, .{
+            results.putOneUncancelable(self.io, .{
                 .node = job,
                 .result = .{
                     .exit_code = 1,
                     .msg = "Failed to spawn thread",
                 },
             }) catch {};
+            if (notify) |work_notify| work_notify.callback(work_notify.ptr);
+            return;
         };
     }
 
-    /// Execute the job node
+    /// Execute the job node.
     fn runFn(
         self: *LocalRunner,
         gpa: std.mem.Allocator,
         results: *std.Io.Queue(Result),
         logs: *LogQueue,
         mode: ExecMode,
+        notify: ?WorkNotify,
     ) void {
         defer self.running.store(false, .seq_cst);
         const job = self.job orelse return;
@@ -164,6 +174,7 @@ pub const LocalRunner = struct {
                 .msg = err_msg,
             },
         }) catch {};
+        if (notify) |work_notify| work_notify.callback(work_notify.ptr);
     }
 
     /// Join the runner thread

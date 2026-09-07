@@ -166,11 +166,11 @@ const commands = &[_]zcli.Cmd{
             },
             .{
                 .long_name = "edit",
-                .short_name = "e",
                 .desc = "Go to edit the task after creation",
             },
             .{
                 .long_name = "editor",
+                .short_name = "e",
                 .desc = "Text editor to use for editing",
                 .arg = .{ .name = "EDITOR", .type = .Text },
             },
@@ -232,6 +232,7 @@ const commands = &[_]zcli.Cmd{
         .options = task_options ++ &[_]zcli.Opt{
             .{
                 .long_name = "editor",
+                .short_name = "e",
                 .desc = "Text editor to use for editing",
                 .arg = .{ .name = "EDITOR", .type = .Text },
             },
