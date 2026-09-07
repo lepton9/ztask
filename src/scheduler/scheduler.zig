@@ -365,11 +365,12 @@ pub const Scheduler = struct {
     /// Callback to receive a runner
     fn onRunnerAvailable(opq: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        _ = self.requestRunner();
+        if (self.status == .running and !self.queue.empty()) _ = self.requestRunner();
     }
 
     /// Force stop if scheduler is running and skip remaining jobs
     pub fn forceStop(self: *Scheduler, reason: InterruptReason) void {
+        self.pool.cancelWaiter(self);
         self.status = if (self.status == .running) .interrupted else .inactive;
 
         self.emitEvent(.{ .task_interrupted = .{

@@ -675,6 +675,7 @@ pub const TaskManager = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
+        // TODO: add a timeout
         while (self.schedulers.count() > 0) {
             try self.idle_cond.wait(self.io, &self.mutex);
         }

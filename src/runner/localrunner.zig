@@ -98,7 +98,11 @@ pub const LocalRunner = struct {
             logs,
             mode,
             notify,
-        }) catch {
+        }) catch |err| {
+            log.err(
+                "Failed to spawn runner thread for job '{s}': {s}",
+                .{ job.ptr.name, @errorName(err) },
+            );
             results.putOneUncancelable(self.io, .{
                 .node = job,
                 .result = .{
@@ -122,7 +126,12 @@ pub const LocalRunner = struct {
     ) void {
         defer self.running.store(false, .seq_cst);
         const job = self.job orelse return;
-        log.debug("Start job: {s} ({d})", .{ job.ptr.name, job.id });
+        log.debug("Start job: {s} ({d}, mode={s}, cwd={s})", .{
+            job.ptr.name,
+            job.id,
+            @tagName(mode),
+            self.cwd orelse "inherit",
+        });
 
         logs.append(gpa, .{ .job_started = .{
             .job_id = job.id,
@@ -143,11 +152,12 @@ pub const LocalRunner = struct {
             switch (step.kind) {
                 .command => exit_code =
                     self.runCommandStep(gpa, step, logs, mode) catch |err| blk: {
-                        log.debug("{s}: step {s}: error: {}", .{
+                        log.warn("Job '{s}' step '{s}' failed: {s}", .{
                             job.ptr.name,
                             step.value,
-                            err,
+                            @errorName(err),
                         });
+                        err_msg = @errorName(err);
                         break :blk 1;
                     },
                 // else => @panic("TODO"),
@@ -156,7 +166,10 @@ pub const LocalRunner = struct {
             if (exit_code != 0) break;
         }
 
-        log.debug("Finish job: {s} ({d})", .{ job.ptr.name, job.id });
+        log.debug(
+            "Finish job: {s} ({d}, exit={d})",
+            .{ job.ptr.name, job.id, exit_code },
+        );
 
         // Already force interrupted
         if (!self.running.load(.seq_cst)) return;
@@ -260,6 +273,12 @@ pub const LocalRunner = struct {
         else
             .inherit;
 
+        log.debug("Spawn command for job '{s}', step={d}: {s}", .{
+            job.ptr.name,
+            step_index,
+            step.value,
+        });
+
         switch (mode) {
             .attached => {
                 const is_posix = builtin.os.tag != .windows and
@@ -269,14 +288,20 @@ pub const LocalRunner = struct {
                 var tty: ?JobTty = JobTty.init(self.io);
                 defer if (tty) |*t| t.restore(self.io);
 
-                var child = try std.process.spawn(self.io, .{
+                var child = std.process.spawn(self.io, .{
                     .argv = argv.items,
                     .cwd = child_cwd,
                     .stdin = .inherit,
                     .stdout = .inherit,
                     .stderr = .inherit,
                     .pgid = if (comptime is_posix) 0 else null,
-                });
+                }) catch |err| {
+                    log.debug(
+                        "Child process spawn failed for job '{s}', mode={s}, step={d}: {s}",
+                        .{ job.ptr.name, @tagName(mode), step_index, @errorName(err) },
+                    );
+                    return err;
+                };
                 errdefer child.kill(self.io);
 
                 self.mutex.lockUncancelable(self.io);
@@ -299,13 +324,19 @@ pub const LocalRunner = struct {
                 return termToExitCode(term);
             },
             .piped => {
-                var child = try std.process.spawn(self.io, .{
+                var child = std.process.spawn(self.io, .{
                     .argv = argv.items,
                     .cwd = child_cwd,
                     .stdin = .ignore,
                     .stdout = .pipe,
                     .stderr = .pipe,
-                });
+                }) catch |err| {
+                    log.debug(
+                        "Child process spawn failed for job '{s}', mode={s}, step={d}: {s}",
+                        .{ job.ptr.name, @tagName(mode), step_index, @errorName(err) },
+                    );
+                    return err;
+                };
                 errdefer child.kill(self.io);
 
                 self.mutex.lockUncancelable(self.io);

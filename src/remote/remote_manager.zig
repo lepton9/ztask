@@ -15,6 +15,8 @@ const Scheduler = scheduler_zig.Scheduler;
 const JobNode = localrunner.JobNode;
 const ExecResult = localrunner.ExecResult;
 
+const log = std.log.scoped(.remote_manager);
+
 pub const DEFAULT_ADDR = "127.0.0.1";
 pub const DEFAULT_PORT = 5555;
 
@@ -142,6 +144,7 @@ pub const DispatchRequest = struct {
     agent: RemoteRunSpec,
     job_node: *localrunner.JobNode,
     scheduler: *Scheduler,
+    agent_fd: ?std.Io.net.Socket.Handle = null,
     /// Absolute time after which an unavailable dispatch fails.
     deadline_ms: ?i64 = null,
 
@@ -508,7 +511,9 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         req: DispatchRequest,
     ) !void {
-        try self.dispatched_jobs.put(self.gpa, req.job_node.id, req);
+        var dispatched = req;
+        dispatched.agent_fd = agent.connection.conn.stream.socket.handle;
+        try self.dispatched_jobs.put(self.gpa, dispatched.job_node.id, dispatched);
         // Send to agent
         const startMsg: protocol.RunJobMsg = .{
             .job_id = req.job_node.id,
@@ -524,8 +529,7 @@ pub const RemoteManager = struct {
         defer self.gpa.free(msg);
         self.sendMessage(agent, msg) catch {
             // Remove runner and send an error to scheduler
-            const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse
-                unreachable;
+            const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse return;
             try self.events.append(self.gpa, .{ .job_finished = .{
                 .scheduler = kv.value.scheduler,
                 .node = req.job_node,
@@ -628,10 +632,49 @@ pub const RemoteManager = struct {
         }
     }
 
+    fn failDisconnectedJob(self: *RemoteManager, req: DispatchRequest) void {
+        self.events.append(self.gpa, .{ .job_finished = .{
+            .scheduler = req.scheduler,
+            .node = req.job_node,
+            .job_id = req.job_node.id,
+            .name = self.gpa.dupe(u8, req.job_node.ptr.name) catch return,
+            .exit_code = 1,
+            .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+            .result = .{
+                .exit_code = 1,
+                .err = ResultError.RunnerNotConnected,
+                .runner = .remote,
+                .msg = "Remote runner disconnected while executing job",
+            },
+        } }) catch {};
+        log.warn("Remote runner disconnected; failing job {x}", .{req.job_node.id});
+    }
+
+    fn failJobsForAgent(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
+        while (true) {
+            var job_id: ?usize = null;
+            var it = self.dispatched_jobs.iterator();
+            while (it.next()) |entry| {
+                const job_fd = entry.value_ptr.agent_fd orelse continue;
+                if (job_fd != fd) continue;
+                job_id = entry.key_ptr.*;
+                break;
+            }
+            const id = job_id orelse break;
+            const req = self.dispatched_jobs.fetchRemove(id) orelse continue;
+            self.failDisconnectedJob(req.value);
+        }
+    }
+
     /// Remove a connected agent using the socket
     fn removeAgentByFd(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
+        self.failJobsForAgent(fd);
         var kv = self.agents.fetchRemove(fd);
         if (kv) |*e| {
+            log.info("Remote agent disconnected (fd={d}, name={s})", .{
+                fd,
+                e.value.name orelse "unregistered",
+            });
             e.value.deinit(self.gpa);
             self.agent_count.store(self.agents.count(), .seq_cst);
             self.events.append(self.gpa, .agent_changed) catch {};

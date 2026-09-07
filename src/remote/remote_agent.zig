@@ -88,12 +88,19 @@ pub const RemoteAgent = struct {
 
     pub fn deinit(self: *RemoteAgent) void {
         self.stopReader();
+        self.running.store(false, .seq_cst);
+        self.pool.cancelWaiter(self);
+        var active = self.active_runners.iterator();
+        while (active.next()) |entry| {
+            entry.value_ptr.*.forceStop();
+            self.pool.release(entry.value_ptr.*);
+        }
+        self.active_runners.clearRetainingCapacity();
         var it = self.jobs.iterator();
         while (it.next()) |e| {
             e.value_ptr.node.deinit(self.gpa);
             const job = e.value_ptr.job;
-            self.gpa.free(job.name);
-            self.gpa.free(job.steps);
+            job.deinit(self.gpa);
         }
         self.jobs.deinit(self.gpa);
         self.result_queue.close(self.io);
@@ -285,8 +292,10 @@ pub const RemoteAgent = struct {
     /// Force stop the runner if active, otherwise remove from the queue.
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
         const e = self.jobs.getPtr(msg.job_id) orelse return;
-        if (self.active_runners.get(&e.node)) |runner| {
-            runner.forceStop();
+        if (self.active_runners.fetchRemove(&e.node)) |kv| {
+            kv.value.forceStop();
+            self.pool.release(kv.value);
+            log.info("Cancelled remote job {x} while running", .{msg.job_id});
         } else {
             var it = self.queue.iterator();
             while (it.next()) |node| {
@@ -298,9 +307,7 @@ pub const RemoteAgent = struct {
         }
         var kv = self.jobs.fetchRemove(msg.job_id) orelse unreachable;
         kv.value.node.deinit(self.gpa);
-        const job = kv.value.job;
-        self.gpa.free(job.name);
-        self.gpa.free(job.steps);
+        kv.value.job.deinit(self.gpa);
     }
 
     /// Send a register packet
@@ -345,9 +352,7 @@ pub const RemoteAgent = struct {
                 if (self.jobs.fetchRemove(res.node.id)) |kv| {
                     var value = kv.value;
                     value.node.deinit(self.gpa);
-                    const job = value.job;
-                    self.gpa.free(job.name);
-                    self.gpa.free(job.steps);
+                    value.job.deinit(self.gpa);
                 }
             }
         }
@@ -441,6 +446,6 @@ pub const RemoteAgent = struct {
     /// Callback to receive a runner
     fn onRunnerAvailable(opq: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(opq));
-        self.requestRunner();
+        if (self.running.load(.seq_cst) and !self.queue.empty()) self.requestRunner();
     }
 };

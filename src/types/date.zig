@@ -9,7 +9,7 @@ pub const DateTime = struct {
         const t = self.time;
         return try std.fmt.bufPrint(
             buf,
-            "{d}-{d:0>2}-{d} {d:0>2}:{d:0>2}:{d:0>2}",
+            "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}",
             .{ d.year, d.month, d.day, t.h, t.min, t.sec },
         );
     }

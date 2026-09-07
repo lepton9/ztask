@@ -1,7 +1,7 @@
 const std = @import("std");
 const LocalRunner = @import("localrunner.zig").LocalRunner;
 
-/// A waiter waiting for a free runner
+/// A waiter waiting for a free runner.
 pub fn Waiter(comptime T: type) type {
     return struct {
         ptr: *T,
@@ -35,13 +35,13 @@ pub const RunnerPool = struct {
         self.waiters.deinit(self.gpa);
     }
 
-    /// Get a runner if one is available
+    /// Get a runner if one is available.
     pub fn tryAcquire(self: *RunnerPool) ?*LocalRunner {
         if (self.free_idx.pop()) |i| return &self.runners[i];
         return null;
     }
 
-    /// Release the runner back to the pool
+    /// Release the runner back to the pool.
     pub fn release(self: *RunnerPool, runner: *LocalRunner) void {
         const idx: usize = @divExact(
             @intFromPtr(runner) - @intFromPtr(self.runners.ptr),
@@ -51,15 +51,28 @@ pub const RunnerPool = struct {
         self.notifyNextWaiter();
     }
 
-    /// Notify the next waiter that a runner is available
+    /// Notify the next waiter that a runner is available.
     fn notifyNextWaiter(self: *RunnerPool) void {
         if (self.waiters.pop()) |waiter| {
             waiter.callback(waiter.ptr);
         }
     }
 
-    /// Put a new waiter to the waiting queue
+    /// Remove a waiter from the waiting list.
+    pub fn cancelWaiter(self: *RunnerPool, ptr: *anyopaque) void {
+        var i: usize = self.waiters.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.waiters.items[i].ptr == ptr) _ = self.waiters.swapRemove(i);
+        }
+    }
+
+    /// Put a new waiter to the waiting queue.
     pub fn waitForRunner(self: *RunnerPool, w: Waiter(anyopaque)) void {
+        for (self.waiters.items) |waiter| {
+            // Already in the wait list
+            if (waiter.ptr == w.ptr) return;
+        }
         self.waiters.append(self.gpa, w) catch {};
     }
 };
