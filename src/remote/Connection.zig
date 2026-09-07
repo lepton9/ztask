@@ -96,11 +96,20 @@ pub const Reader = struct {
         gpa: std.mem.Allocator,
         stream: std.Io.net.Stream,
     ) !Reader {
+        return initWithSize(io, gpa, stream, 4096);
+    }
+
+    pub fn initWithSize(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+        buffer_size: usize,
+    ) !Reader {
         return .{
             .io = io,
             .gpa = gpa,
             .stream = stream,
-            .read_buf = try .initCapacity(gpa, 4096),
+            .read_buf = try .initCapacity(gpa, buffer_size),
         };
     }
 
@@ -145,3 +154,23 @@ pub const Reader = struct {
         return frame;
     }
 };
+
+test "reader compacts buffered frames" {
+    const gpa = std.testing.allocator;
+    var reader: Reader = try .initWithSize(std.testing.io, gpa, undefined, 0);
+    defer reader.deinit();
+
+    const first = "first";
+    const second = "second";
+    var frames: [19]u8 = undefined;
+    std.mem.writeInt(u32, frames[0..4], first.len, .little);
+    @memcpy(frames[4..9], first);
+    std.mem.writeInt(u32, frames[9..13], second.len, .little);
+    @memcpy(frames[13..19], second);
+    try reader.read_buf.appendSlice(gpa, &frames);
+
+    const frame1 = (try reader.popFrame()).?;
+    try std.testing.expectEqualStrings(first, frame1);
+    const frame2 = (try reader.popFrame()).?;
+    try std.testing.expectEqualStrings(second, frame2);
+}

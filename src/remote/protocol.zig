@@ -116,7 +116,17 @@ pub const RunJobMsg = struct {
             return error.InvalidStepsFormat;
         defer json.deinit();
         const steps = json.value;
-        return try gpa.dupe(task.Step, steps);
+        const copied = try gpa.alloc(task.Step, steps.len);
+        var copied_len: usize = 0;
+        errdefer {
+            for (copied[0..copied_len]) |step| step.deinit(gpa);
+            gpa.free(copied);
+        }
+        for (steps, 0..) |step, i| {
+            copied[i] = try step.copy(gpa);
+            copied_len += 1;
+        }
+        return copied;
     }
 };
 
@@ -424,7 +434,10 @@ test "run_job" {
     const parsed_msg = try parser.parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
     const parsed_steps = try parsed.parseSteps(alloc);
-    defer alloc.free(parsed_steps);
+    defer {
+        for (parsed_steps) |step| step.deinit(alloc);
+        alloc.free(parsed_steps);
+    }
 
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(std.mem.eql(u8, msg.steps, parsed.steps));

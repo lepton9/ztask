@@ -242,6 +242,13 @@ pub const Step = struct {
     kind: StepKind,
     value: []const u8,
 
+    pub fn copy(step: Step, gpa: std.mem.Allocator) !Step {
+        return .{
+            .kind = step.kind,
+            .value = try gpa.dupe(u8, step.value),
+        };
+    }
+
     pub fn deinit(self: Step, gpa: std.mem.Allocator) void {
         gpa.free(self.value);
     }
