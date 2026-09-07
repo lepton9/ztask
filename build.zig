@@ -1,6 +1,13 @@
 const std = @import("std");
 const zon = @import("build.zig.zon");
 
+const targets: []const std.Target.Query = &.{
+    .{ .cpu_arch = .x86_64, .os_tag = .linux },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux },
+    .{ .cpu_arch = .x86_64, .os_tag = .windows },
+    .{ .cpu_arch = .aarch64, .os_tag = .windows },
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -34,15 +41,16 @@ pub fn build(b: *std.Build) void {
 
     // Check step
     const check_step = b.step("check", "Check for compilation errors");
-    check_step.dependOn(&run_cmd.step);
-    check_step.dependOn(&run_tests.step);
+    check_step.dependOn(&exe.step);
+    check_step.dependOn(&tests.step);
 }
 
-pub fn setupExe(
+fn setupExe(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
+    const version = buildVersion(b);
     const options = b.addOptions();
     options.addOption([]const u8, "PROGRAM_NAME", @tagName(zon.name));
 
@@ -55,7 +63,7 @@ pub fn setupExe(
     const zcli = b.dependency("zcli", .{
         .target = target,
         .optimize = optimize,
-        .version_tag = @import("build.zig.zon").version,
+        .version_tag = version,
     });
     const zcli_mod = zcli.module("zcli");
 
@@ -90,7 +98,7 @@ pub fn setupExe(
     return exe;
 }
 
-pub fn setupTests(
+fn setupTests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -114,7 +122,7 @@ pub fn setupTests(
     return tests;
 }
 
-pub fn setupCi(b: *std.Build, step: *std.Build.Step) void {
+fn setupCi(b: *std.Build, step: *std.Build.Step) void {
     for (targets) |t| {
         const target = b.resolveTargetQuery(t);
         const optimize: std.builtin.OptimizeMode = .Debug;
@@ -125,7 +133,7 @@ pub fn setupCi(b: *std.Build, step: *std.Build.Step) void {
     }
 }
 
-pub fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
+fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
     for (targets) |t| {
         const target = b.resolveTargetQuery(t);
         const optimize: std.builtin.OptimizeMode = .ReleaseFast;
@@ -172,9 +180,63 @@ pub fn setupRelease(b: *std.Build, step: *std.Build.Step) void {
     }
 }
 
-const targets: []const std.Target.Query = &.{
-    .{ .cpu_arch = .x86_64, .os_tag = .linux },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux },
-    .{ .cpu_arch = .x86_64, .os_tag = .windows },
-    .{ .cpu_arch = .aarch64, .os_tag = .windows },
-};
+fn buildVersion(b: *std.Build) []const u8 {
+    const version_tag = b.fmt("v{s}", .{zon.version});
+    const git_describe = runGitDescribe(b, version_tag) catch return zon.version;
+    defer b.allocator.free(git_describe);
+
+    const text = std.mem.trim(u8, git_describe, "\n");
+    const hash_separator = std.mem.lastIndexOf(u8, text, "-g") orelse
+        return zon.version;
+    const count_separator = std.mem.lastIndexOfScalar(u8, text[0..hash_separator], '-') orelse
+        return zon.version;
+    const tag_name = text[0..count_separator];
+    const count = text[count_separator + 1 .. hash_separator];
+    const hash_end = if (std.mem.endsWith(u8, text, "-dirty"))
+        text.len - "-dirty".len
+    else
+        text.len;
+    const hash = text[hash_separator + 2 .. hash_end];
+
+    if (!std.mem.eql(u8, tag_name, version_tag) and
+        !std.mem.eql(u8, tag_name, zon.version)) return zon.version;
+
+    const not_dirty = hash_end == text.len;
+    if (std.mem.eql(u8, count, "0")) return if (not_dirty)
+        zon.version
+    else
+        b.fmt("{s}-dev+{s}.dirty", .{ zon.version, hash });
+
+    const dirty = if (not_dirty) "" else ".dirty";
+    return b.fmt("{s}-dev.{s}+{s}{s}", .{ zon.version, count, hash, dirty });
+}
+
+fn runGitDescribe(b: *std.Build, version_tag: []const u8) ![]u8 {
+    const result = try std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{
+            "git",
+            "describe",
+            "--tags",
+            "--long",
+            "--dirty",
+            "--match",
+            version_tag,
+            "--match",
+            zon.version,
+        },
+    });
+    defer b.allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            b.allocator.free(result.stdout);
+            return error.GitCommandFailed;
+        },
+        else => {
+            b.allocator.free(result.stdout);
+            return error.GitCommandFailed;
+        },
+    }
+
+    return result.stdout;
+}
