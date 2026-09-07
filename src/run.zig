@@ -94,7 +94,15 @@ pub const AgentOptions = struct {
 pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
     const io = ctx.io;
     const gpa = ctx.gpa;
-    var agent: *RemoteAgent = try .init(ctx.io, gpa, options.name, options.runners_n);
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+    var agent: *RemoteAgent = try .init(
+        ctx.io,
+        gpa,
+        options.name,
+        options.runners_n,
+        &stdout.interface,
+    );
     defer agent.deinit();
     const address: std.Io.net.IpAddress = try .parseIp4(
         options.connect.addr,
@@ -211,7 +219,9 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         .diagnostics = options.diagnostics,
     });
 
-    const log = std.log.scoped(.run);
+    var stdout_buffer: [1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+    const out = &stdout.interface;
     var exit: bool = false;
 
     while (true) {
@@ -242,8 +252,8 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
                     if (e.task_id != task_id_value) continue;
 
                     if (options.verbose) {
-                        log.info(
-                            "{s:<12} task={s} status={s}",
+                        try out.print(
+                            "{s:<12} task={s} status={s}\n",
                             .{ "run_finished", task_id, @tagName(e.status) },
                         );
                     }
@@ -253,15 +263,15 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
                     defer gpa.free(e.msg);
                     if (!options.verbose) continue;
                     if (e.task_id != task_id_value) continue;
-                    log.info(
-                        "{s:<12} task={s} {s}",
+                    try out.print(
+                        "{s:<12} task={s} {s}\n",
                         .{ "info", task_id, e.msg },
                     );
                 },
                 .err => |e| {
                     defer if (e.msg) |m| gpa.free(m);
                     if (!options.verbose) continue;
-                    log.err("{s:<12} scope={s} ({s})", .{
+                    try out.print("{s:<12} scope={s} ({s})\n", .{
                         "error",
                         @tagName(e.scope),
                         e.msg orelse @errorName(e.err),
@@ -269,6 +279,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
                 },
             }
         }
+        try out.flush();
         if (exit) return;
 
         std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 25), .awake) catch {};

@@ -249,7 +249,8 @@ test "remote_job" {
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
-    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5);
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
@@ -289,7 +290,8 @@ test "remote_job_addr" {
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
-    var agent = try remote_agent.RemoteAgent.init(io, gpa, "agent", 5);
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "agent", 5, &output.writer);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});

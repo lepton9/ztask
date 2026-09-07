@@ -199,6 +199,11 @@ pub const Scheduler = struct {
         self.active_runners.deinit(self.gpa);
         self.result_queue.close(self.io);
         self.gpa.free(self.result_buffer);
+        while (self.log_queue.pop()) |event| switch (event) {
+            .job_started => |e| if (e.name) |name| self.gpa.free(name),
+            .job_output => |e| self.gpa.free(e.data),
+            .job_finished => |e| if (e.name) |name| self.gpa.free(name),
+        };
         self.log_queue.deinit(self.gpa);
         self.run_logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);

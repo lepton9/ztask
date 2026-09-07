@@ -19,6 +19,8 @@ const HEARTBEAT_FREQ_S = 10;
 pub const RemoteAgent = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
+    /// Writer for printing status messages.
+    output: *std.Io.Writer,
     running: std.atomic.Value(bool) = .init(false),
     hostname: []const u8,
     buffer: [256]u8 = undefined,
@@ -52,12 +54,14 @@ pub const RemoteAgent = struct {
         gpa: std.mem.Allocator,
         name: []const u8,
         runners_n: u16,
+        output: *std.Io.Writer,
     ) !*RemoteAgent {
         const agent = try gpa.create(RemoteAgent);
         const result_buffer = try gpa.alloc(Result, runners_n);
         agent.* = .{
             .io = io,
             .gpa = gpa,
+            .output = output,
             .hostname = try gpa.dupe(u8, name),
             .pool = try .init(io, gpa, runners_n),
             .result_queue = .init(result_buffer),
@@ -71,6 +75,15 @@ pub const RemoteAgent = struct {
         };
         try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
+    }
+
+    fn writeStatus(self: *RemoteAgent, comptime format: []const u8, args: anytype) void {
+        self.output.print(format, args) catch |err| {
+            log.warn("Failed to write runner status: {s}", .{@errorName(err)});
+            return;
+        };
+        self.output.flush() catch |err|
+            log.warn("Failed to flush runner status: {s}", .{@errorName(err)});
     }
 
     pub fn deinit(self: *RemoteAgent) void {
@@ -103,14 +116,18 @@ pub const RemoteAgent = struct {
             if (self.connection.closed) {
                 self.tryReconnect();
             }
-            self.heartbeat() catch {};
-            self.listen() catch {};
+            self.heartbeat() catch |err|
+                log.warn("Failed to send heartbeat: {s}", .{@errorName(err)});
+            self.listen() catch |err|
+                log.err("Failed to handle remote message: {s}", .{@errorName(err)});
             self.tryRunNext();
-            self.handleLogs() catch {};
+            self.handleLogs() catch |err|
+                log.err("Failed to handle job log event: {s}", .{@errorName(err)});
             self.handleResults();
         }
 
-        self.handleLogs() catch {};
+        self.handleLogs() catch |err|
+            log.err("Failed to handle remaining job log event: {s}", .{@errorName(err)});
         self.handleResults();
         self.stopReader();
     }
@@ -142,15 +159,16 @@ pub const RemoteAgent = struct {
         while (true) {
             if (!self.running.load(.seq_cst)) break;
             switch (addr) {
-                .ip4 => |a4| log.info(
-                    "Connecting to {d}.{d}.{d}.{d}:{d}",
+                .ip4 => |a4| self.writeStatus(
+                    "Connecting to {d}.{d}.{d}.{d}:{d}\n",
                     .{ a4.bytes[0], a4.bytes[1], a4.bytes[2], a4.bytes[3], a4.port },
                 ),
-                else => log.info("Connecting to remote server", .{}),
+                else => self.writeStatus("Connecting to remote server\n", .{}),
             }
             self.connect(addr) catch |err| switch (err) {
                 error.AlreadyConnected => break,
                 else => {
+                    log.warn("Failed to connect to remote server: {s}", .{@errorName(err)});
                     std.Io.sleep(self.io, std.Io.Duration.fromSeconds(1), .awake) catch {};
                     continue;
                 },
@@ -179,14 +197,25 @@ pub const RemoteAgent = struct {
             self.io,
             self.gpa,
             self.connection.conn.stream,
-        ) catch return;
+        ) catch |err| {
+            log.warn("Failed to initialize remote connection reader: {s}", .{@errorName(err)});
+            return;
+        };
         defer reader.deinit();
 
         while (true) {
-            const frame = reader.readNextFrame() catch break;
-            const owned = self.gpa.dupe(u8, frame) catch break;
-            self.incoming_frames.append(self.gpa, owned) catch {
+            const frame = reader.readNextFrame() catch |err| {
+                if (self.running.load(.seq_cst))
+                    log.warn("Remote connection reader stopped: {s}", .{@errorName(err)});
+                break;
+            };
+            const owned = self.gpa.dupe(u8, frame) catch |err| {
+                log.err("Failed to allocate remote message frame: {s}", .{@errorName(err)});
+                break;
+            };
+            self.incoming_frames.append(self.gpa, owned) catch |err| {
                 self.gpa.free(owned);
+                log.err("Failed to queue remote message frame: {s}", .{@errorName(err)});
                 break;
             };
         }
@@ -207,8 +236,12 @@ pub const RemoteAgent = struct {
             .run_job => |m| try self.queueJob(m),
             .cancel_job => |m| self.cancelJob(m),
             .error_msg => |m| {
-                log.info(
-                    "Error message: ({s}/{d}): {s}",
+                self.writeStatus(
+                    "Remote server error ({s}/{d}): {s}\n",
+                    .{ @tagName(m.code), @intFromEnum(m.code), m.message },
+                );
+                log.err(
+                    "Remote server error ({s}/{d}): {s}",
                     .{ @tagName(m.code), @intFromEnum(m.code), m.message },
                 );
                 if (m.code == protocol.ErrorCode.NameTaken) {
@@ -240,7 +273,8 @@ pub const RemoteAgent = struct {
 
     /// Send a message to the server
     fn sendMessage(self: *RemoteAgent, message: []const u8) void {
-        self.connection.sendFrame(message) catch {
+        self.connection.sendFrame(message) catch |err| {
+            log.warn("Failed to send remote message: {s}", .{@errorName(err)});
             if (self.running.load(.seq_cst)) {
                 self.tryReconnect();
             }
@@ -275,7 +309,7 @@ pub const RemoteAgent = struct {
         const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         self.sendMessage(payload);
-        log.info("Connected as {s}", .{reg.hostname});
+        self.writeStatus("Connected as {s}\n", .{reg.hostname});
     }
 
     /// Send a heartbeat packet
@@ -334,9 +368,9 @@ pub const RemoteAgent = struct {
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
                 if (e.name) |name|
-                    log.info("{s:<12} job='{s}'", .{ "job_started", name })
+                    self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name })
                 else
-                    log.info("{s:<12} job={x}", .{ "job_started", e.job_id });
+                    self.writeStatus("{s:<12} job={x}\n", .{ "job_started", e.job_id });
             },
             .job_output => |e| {
                 defer self.gpa.free(e.data); // Allocated by runner
@@ -364,13 +398,13 @@ pub const RemoteAgent = struct {
                 defer self.gpa.free(payload);
                 self.sendMessage(payload);
                 if (e.name) |name|
-                    log.info(
-                        "{s:<12} job='{s}' exit={d}",
+                    self.writeStatus(
+                        "{s:<12} job='{s}' exit={d}\n",
                         .{ "job_finished", name, e.exit_code },
                     )
                 else
-                    log.info(
-                        "{s:<12} job='{x}' exit={d}",
+                    self.writeStatus(
+                        "{s:<12} job='{x}' exit={d}\n",
                         .{ "job_finished", e.job_id, e.exit_code },
                     );
             },

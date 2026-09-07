@@ -126,7 +126,7 @@ pub const Reader = struct {
     fn popFrame(self: *Reader) !?[]const u8 {
         if (self.cursor > 0 and self.cursor > self.read_buf.capacity / 2) {
             const remaining = self.read_buf.items[self.cursor..];
-            @memmove(self.read_buf.items[0..], remaining);
+            @memmove(self.read_buf.items[0..remaining.len], remaining);
             self.read_buf.items.len = remaining.len;
             self.cursor = 0;
         }
