@@ -109,8 +109,7 @@ pub const Scheduler = struct {
 
     event_sink: ?EventSink = null,
     work_notify: ?queue_zig.Notify = null,
-    /// Used by `TaskManager` to dedupe watch-trigger bursts.
-    last_watch_epoch: u64 = 0,
+    last_trigger_event_ns: i96 = 0,
     /// Watch path list used for file watch triggers.
     /// Managed and allocated by `TaskManager`.
     /// Used to keep track of paths that are connected to this scheduler.

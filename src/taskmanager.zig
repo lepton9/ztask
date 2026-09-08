@@ -17,6 +17,10 @@ const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 
 const log = std.log.scoped(.taskmanager);
 
+const MAX_CONTROL_EVENTS_PER_BATCH = 128;
+const CONTROL_BATCH_BUDGET_NS = 2 * std.time.ns_per_ms;
+const WATCH_DEDUPE_NS = 50 * std.time.ns_per_ms;
+
 test {
     _ = scheduler;
 }
@@ -85,9 +89,6 @@ pub const TaskManager = struct {
     watcher: *Watcher,
     /// Maps paths to active schedulers by their watch scope.
     watch_map: std.StringHashMapUnmanaged(WatchEntry),
-
-    /// Epoch counter used to dedupe watcher-event bursts.
-    watch_epoch: u64 = 0,
 
     control_events: MutexQueue(ControlEvent),
 
@@ -566,89 +567,95 @@ pub const TaskManager = struct {
         try s.watch_paths.append(self.gpa, key);
     }
 
-    /// Handle all the incoming control events.
+    /// Handle a bounded batch of incoming control events.
     fn processControlEvents(self: *TaskManager) !void {
-        // TODO: better watch event deduplication
-        self.watch_epoch +%= 1;
-        const watch_epoch = self.watch_epoch;
+        const started = std.Io.Timestamp.now(self.io, .awake);
+        var processed: usize = 0;
 
-        while (self.control_events.pop()) |event| switch (event) {
-            .watcher => |watcher_event| switch (watcher_event) {
-                .fileEvent => |fe| {
-                    defer fe.deinit(self.gpa);
-                    const entry = self.watch_map.get(fe.watched_path) orelse continue;
-                    const schedulers = switch (fe.scope) {
-                        .direct => entry.direct.items,
-                        .recursive => entry.recursive.items,
-                    };
-                    for (schedulers) |s| try self.handleFileTriggerEvent(s, watch_epoch);
+        while (processed < MAX_CONTROL_EVENTS_PER_BATCH and
+            started.untilNow(self.io, .awake).toNanoseconds() <
+                CONTROL_BATCH_BUDGET_NS)
+        {
+            const event = self.control_events.pop() orelse break;
+            processed += 1;
+            switch (event) {
+                .watcher => |watcher_event| switch (watcher_event) {
+                    .fileEvent => |fe| {
+                        defer fe.deinit(self.gpa);
+                        const entry = self.watch_map.get(fe.watched_path) orelse continue;
+                        const schedulers = switch (fe.scope) {
+                            .direct => entry.direct.items,
+                            .recursive => entry.recursive.items,
+                        };
+                        for (schedulers) |s| try self.handleFileTriggerEvent(s);
+                    },
+                    .timeEvent => |te| {
+                        const s = self.getScheduler(te.task_id) orelse continue;
+                        try self.handleTimeTriggerEvent(s);
+                    },
                 },
-                .timeEvent => |te| {
-                    const s = self.getScheduler(te.task_id) orelse continue;
-                    try self.handleTimeTriggerEvent(s);
-                },
-            },
-            .remote => |remote_event| {
-                var owned = true;
-                defer if (owned) remote_event.deinit(self.gpa);
+                .remote => |remote_event| {
+                    var owned = true;
+                    defer if (owned) remote_event.deinit(self.gpa);
 
-                switch (remote_event) {
-                    .agent_changed => self.tasks_changed.store(true, .seq_cst),
-                    .job_started => |e| {
-                        try e.scheduler.log_queue.append(self.gpa, .{
-                            .job_started = .{
-                                .job_id = e.job_id,
-                                .name = e.name,
-                                .timestamp_ms = e.timestamp_ms,
-                            },
-                        });
-                        owned = false;
-                    },
-                    .job_output => |e| {
-                        try e.scheduler.log_queue.append(self.gpa, .{
-                            .job_output = .{
-                                .job_id = e.job_id,
-                                .step = e.step,
-                                .data = e.data,
-                            },
-                        });
-                        owned = false;
-                    },
-                    .job_finished => |e| {
-                        try e.scheduler.log_queue.append(self.gpa, .{
-                            .job_finished = .{
-                                .job_id = e.job_id,
-                                .name = e.name,
-                                .exit_code = e.exit_code,
-                                .timestamp_ms = e.timestamp_ms,
-                            },
-                        });
-                        owned = false;
-                        try e.scheduler.result_queue.putOneUncancelable(
-                            self.io,
-                            .{
-                                .node = e.node,
-                                .result = e.result,
-                            },
-                        );
-                    },
-                }
-            },
-        };
+                    switch (remote_event) {
+                        .agent_changed => self.tasks_changed.store(true, .seq_cst),
+                        .job_started => |e| {
+                            try e.scheduler.log_queue.append(self.gpa, .{
+                                .job_started = .{
+                                    .job_id = e.job_id,
+                                    .name = e.name,
+                                    .timestamp_ms = e.timestamp_ms,
+                                },
+                            });
+                            owned = false;
+                        },
+                        .job_output => |e| {
+                            try e.scheduler.log_queue.append(self.gpa, .{
+                                .job_output = .{
+                                    .job_id = e.job_id,
+                                    .step = e.step,
+                                    .data = e.data,
+                                },
+                            });
+                            owned = false;
+                        },
+                        .job_finished => |e| {
+                            try e.scheduler.log_queue.append(self.gpa, .{
+                                .job_finished = .{
+                                    .job_id = e.job_id,
+                                    .name = e.name,
+                                    .exit_code = e.exit_code,
+                                    .timestamp_ms = e.timestamp_ms,
+                                },
+                            });
+                            owned = false;
+                            try e.scheduler.result_queue.putOneUncancelable(
+                                self.io,
+                                .{
+                                    .node = e.node,
+                                    .result = e.result,
+                                },
+                            );
+                        },
+                    }
+                },
+            }
+        }
+
+        if (!self.control_events.empty()) self.signalWork();
     }
 
     /// Handle a file-watch event for a scheduler.
-    fn handleFileTriggerEvent(
-        self: *TaskManager,
-        s: *Scheduler,
-        epoch: u64,
-    ) !void {
+    fn handleFileTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        // Combine multiple fs events into one to avoid constant retriggering
-        if (s.last_watch_epoch == epoch) return;
-        s.last_watch_epoch = epoch;
+        const now_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+        if (s.last_trigger_event_ns != 0 and
+            now_ns - s.last_trigger_event_ns < WATCH_DEDUPE_NS)
+            return;
+        s.last_trigger_event_ns = now_ns;
 
         switch (s.status) {
             .waiting => {
