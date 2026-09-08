@@ -147,6 +147,7 @@ pub const TaskManager = struct {
         listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
         listen_port: u16 = remotemanager.DEFAULT_PORT,
         verbose_events: bool = false,
+        remote: bool = true,
     };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
@@ -386,11 +387,13 @@ pub const TaskManager = struct {
         self.verbose_events = options.verbose_events;
 
         try self.watcher.start();
-        const addr: std.Io.net.IpAddress = try .parseIp4(
-            options.listen_addr,
-            options.listen_port,
-        );
-        try self.remote_manager.start(addr);
+        if (options.remote) {
+            const addr: std.Io.net.IpAddress = try .parseIp4(
+                options.listen_addr,
+                options.listen_port,
+            );
+            try self.remote_manager.start(addr);
+        }
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 

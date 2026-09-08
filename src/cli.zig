@@ -55,6 +55,7 @@ const commands = &[_]zcli.Cmd{
         .desc = "Run the text user interface (TUI)",
         .action = cmdTuiFn,
         .options = task_options ++ listen_options ++ &[_]zcli.Opt{
+            no_remote_option,
             runner_n_option,
             verbose_option,
         },
@@ -63,6 +64,7 @@ const commands = &[_]zcli.Cmd{
         .name = "run",
         .desc = "Run a single task",
         .options = task_options ++ listen_options ++ &[_]zcli.Opt{
+            no_remote_option,
             .{
                 .long_name = "attach",
                 .short_name = "a",
@@ -312,6 +314,11 @@ const path_positional: zcli.PosArg = .{
     .exclusive_group = TASK_SELECT_TAG,
 };
 
+const no_remote_option: zcli.Opt = .{
+    .long_name = "no-remote",
+    .desc = "Do not start the remote manager",
+};
+
 const runner_n_option: zcli.Opt = .{
     .long_name = "runners",
     .short_name = "r",
@@ -355,6 +362,7 @@ fn cmdTuiFn(ptr: *anyopaque) !void {
     var opts: run.TuiOptions = .{
         .listen = getListenOptions(ctx),
         .verbose = cli.findOption("verbose") != null,
+        .no_remote = cli.findOption("no-remote") != null,
     };
     if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
@@ -483,6 +491,7 @@ fn cmdRunFn(ptr: *anyopaque) !void {
 
     var opts: run.RunOptions = .{
         .listen = getListenOptions(ctx),
+        .no_remote = cli.findOption("no-remote") != null,
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
             const value = o.value orelse break :blk .first;
@@ -526,6 +535,10 @@ fn cmdRunFn(ptr: *anyopaque) !void {
             error.InvalidWatchPath => ctx.fatal("Invalid file path for watch trigger", .{}),
             error.WatchPathNotFound => ctx.fatal("File path for watch trigger not found", .{}),
             error.NoTaskFileGiven => ctx.fatal("No task file given", .{}),
+            error.RemoteJobsWithNoRemote => ctx.fatal(
+                "Task has remote jobs but --{s} was set",
+                .{no_remote_option.long_name},
+            ),
             else => {
                 if (inErrorSet(err, ParseError)) ctx.fatal(
                     "Invalid task file: {any}",

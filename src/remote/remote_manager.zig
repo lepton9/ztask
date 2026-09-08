@@ -268,6 +268,7 @@ pub const RemoteManager = struct {
 
     /// Start server and receive connections from remote agents
     pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
+        if (self.thread != null) return;
         if (self.event_sink == null) return error.EventSinkNotSet;
         errdefer self.stop();
         self.server = try addr.listen(self.io, .{ .reuse_address = true });

@@ -56,6 +56,7 @@ pub const TuiOptions = struct {
     listen: ConnectOptions = .{},
     runners_n: u8 = BASE_RUNNERS_N,
     verbose: bool = false,
+    no_remote: bool = false,
 };
 
 pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
@@ -75,6 +76,7 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
         .listen_addr = options.listen.addr,
         .listen_port = options.listen.port,
         .verbose_events = options.verbose,
+        .remote = !options.no_remote,
     });
 
     const model = try Model.init(gpa, task_manager);
@@ -152,6 +154,7 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
 pub const RunOptions = struct {
     listen: ConnectOptions = .{},
     path: ?[]const u8 = null,
+    no_remote: bool = false,
     id: ?[]const u8 = null,
     attach_job: ?manager.AttachJob = null,
     retrigger: bool = false,
@@ -194,6 +197,17 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         };
         return error.NoTaskFileGiven;
     };
+
+    const has_remote_jobs: bool = blk: {
+        var job_it = task.jobs.iterator();
+        while (job_it.next()) |entry| {
+            if (entry.value_ptr.run_on == .remote) break :blk true;
+        }
+        break :blk false;
+    };
+    if (options.no_remote and has_remote_jobs)
+        return error.RemoteJobsWithNoRemote;
+
     const task_id = task.id.fmt();
     const task_id_value = task.id.value;
     const task_has_trigger = task.trigger != null;
@@ -213,6 +227,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     try task_manager.startWithOptions(.{
         .listen_addr = options.listen.addr,
         .listen_port = options.listen.port,
+        .remote = !options.no_remote and has_remote_jobs,
     });
     try task_manager.beginTask(task_id, .{
         .attach_job = options.attach_job,
