@@ -157,7 +157,11 @@ pub const RemoteCommand = union(enum) {
     shutdown,
 };
 
-/// Events are consumed by TaskManager, which remains the sole owner of schedulers.
+pub const EventSink = struct {
+    ptr: *anyopaque,
+    emit: *const fn (ptr: *anyopaque, event: RemoteEvent) void,
+};
+
 pub const RemoteEvent = union(enum) {
     agent_changed,
     job_started: struct { scheduler: *Scheduler, job_id: u64, name: []u8, timestamp_ms: i64 },
@@ -171,6 +175,15 @@ pub const RemoteEvent = union(enum) {
         timestamp_ms: i64,
         result: ExecResult,
     },
+
+    pub fn deinit(event: RemoteEvent, gpa: std.mem.Allocator) void {
+        switch (event) {
+            .agent_changed => {},
+            .job_started => |e| gpa.free(e.name),
+            .job_output => |e| gpa.free(e.data),
+            .job_finished => |e| gpa.free(e.name),
+        }
+    }
 };
 
 pub const AgentHandle = struct {
@@ -211,7 +224,7 @@ pub const RemoteManager = struct {
     agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
     incoming_frames: MutexQueue(InboundFrame),
     commands: MutexQueue(RemoteCommand),
-    events: MutexQueue(RemoteEvent),
+    event_sink: ?EventSink = null,
     agent_count: std.atomic.Value(usize) = .init(0),
 
     dispatch_queue: Queue(DispatchRequest),
@@ -225,7 +238,6 @@ pub const RemoteManager = struct {
             .agents = .{},
             .incoming_frames = .init(io),
             .commands = .init(io),
-            .events = .init(io),
             .dispatch_timer = undefined,
             .dispatch_queue = .{},
             .dispatched_jobs = .{},
@@ -251,18 +263,12 @@ pub const RemoteManager = struct {
         };
         self.incoming_frames.deinit(self.gpa);
         self.commands.deinit(self.gpa);
-        while (self.events.pop()) |event| switch (event) {
-            .agent_changed => {},
-            .job_started => |e| self.gpa.free(e.name),
-            .job_output => |e| self.gpa.free(e.data),
-            .job_finished => |e| self.gpa.free(e.name),
-        };
-        self.events.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
     /// Start server and receive connections from remote agents
     pub fn start(self: *RemoteManager, addr: std.Io.net.IpAddress) !void {
+        if (self.event_sink == null) return error.EventSinkNotSet;
         errdefer self.stop();
         self.server = try addr.listen(self.io, .{ .reuse_address = true });
         self.running.store(true, .seq_cst);
@@ -278,8 +284,16 @@ pub const RemoteManager = struct {
         self.thread = null;
     }
 
-    pub fn setEventNotify(self: *RemoteManager, event_notify: ?Notify) void {
-        self.events.setNotify(event_notify);
+    pub fn setEventSink(self: *RemoteManager, sink: ?EventSink) void {
+        self.event_sink = sink;
+    }
+
+    fn emitEvent(self: *RemoteManager, event: RemoteEvent) !void {
+        const sink = self.event_sink orelse {
+            event.deinit(self.gpa);
+            return error.EventSinkNotSet;
+        };
+        sink.emit(sink.ptr, event);
     }
 
     fn notify(opq: *anyopaque) void {
@@ -401,12 +415,12 @@ pub const RemoteManager = struct {
                     return error.ConnectionError;
                 }
                 try agent.setName(self.gpa, m.hostname);
-                try self.events.append(self.gpa, .agent_changed);
+                try self.emitEvent(.agent_changed);
             },
             .heartbeat => agent.last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             .job_start => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse return;
-                try self.events.append(self.gpa, .{ .job_started = .{
+                try self.emitEvent(.{ .job_started = .{
                     .scheduler = req.scheduler,
                     .job_id = req.job_node.id,
                     .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
@@ -415,7 +429,7 @@ pub const RemoteManager = struct {
             },
             .job_log => |m| {
                 const req = self.dispatched_jobs.get(m.job_id) orelse return;
-                try self.events.append(self.gpa, .{ .job_output = .{
+                try self.emitEvent(.{ .job_output = .{
                     .scheduler = req.scheduler,
                     .job_id = req.job_node.id,
                     .step = m.step,
@@ -425,7 +439,7 @@ pub const RemoteManager = struct {
             .job_finish => |m| {
                 const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse return;
                 const req = kv.value;
-                try self.events.append(self.gpa, .{ .job_finished = .{
+                try self.emitEvent(.{ .job_finished = .{
                     .scheduler = req.scheduler,
                     .node = req.job_node,
                     .job_id = req.job_node.id,
@@ -487,7 +501,7 @@ pub const RemoteManager = struct {
             }
 
             // Failed to find matching agent
-            try self.events.append(self.gpa, .{ .job_finished = .{
+            try self.emitEvent(.{ .job_finished = .{
                 .scheduler = req.scheduler,
                 .node = req.job_node,
                 .job_id = req.job_node.id,
@@ -530,7 +544,7 @@ pub const RemoteManager = struct {
         self.sendMessage(agent, msg) catch {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse return;
-            try self.events.append(self.gpa, .{ .job_finished = .{
+            try self.emitEvent(.{ .job_finished = .{
                 .scheduler = kv.value.scheduler,
                 .node = req.job_node,
                 .job_id = req.job_node.id,
@@ -628,12 +642,12 @@ pub const RemoteManager = struct {
                 .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
             };
             self.agent_count.store(self.agents.count(), .seq_cst);
-            try self.events.append(self.gpa, .agent_changed);
+            try self.emitEvent(.agent_changed);
         }
     }
 
     fn failDisconnectedJob(self: *RemoteManager, req: DispatchRequest) void {
-        self.events.append(self.gpa, .{ .job_finished = .{
+        self.emitEvent(.{ .job_finished = .{
             .scheduler = req.scheduler,
             .node = req.job_node,
             .job_id = req.job_node.id,
@@ -677,7 +691,7 @@ pub const RemoteManager = struct {
             });
             e.value.deinit(self.gpa);
             self.agent_count.store(self.agents.count(), .seq_cst);
-            self.events.append(self.gpa, .agent_changed) catch {};
+            self.emitEvent(.agent_changed) catch {};
         }
     }
 

@@ -1,7 +1,5 @@
 const std = @import("std");
-const queue_zig = @import("../types/queue.zig");
-const builtin = @import("builtin");
-const task = @import("../types/task.zig");
+const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const date = @import("../types/date.zig");
 
 const FileWatcher = @import("FileWatcher.zig");
@@ -16,7 +14,10 @@ pub const WatchEvent = union(enum) {
     timeEvent: TimeWatcher.TimeEvent,
 };
 
-const EventQueue = queue_zig.MutexQueue(WatchEvent);
+pub const EventSink = struct {
+    ptr: *anyopaque,
+    emit: *const fn (ptr: *anyopaque, event: WatchEvent) void,
+};
 
 /// Event watcher that polls all the watchers for events
 pub const Watcher = struct {
@@ -26,8 +27,7 @@ pub const Watcher = struct {
     cond: std.Io.Condition = .init,
     thread: std.Thread = undefined,
     running: std.atomic.Value(bool) = .init(false),
-    /// Event queue for all the watcher events.
-    queue: EventQueue,
+    event_sink: ?EventSink = null,
     /// Watcher for file events.
     file_watcher: FileWatcher,
     /// Watcher for time events.
@@ -41,22 +41,19 @@ pub const Watcher = struct {
         watcher.* = .{
             .io = io,
             .gpa = gpa,
-            .queue = .init(io),
-            .file_watcher = .init(io, gpa, &watcher.queue, addFileEvent),
+            .file_watcher = .init(io, gpa, watcher, addFileEvent),
             .time_watcher = .init(io),
         };
         return watcher;
     }
 
-    pub fn setEventNotify(self: *Watcher, notify: ?queue_zig.Notify) void {
-        self.queue.setNotify(notify);
+    pub fn setEventSink(self: *Watcher, sink: ?EventSink) void {
+        self.event_sink = sink;
     }
 
     pub fn deinit(self: *Watcher) void {
         self.file_watcher.deinit();
         self.time_watcher.deinit(self.gpa);
-        self.drainEvents();
-        self.queue.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 
@@ -103,7 +100,7 @@ pub const Watcher = struct {
 
             self.time_watcher.pollEvents(
                 self.gpa,
-                &self.queue,
+                self,
                 addTimeEvent,
             ) catch |err| log.err("{}: time watcher poll failed", .{err});
         }
@@ -122,11 +119,6 @@ pub const Watcher = struct {
             best = if (best) |b| @min(b, t_ns) else t_ns;
         }
         return best orelse FILE_POLL_NS;
-    }
-
-    /// Pop an event from the event queue if there is one
-    pub fn getEvent(self: *Watcher) ?WatchEvent {
-        return self.queue.pop();
     }
 
     /// Add a file path for the `FileWatcher` to watch for changes
@@ -150,37 +142,6 @@ pub const Watcher = struct {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         self.file_watcher.removeWatch(path, options) catch {};
-    }
-
-    /// Drain all the remaining events.
-    fn drainEvents(self: *Watcher) void {
-        while (self.getEvent()) |event| switch (event) {
-            .fileEvent => |file_event| file_event.deinit(self.gpa),
-            .timeEvent => {},
-        };
-    }
-
-    /// Wait for a file event on a path.
-    fn waitForFileEvent(
-        w: *Watcher,
-        expected_path: []const u8,
-        timeout_ns: u64,
-    ) !FileWatcher.FileEvent {
-        const timer = std.Io.Timestamp.now(w.io, .awake);
-        while (timer.untilNow(w.io, .awake).toNanoseconds() < timeout_ns) {
-            if (w.getEvent()) |ev| switch (ev) {
-                .fileEvent => |fe| {
-                    if (!std.mem.eql(u8, fe.watched_path, expected_path)) {
-                        fe.deinit(w.gpa);
-                        continue;
-                    }
-                    return fe;
-                },
-                else => {},
-            };
-            std.Io.sleep(w.io, .fromNanoseconds(5 * std.time.ns_per_ms), .awake) catch {};
-        }
-        return error.Timeout;
     }
 
     /// Add an interval time watch for `TimeWatcher` to watch for.
@@ -213,42 +174,121 @@ pub const Watcher = struct {
     }
 };
 
-/// Add a file event to the event queue
+/// Emit a file event to the event sink.
 pub fn addFileEvent(
     gpa: std.mem.Allocator,
     queue_ptr: *anyopaque,
     ev: FileWatcher.FileEvent,
 ) !void {
-    var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
-    try queue.append(gpa, .{ .fileEvent = ev });
+    const watcher: *Watcher = @ptrCast(@alignCast(queue_ptr));
+    if (watcher.event_sink) |sink| {
+        sink.emit(sink.ptr, .{ .fileEvent = ev });
+    } else {
+        ev.deinit(gpa);
+    }
 }
 
-/// Add a time event to the event queue
 fn addTimeEvent(
-    gpa: std.mem.Allocator,
+    _: std.mem.Allocator,
     queue_ptr: *anyopaque,
     ev: TimeWatcher.TimeEvent,
 ) !void {
-    var queue: *EventQueue = @ptrCast(@alignCast(queue_ptr));
-    try queue.append(gpa, .{ .timeEvent = ev });
+    const watcher: *Watcher = @ptrCast(@alignCast(queue_ptr));
+    if (watcher.event_sink) |sink| {
+        sink.emit(sink.ptr, .{ .timeEvent = ev });
+    }
 }
 
 const test_timeout = 2 * std.time.ns_per_s;
 
+/// Test helper that collects watcher events through the event sink.
+const TestWatcher = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    watcher: *Watcher,
+    queue: MutexQueue(WatchEvent),
+
+    fn init(io: std.Io, gpa: std.mem.Allocator) !*TestWatcher {
+        const self = try gpa.create(TestWatcher);
+        errdefer gpa.destroy(self);
+        self.* = .{
+            .io = io,
+            .gpa = gpa,
+            .watcher = try Watcher.init(io, gpa),
+            .queue = MutexQueue(WatchEvent).init(io),
+        };
+        self.watcher.setEventSink(.{ .ptr = self, .emit = emit });
+        return self;
+    }
+
+    fn emit(ptr: *anyopaque, event: WatchEvent) void {
+        const self: *TestWatcher = @ptrCast(@alignCast(ptr));
+        self.queue.append(self.gpa, event) catch switch (event) {
+            .fileEvent => |fe| fe.deinit(self.gpa),
+            .timeEvent => {},
+        };
+    }
+
+    fn getEvent(self: *TestWatcher) ?WatchEvent {
+        return self.queue.pop();
+    }
+
+    fn drain(self: *TestWatcher) void {
+        while (self.queue.pop()) |event| switch (event) {
+            .fileEvent => |fe| fe.deinit(self.gpa),
+            .timeEvent => {},
+        };
+    }
+
+    fn waitForFileEvent(
+        self: *TestWatcher,
+        expected_path: []const u8,
+        timeout_ns: u64,
+    ) !FileWatcher.FileEvent {
+        const timer = std.Io.Timestamp.now(self.io, .awake);
+        while (timer.untilNow(self.io, .awake).toNanoseconds() < timeout_ns) {
+            if (self.getEvent()) |ev| switch (ev) {
+                .fileEvent => |fe| {
+                    if (!std.mem.eql(u8, fe.watched_path, expected_path)) {
+                        fe.deinit(self.gpa);
+                        continue;
+                    }
+                    return fe;
+                },
+                else => {},
+            };
+            std.Io.sleep(
+                self.io,
+                .fromNanoseconds(5 * std.time.ns_per_ms),
+                .awake,
+            ) catch {};
+        }
+        return error.Timeout;
+    }
+
+    fn deinit(self: *TestWatcher) void {
+        self.watcher.deinit();
+        self.drain();
+        self.queue.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+};
+
 test "watcher_stop_no_work" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
-    try watcher.start();
-    try watcher.stop();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    try tw.watcher.start();
+    try tw.watcher.stop();
 }
 
 test "file_watch_add" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -279,8 +319,9 @@ test "file_watch_add" {
 test "file_watch_add_relative_path" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -293,8 +334,9 @@ test "file_watch_add_relative_path" {
 test "file_watch_add_duplicate" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -329,8 +371,9 @@ test "file_events_modify_and_delete" {
         try w.flush();
     }
 
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -349,15 +392,15 @@ test "file_events_modify_and_delete" {
         try w.interface.writeAll("world");
         try w.flush();
     }
-    const fe = try watcher.waitForFileEvent(file_path, test_timeout);
+    const fe = try tw.waitForFileEvent(file_path, test_timeout);
     defer fe.deinit(gpa);
     try std.testing.expect(fe.kind == .modified);
-    watcher.drainEvents();
+    tw.drain();
 
     // Delete file
     try tmp.dir.deleteFile(io, "watch.txt");
     const fe_del = blk: while (true) {
-        const fe_del = try watcher.waitForFileEvent(file_path, test_timeout);
+        const fe_del = try tw.waitForFileEvent(file_path, test_timeout);
         if (fe_del.kind == .deleted) break :blk fe_del;
         fe_del.deinit(gpa);
     };
@@ -372,8 +415,9 @@ test "file_watch_survives_atomic_replacement" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -397,9 +441,9 @@ test "file_watch_survives_atomic_replacement" {
     }
     try tmp.dir.rename("replacement.txt", tmp.dir, "watch.txt", io);
 
-    const replaced = try watcher.waitForFileEvent(file_path, test_timeout);
+    const replaced = try tw.waitForFileEvent(file_path, test_timeout);
     replaced.deinit(gpa);
-    watcher.drainEvents();
+    tw.drain();
 
     {
         var file = try tmp.dir.createFile(io, "watch.txt", .{ .truncate = true });
@@ -409,7 +453,7 @@ test "file_watch_survives_atomic_replacement" {
         try writer.flush();
     }
     const modified = blk: while (true) {
-        const event = try watcher.waitForFileEvent(file_path, test_timeout);
+        const event = try tw.waitForFileEvent(file_path, test_timeout);
         if (event.kind == .modified) break :blk event;
         event.deinit(gpa);
     };
@@ -424,8 +468,9 @@ test "file_events_create_in_dir" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -442,7 +487,7 @@ test "file_events_create_in_dir" {
         try w.flush();
     }
 
-    const fe = try watcher.waitForFileEvent(dir_path, test_timeout);
+    const fe = try tw.waitForFileEvent(dir_path, test_timeout);
     defer fe.deinit(gpa);
     try std.testing.expect(fe.kind == .created);
 }
@@ -454,8 +499,9 @@ test "recursive_directory_events" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
     try watcher.start();
     defer watcher.stop() catch {};
 
@@ -475,7 +521,7 @@ test "recursive_directory_events" {
 
     const timer = std.Io.Timestamp.now(io, .awake);
     while (timer.untilNow(io, .awake).toNanoseconds() < test_timeout) {
-        if (watcher.getEvent()) |event| switch (event) {
+        if (tw.getEvent()) |event| switch (event) {
             .fileEvent => |file_event| {
                 if (!std.mem.eql(u8, file_event.watched_path, dir_path)) {
                     file_event.deinit(gpa);
@@ -502,8 +548,9 @@ test "recursive_directory_events" {
 test "file_watch_remove_not_existing" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    const watcher = try Watcher.init(io, gpa);
-    defer watcher.deinit();
+    const tw = try TestWatcher.init(io, gpa);
+    defer tw.deinit();
+    const watcher = tw.watcher;
 
     try watcher.start();
     defer watcher.stop() catch {};

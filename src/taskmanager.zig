@@ -7,6 +7,7 @@ const parse = @import("parse.zig");
 const watcher_zig = @import("watcher/watcher.zig");
 const task_zig = @import("types/task.zig");
 const MutexQueue = @import("types/queue.zig").MutexQueue;
+const event_hub = @import("types/event_hub.zig");
 const Task = task_zig.Task;
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
@@ -38,6 +39,21 @@ const WatchEntry = struct {
     recursive: std.ArrayList(*Scheduler) = .empty,
 };
 
+const ControlEvent = union(enum) {
+    watcher: watcher_zig.WatchEvent,
+    remote: remotemanager.RemoteEvent,
+
+    fn deinit(self: ControlEvent, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .watcher => |event| switch (event) {
+                .fileEvent => |file_event| file_event.deinit(gpa),
+                .timeEvent => {},
+            },
+            .remote => |event| event.deinit(gpa),
+        }
+    }
+};
+
 /// Manages all tasks and triggers
 pub const TaskManager = struct {
     io: std.Io,
@@ -52,9 +68,7 @@ pub const TaskManager = struct {
     /// Condition for tasks currently running
     idle_cond: std.Io.Condition = .init,
 
-    /// Queue of task events (single-consumer)
-    events: MutexQueue(Event),
-    /// Emit additional events into the event queue.
+    event_hub: *EventHub,
     verbose_events: bool = false,
     datastore: data.DataStore,
     pool: RunnerPool,
@@ -75,35 +89,58 @@ pub const TaskManager = struct {
     /// Epoch counter used to dedupe watcher-event bursts.
     watch_epoch: u64 = 0,
 
+    control_events: MutexQueue(ControlEvent),
+
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
 
     pub const Event = union(enum) {
-        /// Event for informing that the run finished.
         run_finished: struct {
             task_id: u64,
             status: data.TaskRunStatus,
         },
-        /// Informational events intended for verbose output.
-        /// The field `msg` is owned by the receiver and must be freed.
         info: struct {
             task_id: u64,
             msg: []u8,
         },
-        /// General error event.
         err: struct {
             scope: ErrorScope,
             err: anyerror,
             msg: ?[]const u8 = null,
         },
 
-        const ErrorScope = enum {
+        pub const ErrorScope = enum {
             task_manager,
             watcher,
             remote_manager,
             scheduler,
         };
+
+        pub fn clone(self: @This(), gpa: std.mem.Allocator) !@This() {
+            return switch (self) {
+                .run_finished => |e| .{ .run_finished = e },
+                .info => |e| .{ .info = .{
+                    .task_id = e.task_id,
+                    .msg = try gpa.dupe(u8, e.msg),
+                } },
+                .err => |e| .{ .err = .{
+                    .scope = e.scope,
+                    .err = e.err,
+                    .msg = if (e.msg) |msg| try gpa.dupe(u8, msg) else null,
+                } },
+            };
+        }
+
+        pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+            switch (self) {
+                .run_finished => {},
+                .info => |e| gpa.free(e.msg),
+                .err => |e| if (e.msg) |msg| gpa.free(msg),
+            }
+        }
     };
+
+    pub const EventHub = event_hub.EventHub(Event);
 
     pub const StartOptions = struct {
         listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
@@ -128,9 +165,15 @@ pub const TaskManager = struct {
         var datastore = try data.DataStore.init(io, gpa, data_opts);
         errdefer datastore.deinit(gpa);
 
-        var events = try MutexQueue(Event).initCapacity(io, gpa, 64);
-        errdefer events.deinit(gpa);
+        var control_events = MutexQueue(ControlEvent).init(io);
+        errdefer control_events.deinit(gpa);
 
+        const hub = try gpa.create(EventHub);
+        hub.* = EventHub.init(io, gpa);
+        errdefer {
+            hub.deinit();
+            gpa.destroy(hub);
+        }
         var pool = try RunnerPool.init(io, gpa, runners_n);
         errdefer pool.deinit();
 
@@ -148,7 +191,8 @@ pub const TaskManager = struct {
         self.* = .{
             .io = io,
             .gpa = gpa,
-            .events = events,
+            .control_events = control_events,
+            .event_hub = hub,
             .datastore = datastore,
             .pool = pool,
             .schedulers = .{},
@@ -158,15 +202,16 @@ pub const TaskManager = struct {
             .remote_manager = remote_manager,
             .watcher = watcher,
         };
-        self.remote_manager.setEventNotify(.{ .ptr = self, .callback = notifyWork });
-        self.watcher.setEventNotify(.{ .ptr = self, .callback = notifyWork });
+        self.remote_manager.setEventSink(.{ .ptr = self, .emit = submitRemoteEvent });
+        self.watcher.setEventSink(.{ .ptr = self, .emit = submitWatcherEvent });
         return self;
     }
 
     pub fn deinit(self: *TaskManager) void {
         self.stop() catch {};
-        self.drainEvents();
-        self.events.deinit(self.gpa);
+        self.drainControlEvents();
+        self.event_hub.deinit();
+        self.gpa.destroy(self.event_hub);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| s.*.deinit();
         var lt_it = self.loaded_tasks.iterator();
@@ -190,25 +235,21 @@ pub const TaskManager = struct {
         self.gpa.destroy(self);
     }
 
-    /// Pop the next task event if available (non-blocking)
-    pub fn tryPopEvent(self: *TaskManager) ?Event {
-        return self.events.pop();
+    pub fn subscribeEvents(self: *TaskManager) !*EventHub.Subscriber {
+        return self.event_hub.subscribe();
     }
 
-    /// Pop the next task event (blocking)
-    pub fn nextEvent(self: *TaskManager) ?Event {
-        return self.events.popBlocking();
+    pub fn unsubscribeEvents(self: *TaskManager, subscriber: *EventHub.Subscriber) void {
+        self.event_hub.unsubscribe(subscriber);
     }
 
-    /// Drain all the remaining events.
-    fn drainEvents(self: *TaskManager) void {
-        while (self.tryPopEvent()) |event| {
-            switch (event) {
-                .run_finished => {},
-                .info => |e| self.gpa.free(e.msg),
-                .err => |e| if (e.msg) |m| self.gpa.free(m),
-            }
-        }
+    fn publishEvent(self: *TaskManager, event: Event) void {
+        self.event_hub.publish(event);
+    }
+
+    fn drainControlEvents(self: *TaskManager) void {
+        while (self.control_events.pop()) |event| event.deinit(self.gpa);
+        self.control_events.deinit(self.gpa);
     }
 
     /// Handle error and push it to the event queue.
@@ -221,13 +262,11 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        self.events.append(self.gpa, .{ .err = .{
+        self.publishEvent(.{ .err = .{
             .scope = scope,
             .msg = custom_msg,
             .err = err,
-        } }) catch {
-            self.gpa.free(custom_msg);
-        };
+        } });
         log.err("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
     }
 
@@ -237,10 +276,10 @@ pub const TaskManager = struct {
         scope: Event.ErrorScope,
         err: anyerror,
     ) void {
-        self.events.append(self.gpa, .{ .err = .{
+        self.publishEvent(.{ .err = .{
             .scope = scope,
             .err = err,
-        } }) catch {};
+        } });
         log.err("{any}: error: {any}", .{ scope, err });
     }
 
@@ -252,11 +291,9 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
-        self.events.append(self.gpa, .{
+        self.publishEvent(.{
             .info = .{ .task_id = task_id, .msg = msg },
-        }) catch {
-            self.gpa.free(msg);
-        };
+        });
         log.info("task={d} {s}", .{ task_id, msg });
     }
 
@@ -296,6 +333,24 @@ pub const TaskManager = struct {
                 .{ e.job_name, if (e.msg) |m| m else e.err_name },
             ),
         }
+    }
+
+    fn submitWatcherEvent(opq: *anyopaque, event: watcher_zig.WatchEvent) void {
+        const self: *TaskManager = @ptrCast(@alignCast(opq));
+        self.control_events.append(self.gpa, .{ .watcher = event }) catch {
+            (ControlEvent{ .watcher = event }).deinit(self.gpa);
+            return;
+        };
+        self.signalWork();
+    }
+
+    fn submitRemoteEvent(opq: *anyopaque, event: remotemanager.RemoteEvent) void {
+        const self: *TaskManager = @ptrCast(@alignCast(opq));
+        self.control_events.append(self.gpa, .{ .remote = event }) catch {
+            (ControlEvent{ .remote = event }).deinit(self.gpa);
+            return;
+        };
+        self.signalWork();
     }
 
     fn notifyWork(opq: *anyopaque) void {
@@ -341,16 +396,14 @@ pub const TaskManager = struct {
     /// Main run loop.
     fn run(self: *TaskManager) void {
         while (self.running.load(.seq_cst)) {
-            self.checkWatcher() catch |err| {
-                self.emitError(.watcher, err);
-            };
-            self.updateRemoteManager() catch |err| {
-                self.emitError(.remote_manager, err);
+            self.processControlEvents() catch |err| {
+                self.emitError(.task_manager, err);
             };
             self.updateSchedulers() catch |err| {
                 self.emitError(.scheduler, err);
             };
 
+            // Wait until there is work to do
             self.work_mutex.lockUncancelable(self.io);
             while (self.running.load(.seq_cst) and !self.work_pending.swap(false, .seq_cst)) {
                 self.work_cond.wait(self.io, &self.work_mutex) catch {};
@@ -513,33 +566,73 @@ pub const TaskManager = struct {
         try s.watch_paths.append(self.gpa, key);
     }
 
-    /// Move remote thread events into scheduler-owned queues.
-    fn updateRemoteManager(self: *TaskManager) !void {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
-        while (self.remote_manager.events.pop()) |event| switch (event) {
-            .agent_changed => self.tasks_changed.store(true, .seq_cst),
-            .job_started => |e| try e.scheduler.log_queue.append(self.gpa, .{ .job_started = .{
-                .job_id = e.job_id,
-                .name = e.name,
-                .timestamp_ms = e.timestamp_ms,
-            } }),
-            .job_output => |e| try e.scheduler.log_queue.append(self.gpa, .{ .job_output = .{
-                .job_id = e.job_id,
-                .step = e.step,
-                .data = e.data,
-            } }),
-            .job_finished => |e| {
-                try e.scheduler.log_queue.append(self.gpa, .{ .job_finished = .{
-                    .job_id = e.job_id,
-                    .name = e.name,
-                    .exit_code = e.exit_code,
-                    .timestamp_ms = e.timestamp_ms,
-                } });
-                try e.scheduler.result_queue.putOneUncancelable(self.io, .{
-                    .node = e.node,
-                    .result = e.result,
-                });
+    /// Handle all the incoming control events.
+    fn processControlEvents(self: *TaskManager) !void {
+        // TODO: better watch event deduplication
+        self.watch_epoch +%= 1;
+        const watch_epoch = self.watch_epoch;
+
+        while (self.control_events.pop()) |event| switch (event) {
+            .watcher => |watcher_event| switch (watcher_event) {
+                .fileEvent => |fe| {
+                    defer fe.deinit(self.gpa);
+                    const entry = self.watch_map.get(fe.watched_path) orelse continue;
+                    const schedulers = switch (fe.scope) {
+                        .direct => entry.direct.items,
+                        .recursive => entry.recursive.items,
+                    };
+                    for (schedulers) |s| try self.handleFileTriggerEvent(s, watch_epoch);
+                },
+                .timeEvent => |te| {
+                    const s = self.getScheduler(te.task_id) orelse continue;
+                    try self.handleTimeTriggerEvent(s);
+                },
+            },
+            .remote => |remote_event| {
+                var owned = true;
+                defer if (owned) remote_event.deinit(self.gpa);
+
+                switch (remote_event) {
+                    .agent_changed => self.tasks_changed.store(true, .seq_cst),
+                    .job_started => |e| {
+                        try e.scheduler.log_queue.append(self.gpa, .{
+                            .job_started = .{
+                                .job_id = e.job_id,
+                                .name = e.name,
+                                .timestamp_ms = e.timestamp_ms,
+                            },
+                        });
+                        owned = false;
+                    },
+                    .job_output => |e| {
+                        try e.scheduler.log_queue.append(self.gpa, .{
+                            .job_output = .{
+                                .job_id = e.job_id,
+                                .step = e.step,
+                                .data = e.data,
+                            },
+                        });
+                        owned = false;
+                    },
+                    .job_finished => |e| {
+                        try e.scheduler.log_queue.append(self.gpa, .{
+                            .job_finished = .{
+                                .job_id = e.job_id,
+                                .name = e.name,
+                                .exit_code = e.exit_code,
+                                .timestamp_ms = e.timestamp_ms,
+                            },
+                        });
+                        owned = false;
+                        try e.scheduler.result_queue.putOneUncancelable(
+                            self.io,
+                            .{
+                                .node = e.node,
+                                .result = e.result,
+                            },
+                        );
+                    },
+                }
             },
         };
     }
@@ -583,29 +676,6 @@ pub const TaskManager = struct {
         }
     }
 
-    /// Handle watcher events and trigger corresponding schedulers.
-    /// Handle only one event per scheduler during each event drain.
-    fn checkWatcher(self: *TaskManager) !void {
-        // Set a new epoch for this event drain
-        self.watch_epoch +%= 1;
-        const epoch = self.watch_epoch;
-
-        while (self.watcher.getEvent()) |event| switch (event) {
-            .fileEvent => |fe| {
-                defer fe.deinit(self.gpa);
-                const entry = self.watch_map.get(fe.watched_path) orelse continue;
-                const schedulers = switch (fe.scope) {
-                    .direct => entry.direct.items,
-                    .recursive => entry.recursive.items,
-                };
-                for (schedulers) |s| try self.handleFileTriggerEvent(s, epoch);
-            },
-            .timeEvent => |te| if (self.getScheduler(te.task_id)) |s| {
-                try self.handleTimeTriggerEvent(s);
-            },
-        };
-    }
-
     /// Advance the schedulers
     fn updateSchedulers(self: *TaskManager) !void {
         try self.mutex.lock(self.io);
@@ -630,7 +700,7 @@ pub const TaskManager = struct {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
 
-                try self.events.append(self.gpa, .{ .run_finished = .{
+                self.publishEvent(.{ .run_finished = .{
                     .task_id = s.*.task.id.value,
                     .status = s.*.task_meta.status,
                 } });
@@ -641,7 +711,7 @@ pub const TaskManager = struct {
             .interrupted => {
                 s.*.status = .inactive;
 
-                try self.events.append(self.gpa, .{ .run_finished = .{
+                self.publishEvent(.{ .run_finished = .{
                     .task_id = s.*.task.id.value,
                     .status = .interrupted,
                 } });

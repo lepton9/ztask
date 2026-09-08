@@ -171,6 +171,8 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
             .data_dir = ctx.data_dir,
         });
     defer task_manager.deinit();
+    const events = try task_manager.subscribeEvents();
+    defer events.deinit();
 
     const task = blk: {
         if (options.path) |path| {
@@ -246,7 +248,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         }
 
         // Drain task events
-        while (task_manager.tryPopEvent()) |ev| {
+        while (events.tryNext()) |ev| {
             switch (ev) {
                 .run_finished => |e| {
                     if (e.task_id != task_id_value) continue;

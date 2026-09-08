@@ -139,6 +139,8 @@ test "force_interrupt" {
         .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
+    const events = try task_manager.subscribeEvents();
+    defer events.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.beginTask(task.id.fmt(), .{});
@@ -147,7 +149,7 @@ test "force_interrupt" {
 
     var it = task_manager.schedulers.valueIterator();
     while (it.next()) |s| try std.testing.expect(s.*.status == .interrupted);
-    if (task_manager.tryPopEvent()) |event| switch (event) {
+    if (events.tryNext()) |event| switch (event) {
         .run_finished => |e| try std.testing.expect(e.status == .interrupted),
         .info => |e| gpa.free(e.msg),
         .err => |e| if (e.msg) |m| gpa.free(m),
@@ -187,6 +189,8 @@ test "complete_tasks" {
         .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
+    const events = try task_manager.subscribeEvents();
+    defer events.deinit();
     const task1 = try parse.parseTaskBuffer(io, gpa, task1_file);
     const task2 = try parse.parseTaskBuffer(io, gpa, task2_file);
 
@@ -195,7 +199,7 @@ test "complete_tasks" {
     try task_manager.loaded_tasks.put(gpa, task1.id.fmt(), task1);
     try task_manager.loaded_tasks.put(gpa, task2.id.fmt(), task2);
 
-    try std.testing.expect(task_manager.events.empty());
+    try std.testing.expect(events.len() == 0);
 
     try task_manager.start();
 
@@ -209,8 +213,8 @@ test "complete_tasks" {
     try std.testing.expect(task_manager.loaded_tasks.count() == 0);
     try std.testing.expect(task_manager.schedulers.count() == 0);
 
-    try std.testing.expect(task_manager.events.len() == 2);
-    while (task_manager.tryPopEvent()) |event| switch (event) {
+    try std.testing.expect(events.len() == 2);
+    while (events.tryNext()) |event| switch (event) {
         .run_finished => |e| {
             try std.testing.expect(e.status == .success);
             try std.testing.expect(
@@ -245,6 +249,8 @@ test "remote_job" {
         .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
+    const events = try task_manager.subscribeEvents();
+    defer events.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
@@ -262,7 +268,7 @@ test "remote_job" {
     agent_thread.join();
 
     try std.testing.expect(agent.isIdle());
-    try std.testing.expect(task_manager.events.len() == 1);
+    try std.testing.expect(events.len() == 1);
 }
 
 test "remote_job_addr" {
@@ -286,6 +292,8 @@ test "remote_job_addr" {
         .data_dir = env.data_dir,
     });
     defer task_manager.deinit();
+    const events = try task_manager.subscribeEvents();
+    defer events.deinit();
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
     try task_manager.startWithOptions(.{ .listen_port = 0 });
@@ -302,8 +310,8 @@ test "remote_job_addr" {
     agent.stop();
     t.join();
 
-    try std.testing.expect(task_manager.events.len() == 1);
-    const finished = task_manager.events.pop().?.run_finished;
+    try std.testing.expect(events.len() == 1);
+    const finished = events.tryNext().?.run_finished;
     try std.testing.expect(finished.status == .success);
 }
 

@@ -37,6 +37,7 @@ pub const Model = struct {
     task_split: *TaskSplit,
 
     taskmanager: *tm.TaskManager,
+    events: *tm.TaskManager.EventHub.Subscriber,
     snapshot: UiSnapshot = undefined,
 
     /// Active TUI section
@@ -63,6 +64,8 @@ pub const Model = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, manager: *tm.TaskManager) !*Model {
+        const events = try manager.subscribeEvents();
+        errdefer events.deinit();
         const model = try gpa.create(Model);
         model.* = .{
             .gpa = gpa,
@@ -70,11 +73,13 @@ pub const Model = struct {
             .arena_list = std.heap.ArenaAllocator.init(gpa),
             .task_split = try .init(gpa, model),
             .taskmanager = manager,
+            .events = events,
         };
         return model;
     }
 
     pub fn deinit(self: *Model) void {
+        self.events.deinit();
         if (self.info.text) |t| self.gpa.free(t);
         self.deinitConfirm();
         self.arena_task.deinit();
@@ -280,13 +285,13 @@ pub const Model = struct {
     fn onTick(self: *Model, ctx: *vxfw.EventContext) anyerror!void {
         self.checkInfo();
         try self.requestSnapshot();
-        try self.handleTaskManagerEvents();
+        try self.handleSubscriberEvents();
         try ctx.queueRefresh();
     }
 
-    /// Pop and show all the events in the task manager event queue.
-    fn handleTaskManagerEvents(self: *Model) !void {
-        while (self.taskmanager.tryPopEvent()) |ev| switch (ev) {
+    /// Pop and show all events from this subscriber.
+    fn handleSubscriberEvents(self: *Model) !void {
+        while (self.events.tryNext()) |ev| switch (ev) {
             .run_finished => |r| try self.setInfo(
                 "Finished task {x} ({s})",
                 .{ r.task_id, @tagName(r.status) },
