@@ -36,11 +36,6 @@ pub const ExecResult = struct {
     msg: ?[]const u8 = null,
 };
 
-pub const WorkNotify = struct {
-    ptr: *anyopaque,
-    callback: *const fn (ptr: *anyopaque) void,
-};
-
 /// Runner for one job
 pub const LocalRunner = struct {
     io: std.Io = undefined,
@@ -84,7 +79,7 @@ pub const LocalRunner = struct {
         logs: *LogQueue,
         mode: ExecMode,
         cwd: ?[]const u8,
-        notify: ?WorkNotify,
+        notify: ?queue.Notify,
     ) void {
         self.running.store(true, .seq_cst);
         self.job = job;
@@ -122,7 +117,7 @@ pub const LocalRunner = struct {
         results: *std.Io.Queue(Result),
         logs: *LogQueue,
         mode: ExecMode,
-        notify: ?WorkNotify,
+        notify: ?queue.Notify,
     ) void {
         defer self.running.store(false, .seq_cst);
         const job = self.job orelse return;

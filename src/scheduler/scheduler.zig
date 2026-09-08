@@ -29,7 +29,6 @@ const JobNode = localrunner.JobNode;
 const Result = localrunner.Result;
 const LogEvent = localrunner.LogEvent;
 const LogQueue = localrunner.LogQueue;
-const WorkNotify = localrunner.WorkNotify;
 
 /// Scheduler -> TaskManager event sink.
 pub const EventSink = struct {
@@ -109,7 +108,7 @@ pub const Scheduler = struct {
     task_start_ms: ?i64 = null,
 
     event_sink: ?EventSink = null,
-    work_notify: ?WorkNotify = null,
+    work_notify: ?queue_zig.Notify = null,
     /// Used by `TaskManager` to dedupe watch-trigger bursts.
     last_watch_epoch: u64 = 0,
     /// Watch path list used for file watch triggers.
@@ -133,7 +132,7 @@ pub const Scheduler = struct {
         remote_manager: *remote.RemoteManager,
         datastore: *data.DataStore,
         event_sink: ?EventSink,
-        work_notify: ?WorkNotify,
+        work_notify: ?queue_zig.Notify,
     ) !*Scheduler {
         const scheduler = try gpa.create(Scheduler);
         errdefer scheduler.deinit();
@@ -172,6 +171,7 @@ pub const Scheduler = struct {
             .event_sink = event_sink,
             .work_notify = work_notify,
         };
+        if (work_notify) |notify| scheduler.log_queue.setNotify(notify);
 
         // Build the job node DAG
         try scheduler.buildDAG();
