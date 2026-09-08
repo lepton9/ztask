@@ -72,7 +72,7 @@ const DeadlineTimer = struct {
     }
 
     fn sleepUntil(ctx: SleepContext) u8 {
-        const now_ms = std.Io.Timestamp.now(ctx.io, .real).toMilliseconds();
+        const now_ms = std.Io.Timestamp.now(ctx.io, .awake).toMilliseconds();
         const wait_ms = @max(0, ctx.deadline_ms - now_ms);
         std.Io.sleep(ctx.io, .fromMilliseconds(wait_ms), .awake) catch {};
         return 0;
@@ -475,7 +475,7 @@ pub const RemoteManager = struct {
     /// Dispatch all jobs in the queue to agents
     fn dispatchJobs(self: *RemoteManager) !void {
         const count = self.dispatch_queue.len();
-        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
         var earliest_deadline_ms: ?i64 = null;
 
         for (0..count) |_| {

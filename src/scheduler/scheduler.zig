@@ -104,8 +104,8 @@ pub const Scheduler = struct {
     /// Metadatas for the jobs of the current task run.
     job_metas: std.AutoHashMapUnmanaged(u64, data.JobRunMetadata),
 
-    /// Task starting timestamp in milliseconds.
-    task_start_ms: ?i64 = null,
+    /// Task starting timestamp.
+    task_start_ts: ?std.Io.Timestamp = null,
 
     event_sink: ?EventSink = null,
     work_notify: ?queue_zig.Notify = null,
@@ -269,7 +269,7 @@ pub const Scheduler = struct {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
         try self.run_logger.startTask(self.gpa, &self.task_meta, run_id);
-        self.task_start_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        self.task_start_ts = .now(self.io, .awake);
 
         self.emitEvent(.{ .task_started = .{ .task_id = self.task.id.value } });
 
@@ -402,7 +402,7 @@ pub const Scheduler = struct {
             .status = .interrupted,
             .jobs_completed = self.task_meta.jobs_completed,
             .jobs_total = self.task_meta.jobs_total,
-            .duration_ms = self.taskDuration(),
+            .duration_ms = self.taskDurationMs(),
         } });
 
         self.endTask() catch {};
@@ -431,7 +431,7 @@ pub const Scheduler = struct {
         // Log job metadata
         var job_meta = self.job_metas.getPtr(node.id) orelse unreachable;
         job_meta.status = .interrupted;
-        job_meta.end_time_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        job_meta.end_time_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
@@ -495,7 +495,7 @@ pub const Scheduler = struct {
                     .task_id = self.task.id.value,
                     .job_name = job_meta.job_name,
                     .exit_code = e.exit_code,
-                    .duration_ms = self.taskDuration(),
+                    .duration_ms = if (job_meta.start_time_ms != null and e.timestamp_ms >= job_meta.start_time_ms.?) e.timestamp_ms - job_meta.start_time_ms.? else null,
                 } });
             },
         };
@@ -563,10 +563,9 @@ pub const Scheduler = struct {
     }
 
     /// Return the task running duration until now in milliseconds.
-    fn taskDuration(self: *const Scheduler) ?i64 {
-        const now = std.Io.Timestamp.now(self.io, .awake);
-        const now_ms = now.toMilliseconds();
-        return if (self.task_start_ms) |st| (now_ms - st) else null;
+    fn taskDurationMs(self: *const Scheduler) ?i64 {
+        const start_time = self.task_start_ts orelse return null;
+        return start_time.untilNow(self.io, .awake).toMilliseconds();
     }
 
     /// Mark task as completed and log the final metadata
@@ -580,7 +579,7 @@ pub const Scheduler = struct {
             .status = self.task_meta.status,
             .jobs_completed = self.task_meta.jobs_completed,
             .jobs_total = self.task_meta.jobs_total,
-            .duration_ms = self.taskDuration(),
+            .duration_ms = self.taskDurationMs(),
         } });
 
         self.endTask() catch {};

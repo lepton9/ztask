@@ -1145,7 +1145,8 @@ const TaskView = struct {
         };
 
         var scratch: [512]u8 = undefined;
-        var buf: [64]u8 = undefined;
+        var start_buf: [64]u8 = undefined;
+        var end_buf: [64]u8 = undefined;
         var buffer = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
 
         var text_height: u16 = 0;
@@ -1166,7 +1167,7 @@ const TaskView = struct {
                 , .{
                     run.run_id,
                     @tagName(run.status),
-                    start_d.fmt(&buf) catch "",
+                    start_d.fmt(&start_buf) catch "",
                 }) catch "");
                 text_height = 2;
             },
@@ -1183,8 +1184,8 @@ const TaskView = struct {
                 , .{
                     meta.run_id orelse 0,
                     @tagName(meta.status),
-                    start_d.fmt(&buf) catch "",
-                    if (end_d) |e| e.fmt(&buf) catch "" else "",
+                    start_d.fmt(&start_buf) catch "",
+                    if (end_d) |e| e.fmt(&end_buf) catch "" else "",
                     meta.jobs_completed,
                     meta.jobs_total,
                 }) catch "");

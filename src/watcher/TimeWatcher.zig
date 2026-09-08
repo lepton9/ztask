@@ -81,7 +81,7 @@ pub fn addTimeOfDayWatch(
     time: date.Time,
 ) !void {
     var last_triggered: i64 = -1;
-    const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+    const now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     if (now >= 0) {
         const ms_per_day = std.time.ms_per_day;
         const today: i64 = @divTrunc(now, ms_per_day);
@@ -122,7 +122,7 @@ pub fn pollEvents(
             try addEvent(gpa, queue, .{ .task_id = e.key_ptr.* });
         },
         .time => |*t| {
-            const now = std.Io.Timestamp.now(self.io, .awake);
+            const now = std.Io.Timestamp.now(self.io, .real);
             const now_ms_i64 = now.toMilliseconds();
             if (now_ms_i64 < 0) continue;
 
@@ -145,21 +145,19 @@ pub fn pollEvents(
 pub fn nextDueInNs(self: *TimeWatcher) ?u64 {
     if (self.watch_list.count() == 0) return null;
 
-    const now = std.Io.Timestamp.now(self.io, .awake);
-    const now_ms = now.toMilliseconds();
-
     const ms_per_day: i64 = @intCast(std.time.ms_per_day);
-    const today: i64 = @divTrunc(now_ms, ms_per_day);
-    const ms_since_midnight: i64 = @rem(now_ms, ms_per_day);
-
     var best_ms: ?u64 = null;
     var it = self.watch_list.iterator();
     while (it.next()) |e| switch (e.value_ptr.*) {
         .interval => |i| {
+            const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
             const delta_ms: u64 = @max(i.next_due_ms - now_ms, 0);
             best_ms = if (best_ms) |b| @min(b, delta_ms) else delta_ms;
         },
         .time => |t| {
+            const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+            const today: i64 = @divTrunc(now_ms, ms_per_day);
+            const ms_since_midnight: i64 = @rem(now_ms, ms_per_day);
             const target_ms: i64 = date.timeToMs(t.time);
             const due_ms: i64 = if (ms_since_midnight < target_ms)
                 target_ms - ms_since_midnight
