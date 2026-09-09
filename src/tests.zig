@@ -5,6 +5,7 @@ const data = @import("data.zig");
 const run = @import("run.zig");
 const task_types = @import("types/task.zig");
 const remote_agent = @import("remote/remote_agent.zig");
+const testutil = @import("testing/utils.zig");
 
 const TaskManager = manager.TaskManager;
 
@@ -14,33 +15,8 @@ test {
     _ = manager;
 }
 
-/// Only used for testing.
-const TestEnv = struct {
-    dir: std.testing.TmpDir,
-    path: [:0]u8,
-    data_dir: []u8,
-    env: std.process.Environ.Map,
-    cwd: std.Io.Dir,
-
-    fn init(gpa: std.mem.Allocator) !TestEnv {
-        var tmp = std.testing.tmpDir(.{});
-        const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
-        return .{
-            .dir = tmp,
-            .path = dir_path,
-            .data_dir = try std.fs.path.join(gpa, &.{ dir_path, "ztask-data" }),
-            .env = try std.testing.environ.createMap(gpa),
-            .cwd = tmp.dir,
-        };
-    }
-
-    fn deinit(self: *TestEnv, gpa: std.mem.Allocator) void {
-        self.dir.cleanup();
-        gpa.free(self.path);
-        gpa.free(self.data_dir);
-        self.env.deinit();
-    }
-};
+/// Shared test fixture over a temporary data directory.
+const TestEnv = testutil.TestEnv;
 
 test "manager_simple" {
     const io = std.testing.io;
@@ -390,7 +366,7 @@ test "sync_dedup_same_task_file_path" {
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
-    const cwd = env.cwd;
+    const cwd = env.dir;
 
     var store = try data.DataStore.init(io, gpa, .{
         .data_dir = env.data_dir,
@@ -529,7 +505,6 @@ test "manager_run_history_prefetch" {
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
-    const cwd = std.Io.Dir.cwd();
 
     const task_file =
         \\name: history
@@ -549,32 +524,9 @@ test "manager_run_history_prefetch" {
     defer gpa.free(task_id);
 
     // Create an on-disk run history of 250 runs
-    var n: u64 = 1;
-    while (n <= 250) : (n += 1) {
-        var id_buf: [32]u8 = undefined;
-        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{n});
-        const run_dir_path = try std.fs.path.join(gpa, &.{
-            env.data_dir, "data", task_id, "runs", run_id_str,
-        });
-        defer gpa.free(run_dir_path);
-        try cwd.createDirPath(io, run_dir_path);
-        const run_meta = try data.toJson(gpa, data.TaskRunMetadata{
-            .task_id = task_id,
-            .run_id = n,
-            .start_time = @intCast(n),
-            .end_time = @intCast(n),
-            .status = .success,
-            .jobs_total = 0,
-            .jobs_completed = 0,
-        });
-        defer gpa.free(run_meta);
-        const run_meta_path = try std.fs.path.join(gpa, &.{ run_dir_path, "meta.json" });
-        defer gpa.free(run_meta_path);
-        try data.writeFile(io, run_meta_path, run_meta, .{
-            .truncate = true,
-            .make_path = true,
-        });
-    }
+    try testutil.createRunHistory(io, gpa, &task_manager.datastore, task_id, .{
+        .count = 250,
+    });
 
     // Start the manager: the background prefetch warms the run history
     try task_manager.startWithOptions(.{ .remote = false, .prefetch_runs = true });
@@ -649,36 +601,10 @@ test "manager_no_prefetch_by_default" {
     const task_id = try gpa.dupe(u8, task.id.fmt());
     defer gpa.free(task_id);
 
-    // TODO: unify the mock data generation
-
     // Create an on-disk run history
-    const cwd = std.Io.Dir.cwd();
-    var n: u64 = 1;
-    while (n <= 5) : (n += 1) {
-        var id_buf: [32]u8 = undefined;
-        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{n});
-        const run_dir_path = try std.fs.path.join(gpa, &.{
-            env.data_dir, "data", task_id, "runs", run_id_str,
-        });
-        defer gpa.free(run_dir_path);
-        try cwd.createDirPath(io, run_dir_path);
-        const run_meta = try data.toJson(gpa, data.TaskRunMetadata{
-            .task_id = task_id,
-            .run_id = n,
-            .start_time = @intCast(n),
-            .end_time = @intCast(n),
-            .status = .success,
-            .jobs_total = 0,
-            .jobs_completed = 0,
-        });
-        defer gpa.free(run_meta);
-        const run_meta_path = try std.fs.path.join(gpa, &.{ run_dir_path, "meta.json" });
-        defer gpa.free(run_meta_path);
-        try data.writeFile(io, run_meta_path, run_meta, .{
-            .truncate = true,
-            .make_path = true,
-        });
-    }
+    try testutil.createRunHistory(io, gpa, &task_manager.datastore, task_id, .{
+        .count = 5,
+    });
 
     // Start the manager without opting into prefetch
     try task_manager.startWithOptions(.{ .remote = false });

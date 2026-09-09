@@ -1872,21 +1872,10 @@ test "move_task" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -1898,7 +1887,7 @@ test "move_task" {
         .make_path = true,
         .truncate = true,
     });
-    const old_real = try tmp.dir.realPathFileAlloc(io, old_path, gpa);
+    const old_real = try env.dir.realPathFileAlloc(io, old_path, gpa);
     defer gpa.free(old_real);
 
     const new_path = try std.fs.path.join(gpa, &.{ tasks_dir, "moved", "a.yml" });
@@ -1908,7 +1897,7 @@ test "move_task" {
     try std.testing.expect(store.tasks.count() == 1);
 
     try store.moveTask(gpa, old_path, new_path, .{ .repair = false });
-    const new_real = try tmp.dir.realPathFileAlloc(io, new_path, gpa);
+    const new_real = try env.dir.realPathFileAlloc(io, new_path, gpa);
     defer gpa.free(new_real);
 
     var new_id = task.Id.fromPath(new_real);
@@ -1926,21 +1915,10 @@ test "move_task_repair" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -1962,9 +1940,9 @@ test "move_task_repair" {
     var old_id_from_path = task.Id.fromPath(old_file_path);
     try std.testing.expect(std.mem.eql(u8, old_id, old_id_from_path.fmt()));
 
-    const new_dir = try std.fs.path.join(gpa, &.{ root, "moved" });
+    const new_dir = try std.fs.path.join(gpa, &.{ env.path, "moved" });
     defer gpa.free(new_dir);
-    try tmp.dir.createDirPath(io, new_dir);
+    try env.dir.createDirPath(io, new_dir);
     const new_path = try std.fs.path.join(gpa, &.{ new_dir, "a.yml" });
     defer gpa.free(new_path);
 
@@ -1974,7 +1952,7 @@ test "move_task_repair" {
     // Repair moved task file
     try store.moveTask(gpa, old_file_path, new_dir, .{ .repair = true });
 
-    const new_real = try tmp.dir.realPathFileAlloc(io, new_path, gpa);
+    const new_real = try env.dir.realPathFileAlloc(io, new_path, gpa);
     defer gpa.free(new_real);
     var new_id_from_path = task.Id.fromPath(new_real);
     const new_id = new_id_from_path.fmt();
@@ -1987,28 +1965,17 @@ test "move_task_repair" {
 
     const old_meta_path = try store.taskMetaPath(gpa, old_id);
     defer gpa.free(old_meta_path);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old_meta_path, .{}));
+    try std.testing.expectError(error.FileNotFound, env.dir.statFile(io, old_meta_path, .{}));
 }
 
 test "edit_task_updates_id" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2045,54 +2012,19 @@ test "edit_task_updates_id" {
     const new_data_dir = try store.taskDataPath(gpa, new_id);
     defer gpa.free(new_data_dir);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old_data_dir, .{}));
-    _ = try tmp.dir.statFile(io, new_data_dir, .{});
-}
-
-/// Create a fake on-disk run history with `count` runs for the task.
-fn createTestRunHistory(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    store: *DataStore,
-    task_id: []const u8,
-    count: u64,
-) !void {
-    for (1..count + 1) |i| {
-        var id_buf: [32]u8 = undefined;
-        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{i});
-        const meta_path = try store.taskRunMetaPath(gpa, task_id, run_id_str);
-        defer gpa.free(meta_path);
-        const meta: TaskRunMetadata = .{
-            .task_id = task_id,
-            .run_id = i,
-            .start_time = @as(i64, @intCast(i)) + 1000,
-            .jobs_total = 1,
-        };
-        const json = try toJson(gpa, meta);
-        defer gpa.free(json);
-        try writeFile(io, meta_path, json, .{ .make_path = true, .truncate = true });
-    }
+    try std.testing.expectError(error.FileNotFound, env.dir.statFile(io, old_data_dir, .{}));
+    _ = try env.dir.statFile(io, new_data_dir, .{});
 }
 
 test "task_runs_pagination" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    const testutil = @import("testing/utils.zig");
+    var env: testutil.TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2106,7 +2038,7 @@ test "task_runs_pagination" {
         @max(DataStore.RUNS_INITIAL_LOAD, DataStore.RUNS_LOAD_BATCH) +
         @min(DataStore.RUNS_INITIAL_LOAD, DataStore.RUNS_LOAD_BATCH) / 2;
     const meta = try store.addTask(gpa, task_path, .{});
-    try createTestRunHistory(io, gpa, &store, meta.id, run_count);
+    try testutil.createRunHistory(io, gpa, &store, meta.id, .{ .count = run_count });
 
     // Initial load: only the newest runs are parsed, total is still known
     try store.loadTaskRuns(gpa, meta.id, .{});
@@ -2135,7 +2067,7 @@ test "task_runs_pagination" {
 
     // Whole history loaded in ascending order
     try std.testing.expectEqual(1, cache.runs.keys()[0]);
-    try std.testing.expectEqual(run_count, cache.runs.keys()[249]);
+    try std.testing.expectEqual(run_count, cache.runs.keys()[cache.runs.count() - 1]);
     try std.testing.expectEqual(run_count, cache.loaded_prefix);
 
     // A new run finishing: counted in the total, present in memory, newest
@@ -2164,21 +2096,11 @@ test "task_runs_pagination_limit_zero" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    const testutil = @import("testing/utils.zig");
+    var env: testutil.TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2190,7 +2112,7 @@ test "task_runs_pagination_limit_zero" {
 
     const run_count = 10;
     const meta = try store.addTask(gpa, task_path, .{});
-    try createTestRunHistory(io, gpa, &store, meta.id, run_count);
+    try testutil.createRunHistory(io, gpa, &store, meta.id, .{ .count = run_count });
 
     // Listing only: nothing is parsed but the total is known
     try store.loadTaskRuns(gpa, meta.id, .{ .limit = 0 });
@@ -2218,21 +2140,10 @@ test "task_runs_unknown_task" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    var env = try std.testing.environ.createMap(gpa);
-    defer env.deinit();
+    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
-    defer gpa.free(root);
-    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
-    defer gpa.free(data_dir);
-
-    var store = try DataStore.init(io, gpa, .{
-        .data_dir = data_dir,
-        .load = .{ .tasks = true },
-    });
+    var store = try env.initDataStore(gpa, .{});
     defer store.deinit(gpa);
 
     const unknown_id = "unknown-id";
@@ -2247,7 +2158,7 @@ test "task_runs_unknown_task" {
     try std.testing.expectEqual(0, store.runsVersion(unknown_id));
 
     // No data directory was created for the unknown task
-    const unknown_dir = try std.fs.path.join(gpa, &.{ data_dir, "data", unknown_id });
+    const unknown_dir = try std.fs.path.join(gpa, &.{ env.data_dir, "data", unknown_id });
     defer gpa.free(unknown_dir);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, unknown_dir, .{}));
+    try std.testing.expectError(error.FileNotFound, env.dir.statFile(io, unknown_dir, .{}));
 }
