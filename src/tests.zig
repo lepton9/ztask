@@ -516,12 +516,178 @@ test "sync_dedup_same_task_file_path" {
     try std.testing.expect(repaired.getTaskMetadata(task_id) != null);
 
     const runs = try repaired.getTaskRuns(gpa, task_id);
-    try std.testing.expect(runs.count() == 2);
-    try std.testing.expect(runs.get(1) != null);
-    try std.testing.expect(runs.get(2) != null);
+    try std.testing.expect(runs.runs.count() == 2);
+    try std.testing.expect(runs.runs.get(1) != null);
+    try std.testing.expect(runs.runs.get(2) != null);
 
     const next = try repaired.nextRunId(gpa, task_id);
     try std.testing.expect(next >= 3);
+}
+
+test "manager_run_history_prefetch" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+    const cwd = std.Io.Dir.cwd();
+
+    const task_file =
+        \\name: history
+        \\id: "history-task"
+    ;
+    const task_path = try std.fs.path.join(gpa, &.{ env.path, "history.yml" });
+    defer gpa.free(task_path);
+    try data.writeFile(io, task_path, task_file, .{ .truncate = true });
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+
+    const task = try task_manager.loadOrCreateWithPath(task_path, null);
+    const task_id = try gpa.dupe(u8, task.id.fmt());
+    defer gpa.free(task_id);
+
+    // Create an on-disk run history of 250 runs
+    var n: u64 = 1;
+    while (n <= 250) : (n += 1) {
+        var id_buf: [32]u8 = undefined;
+        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{n});
+        const run_dir_path = try std.fs.path.join(gpa, &.{
+            env.data_dir, "data", task_id, "runs", run_id_str,
+        });
+        defer gpa.free(run_dir_path);
+        try cwd.createDirPath(io, run_dir_path);
+        const run_meta = try data.toJson(gpa, data.TaskRunMetadata{
+            .task_id = task_id,
+            .run_id = n,
+            .start_time = @intCast(n),
+            .end_time = @intCast(n),
+            .status = .success,
+            .jobs_total = 0,
+            .jobs_completed = 0,
+        });
+        defer gpa.free(run_meta);
+        const run_meta_path = try std.fs.path.join(gpa, &.{ run_dir_path, "meta.json" });
+        defer gpa.free(run_meta_path);
+        try data.writeFile(io, run_meta_path, run_meta, .{
+            .truncate = true,
+            .make_path = true,
+        });
+    }
+
+    // Start the manager: the background prefetch warms the run history
+    try task_manager.startWithOptions(.{ .remote = false, .prefetch_runs = true });
+
+    // Wait until the prefetch thread parsed the initial run window. Poll
+    // through `buildTaskState` so the store lock is held while reading, as
+    // the cache entry exists before its runs are fully parsed.
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var waited: usize = 0;
+    var loaded_n: usize = 0;
+    while (loaded_n < data.DataStore.RUNS_INITIAL_LOAD) {
+        const detail = try task_manager.buildTaskState(
+            arena_state.allocator(),
+            task_id,
+            .{},
+        );
+        loaded_n = detail.past_runs.len;
+        if (loaded_n >= data.DataStore.RUNS_INITIAL_LOAD) break;
+        waited += 1;
+        try expect(waited < 200);
+        try std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 10), .awake);
+        _ = arena_state.reset(.retain_capacity);
+    }
+
+    const cache = try task_manager.datastore.getTaskRuns(gpa, task_id);
+    try expect(cache.runs.count() == data.DataStore.RUNS_INITIAL_LOAD);
+    try expect(task_manager.datastore.totalRuns(task_id) == 250);
+
+    // The detail built for the TUI holds only the loaded window
+    const detail = try task_manager.buildTaskState(arena_state.allocator(), task_id, .{});
+    try expect(detail.past_runs.len == data.DataStore.RUNS_INITIAL_LOAD);
+    try expect(detail.total_runs == 250);
+
+    // No changes and the task is inactive: the view is up to date
+    try expect(!try task_manager.taskHasChanged(task_id, detail.runs_version));
+
+    // Load the remaining runs in a batch
+    const loaded = try task_manager.loadOlderTaskRuns(
+        task_id,
+        data.DataStore.RUNS_LOAD_BATCH,
+    );
+    try expect(loaded == 250 - data.DataStore.RUNS_INITIAL_LOAD);
+
+    const detail2 = try task_manager.buildTaskState(arena_state.allocator(), task_id, .{});
+    try expect(detail2.past_runs.len == 250);
+    try expect(detail2.runs_version != detail.runs_version);
+    try expect(try task_manager.taskHasChanged(task_id, detail.runs_version));
+    try expect(!try task_manager.taskHasChanged(task_id, detail2.runs_version));
+}
+
+test "manager_no_prefetch_by_default" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\name: history
+        \\id: "history-task"
+    ;
+    const task_path = try std.fs.path.join(gpa, &.{ env.path, "history.yml" });
+    defer gpa.free(task_path);
+    try data.writeFile(io, task_path, task_file, .{ .truncate = true });
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+
+    const task = try task_manager.loadOrCreateWithPath(task_path, null);
+    const task_id = try gpa.dupe(u8, task.id.fmt());
+    defer gpa.free(task_id);
+
+    // TODO: unify the mock data generation
+
+    // Create an on-disk run history
+    const cwd = std.Io.Dir.cwd();
+    var n: u64 = 1;
+    while (n <= 5) : (n += 1) {
+        var id_buf: [32]u8 = undefined;
+        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{n});
+        const run_dir_path = try std.fs.path.join(gpa, &.{
+            env.data_dir, "data", task_id, "runs", run_id_str,
+        });
+        defer gpa.free(run_dir_path);
+        try cwd.createDirPath(io, run_dir_path);
+        const run_meta = try data.toJson(gpa, data.TaskRunMetadata{
+            .task_id = task_id,
+            .run_id = n,
+            .start_time = @intCast(n),
+            .end_time = @intCast(n),
+            .status = .success,
+            .jobs_total = 0,
+            .jobs_completed = 0,
+        });
+        defer gpa.free(run_meta);
+        const run_meta_path = try std.fs.path.join(gpa, &.{ run_dir_path, "meta.json" });
+        defer gpa.free(run_meta_path);
+        try data.writeFile(io, run_meta_path, run_meta, .{
+            .truncate = true,
+            .make_path = true,
+        });
+    }
+
+    // Start the manager without opting into prefetch
+    try task_manager.startWithOptions(.{ .remote = false });
+
+    // Give the manager thread time to run: the run history must stay
+    // unloaded
+    try std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 150), .awake);
+    try expect(!task_manager.datastore.hasTaskRuns(task_id));
+    try expect(task_manager.datastore.totalRuns(task_id) == 0);
 }
 
 test "examples" {

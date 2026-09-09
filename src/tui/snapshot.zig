@@ -34,8 +34,15 @@ pub const UiTaskSnap = struct {
 
 pub const UiTaskDetail = struct {
     task_id: []const u8,
+    /// Loaded list of old task runs.
     past_runs: []UiTaskRunSnap,
+    /// Total runs recorded on disk, including runs not loaded in memory.
+    total_runs: usize = 0,
+    /// Version of the run history when this detail was built.
+    runs_version: u64 = 0,
+    /// Currently running task run.
     active_run: ?UiTaskRunSnap = null,
+    /// Currently show run.
     selected_run: ?*const UiTaskRunSnap = null,
 };
 

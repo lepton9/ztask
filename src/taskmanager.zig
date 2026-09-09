@@ -17,9 +17,13 @@ const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 
 const log = std.log.scoped(.taskmanager);
 
-const MAX_CONTROL_EVENTS_PER_BATCH = 128;
-const CONTROL_BATCH_BUDGET_NS = 2 * std.time.ns_per_ms;
 const WATCH_DEDUPE_NS = 50 * std.time.ns_per_ms;
+/// Max amount of control events processed per loop pass.
+const MAX_CONTROL_EVENTS_PER_BATCH = 128;
+/// Max time spent processing the control events per loop pass.
+const CONTROL_BATCH_BUDGET_NS = 2 * std.time.ns_per_ms;
+/// Max disk time spent loading the run history cache per loop pass.
+const PREFETCH_BUDGET_NS = 5 * std.time.ns_per_ms;
 
 test {
     _ = scheduler;
@@ -95,6 +99,11 @@ pub const TaskManager = struct {
     /// Has any tasks been added, removed or modified
     tasks_changed: std.atomic.Value(bool) = .init(true),
 
+    /// Run history cache warming is enabled
+    prefetch_enabled: bool = false,
+    /// Run history cache needs warming for some tasks
+    prefetch_pending: std.atomic.Value(bool) = .init(false),
+
     pub const Event = union(enum) {
         run_finished: struct {
             task_id: u64,
@@ -144,10 +153,17 @@ pub const TaskManager = struct {
     pub const EventHub = event_hub.EventHub(Event);
 
     pub const StartOptions = struct {
+        /// Listen address for the remote manager.
         listen_addr: []const u8 = remotemanager.DEFAULT_ADDR,
+        /// Listen port for the remote manager.
         listen_port: u16 = remotemanager.DEFAULT_PORT,
-        verbose_events: bool = false,
+        /// Start the remote manager.
         remote: bool = true,
+        /// Emit extra status events.
+        verbose_events: bool = false,
+        /// Load the run history cache of all tasks in the background on
+        /// start.
+        prefetch_runs: bool = false,
     };
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator, runners_n: u16) !*TaskManager {
@@ -385,6 +401,10 @@ pub const TaskManager = struct {
         errdefer self.running.store(false, .seq_cst);
 
         self.verbose_events = options.verbose_events;
+        self.prefetch_enabled = options.prefetch_runs;
+        if (options.prefetch_runs) {
+            self.prefetch_pending.store(true, .seq_cst);
+        }
 
         try self.watcher.start();
         if (options.remote) {
@@ -406,6 +426,9 @@ pub const TaskManager = struct {
             self.updateSchedulers() catch |err| {
                 self.emitError(.scheduler, err);
             };
+            self.prefetchTaskRuns() catch |err| {
+                self.emitError(.task_manager, err);
+            };
 
             // Wait until there is work to do
             self.work_mutex.lockUncancelable(self.io);
@@ -414,6 +437,36 @@ pub const TaskManager = struct {
             }
             self.work_mutex.unlock(self.io);
         }
+    }
+
+    /// Warm the run history cache for tasks that are not loaded yet.
+    ///
+    /// Only runs when enabled via `StartOptions.prefetch_runs`.
+    /// Processes at most `PREFETCH_BUDGET_NS` worth of disk work per call.
+    /// If work remains, the loop is re-signaled to continue on the next pass.
+    fn prefetchTaskRuns(self: *TaskManager) !void {
+        if (!self.prefetch_enabled) return;
+        if (!self.prefetch_pending.swap(false, .seq_cst)) return;
+        const started = std.Io.Timestamp.now(self.io, .awake);
+
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        var it = self.datastore.tasks.iterator();
+        while (it.next()) |e| {
+            const task_id = e.key_ptr.*;
+            if (self.datastore.hasTaskRuns(task_id)) continue;
+            self.datastore.loadTaskRuns(self.gpa, task_id, .{}) catch |err| {
+                log.err("Failed to prefetch runs of task '{s}': {}", .{ task_id, err });
+                continue;
+            };
+            if (started.untilNow(self.io, .awake).toNanoseconds() <
+                PREFETCH_BUDGET_NS) continue;
+            self.prefetch_pending.store(true, .seq_cst);
+            break;
+        }
+
+        if (self.prefetch_pending.load(.seq_cst)) self.signalWork();
     }
 
     /// Stop the task manager thread.
@@ -868,7 +921,7 @@ pub const TaskManager = struct {
         self.stopSchedulers() catch {};
     }
 
-    /// Load a task from file path or create the meta file
+    /// Load a task from file path or create the meta file.
     pub fn loadOrCreateWithPath(
         self: *TaskManager,
         file_path: []const u8,
@@ -879,10 +932,17 @@ pub const TaskManager = struct {
         const cwd = std.Io.Dir.cwd();
         const real_path = try cwd.realPathFileAlloc(self.io, file_path, self.gpa);
         defer self.gpa.free(real_path);
-        const meta = self.datastore.findTaskMetaPath(real_path) orelse
-            try self.datastore.addTask(self.gpa, real_path, .{
+        const meta = self.datastore.findTaskMetaPath(real_path) orelse blk: {
+            const added = try self.datastore.addTask(self.gpa, real_path, .{
                 .diagnostics = diagnostics,
             });
+            // Warm the run history cache for the new task
+            if (self.prefetch_enabled) {
+                self.prefetch_pending.store(true, .seq_cst);
+                self.signalWork();
+            }
+            break :blk added;
+        };
         return self.loadTask(meta.id, diagnostics);
     }
 
@@ -973,8 +1033,8 @@ pub const TaskManager = struct {
 
         // Build past runs for the task
         const runs: []snap.UiTaskRunSnap = blk: {
-            const task_runs = try self.datastore.getTaskRuns(self.gpa, task_id);
-            const run_entries = task_runs.values();
+            const cache = try self.datastore.getTaskRuns(self.gpa, task_id);
+            const run_entries = cache.runs.values();
             var runs = try arena.alloc(snap.UiTaskRunSnap, run_entries.len);
 
             for (run_entries, 0..) |*entry, offset| {
@@ -1039,10 +1099,42 @@ pub const TaskManager = struct {
         };
 
         return .{
-            .task_id = task_id,
+            .task_id = try arena.dupe(u8, task_id),
             .past_runs = runs,
+            .total_runs = self.datastore.totalRuns(task_id),
+            .runs_version = self.datastore.runsVersion(task_id),
             .active_run = active_run,
             .selected_run = selected_run,
+        };
+    }
+
+    /// Load the next batch of older past runs of a task from disk.
+    /// Returns the number of runs added to memory.
+    pub fn loadOlderTaskRuns(
+        self: *TaskManager,
+        task_id: []const u8,
+        batch: usize,
+    ) !usize {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.datastore.loadOlderRuns(self.gpa, task_id, batch);
+    }
+
+    /// Check if the state of a task's run history changed since
+    /// `built_version`, or if the task is currently active and its state can
+    /// change at any moment.
+    pub fn taskHasChanged(
+        self: *TaskManager,
+        task_id: []const u8,
+        built_version: u64,
+    ) error{Canceled}!bool {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.datastore.runsVersion(task_id) != built_version) return true;
+        const sched = self.getScheduler(task_id) orelse return false;
+        return switch (sched.status) {
+            .inactive, .completed => false,
+            else => true,
         };
     }
 

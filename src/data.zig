@@ -105,15 +105,49 @@ pub const DataStore = struct {
     root_dir: []u8,
     /// Map of task_id -> TaskMetadata
     tasks: std.StringArrayHashMapUnmanaged(TaskMetadata),
-    /// Map of task_id -> map of run_id -> TaskRunEntry
-    task_runs: std.StringHashMapUnmanaged(
-        std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry),
-    ),
+    /// Map of task_id -> cached run history of the task
+    task_runs: std.StringHashMapUnmanaged(TaskRunsCache),
+
+    /// Number of newest runs parsed into memory when a task's run history is
+    /// first loaded.
+    pub const RUNS_INITIAL_LOAD: usize = 100;
+    /// Number of older runs parsed per batch when more run history is needed.
+    pub const RUNS_LOAD_BATCH: usize = 200;
 
     pub const TaskRunEntry = struct {
         meta: TaskRunMetadata,
         /// Lazily loaded job run metadatas for this run
         jobs: ?[]JobRunMetadata = null,
+    };
+
+    /// In-memory cache of a task's run history.
+    ///
+    /// The full listing of run ids found on disk is kept in `all_ids`,
+    /// but only a window of the newest runs is parsed into `runs`.
+    pub const TaskRunsCache = struct {
+        /// Parsed run entries by run id, sorted ascending by run id.
+        runs: std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry) = .{},
+        /// Owned list of all run ids found on disk at the last listing,
+        /// sorted descending (newest first).
+        all_ids: []u64 = &.{},
+        /// Number of ids consumed from the front of `all_ids`. An id is
+        /// consumed when its metadata is parsed into `runs`, or when its
+        /// metadata file could not be read.
+        loaded_prefix: usize = 0,
+        /// Runs added to `runs` after the last listing.
+        added_after: usize = 0,
+        /// Monotonic counter bumped whenever the run history changes.
+        version: u64 = 0,
+
+        fn deinit(cache: *TaskRunsCache, gpa: std.mem.Allocator) void {
+            var runs_it = cache.runs.iterator();
+            while (runs_it.next()) |re| {
+                re.value_ptr.meta.deinit(gpa);
+                if (re.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
+            }
+            cache.runs.deinit(gpa);
+            if (cache.all_ids.len != 0) gpa.free(cache.all_ids);
+        }
     };
 
     pub const InitOptions = struct {
@@ -162,14 +196,8 @@ pub const DataStore = struct {
         // Free task runs
         var it = self.task_runs.iterator();
         while (it.next()) |e| {
-            var runs = e.value_ptr;
-            var runs_it = runs.iterator();
-            while (runs_it.next()) |re| {
-                re.value_ptr.meta.deinit(gpa);
-                if (re.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
-            }
+            e.value_ptr.deinit(gpa);
             gpa.free(e.key_ptr.*);
-            runs.deinit(gpa);
         }
         self.task_runs.deinit(gpa);
 
@@ -539,7 +567,7 @@ pub const DataStore = struct {
         });
     }
 
-    /// Iterate the runs directory and find the last run id
+    /// Iterate the runs directory and find the last run id.
     inline fn findLastRun(
         self: *const DataStore,
         gpa: std.mem.Allocator,
@@ -565,7 +593,7 @@ pub const DataStore = struct {
         return last_id;
     }
 
-    /// Load and parse a task run metadata file
+    /// Load and parse a task run metadata file.
     fn loadTaskRunMeta(
         self: *const DataStore,
         gpa: std.mem.Allocator,
@@ -582,7 +610,7 @@ pub const DataStore = struct {
         return parseMetaFile(TaskRunMetadata, self.io, gpa, task_path);
     }
 
-    /// Load and parse a task run job metadata file
+    /// Load and parse a task run job metadata file.
     fn loadJobMeta(
         self: *const DataStore,
         gpa: std.mem.Allocator,
@@ -603,8 +631,8 @@ pub const DataStore = struct {
         task_id: []const u8,
         run_id: u64,
     ) ![]JobRunMetadata {
-        const runs = try self.getTaskRuns(gpa, task_id);
-        const entry = runs.getPtr(run_id) orelse return &.{};
+        const cache = try self.getTaskRuns(gpa, task_id);
+        const entry = cache.runs.getPtr(run_id) orelse return &.{};
         if (entry.jobs) |cached_jobs| return cached_jobs;
 
         const jobs = try self.loadJobRunMetasFromDisk(gpa, task_id, run_id);
@@ -704,77 +732,172 @@ pub const DataStore = struct {
                 }
                 gop.value_ptr.* = meta;
                 if (changed) try self.writeTaskMeta(gpa, &meta);
-                if (options.load_runs) try self.loadTaskRuns(gpa, task_id);
+                if (options.load_runs) try self.loadTaskRuns(gpa, task_id, .{});
             },
             else => continue,
         };
     }
 
-    /// Load all the task runs
-    pub fn loadTaskRuns(
+    /// Sort the run entries of a run map by run id in ascending order.
+    fn sortRuns(runs: *std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry)) void {
+        const Ctx = struct {
+            keys: []u64,
+
+            pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
+                return ctx.keys[a_index] < ctx.keys[b_index];
+            }
+        };
+        const sort_ctx: Ctx = .{ .keys = runs.keys() };
+        runs.sort(sort_ctx);
+    }
+
+    /// Get or create the cached run history of a task without checking the
+    /// task registry.
+    fn getOrCreateTaskRunsCache(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-    ) !void {
+    ) !*TaskRunsCache {
         const res = try self.task_runs.getOrPut(gpa, task_id);
         if (!res.found_existing) {
             res.key_ptr.* = try gpa.dupe(u8, task_id);
             res.value_ptr.* = .{};
         }
-        var task_runs = res.value_ptr;
+        return res.value_ptr;
+    }
+
+    /// Load the run history of a task from disk.
+    ///
+    /// Lists all runs found on disk and parses only the newest
+    /// `options.limit` runs into memory. Runs already parsed in
+    /// memory are not re-parsed.
+    pub fn loadTaskRuns(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        options: struct { limit: usize = RUNS_INITIAL_LOAD },
+    ) !void {
+        if (self.tasks.getPtr(task_id) == null) return error.TaskNotFound;
+        const cache = try self.getOrCreateTaskRunsCache(gpa, task_id);
+        cache.version += 1;
 
         const runs_path = try self.taskRunsPath(gpa, task_id);
         defer gpa.free(runs_path);
         var dir = try openDir(self.io, runs_path, .{ .iterate = true, .create = true });
         defer dir.close(self.io);
+
+        // Collect all the run ids from disk, newest first
+        var all_ids: std.ArrayList(u64) = .empty;
+        defer all_ids.deinit(gpa);
         var it = dir.iterate();
         while (it.next(self.io) catch null) |e| switch (e.kind) {
             .directory => {
-                const run_id: u64 = blk: {
-                    const run_id = std.fs.path.basename(e.name);
-                    break :blk std.fmt.parseInt(u64, run_id, 10) catch
-                        continue;
-                };
-
-                const run_res = try task_runs.getOrPut(gpa, run_id);
-                if (run_res.found_existing) continue;
-
-                const parsed_meta = self.loadTaskRunMeta(gpa, task_id, run_id);
-                const meta = parsed_meta catch null orelse {
-                    _ = task_runs.swapRemove(run_id);
-                    continue;
-                };
-                run_res.key_ptr.* = meta.run_id orelse run_id;
-                run_res.value_ptr.* = .{ .meta = meta };
+                const id = std.fmt.parseInt(
+                    u64,
+                    std.fs.path.basename(e.name),
+                    10,
+                ) catch continue;
+                try all_ids.append(gpa, id);
             },
             else => continue,
         };
-
-        // Sort the runs by the run_id in ascending order
-        const Ctx = struct {
-            keys: []u64,
-
-            pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
-                const a = ctx.keys[a_index];
-                const b = ctx.keys[b_index];
-                return a < b;
+        std.mem.sort(u64, all_ids.items, {}, struct {
+            fn gt(_: void, a: u64, b: u64) bool {
+                return a > b;
             }
-        };
-        const sort_ctx: Ctx = .{ .keys = task_runs.keys() };
-        task_runs.sort(sort_ctx);
+        }.gt);
+
+        // Record the listing and reset the loaded window
+        gpa.free(cache.all_ids);
+        cache.all_ids = try gpa.dupe(u64, all_ids.items);
+        cache.added_after = 0;
+        cache.loaded_prefix = 0;
+
+        // Parse the newest runs up to the limit
+        const max_loaded = @min(options.limit, cache.all_ids.len);
+        while (cache.loaded_prefix < max_loaded) : (cache.loaded_prefix += 1) {
+            const run_id = cache.all_ids[cache.loaded_prefix];
+            const gop = try cache.runs.getOrPut(gpa, run_id);
+            if (gop.found_existing) continue;
+            const parsed_meta = self.loadTaskRunMeta(gpa, task_id, run_id);
+            const meta = parsed_meta catch null orelse {
+                _ = cache.runs.swapRemove(run_id);
+                continue;
+            };
+            gop.key_ptr.* = meta.run_id orelse run_id;
+            gop.value_ptr.* = .{ .meta = meta };
+        }
+
+        sortRuns(&cache.runs);
     }
 
-    /// Get all the past runs for a task.
+    /// Get the cached run history of a task.
     /// Load the runs if not already loaded.
+    /// Returns `error.TaskNotFound` if the task is unknown.
     pub fn getTaskRuns(
         self: *DataStore,
         gpa: std.mem.Allocator,
         task_id: []const u8,
-    ) !*std.AutoArrayHashMapUnmanaged(u64, TaskRunEntry) {
+    ) !*TaskRunsCache {
+        if (self.tasks.getPtr(task_id) == null) return error.TaskNotFound;
         return self.task_runs.getPtr(task_id) orelse {
-            try self.loadTaskRuns(gpa, task_id);
+            try self.loadTaskRuns(gpa, task_id, .{});
             return self.task_runs.getPtr(task_id) orelse unreachable;
         };
+    }
+
+    /// Total number of runs recorded on disk for the task, including runs
+    /// that are not parsed into memory. Not thread safe.
+    pub fn totalRuns(self: *const DataStore, task_id: []const u8) usize {
+        const cache = self.task_runs.getPtr(task_id) orelse return 0;
+        return cache.all_ids.len + cache.added_after;
+    }
+
+    /// Check if the run history of the task is loaded in memory.
+    pub fn hasTaskRuns(self: *const DataStore, task_id: []const u8) bool {
+        return self.task_runs.contains(task_id);
+    }
+
+    /// Current version of the task's cached run history. Not thread safe.
+    pub fn runsVersion(self: *const DataStore, task_id: []const u8) u64 {
+        const cache = self.task_runs.getPtr(task_id) orelse return 0;
+        return cache.version;
+    }
+
+    /// Parse the next batch of older runs from disk into memory.
+    ///
+    /// Returns the number of runs newly added to memory. Returns 0 once
+    /// the whole on-disk history is loaded.
+    pub fn loadOlderRuns(
+        self: *DataStore,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        batch: usize,
+    ) !usize {
+        if (batch == 0) return 0;
+        const cache = try self.getTaskRuns(gpa, task_id);
+
+        var loaded: usize = 0;
+        while (loaded < batch and cache.loaded_prefix < cache.all_ids.len) {
+            const run_id = cache.all_ids[cache.loaded_prefix];
+            cache.loaded_prefix += 1;
+            const gop = try cache.runs.getOrPut(gpa, run_id);
+            if (gop.found_existing) continue;
+            const parsed_meta = self.loadTaskRunMeta(gpa, task_id, run_id);
+            const meta = parsed_meta catch null orelse {
+                _ = cache.runs.swapRemove(run_id);
+                continue;
+            };
+            gop.key_ptr.* = meta.run_id orelse run_id;
+            gop.value_ptr.* = .{ .meta = meta };
+            loaded += 1;
+        }
+
+        if (loaded > 0) {
+            sortRuns(&cache.runs);
+            cache.version += 1;
+        }
+        return loaded;
     }
 
     /// Get task metadata with ID
@@ -993,14 +1116,9 @@ pub const DataStore = struct {
 
         // Drop cached runs in memory
         if (self.task_runs.fetchRemove(task_id)) |rkv| {
-            var runs = rkv.value;
-            var runs_it = runs.iterator();
-            while (runs_it.next()) |re| {
-                re.value_ptr.meta.deinit(gpa);
-                if (re.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
-            }
+            var cache = rkv.value;
+            cache.deinit(gpa);
             gpa.free(rkv.key);
-            runs.deinit(gpa);
         }
 
         const meta_path = try self.taskMetaPath(gpa, task_id);
@@ -1069,11 +1187,11 @@ pub const DataStore = struct {
 
         // Move cached runs map key if loaded
         if (self.task_runs.fetchRemove(meta.id)) |rkv| {
-            const runs = rkv.value;
+            const cache = rkv.value;
             gpa.free(rkv.key);
             const gop = try self.task_runs.getOrPut(gpa, new_id_str);
             if (!gop.found_existing) gop.key_ptr.* = try gpa.dupe(u8, new_id_str);
-            gop.value_ptr.* = runs;
+            gop.value_ptr.* = cache;
         }
 
         // Set the new id and reinsert meta
@@ -1231,21 +1349,38 @@ pub const DataStore = struct {
         return null;
     }
 
-    /// Add a new task run to the task runs hashmap
-    pub fn addNewTaskRun(
+    /// Add a new task run to the task runs hashmap.
+    pub fn addTaskRun(
         self: *DataStore,
         gpa: std.mem.Allocator,
         meta: TaskRunMetadata,
     ) !void {
         const run_id = meta.run_id orelse return error.NoRunId;
-        const meta_copy = try meta.copy(gpa);
-        const runs = try self.getTaskRuns(gpa, meta.task_id);
-        const res = try runs.getOrPut(gpa, run_id);
+        // Record the run even if the task is not registered in the store
+        const cache = self.getTaskRuns(gpa, meta.task_id) catch |err| switch (err) {
+            error.TaskNotFound => try self.getOrCreateTaskRunsCache(gpa, meta.task_id),
+            else => |e| return e,
+        };
+        var meta_copy = try meta.copy(gpa);
+        errdefer meta_copy.deinit(gpa);
+        const res = try cache.runs.getOrPut(gpa, run_id);
         if (res.found_existing) {
             res.value_ptr.meta.deinit(gpa);
             if (res.value_ptr.jobs) |jobs| deinitJobMetaSlice(gpa, jobs);
+        } else {
+            // The run is newer than every listed run and not part of the
+            // recorded listing.
+            if (cache.all_ids.len == 0 or run_id > cache.all_ids[0]) {
+                cache.added_after += 1;
+            }
+            // Keep ascending order if the new run is not the newest
+            const count = cache.runs.count();
+            if (count > 1 and run_id < cache.runs.keys()[count - 2]) {
+                sortRuns(&cache.runs);
+            }
         }
         res.value_ptr.* = .{ .meta = meta_copy };
+        cache.version += 1;
     }
 
     pub const LogReadOptions = struct {
@@ -1912,4 +2047,207 @@ test "edit_task_updates_id" {
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, old_data_dir, .{}));
     _ = try tmp.dir.statFile(io, new_data_dir, .{});
+}
+
+/// Create a fake on-disk run history with `count` runs for the task.
+fn createTestRunHistory(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    store: *DataStore,
+    task_id: []const u8,
+    count: u64,
+) !void {
+    for (1..count + 1) |i| {
+        var id_buf: [32]u8 = undefined;
+        const run_id_str = try std.fmt.bufPrint(&id_buf, "{d}", .{i});
+        const meta_path = try store.taskRunMetaPath(gpa, task_id, run_id_str);
+        defer gpa.free(meta_path);
+        const meta: TaskRunMetadata = .{
+            .task_id = task_id,
+            .run_id = i,
+            .start_time = @as(i64, @intCast(i)) + 1000,
+            .jobs_total = 1,
+        };
+        const json = try toJson(gpa, meta);
+        defer gpa.free(json);
+        try writeFile(io, meta_path, json, .{ .make_path = true, .truncate = true });
+    }
+}
+
+test "task_runs_pagination" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "a.yml" });
+    defer gpa.free(task_path);
+    try writeFile(io, task_path, "name: a\n", .{ .make_path = true, .truncate = true });
+
+    const run_count =
+        @max(DataStore.RUNS_INITIAL_LOAD, DataStore.RUNS_LOAD_BATCH) +
+        @min(DataStore.RUNS_INITIAL_LOAD, DataStore.RUNS_LOAD_BATCH) / 2;
+    const meta = try store.addTask(gpa, task_path, .{});
+    try createTestRunHistory(io, gpa, &store, meta.id, run_count);
+
+    // Initial load: only the newest runs are parsed, total is still known
+    try store.loadTaskRuns(gpa, meta.id, .{});
+    const cache = try store.getTaskRuns(gpa, meta.id);
+    try std.testing.expectEqual(DataStore.RUNS_INITIAL_LOAD, cache.runs.count());
+    try std.testing.expectEqual(run_count, store.totalRuns(meta.id));
+    try std.testing.expectEqual(1, store.runsVersion(meta.id));
+
+    // Runs are sorted ascending by run id and only the newest are present
+    try std.testing.expectEqual(
+        @as(u64, run_count - DataStore.RUNS_INITIAL_LOAD + 1),
+        cache.runs.keys()[0],
+    );
+    try std.testing.expectEqual(
+        @as(u64, run_count),
+        cache.runs.keys()[cache.runs.count() - 1],
+    );
+
+    // Stream in the older runs in batches
+    var loaded = try store.loadOlderRuns(gpa, meta.id, DataStore.RUNS_LOAD_BATCH);
+    try std.testing.expectEqual(@as(usize, run_count - DataStore.RUNS_INITIAL_LOAD), loaded);
+    try std.testing.expectEqual(run_count, cache.runs.count());
+    try std.testing.expectEqual(2, store.runsVersion(meta.id));
+    loaded = try store.loadOlderRuns(gpa, meta.id, DataStore.RUNS_LOAD_BATCH);
+    try std.testing.expectEqual(0, loaded);
+
+    // Whole history loaded in ascending order
+    try std.testing.expectEqual(1, cache.runs.keys()[0]);
+    try std.testing.expectEqual(run_count, cache.runs.keys()[249]);
+    try std.testing.expectEqual(run_count, cache.loaded_prefix);
+
+    // A new run finishing: counted in the total, present in memory, newest
+    try store.addTaskRun(gpa, .{
+        .task_id = meta.id,
+        .run_id = 251,
+        .start_time = 999,
+        .jobs_total = 1,
+    });
+    try std.testing.expectEqual(run_count + 1, store.totalRuns(meta.id));
+    try std.testing.expectEqual(3, store.runsVersion(meta.id));
+    try std.testing.expect(cache.runs.get(run_count + 1) != null);
+
+    // Loading older runs after the new run skips already parsed entries
+    loaded = try store.loadOlderRuns(gpa, meta.id, DataStore.RUNS_LOAD_BATCH);
+    try std.testing.expectEqual(0, loaded);
+
+    // Deleting the task drops the cache
+    try store.deleteTask(gpa, meta.id);
+    try std.testing.expect(!store.hasTaskRuns(meta.id));
+    try std.testing.expectEqual(0, store.totalRuns(meta.id));
+    try std.testing.expectEqual(0, store.runsVersion(meta.id));
+}
+
+test "task_runs_pagination_limit_zero" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "b.yml" });
+    defer gpa.free(task_path);
+    try writeFile(io, task_path, "name: b\n", .{ .make_path = true, .truncate = true });
+
+    const run_count = 10;
+    const meta = try store.addTask(gpa, task_path, .{});
+    try createTestRunHistory(io, gpa, &store, meta.id, run_count);
+
+    // Listing only: nothing is parsed but the total is known
+    try store.loadTaskRuns(gpa, meta.id, .{ .limit = 0 });
+    const cache = try store.getTaskRuns(gpa, meta.id);
+    try std.testing.expectEqual(0, cache.runs.count());
+    try std.testing.expectEqual(run_count, store.totalRuns(meta.id));
+
+    // A single batch loads everything
+    const loaded = try store.loadOlderRuns(gpa, meta.id, DataStore.RUNS_LOAD_BATCH);
+    try std.testing.expectEqual(run_count, loaded);
+    try std.testing.expectEqual(run_count, cache.runs.count());
+
+    // Task without any runs
+    const other_path = try std.fs.path.join(gpa, &.{ tasks_dir, "c.yml" });
+    defer gpa.free(other_path);
+    try writeFile(io, other_path, "name: c\n", .{ .make_path = true, .truncate = true });
+    const other = try store.addTask(gpa, other_path, .{});
+    try store.loadTaskRuns(gpa, other.id, .{});
+    try std.testing.expectEqual(0, store.totalRuns(other.id));
+    const loaded_other = try store.loadOlderRuns(gpa, other.id, DataStore.RUNS_LOAD_BATCH);
+    try std.testing.expectEqual(0, loaded_other);
+}
+
+test "task_runs_unknown_task" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var env = try std.testing.environ.createMap(gpa);
+    defer env.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const data_dir = try std.fs.path.join(gpa, &.{ root, "ztask-data" });
+    defer gpa.free(data_dir);
+
+    var store = try DataStore.init(io, gpa, .{
+        .data_dir = data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const unknown_id = "unknown-id";
+
+    // Unknown task: error instead of creating data directories
+    try std.testing.expectError(error.TaskNotFound, store.getTaskRuns(gpa, unknown_id));
+    try std.testing.expectError(error.TaskNotFound, store.loadTaskRuns(gpa, unknown_id, .{}));
+    try std.testing.expectError(error.TaskNotFound, store.loadOlderRuns(gpa, unknown_id, 10));
+
+    try std.testing.expect(!store.hasTaskRuns(unknown_id));
+    try std.testing.expectEqual(0, store.totalRuns(unknown_id));
+    try std.testing.expectEqual(0, store.runsVersion(unknown_id));
+
+    // No data directory was created for the unknown task
+    const unknown_dir = try std.fs.path.join(gpa, &.{ data_dir, "data", unknown_id });
+    defer gpa.free(unknown_dir);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, unknown_dir, .{}));
 }

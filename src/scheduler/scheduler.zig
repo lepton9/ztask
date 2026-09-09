@@ -589,7 +589,7 @@ pub const Scheduler = struct {
     /// Log the end of task and add the new task run to datastore
     fn endTask(self: *Scheduler) !void {
         try self.run_logger.endTask(self.gpa, &self.task_meta);
-        try self.datastore.addNewTaskRun(self.gpa, self.task_meta);
+        try self.datastore.addTaskRun(self.gpa, self.task_meta);
         // Reset run id
         self.task_meta.run_id = null;
     }

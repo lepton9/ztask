@@ -14,7 +14,11 @@ const GenericDiagnostics = @import("../diagnostics.zig").GenericDiagnostics;
 const log = std.log.scoped(.tui);
 
 const UPDATE_TICK_MS = 300;
+/// Time of how long the info text stays visible.
 const INFO_TIME_S = 3;
+/// Load more past runs when the cursor is this close to the end of the
+/// loaded run window.
+const RUNS_LOAD_MARGIN: usize = 20;
 
 const COLOR_SELECTED: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
 const COLOR_GREEN: vaxis.Color = .{ .rgb = .{ 0, 255, 0 } };
@@ -31,6 +35,9 @@ pub const Model = struct {
     gpa: std.mem.Allocator,
     /// Arena for selected task
     arena_task: std.heap.ArenaAllocator,
+    /// Spare arena the next selected task state is built in, so the
+    /// currently displayed state stays valid until the build succeeds.
+    arena_task_next: std.heap.ArenaAllocator,
     /// Arena for the task list
     arena_list: std.heap.ArenaAllocator,
 
@@ -42,6 +49,17 @@ pub const Model = struct {
 
     /// Active TUI section
     active: ActiveArea = .status,
+
+    /// What the selected task view was last built from. Used to skip
+    /// needless rebuilds of the task view.
+    built: struct {
+        /// Owned ID of the built task.
+        task_id: ?[]u8 = null,
+        /// Selected run of the built task.
+        selected_run_id: ?u64 = null,
+        /// Version of the run history when the view was built.
+        runs_version: u64 = 0,
+    } = .{},
 
     info: struct {
         text: ?[]const u8 = null,
@@ -70,6 +88,7 @@ pub const Model = struct {
         model.* = .{
             .gpa = gpa,
             .arena_task = std.heap.ArenaAllocator.init(gpa),
+            .arena_task_next = std.heap.ArenaAllocator.init(gpa),
             .arena_list = std.heap.ArenaAllocator.init(gpa),
             .task_split = try .init(gpa, model),
             .taskmanager = manager,
@@ -82,7 +101,9 @@ pub const Model = struct {
         self.events.deinit();
         if (self.info.text) |t| self.gpa.free(t);
         self.deinitConfirm();
+        self.clearBuiltTask();
         self.arena_task.deinit();
+        self.arena_task_next.deinit();
         self.arena_list.deinit();
         self.gpa.destroy(self.task_split);
         self.gpa.destroy(self);
@@ -310,12 +331,13 @@ pub const Model = struct {
         };
     }
 
-    /// Request a snapshot of the UI from TaskManager
+    /// Request a snapshot of the UI from TaskManager.
     fn requestSnapshot(self: *Model) !void {
         // Update status
         self.snapshot.status = try self.taskmanager.getStatus();
 
         // Update task list
+        var list_rebuilt = false;
         if (self.taskmanager.tasksModified()) {
             _ = self.arena_list.reset(.retain_capacity);
             const arena = self.arena_list.allocator();
@@ -323,21 +345,16 @@ pub const Model = struct {
             self.snapshot.tasks = tasks;
             self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
             try self.task_split.buildTaskList(arena);
+            list_rebuilt = true;
         }
 
-        // Update selected task
+        // Update selected task only if its data may have changed
         if (self.task_split.selectedTask()) |t| {
-            _ = self.arena_task.reset(.retain_capacity);
-            const arena = self.arena_task.allocator();
-            self.snapshot.selected_task = try self.taskmanager.buildTaskState(
-                arena,
-                t.meta.id,
-                self.task_split.getState(),
-            );
-            self.task_split.setSelectedState(&self.snapshot.selected_task.?);
-        } else {
-            self.snapshot.selected_task = null;
-            self.task_split.setSelectedState(null);
+            if (list_rebuilt or try self.selectedTaskStale(t)) {
+                try self.rebuildSelectedTask();
+            }
+        } else if (self.snapshot.selected_task != null) {
+            self.clearSelectedTask();
         }
         self.snapshot.updated = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
@@ -453,22 +470,83 @@ pub const Model = struct {
         self.confirm = null;
     }
 
-    /// Fetch new data for selected task
-    fn updateSelectedTask(
-        self: *Model,
-        options: snap.TaskStateOptions,
-    ) !?*snap.UiTaskDetail {
-        _ = self.arena_task.reset(.retain_capacity);
-        const arena = self.arena_task.allocator();
-        if (self.task_split.selectedTask()) |t| {
-            self.snapshot.selected_task = try self.taskmanager.buildTaskState(
-                arena,
-                t.meta.id,
-                options,
-            );
-            return &self.snapshot.selected_task.?;
+    /// Check if the data the selected task view was built from has changed.
+    fn selectedTaskStale(self: *Model, task: *const snap.UiTaskSnap) !bool {
+        const built_id = self.built.task_id orelse return true;
+        if (!std.mem.eql(u8, built_id, task.meta.id)) return true;
+        if (self.built.selected_run_id !=
+            self.task_split.getState().selected_run_id) return true;
+        return try self.taskmanager.taskHasChanged(
+            task.meta.id,
+            self.built.runs_version,
+        );
+    }
+
+    /// Rebuild the data for the selected task from the task manager and
+    /// update the selected task view.
+    fn rebuildSelectedTask(self: *Model) !void {
+        const t = self.task_split.selectedTask() orelse {
+            self.clearSelectedTask();
+            return;
+        };
+
+        const task_changed = self.built.task_id == null or
+            !std.mem.eql(u8, self.built.task_id.?, t.meta.id);
+        if (task_changed) self.task_split.selected_task_view.resetView();
+
+        const options = self.task_split.getState();
+        _ = self.arena_task_next.reset(.retain_capacity);
+        // Retry on the next update if building the state fails
+        errdefer self.clearBuiltTask();
+        const detail = try self.taskmanager.buildTaskState(
+            self.arena_task_next.allocator(),
+            t.meta.id,
+            options,
+        );
+        // Swap to the built task state
+        std.mem.swap(
+            std.heap.ArenaAllocator,
+            &self.arena_task,
+            &self.arena_task_next,
+        );
+        self.snapshot.selected_task = detail;
+        self.task_split.setSelectedState(&self.snapshot.selected_task.?);
+        self.trackBuiltTask(t.meta.id, options.selected_run_id);
+    }
+
+    /// Reset the data of the selected task.
+    fn clearSelectedTask(self: *Model) void {
+        self.snapshot.selected_task = null;
+        self.task_split.setSelectedState(null);
+        self.clearBuiltTask();
+    }
+
+    /// Store what the selected task view was last built from.
+    fn trackBuiltTask(self: *Model, task_id: []const u8, selected_run_id: ?u64) void {
+        if (self.built.task_id) |id| {
+            if (std.mem.eql(u8, id, task_id)) {
+                self.built.selected_run_id = selected_run_id;
+                if (self.snapshot.selected_task) |detail| {
+                    self.built.runs_version = detail.runs_version;
+                }
+                return;
+            }
+            self.gpa.free(id);
         }
-        return null;
+        self.built.task_id = self.gpa.dupe(u8, task_id) catch null;
+        self.built.selected_run_id = selected_run_id;
+        self.built.runs_version = if (self.snapshot.selected_task) |detail|
+            detail.runs_version
+        else
+            0;
+    }
+
+    /// Forget what the selected task view was built from.
+    fn clearBuiltTask(self: *Model) void {
+        if (self.built.task_id) |id| self.gpa.free(id);
+        self.built.task_id = null;
+        self.built.selected_run_id = null;
+        self.built.runs_version = 0;
     }
 
     /// Return the current snapshot of the UI state
@@ -684,10 +762,17 @@ const TaskSplit = struct {
         self.task_list_view.ensureScroll();
     }
 
-    /// Update selected task
+    /// Update selected task.
     fn updateSelected(self: *@This()) !void {
-        const state = try self.model.updateSelectedTask(self.getState());
-        self.setSelectedState(state);
+        const selected = self.selectedTask() orelse {
+            if (self.model.snapshot.selected_task != null)
+                self.model.clearSelectedTask();
+            return;
+        };
+        // Skip the rebuild when the selection and its data are unchanged
+        if (try self.model.selectedTaskStale(selected)) {
+            try self.model.rebuildSelectedTask();
+        }
     }
 
     /// Set selected task data state
@@ -803,8 +888,10 @@ const TaskView = struct {
                 }
                 if (keyDown(key)) {
                     self.handleDown(ctx);
+                    try self.loadOlderRunsIfNeeded();
                 } else if (keyUp(key)) {
                     self.handleUp(ctx);
+                    try self.loadOlderRunsIfNeeded();
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     switch (self.tab) {
                         .run_list => {
@@ -833,8 +920,6 @@ const TaskView = struct {
             .focus_in => {
                 self.parent.model.active = .task_view;
                 self.display_job_log = false;
-                self.task_runs_list_view.cursor = 0;
-                self.job_list.cursor = 0;
             },
             else => {},
         }
@@ -854,6 +939,29 @@ const TaskView = struct {
             .task_run => self.job_list.nextItem(ctx),
             .run_list => self.task_runs_list_view.nextItem(ctx),
         }
+    }
+
+    /// Load the next batch of past runs when the cursor approaches the end
+    /// of the loaded run window.
+    fn loadOlderRunsIfNeeded(self: *TaskView) !void {
+        if (self.tab != .run_list) return;
+        const task = self.task orelse return;
+        const loaded = task.details.past_runs.len;
+        if (loaded >= task.details.total_runs) return;
+        const cursor: usize = @intCast(self.task_runs_list_view.cursor);
+        if (cursor + RUNS_LOAD_MARGIN < loaded) return;
+
+        _ = self.parent.model.taskmanager.loadOlderTaskRuns(
+            task.data.meta.id,
+            data.DataStore.RUNS_LOAD_BATCH,
+        ) catch |err| {
+            log.err("Failed to load older runs: {}", .{err});
+            self.parent.model.setInfo("Failed to load runs: {s}", .{
+                @errorName(err),
+            }) catch {};
+            return;
+        };
+        try self.parent.updateSelected();
     }
 
     /// Handle key presses in the job log view
@@ -965,15 +1073,28 @@ const TaskView = struct {
     fn draw(self: *@This(), ctx: vxfw.DrawContext) AllocError!vxfw.Surface {
         const max = ctx.max.size();
         const task = self.task orelse return .empty(self.widget());
-        var buf: [512]u8 = undefined;
+        var buf: [640]u8 = undefined;
         var task_buf = try std.ArrayList(u8).initCapacity(ctx.arena, 128);
+
+        const runs_label = if (task.details.past_runs.len < task.details.total_runs)
+            try std.fmt.allocPrint(
+                ctx.arena,
+                "Total runs: {d} (loaded {d})",
+                .{ task.details.total_runs, task.details.past_runs.len },
+            )
+        else
+            try std.fmt.allocPrint(
+                ctx.arena,
+                "Total runs: {d}",
+                .{task.details.total_runs},
+            );
 
         try task_buf.appendSlice(ctx.arena, std.fmt.bufPrint(&buf,
             \\Task: {s}
             \\ID: {s}
             \\File: {s}
             \\Status: {s}
-            \\Total runs: {d}
+            \\{s}
             \\
             \\
         , .{
@@ -981,7 +1102,7 @@ const TaskView = struct {
             task.data.meta.id,
             task.data.meta.file_path,
             @tagName(task.data.status),
-            task.details.past_runs.len,
+            runs_label,
         }) catch "");
 
         const text_segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 5);
@@ -1452,6 +1573,13 @@ const TaskView = struct {
         }
 
         return log_text;
+    }
+
+    /// Reset the selected run and the list cursors.
+    fn resetView(self: *@This()) void {
+        self.selected_run_id = null;
+        self.task_runs_list_view.cursor = 0;
+        self.job_list.cursor = 0;
     }
 
     /// Set the data for the selected task

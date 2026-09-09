@@ -77,6 +77,7 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
         .listen_port = options.listen.port,
         .verbose_events = options.verbose,
         .remote = !options.no_remote,
+        .prefetch_runs = true,
     });
 
     const model = try Model.init(gpa, task_manager);
@@ -314,12 +315,17 @@ pub const ListOptions = struct {
 /// List all the found tasks
 pub fn listTasks(ctx: RunCtx, options: ListOptions) !void {
     const gpa = ctx.gpa;
-    const pre_load_runs = options.sort.len > 0;
     var datastore = try data.DataStore.init(ctx.io, gpa, .{
         .data_dir = ctx.data_dir,
-        .load = .{ .tasks = true, .runs = pre_load_runs },
+        .load = .{ .tasks = true },
     });
     defer datastore.deinit(gpa);
+
+    // List the runs of every task.
+    var run_loader = datastore.tasks.iterator();
+    while (run_loader.next()) |e| {
+        try datastore.loadTaskRuns(gpa, e.key_ptr.*, .{ .limit = 0 });
+    }
 
     try fmtWrite(
         ctx.io,
@@ -334,7 +340,7 @@ pub fn listTasks(ctx: RunCtx, options: ListOptions) !void {
         switch (sort_by) {
             .id => sortByFieldName(&datastore.tasks, "id", order),
             .name => sortByFieldName(&datastore.tasks, "name", order),
-            .runs => sortByRuns(&datastore.tasks, &datastore.task_runs, order),
+            .runs => sortByRuns(&datastore.tasks, &datastore, order),
         }
     }
 
@@ -343,16 +349,13 @@ pub fn listTasks(ctx: RunCtx, options: ListOptions) !void {
     while (it.next()) |e| {
         const meta = e.value_ptr.*;
         const task_id = e.key_ptr.*;
-        if (!pre_load_runs) try datastore.loadTaskRuns(gpa, task_id);
-
-        const runs = datastore.task_runs.get(task_id) orelse unreachable;
         try fmtWrite(
             ctx.io,
             "{s:<20}{s:<15}{d:<10}{s}\n",
             .{
                 meta.id,
                 meta.name[0..@min(meta.name.len, 15 - 1)],
-                runs.count(),
+                datastore.totalRuns(task_id),
                 meta.file_path,
             },
         );
@@ -362,16 +365,12 @@ pub fn listTasks(ctx: RunCtx, options: ListOptions) !void {
 /// Sort tasks by run amount
 fn sortByRuns(
     tasks: *std.StringArrayHashMapUnmanaged(data.TaskMetadata),
-    task_runs: *const std.StringHashMapUnmanaged(
-        std.AutoArrayHashMapUnmanaged(u64, data.DataStore.TaskRunEntry),
-    ),
+    datastore: *const data.DataStore,
     order: ListOptions.Order,
 ) void {
     const Ctx = struct {
         values: []data.TaskMetadata,
-        runs: *const std.StringHashMapUnmanaged(
-            std.AutoArrayHashMapUnmanaged(u64, data.DataStore.TaskRunEntry),
-        ),
+        datastore: *const data.DataStore,
         sort_order: ListOptions.Order,
 
         pub fn lessThan(ctx: @This(), a_index: usize, b_index: usize) bool {
@@ -379,17 +378,15 @@ fn sortByRuns(
                 .asc => .{ a_index, b_index },
                 .desc => .{ b_index, a_index },
             };
-            const a_meta = ctx.values[idx_order.@"0"];
-            const b_meta = ctx.values[idx_order.@"1"];
-            const a = if (ctx.runs.get(a_meta.id)) |r| r.count() else 0;
-            const b = if (ctx.runs.get(b_meta.id)) |r| r.count() else 0;
+            const a = ctx.datastore.totalRuns(ctx.values[idx_order.@"0"].id);
+            const b = ctx.datastore.totalRuns(ctx.values[idx_order.@"1"].id);
             return a < b;
         }
     };
     const sort_ctx: Ctx = .{
         .values = tasks.values(),
         .sort_order = order,
-        .runs = task_runs,
+        .datastore = datastore,
     };
     tasks.sort(sort_ctx);
 }
