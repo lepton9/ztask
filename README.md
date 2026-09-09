@@ -44,12 +44,21 @@ can be provided as a positional argument.
 Added tasks can be ran using `ztask run` or from the TUI. Existing tasks can be 
 seen using `ztask list` or in the TUI.
 
+Multiple tasks can be run at once by providing multiple paths:
+```bash
+ztask run <task>... 
+```
+
+Tasks without a trigger run once and the command exits after all of them have 
+finished. If any task has a trigger, the command keeps running and exits only
+when interrupted.
+
 Tasks can be executed in either normal mode or attach mode. In normal mode, the 
 job outputs are piped to a log file, and the jobs run in the background. You can 
 view the logs of task runs from the TUI. In attach mode, the attached job's 
 outputs are inherited and displayed on the console. If the attached job is 
 interactive, user input is also forwarded to the command. You can only attach to 
-one job at a time.
+one job at a time, so `--attach` can only be used when running a single task.
 
 You can attach to a job run with `--attach` option:
 ```bash
@@ -174,6 +183,8 @@ directly using the `--editor` option.
 
 ### Build
 
+The compiled binary can be found in `./zig-out/bin/ztask`.
+
 ```bash
 zig build -Doptimize=ReleaseFast
 ```
@@ -182,10 +193,6 @@ zig build -Doptimize=ReleaseFast
 ### Compile and run
 ```bash
 zig build run
-```
-Or run the compiled binary:
-```bash
-./zig-out/bin/ztask
 ```
 
 ### Run tests

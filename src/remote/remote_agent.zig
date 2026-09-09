@@ -23,7 +23,6 @@ pub const RemoteAgent = struct {
     output: *std.Io.Writer,
     running: std.atomic.Value(bool) = .init(false),
     hostname: []const u8,
-    buffer: [256]u8 = undefined,
 
     pool: runnerpool.RunnerPool,
     result_queue: std.Io.Queue(Result),
@@ -44,7 +43,7 @@ pub const RemoteAgent = struct {
     /// Worker thread for reading incoming frames from the server.
     reader_thread: ?std.Thread = null,
 
-    /// Error for exiting
+    /// Error for exiting.
     exit_error: ?ExitError = null,
 
     const ExitError = error{NameTaken};

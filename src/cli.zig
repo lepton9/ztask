@@ -62,7 +62,7 @@ const commands = &[_]zcli.Cmd{
     },
     .{
         .name = "run",
-        .desc = "Run a single task",
+        .desc = "Run one or more tasks",
         .options = task_options ++ listen_options ++ &[_]zcli.Opt{
             no_remote_option,
             .{
@@ -79,7 +79,7 @@ const commands = &[_]zcli.Cmd{
             runner_n_option,
             verbose_option,
         },
-        .positionals = &[_]zcli.PosArg{path_positional},
+        .positionals = &[_]zcli.PosArg{run_path_positional},
         .action = cmdRunFn,
     },
     .{
@@ -307,6 +307,14 @@ const listen_options = &[_]zcli.Opt{
     },
 };
 
+const run_path_positional: zcli.PosArg = .{
+    .name = "path",
+    .desc = "A list of task file paths",
+    .required = false,
+    .multiple = true,
+    .exclusive_group = TASK_SELECT_TAG,
+};
+
 const path_positional: zcli.PosArg = .{
     .name = "path",
     .desc = "Path of the task file",
@@ -482,15 +490,36 @@ fn cmdEditFn(ptr: *anyopaque) !void {
 fn cmdRunFn(ptr: *anyopaque) !void {
     const ctx: *Ctx = @ptrCast(@alignCast(ptr));
     const cli = ctx.cli;
+    const gpa = ctx.run_ctx.gpa;
 
-    const task_arg = getTaskInput(cli) orelse
-        ctx.fatal("No task given to run", .{});
+    // Collect the task selections.
+    var tasks: std.ArrayList(run.TaskSelect) = .empty;
+    defer tasks.deinit(gpa);
+
+    var pos_it = cli.positionalIterator("path");
+    while (pos_it.next()) |pos| {
+        try tasks.append(gpa, .{ .path = pos.value });
+    }
+
+    if (cli.findOption("id")) |opt| {
+        try tasks.append(gpa, .{ .id = opt.value.?.string });
+    } else if (cli.findOption("path")) |opt| {
+        try tasks.append(gpa, .{ .path = opt.value.?.string });
+    }
+
+    if (tasks.items.len == 0) ctx.fatal("No task given to run", .{});
+
+    if (cli.findOption("attach") != null and tasks.items.len > 1) ctx.fatal(
+        "The --attach option can only be used with a single task",
+        .{},
+    );
 
     var diagnostics: GenericDiagnostics = .{};
-    defer diagnostics.deinit(ctx.run_ctx.gpa);
+    defer diagnostics.deinit(gpa);
 
     var opts: run.RunOptions = .{
         .listen = getListenOptions(ctx),
+        .tasks = tasks.items,
         .no_remote = cli.findOption("no-remote") != null,
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
@@ -502,11 +531,6 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         .diagnostics = &diagnostics,
     };
 
-    switch (task_arg) {
-        .id => |id| opts.id = id,
-        .path => |path| opts.path = path,
-    }
-
     if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
     return run.runTask(ctx.run_ctx, opts) catch |err| {
@@ -516,17 +540,24 @@ fn cmdRunFn(ptr: *anyopaque) !void {
         switch (err) {
             error.TaskNotFoundId => ctx.fatal(
                 "Task not found with ID: {s}",
-                .{opts.id orelse ""},
+                .{switch (opts.tasks[0]) {
+                    .id => |i| i,
+                    else => "",
+                }},
             ),
-            error.TaskNotFoundPath => if (opts.path) |p|
-                ctx.fatal("Task file not found: '{s}'", .{p})
-            else
-                ctx.fatal("Task not found", .{}),
+            error.TaskNotFoundPath => switch (opts.tasks[0]) {
+                .path => |p| ctx.fatal("Task file not found: '{s}'", .{p}),
+                else => ctx.fatal("Task not found", .{}),
+            },
             error.ErrorOpenFilePath => ctx.fatal(
                 "Error opening file: '{s}'",
-                .{opts.path orelse ""},
+                .{switch (opts.tasks[0]) {
+                    .path => |p| p,
+                    else => "",
+                }},
             ),
             error.TaskExists => ctx.fatal("Another task exists with the same ID", .{}),
+            error.TaskStartFailed => ctx.fatal("Some tasks failed to run", .{}),
             error.UnknownAttachJob => {
                 const attach_name = if (opts.attach_job) |a| a.name else "";
                 ctx.fatal("Unknown job to attach to '{s}'", .{attach_name});

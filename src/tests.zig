@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parse = @import("parse.zig");
 const manager = @import("taskmanager.zig");
 const data = @import("data.zig");
@@ -10,6 +11,7 @@ const testutil = @import("testing/utils.zig");
 const TaskManager = manager.TaskManager;
 
 const expect = std.testing.expect;
+const expectError = std.testing.expectError;
 
 test {
     _ = manager;
@@ -72,6 +74,16 @@ test "begin_task_while_running" {
         \\     steps:
         \\       - command: "sleep 1"
     ;
+    const watch_file =
+        \\ name: watch
+        \\ id: 101
+        \\ on:
+        \\   interval: "00:00:30"
+        \\ jobs:
+        \\   noop:
+        \\     steps:
+        \\       - command: "true"
+    ;
 
     const task_manager = try TaskManager.initWithOptions(io, gpa, 2, .{
         .data_dir = env.data_dir,
@@ -79,7 +91,12 @@ test "begin_task_while_running" {
     defer task_manager.deinit();
 
     const task = try parse.parseTaskBuffer(io, gpa, task_file);
+    const watch_task = try parse.parseTaskBuffer(io, gpa, watch_file);
     try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.loaded_tasks.put(gpa, watch_task.id.fmt(), watch_task);
+
+    // Unknown tasks are not active
+    try expect(try task_manager.isTaskActive("nonexistent") == false);
 
     try task_manager.start();
 
@@ -90,7 +107,18 @@ test "begin_task_while_running" {
     );
     try std.testing.expect(task_manager.schedulers.count() == 1);
 
+    // A running task is active
+    try expect(try task_manager.isTaskActive(task.id.fmt()) == true);
+
+    // A waiting task with a trigger is active
+    try task_manager.beginTask(watch_task.id.fmt(), .{});
+    try expect(try task_manager.isTaskActive(watch_task.id.fmt()) == true);
+
+    // The triggered task is stopped and both tasks finish
+    try task_manager.stopTask(watch_task.id.fmt());
     try task_manager.waitUntilIdle();
+    try expect(try task_manager.isTaskActive(task.id.fmt()) == false);
+    try expect(try task_manager.isTaskActive(watch_task.id.fmt()) == false);
 }
 
 test "force_interrupt" {
@@ -644,4 +672,158 @@ test "examples" {
 
         _ = try task_manager.loadOrCreateWithPath(task_path, null);
     }
+}
+
+/// Count the runs recorded on disk for the task.
+fn taskRunCount(env: *const TestEnv, gpa: std.mem.Allocator, id: []const u8) !usize {
+    var datastore = try env.initDataStore(gpa, .{});
+    defer datastore.deinit(gpa);
+    try datastore.loadTaskRuns(gpa, id, .{ .limit = 0 });
+    return datastore.totalRuns(id);
+}
+
+test "run_multiple_tasks" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const path2 = try env.createTaskFile(gpa, "task2.yml",
+        \\ name: task2
+        \\ id: 102
+    );
+    defer gpa.free(path2);
+    const path3 = try env.createTaskFile(gpa, "task3.yml",
+        \\ name: task3
+        \\ id: 103
+    );
+    defer gpa.free(path3);
+
+    const run_ctx: run.RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    // Single task
+    try run.runTask(run_ctx, .{
+        .tasks = &.{.{ .path = path3 }},
+    });
+    try expect(try taskRunCount(&env, gpa, "103") == 1);
+
+    // Multiple tasks run and the same task selected twice runs only once
+    try run.runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = path1 }, .{ .path = path1 }, .{ .path = path2 } },
+    });
+
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
+    try expect(try taskRunCount(&env, gpa, "102") == 1);
+}
+
+test "run_task_failures" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const missing_path = try std.fs.path.join(gpa, &.{ env.path, "missing.yml" });
+    defer gpa.free(missing_path);
+
+    const run_ctx: run.RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    // The valid task is run even when another task fails to load
+    try expectError(error.TaskStartFailed, run.runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = missing_path }, .{ .path = path1 } },
+    }));
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
+
+    // All tasks failing to load does not start the event loop
+    try expectError(error.TaskStartFailed, run.runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = missing_path }, .{ .path = missing_path } },
+    }));
+
+    // A single missing task keeps the mapped error
+    try expectError(error.TaskNotFoundPath, run.runTask(run_ctx, .{
+        .tasks = &.{.{ .path = missing_path }},
+    }));
+}
+
+test "run_waits_for_triggered_task" {
+    if (builtin.os.tag != .linux) return;
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const path2 = try env.createTaskFile(gpa, "task2.yml",
+        \\ name: task2
+        \\ id: 102
+        \\ on:
+        \\   interval: "00:00:30"
+        \\ jobs:
+        \\   noop:
+        \\     steps:
+        \\       - command: "true"
+    );
+    defer gpa.free(path2);
+
+    const run_ctx: run.RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    const Runner = struct {
+        err: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn exec(self: *@This(), ctx: run.RunCtx, options: run.RunOptions) void {
+            run.runTask(ctx, options) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .seq_cst);
+        }
+    };
+    var runner: Runner = .{};
+    const start = std.Io.Clock.Timestamp.now(io, .real);
+    const run_opts: run.RunOptions = .{
+        .tasks = &.{ .{ .path = path1 }, .{ .path = path2 } },
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.exec, .{
+        &runner, run_ctx, run_opts,
+    });
+
+    // Give the command time to run the tasks. It must still be waiting.
+    std.Io.sleep(io, .fromNanoseconds(300 * std.time.ns_per_ms), .awake) catch {};
+    try std.posix.raise(std.posix.SIG.INT);
+    thread.join();
+
+    // The command did not exit before the interrupt
+    const elapsed_ms = start.durationTo(.now(io, .real)).raw.toMilliseconds();
+    try expect(elapsed_ms >= 250);
+    try expect(runner.err == null);
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
 }

@@ -11,6 +11,8 @@ const Id = @import("types/task.zig").Id;
 const ParseDiag = parse.ParseDiag;
 const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
+const tui_input = @import("tui/input.zig");
+const InputLoop = tui_input.InputLoop;
 const RemoteAgent = remote_agent.RemoteAgent;
 const TaskManager = manager.TaskManager;
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
@@ -26,25 +28,6 @@ pub const RunCtx = struct {
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
     data_dir: []const u8 = "",
-};
-
-// Signal handler
-const Sig = struct {
-    var seen: std.atomic.Value(bool) = .init(false);
-    fn handler(_: std.posix.SIG) callconv(.c) void {
-        seen.store(true, .seq_cst);
-    }
-
-    fn init() void {
-        if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-        const action = std.posix.Sigaction{
-            .handler = .{ .handler = Sig.handler },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(std.posix.SIG.INT, &action, null);
-        std.posix.sigaction(std.posix.SIG.TERM, &action, null);
-    }
 };
 
 pub const ConnectOptions = struct {
@@ -120,15 +103,14 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
     // Initialize event loop to handle input
     var input_loop = try InputLoop(Event).init(io, gpa, ctx.env);
     defer input_loop.deinit(gpa);
-    const loop = &input_loop.loop;
 
     const agentStart = struct {
         fn start(
             a: *RemoteAgent,
             addr: std.Io.net.IpAddress,
-            event_loop: *vaxis.Loop(Event),
+            input: *InputLoop(Event),
         ) void {
-            defer event_loop.postEvent(.exit) catch {};
+            defer input.postEvent(.exit) catch {};
             a.running.store(true, .seq_cst);
             a.connectUntil(addr);
             if (!a.running.load(.seq_cst)) return;
@@ -136,9 +118,13 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
         }
     }.start;
 
-    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{ agent, address, loop });
+    var agent_thread = try std.Thread.spawn(.{}, agentStart, .{
+        agent,
+        address,
+        input_loop,
+    });
     while (true) {
-        const event = try loop.nextEvent();
+        const event = try input_loop.nextEvent();
         switch (event) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
@@ -154,9 +140,9 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
 
 pub const RunOptions = struct {
     listen: ConnectOptions = .{},
-    path: ?[]const u8 = null,
+    /// Tasks to run, selected by path or ID.
+    tasks: []const TaskSelect = &.{},
     no_remote: bool = false,
-    id: ?[]const u8 = null,
     attach_job: ?manager.AttachJob = null,
     retrigger: bool = false,
     verbose: bool = false,
@@ -165,10 +151,44 @@ pub const RunOptions = struct {
     diagnostics: ?*GenericDiagnostics = null,
 };
 
-/// Run a single task either with path or ID
+/// A task tracked by the `runTask` event loop.
+const SelectedTask = struct {
+    id_value: u64,
+    /// Copy of the formatted task ID.
+    id_buf: [Id.MAX_LEN]u8 = undefined,
+    id_len: u8 = 0,
+    /// The task has a trigger and never finishes on its own.
+    has_trigger: bool = false,
+    /// The task was started successfully.
+    began: bool = true,
+
+    /// The formatted task ID.
+    fn id(self: *const SelectedTask) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+};
+
+/// Find a selected task by its ID value.
+fn findSelectedTask(
+    selected: []const SelectedTask,
+    task_id: u64,
+) ?*const SelectedTask {
+    for (selected) |*sel| {
+        if (sel.id_value == task_id) return sel;
+    }
+    return null;
+}
+
+/// Run one or more tasks either with paths or IDs.
+///
+/// The command exits on its own only when every task is without a trigger
+/// and has finished.
 pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
+
+    if (options.tasks.len == 0) return error.NoTaskFileGiven;
+    const single = options.tasks.len == 1;
 
     const task_manager: *TaskManager =
         try .initWithOptions(io, gpa, options.runners_n, .{
@@ -178,64 +198,114 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     const events = try task_manager.subscribeEvents();
     defer events.deinit();
 
-    const task = blk: {
-        if (options.path) |path| {
-            break :blk task_manager.loadOrCreateWithPath(
+    // Resolve all the selected tasks
+    var selected: std.ArrayList(SelectedTask) =
+        try .initCapacity(gpa, options.tasks.len);
+    defer selected.deinit(gpa);
+
+    var start_failed = false;
+    var any_remote_jobs: bool = false;
+
+    for (options.tasks) |select| {
+        const task = switch (select) {
+            .path => |path| task_manager.loadOrCreateWithPath(
                 path,
                 options.diagnostics,
-            ) catch |err| return switch (err) {
-                error.ErrorOpenFile => error.ErrorOpenFilePath,
-                error.FileNotFound => error.TaskNotFoundPath,
-                else => err,
-            };
-        }
-        if (options.id) |i| break :blk task_manager.loadTaskWithId(
-            i,
-            options.diagnostics,
-        ) catch |err| return switch (err) {
-            error.TaskNotFound => error.TaskNotFoundId,
-            else => err,
+            ) catch |err| {
+                if (single) return switch (err) {
+                    error.ErrorOpenFile => error.ErrorOpenFilePath,
+                    error.FileNotFound => error.TaskNotFoundPath,
+                    else => err,
+                };
+                reportTaskError(io, select, options.diagnostics, err);
+                if (options.diagnostics) |d| d.deinit(gpa);
+                start_failed = true;
+                continue;
+            },
+            .id => |id| task_manager.loadTaskWithId(
+                id,
+                options.diagnostics,
+            ) catch |err| {
+                if (single) return switch (err) {
+                    error.TaskNotFound => error.TaskNotFoundId,
+                    else => err,
+                };
+                reportTaskError(io, select, options.diagnostics, err);
+                if (options.diagnostics) |d| d.deinit(gpa);
+                start_failed = true;
+                continue;
+            },
         };
-        return error.NoTaskFileGiven;
-    };
 
-    const has_remote_jobs: bool = blk: {
-        var job_it = task.jobs.iterator();
-        while (job_it.next()) |entry| {
-            if (entry.value_ptr.run_on == .remote) break :blk true;
+        const has_remote_jobs: bool = blk: {
+            var job_it = task.jobs.iterator();
+            while (job_it.next()) |entry| {
+                if (entry.value_ptr.run_on == .remote) break :blk true;
+            }
+            break :blk false;
+        };
+        if (has_remote_jobs) any_remote_jobs = true;
+        if (options.no_remote and has_remote_jobs) {
+            if (single) return error.RemoteJobsWithNoRemote;
+            fmtWriteErr(
+                io,
+                "Task '{s}' has remote jobs but --no-remote was set\n",
+                .{task.name},
+            ) catch {};
+            start_failed = true;
+            continue;
         }
-        break :blk false;
-    };
-    if (options.no_remote and has_remote_jobs)
-        return error.RemoteJobsWithNoRemote;
 
-    const task_id = task.id.fmt();
-    const task_id_value = task.id.value;
-    const task_has_trigger = task.trigger != null;
+        // Skip tasks that are already selected
+        if (findSelectedTask(selected.items, task.id.value) != null) {
+            if (options.verbose) {
+                fmtWrite(io, "Task '{s}' is already selected\n", .{
+                    task.name,
+                }) catch {};
+            }
+            continue;
+        }
+
+        const id_str = task.id.fmt();
+        try selected.append(gpa, .{
+            .id_value = task.id.value,
+            .id_len = @intCast(id_str.len),
+            .has_trigger = task.trigger != null,
+        });
+        const sel = &selected.items[selected.items.len - 1];
+        @memcpy(sel.id_buf[0..id_str.len], id_str);
+    }
 
     // Initialize event loop to handle input
-    const stdin_is_tty = std.Io.File.stdin().isTty(io) catch false;
-    const input_loop: ?*InputLoop(vaxis.Event) = blk: {
+    const input_loop = blk: {
+        if (!stdinIsTty(io) or builtin.is_test) break :blk null;
         if (options.attach_job != null) break :blk null;
-        if (!stdin_is_tty) break :blk null;
         break :blk try InputLoop(vaxis.Event).init(io, gpa, ctx.env);
     };
     defer if (input_loop) |il| il.deinit(gpa);
+    // Handle interrupt signals
+    tui_input.Sig.init();
 
-    if (input_loop == null) Sig.init();
-
-    // Start task run
+    // Start task runs
     try task_manager.startWithOptions(.{
         .listen_addr = options.listen.addr,
         .listen_port = options.listen.port,
-        .remote = !options.no_remote and has_remote_jobs,
+        .remote = !options.no_remote and any_remote_jobs,
     });
-    try task_manager.beginTask(task_id, .{
-        .attach_job = options.attach_job,
-        .retrigger = options.retrigger,
-        .verbose_events = options.verbose,
-        .diagnostics = options.diagnostics,
-    });
+    for (selected.items) |*sel| {
+        task_manager.beginTask(sel.id(), .{
+            .attach_job = if (single) options.attach_job else null,
+            .retrigger = options.retrigger,
+            .verbose_events = options.verbose,
+            .diagnostics = options.diagnostics,
+        }) catch |err| {
+            if (single) return err;
+            reportBeginTaskError(io, sel, options.diagnostics, err);
+            if (options.diagnostics) |d| d.deinit(gpa);
+            sel.began = false;
+            start_failed = true;
+        };
+    }
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
@@ -244,64 +314,166 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
 
     while (true) {
         if (input_loop) |l| {
-            // If not attached use vaxis input handling
-            while (l.loop.tryEvent() catch null) |event| switch (event) {
-                .key_press => |key| {
-                    if (key.matches('c', .{ .ctrl = true })) {
-                        task_manager.stopTask(task_id) catch {};
-                        task_manager.waitUntilIdle() catch {};
-                        exit = true;
-                        break;
-                    }
-                },
-                else => {},
-            };
-        } else if (Sig.seen.load(.seq_cst)) {
-            Sig.seen.store(false, .seq_cst);
-            task_manager.stopTask(task_id) catch {};
+            while (l.tryEvent() catch null) |event| {
+                if (event != .key_press) continue;
+                const key = event.key_press;
+                if (!key.matches('c', .{ .ctrl = true })) continue;
+                task_manager.stopAllTasks();
+                task_manager.waitUntilIdle() catch {};
+                exit = true;
+                break;
+            }
+        }
+        if (tui_input.Sig.seen.load(.seq_cst)) {
+            tui_input.Sig.seen.store(false, .seq_cst);
+            task_manager.stopAllTasks();
             task_manager.waitUntilIdle() catch {};
             exit = true;
         }
 
-        // Drain task events
-        while (events.tryNext()) |ev| {
-            switch (ev) {
-                .run_finished => |e| {
-                    if (e.task_id != task_id_value) continue;
+        try drainRunEvents(gpa, events, out, selected.items, options.verbose);
 
-                    if (options.verbose) {
-                        try out.print(
-                            "{s:<12} task={s} status={s}\n",
-                            .{ "run_finished", task_id, @tagName(e.status) },
-                        );
-                    }
-                    if (!task_has_trigger) exit = true;
-                },
-                .info => |e| {
-                    defer gpa.free(e.msg);
-                    if (!options.verbose) continue;
-                    if (e.task_id != task_id_value) continue;
-                    try out.print(
-                        "{s:<12} task={s} {s}\n",
-                        .{ "info", task_id, e.msg },
-                    );
-                },
-                .err => |e| {
-                    defer if (e.msg) |m| gpa.free(m);
-                    if (!options.verbose) continue;
-                    try out.print("{s:<12} scope={s} ({s})\n", .{
-                        "error",
-                        @tagName(e.scope),
-                        e.msg orelse @errorName(e.err),
-                    });
-                },
-            }
+        if (!exit and autoExit(task_manager, selected.items)) exit = true;
+
+        if (exit) {
+            try drainRunEvents(gpa, events, out, selected.items, options.verbose);
         }
         try out.flush();
-        if (exit) return;
+
+        if (exit) {
+            // Stop any tasks that might be still running
+            task_manager.stopAllTasks();
+            task_manager.waitUntilIdle() catch {};
+            if (start_failed) return error.TaskStartFailed;
+            return;
+        }
 
         std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 25), .awake) catch {};
     }
+}
+
+/// Drain the task events and print the verbose status lines.
+fn drainRunEvents(
+    gpa: std.mem.Allocator,
+    events: *TaskManager.EventHub.Subscriber,
+    out: *std.Io.Writer,
+    selected: []const SelectedTask,
+    verbose: bool,
+) !void {
+    while (events.tryNext()) |ev| switch (ev) {
+        .run_finished => |e| {
+            if (!verbose) continue;
+            const sel = findSelectedTask(selected, e.task_id) orelse continue;
+            try out.print(
+                "{s:<12} task={s} status={s}\n",
+                .{ "run_finished", sel.id(), @tagName(e.status) },
+            );
+        },
+        .info => |e| {
+            defer gpa.free(e.msg);
+            if (!verbose) continue;
+            const sel = findSelectedTask(selected, e.task_id) orelse continue;
+            try out.print(
+                "{s:<12} task={s} {s}\n",
+                .{ "info", sel.id(), e.msg },
+            );
+        },
+        .err => |e| {
+            defer if (e.msg) |m| gpa.free(m);
+            if (!verbose) continue;
+            try out.print("{s:<12} scope={s} ({s})\n", .{
+                "error",
+                @tagName(e.scope),
+                e.msg orelse @errorName(e.err),
+            });
+        },
+    };
+}
+
+/// Check if the run command should exit on its own.
+///
+/// Only when none of the started tasks has a trigger and all the pending
+/// tasks have finished.
+fn autoExit(task_manager: *TaskManager, selected: []const SelectedTask) bool {
+    var active_tasks: bool = false;
+    for (selected) |*sel| {
+        if (!sel.began) continue;
+        if (sel.has_trigger) return false;
+        const active = task_manager.isTaskActive(sel.id()) catch continue;
+        if (active) active_tasks = true;
+    }
+    return !active_tasks;
+}
+
+/// Report a task load error to stderr. Used when running multiple tasks.
+fn reportTaskError(
+    io: std.Io,
+    select: TaskSelect,
+    diagnostics: ?*GenericDiagnostics,
+    err: anyerror,
+) void {
+    if (diagnostics) |d| if (d.message) |msg| {
+        switch (select) {
+            .path => |path| fmtWriteErr(
+                io,
+                "Task '{s}': {s}\n",
+                .{ path, msg },
+            ) catch {},
+            .id => |id| fmtWriteErr(
+                io,
+                "Task with ID '{s}': {s}\n",
+                .{ id, msg },
+            ) catch {},
+        }
+        return;
+    };
+    switch (select) {
+        .path => |path| switch (err) {
+            error.ErrorOpenFile => fmtWriteErr(
+                io,
+                "Error opening file: '{s}'\n",
+                .{path},
+            ) catch {},
+            error.FileNotFound => fmtWriteErr(
+                io,
+                "Task file not found: '{s}'\n",
+                .{path},
+            ) catch {},
+            else => fmtWriteErr(
+                io,
+                "Failed to load task '{s}': {any}\n",
+                .{ path, err },
+            ) catch {},
+        },
+        .id => |id| switch (err) {
+            error.TaskNotFound => fmtWriteErr(
+                io,
+                "Task not found with ID: '{s}'\n",
+                .{id},
+            ) catch {},
+            else => fmtWriteErr(
+                io,
+                "Failed to load task with ID '{s}': {any}\n",
+                .{ id, err },
+            ) catch {},
+        },
+    }
+}
+
+/// Report a `beginTask` error to stderr. Used when running multiple tasks.
+fn reportBeginTaskError(
+    io: std.Io,
+    sel: *const SelectedTask,
+    diagnostics: ?*GenericDiagnostics,
+    err: anyerror,
+) void {
+    if (diagnostics) |d| if (d.message) |msg| {
+        fmtWriteErr(io, "Task '{s}': {s}\n", .{ sel.id(), msg }) catch {};
+        return;
+    };
+    fmtWriteErr(io, "Failed to start task '{s}': {any}\n", .{
+        sel.id(), err,
+    }) catch {};
 }
 
 pub const ListOptions = struct {
@@ -903,24 +1075,6 @@ pub fn editTask(ctx: RunCtx, options: EditOptions) !void {
     try applyEditResult(gpa, &datastore, old_id, res);
 }
 
-/// Restore normal output behavior.
-fn setupInputTty(tty: *vaxis.Tty) !void {
-    if (builtin.os.tag == .windows) {
-        var mode = try vaxis.tty.WindowsTty.getConsoleMode(
-            vaxis.tty.WindowsTty.CONSOLE_MODE_OUTPUT,
-            tty.stdout,
-        );
-        mode.DISABLE_NEWLINE_AUTO_RETURN = 0;
-        try vaxis.tty.WindowsTty.setConsoleMode(tty.stdout, mode);
-        return;
-    }
-
-    const fd: std.posix.fd_t = tty.fd.handle;
-    var tio = try std.posix.tcgetattr(fd);
-    tio.oflag.OPOST = true;
-    try std.posix.tcsetattr(fd, .FLUSH, tio);
-}
-
 const EditResult = union(enum) {
     success: struct {
         id: []u8,
@@ -1145,39 +1299,6 @@ fn collectDefaultEditors(
 
 fn stdinIsTty(io: std.Io) bool {
     return std.Io.File.stdin().isTty(io) catch false;
-}
-
-/// Input handling using the `vaxis` library.
-fn InputLoop(T: type) type {
-    return struct {
-        tty: vaxis.Tty,
-        vx: vaxis.Vaxis,
-        loop: vaxis.Loop(T),
-
-        fn init(io: std.Io, gpa: std.mem.Allocator, env: *std.process.Environ.Map) !*@This() {
-            var self: *@This() = try gpa.create(@This());
-            errdefer gpa.destroy(self);
-
-            self.tty = try vaxis.Tty.init(io, &.{});
-            errdefer self.tty.deinit();
-            try setupInputTty(&self.tty);
-
-            self.vx = try vaxis.init(io, gpa, env, .{});
-            errdefer self.vx.deinit(gpa, self.tty.writer());
-
-            self.loop = vaxis.Loop(T).init(io, &self.tty, &self.vx);
-            try self.loop.installResizeHandler();
-            try self.loop.start();
-            return self;
-        }
-
-        fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
-            self.loop.stop();
-            self.vx.deinit(gpa, self.tty.writer());
-            self.tty.deinit();
-            gpa.destroy(self);
-        }
-    };
 }
 
 /// Wait until enter key is pressed

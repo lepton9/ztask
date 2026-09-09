@@ -8,6 +8,8 @@ pub const GenericDiagnostics = struct {
 
     pub fn deinit(self: *GenericDiagnostics, gpa: std.mem.Allocator) void {
         if (self.message) |msg| gpa.free(msg);
+        self.message = null;
+        self.err = null;
     }
 
     pub fn failf(

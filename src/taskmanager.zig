@@ -390,6 +390,20 @@ pub const TaskManager = struct {
         return self.schedulers.count();
     }
 
+    /// Check if the task is still running or waiting to run.
+    pub fn isTaskActive(
+        self: *TaskManager,
+        task_id: []const u8,
+    ) error{Canceled}!bool {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const sched = self.getScheduler(task_id) orelse return false;
+        return switch (sched.status) {
+            .inactive, .completed, .interrupted => false,
+            .running, .waiting => true,
+        };
+    }
+
     /// Start task manager thread.
     pub fn start(self: *TaskManager) !void {
         return self.startWithOptions(.{});
@@ -476,19 +490,19 @@ pub const TaskManager = struct {
         self.signalWork();
         self.mutex.unlock(self.io);
         try self.watcher.stop();
-        try self.stopSchedulers();
+        self.stopSchedulers();
         self.remote_manager.stop();
         if (self.thread) |t| t.join();
         self.thread = null;
     }
 
     /// End all running schedulers
-    fn stopSchedulers(self: *TaskManager) error{Canceled}!void {
-        try self.mutex.lock(self.io);
+    fn stopSchedulers(self: *TaskManager) void {
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| {
-            try self.stopScheduler(s.*);
+            self.stopScheduler(s.*) catch continue;
         }
     }
 
@@ -918,7 +932,9 @@ pub const TaskManager = struct {
 
     /// Force stop all active tasks
     pub fn stopAllTasks(self: *TaskManager) void {
-        self.stopSchedulers() catch {};
+        self.stopSchedulers();
+        // Wake the control loop so the interrupted tasks are processed
+        self.signalWork();
     }
 
     /// Load a task from file path or create the meta file.

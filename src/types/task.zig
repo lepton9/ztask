@@ -260,7 +260,7 @@ pub const Id = struct {
     /// Allocated custom id string.
     str: ?[]const u8 = null,
 
-    const MAX_LEN = 16;
+    pub const MAX_LEN = 16;
 
     pub fn deinit(self: *Id, gpa: std.mem.Allocator) void {
         if (self.str) |s| gpa.free(s);

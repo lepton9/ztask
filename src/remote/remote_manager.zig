@@ -686,8 +686,12 @@ pub const RemoteManager = struct {
         self.failJobsForAgent(fd);
         var kv = self.agents.fetchRemove(fd);
         if (kv) |*e| {
+            const fd_val: usize = switch (@typeInfo(std.Io.net.Socket.Handle)) {
+                .pointer => @intFromPtr(fd),
+                else => @intCast(fd),
+            };
             log.info("Remote agent disconnected (fd={d}, name={s})", .{
-                fd,
+                fd_val,
                 e.value.name orelse "unregistered",
             });
             e.value.deinit(self.gpa);
