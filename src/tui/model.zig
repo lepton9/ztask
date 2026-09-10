@@ -57,6 +57,8 @@ pub const Model = struct {
         task_id: ?[]u8 = null,
         /// Selected run of the built task.
         selected_run_id: ?u64 = null,
+        /// Active run shown when the view was last built.
+        active_run_id: ?u64 = null,
         /// Version of the run history when the view was built.
         runs_version: u64 = 0,
     } = .{},
@@ -504,6 +506,20 @@ pub const Model = struct {
             t.meta.id,
             options,
         );
+
+        // Pin the followed active run if it moved into history
+        const finished_run_id = blk: {
+            if (options.selected_run_id != null) break :blk null;
+            const built_id = self.built.task_id orelse break :blk null;
+            if (!std.mem.eql(u8, built_id, t.meta.id)) break :blk null;
+            if (detail.active_run != null) break :blk null;
+            break :blk self.built.active_run_id;
+        };
+        if (finished_run_id) |run_id| {
+            self.task_split.selected_task_view.selected_run_id = run_id;
+            return self.rebuildSelectedTask();
+        }
+
         // Swap to the built task state
         std.mem.swap(
             std.heap.ArenaAllocator,
@@ -512,7 +528,11 @@ pub const Model = struct {
         );
         self.snapshot.selected_task = detail;
         self.task_split.setSelectedState(&self.snapshot.selected_task.?);
-        self.trackBuiltTask(t.meta.id, options.selected_run_id);
+        self.trackBuiltTask(
+            t.meta.id,
+            options.selected_run_id,
+            activeRunId(&detail),
+        );
     }
 
     /// Reset the data of the selected task.
@@ -523,10 +543,16 @@ pub const Model = struct {
     }
 
     /// Store what the selected task view was last built from.
-    fn trackBuiltTask(self: *Model, task_id: []const u8, selected_run_id: ?u64) void {
+    fn trackBuiltTask(
+        self: *Model,
+        task_id: []const u8,
+        selected_run_id: ?u64,
+        active_run_id: ?u64,
+    ) void {
         if (self.built.task_id) |id| {
             if (std.mem.eql(u8, id, task_id)) {
                 self.built.selected_run_id = selected_run_id;
+                self.built.active_run_id = active_run_id;
                 if (self.snapshot.selected_task) |detail| {
                     self.built.runs_version = detail.runs_version;
                 }
@@ -536,6 +562,7 @@ pub const Model = struct {
         }
         self.built.task_id = self.gpa.dupe(u8, task_id) catch null;
         self.built.selected_run_id = selected_run_id;
+        self.built.active_run_id = active_run_id;
         self.built.runs_version = if (self.snapshot.selected_task) |detail|
             detail.runs_version
         else
@@ -547,32 +574,43 @@ pub const Model = struct {
         if (self.built.task_id) |id| self.gpa.free(id);
         self.built.task_id = null;
         self.built.selected_run_id = null;
+        self.built.active_run_id = null;
         self.built.runs_version = 0;
     }
 
-    /// Return the current snapshot of the UI state
+    /// Return the current snapshot of the UI state.
     fn getSnapshot(self: *const Model) UiSnapshot {
         return self.snapshot;
     }
 
-    /// Begin task run
-    fn dispatchTask(self: *Model, task_id: []const u8) !void {
+    /// Begin task run.
+    fn dispatchTask(self: *Model, task_id: []const u8) !bool {
         var diag: GenericDiagnostics = .{};
         defer diag.deinit(self.gpa);
 
         self.taskmanager.beginTask(task_id, .{
             .diagnostics = &diag,
         }) catch |err| {
-            if (err == error.TaskRunning) return;
+            if (err == error.TaskRunning) return false;
             if (diag.message) |err_msg| {
                 try self.setInfo("{s}: {s}", .{ task_id, err_msg });
             } else {
                 try self.setInfo("Failed to start task {s}: {}", .{ task_id, err });
             }
-            return;
+            return false;
         };
         try self.setInfo("Started task {s}", .{task_id});
         try self.requestSnapshot();
+        return true;
+    }
+
+    /// Return the active run id from a detail snapshot.
+    fn activeRunId(detail: *const snap.UiTaskDetail) ?u64 {
+        const active = detail.active_run orelse return null;
+        return switch (active.state) {
+            .run => |run| run.run_id,
+            .wait, .completed => null,
+        };
     }
 
     /// Stop task from running
@@ -662,9 +700,7 @@ const TaskSplit = struct {
                 }
                 // Run selected task
                 else if (key.matches('r', .{})) {
-                    const selected = self.selectedTask() orelse return;
-                    if (selected.status != .inactive) return;
-                    try self.model.dispatchTask(selected.meta.id);
+                    _ = try self.dispatchSelectedTask();
                     ctx.consumeAndRedraw();
                 }
                 // Stop selected task if running
@@ -776,6 +812,16 @@ const TaskSplit = struct {
         }
     }
 
+    /// Start the selected task and follow its new run.
+    fn dispatchSelectedTask(self: *@This()) !bool {
+        const selected = self.selectedTask() orelse return false;
+        if (selected.status != .inactive) return false;
+        if (!try self.model.dispatchTask(selected.meta.id)) return false;
+        self.selected_task_view.detachRun();
+        try self.updateSelected();
+        return true;
+    }
+
     /// Set selected task data state
     fn setSelectedState(self: *@This(), state: ?*const snap.UiTaskDetail) void {
         return self.selected_task_view.setData(self.selectedTask(), state);
@@ -883,6 +929,11 @@ const TaskView = struct {
                 }
             },
             .key_press => |key| {
+                if (key.matches('r', .{})) {
+                    _ = try self.parent.dispatchSelectedTask();
+                    ctx.consumeAndRedraw();
+                    return;
+                }
                 if (self.display_job_log) {
                     self.handleJobLogKey(ctx, key);
                     return;
@@ -1207,15 +1258,29 @@ const TaskView = struct {
                 .text = "Log",
                 .alignment = .top_left,
             };
-            const labels = if (!self.log_view_state.follow) blk: {
+
+            const run_completed = blk: {
+                const run = self.displayedRun() orelse break :blk false;
+                break :blk run.state == .completed;
+            };
+            const status_label: ?[]const u8 = if (!self.log_view_state.follow)
+                "Detached (press 'c' to follow)"
+            else if (run_completed)
+                "Run completed (press Esc to close)"
+            else
+                null;
+
+            const labels: []const vxfw.Border.BorderLabel = blk: {
+                const status = status_label orelse
+                    break :blk &[_]vxfw.Border.BorderLabel{log_label};
                 const labels = try ctx.arena.alloc(vxfw.Border.BorderLabel, 2);
                 labels[0] = log_label;
                 labels[1] = .{
-                    .text = "Detached (press 'c' to follow)",
+                    .text = status,
                     .alignment = .bottom_left,
                 };
                 break :blk labels;
-            } else &[_]vxfw.Border.BorderLabel{log_label};
+            };
 
             const job_log_bordered: vxfw.Border = .{
                 .child = text.widget(),
@@ -1578,6 +1643,8 @@ const TaskView = struct {
 
     /// Reset the selected run and the list cursors.
     fn resetView(self: *@This()) void {
+        self.display_job_log = false;
+        self.log_view_state = .{};
         self.selected_run_id = null;
         self.task_runs_list_view.cursor = 0;
         self.job_list.cursor = 0;
@@ -1598,6 +1665,14 @@ const TaskView = struct {
         self.task_runs_list_view.item_count = 0;
 
         if (self.task) |task| {
+            // Drop the selected run when it is no longer displayed
+            if (self.selected_run_id) |pinned| {
+                if (!pinnedRunDisplayed(task.details, pinned)) {
+                    self.selected_run_id = null;
+                    self.display_job_log = false;
+                    self.log_view_state = .{};
+                }
+            }
             const runs_n = task.details.past_runs.len;
             self.task_runs_list_view.item_count = @intCast(runs_n);
             if (task.details.selected_run) |selected_run| {
@@ -1635,6 +1710,15 @@ const TaskView = struct {
         self.job_list.ensureScroll();
     }
 
+    /// Stop showing the selected run run.
+    fn detachRun(self: *@This()) void {
+        self.selected_run_id = null;
+        self.display_job_log = false;
+        self.log_view_state = .{};
+        self.job_list.cursor = 0;
+        self.job_list.ensureScroll();
+    }
+
     /// Set the selected run from the runs list
     fn selectRunFromList(self: *@This()) !void {
         const selected = self.selectedRunFromList() orelse {
@@ -1654,10 +1738,34 @@ const TaskView = struct {
         return null;
     }
 
+    /// Check if the run with `pinned` id is the currently displayed run.
+    fn pinnedRunDisplayed(
+        details: *const snap.UiTaskDetail,
+        pinned: u64,
+    ) bool {
+        if (details.selected_run) |selected| {
+            if (selected.state == .completed and
+                selected.state.completed.run_id == pinned) return true;
+        }
+        if (details.active_run) |*active| {
+            if (active.state == .run and
+                active.state.run.run_id == pinned) return true;
+        }
+        return false;
+    }
+
     /// Select the job under the cursor from the job list
     fn selectCurrentJob(self: *@This()) void {
         self.display_job_log = false;
         _ = self.selectedJobFromList() orelse return;
+        // Pin the displayed run
+        if (self.selected_run_id == null) {
+            if (self.displayedRun()) |run| switch (run.state) {
+                .run => |r| self.selected_run_id = r.run_id,
+                .completed => |meta| self.selected_run_id = meta.run_id,
+                .wait => {},
+            };
+        }
         self.display_job_log = true;
         self.log_view_state = .{};
     }
