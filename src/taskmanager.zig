@@ -104,6 +104,9 @@ pub const TaskManager = struct {
     /// Run history cache needs warming for some tasks
     prefetch_pending: std.atomic.Value(bool) = .init(false),
 
+    /// Last finished run per task from the current session.
+    last_finished: std.StringHashMapUnmanaged(snap.LastRun) = .empty,
+
     pub const Event = union(enum) {
         run_finished: struct {
             task_id: u64,
@@ -251,6 +254,10 @@ pub const TaskManager = struct {
             e.value_ptr.recursive.deinit(self.gpa);
         }
         self.watch_map.deinit(self.gpa);
+
+        var lf_it = self.last_finished.iterator();
+        while (lf_it.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.last_finished.deinit(self.gpa);
 
         self.datastore.deinit(self.gpa);
         self.gpa.destroy(self);
@@ -784,6 +791,13 @@ pub const TaskManager = struct {
                     .task_id = s.*.task.id.value,
                     .status = s.*.task_meta.status,
                 } });
+                if (s.*.finished_run_id) |run_id| {
+                    self.recordLastFinished(
+                        s.*.task.id.fmt(),
+                        run_id,
+                        s.*.task_meta.status,
+                    );
+                }
                 self.tasks_changed.store(true, .seq_cst);
                 needs_followup = true;
             },
@@ -795,6 +809,13 @@ pub const TaskManager = struct {
                     .task_id = s.*.task.id.value,
                     .status = .interrupted,
                 } });
+                if (s.*.finished_run_id) |run_id| {
+                    self.recordLastFinished(
+                        s.*.task.id.fmt(),
+                        run_id,
+                        .interrupted,
+                    );
+                }
                 self.tasks_changed.store(true, .seq_cst);
                 needs_followup = true;
             },
@@ -1023,6 +1044,7 @@ pub const TaskManager = struct {
         }
 
         try self.datastore.deleteTask(self.gpa, task_id);
+        self.clearLastFinished(task_id);
         self.tasks_changed.store(true, .seq_cst);
     }
 
@@ -1031,6 +1053,29 @@ pub const TaskManager = struct {
         const task = self.loaded_tasks.get(task_id) orelse
             return null;
         return self.schedulers.get(task) orelse null;
+    }
+
+    /// Record the last finished run of a task. Not thread safe.
+    fn recordLastFinished(
+        self: *TaskManager,
+        task_id: []const u8,
+        run_id: u64,
+        status: data.TaskRunStatus,
+    ) void {
+        const gop = self.last_finished.getOrPut(self.gpa, task_id) catch return;
+        gop.value_ptr.* = .{ .run_id = run_id, .status = status };
+        if (!gop.found_existing) {
+            const key = self.gpa.dupe(u8, task_id) catch {
+                _ = self.last_finished.remove(task_id);
+                return;
+            };
+            gop.key_ptr.* = key;
+        }
+    }
+
+    /// Forget the last finished run of a task. Not thread safe.
+    fn clearLastFinished(self: *TaskManager, task_id: []const u8) void {
+        if (self.last_finished.fetchRemove(task_id)) |kv| self.gpa.free(kv.key);
     }
 
     /// Check if any data has changed
@@ -1177,6 +1222,10 @@ pub const TaskManager = struct {
                 const task_meta = e.value_ptr.*;
                 tasks[idx] = .{
                     .meta = try task_meta.copy(arena),
+                    .last_run = if (self.last_finished.get(task_meta.id)) |last| .{
+                        .run_id = last.run_id,
+                        .status = last.status,
+                    } else null,
                     .status = status: {
                         const s = self.getScheduler(task_meta.id) orelse
                             break :status .inactive;

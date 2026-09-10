@@ -27,9 +27,16 @@ pub const TaskStateOptions = struct {
     selected_run_id: ?u64 = null,
 };
 
+pub const LastRun = struct {
+    run_id: u64,
+    status: data.TaskRunStatus,
+};
+
 pub const UiTaskSnap = struct {
     meta: data.TaskMetadata,
     status: UiTaskStatus,
+    /// Last finished run of the task in this session.
+    last_run: ?LastRun = null,
 };
 
 pub const UiTaskDetail = struct {

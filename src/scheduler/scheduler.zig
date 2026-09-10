@@ -106,6 +106,9 @@ pub const Scheduler = struct {
 
     /// Task starting timestamp.
     task_start_ts: ?std.Io.Timestamp = null,
+    /// Id of the run completed by this scheduler.
+    /// Cleared when a new run starts.
+    finished_run_id: ?u64 = null,
 
     event_sink: ?EventSink = null,
     work_notify: ?queue_zig.Notify = null,
@@ -268,6 +271,8 @@ pub const Scheduler = struct {
     pub fn start(self: *Scheduler) !void {
         if (self.status == .running) return error.SchedulerRunning;
         const run_id = try self.datastore.nextRunId(self.gpa, self.task_meta.task_id);
+        // A new run supersedes the recorded finished run
+        self.finished_run_id = null;
         try self.run_logger.startTask(self.gpa, &self.task_meta, run_id);
         self.task_start_ts = .now(self.io, .awake);
 
@@ -588,6 +593,7 @@ pub const Scheduler = struct {
 
     /// Log the end of task and add the new task run to datastore
     fn endTask(self: *Scheduler) !void {
+        self.finished_run_id = self.task_meta.run_id;
         try self.run_logger.endTask(self.gpa, &self.task_meta);
         try self.datastore.addTaskRun(self.gpa, self.task_meta);
         // Reset run id

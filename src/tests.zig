@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const parse = @import("parse.zig");
 const manager = @import("taskmanager.zig");
 const data = @import("data.zig");
+const snap = @import("tui/snapshot.zig");
 const run = @import("run.zig");
 const task_types = @import("types/task.zig");
 const remote_agent = @import("remote/remote_agent.zig");
@@ -15,6 +16,14 @@ const expectError = std.testing.expectError;
 
 test {
     _ = manager;
+}
+
+/// Find a task in the task list snapshot by its id.
+fn findTask(tasks: []snap.UiTaskSnap, task_id: []const u8) ?*snap.UiTaskSnap {
+    for (tasks) |*task| {
+        if (std.mem.eql(u8, task.meta.id, task_id)) return task;
+    }
+    return null;
 }
 
 /// Shared test fixture over a temporary data directory.
@@ -644,6 +653,88 @@ test "manager_no_prefetch_by_default" {
     try std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 150), .awake);
     try expect(!task_manager.datastore.hasTaskRuns(task_id));
     try expect(task_manager.datastore.totalRuns(task_id) == 0);
+}
+
+test "manager_last_finished_run" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\name: last-run
+        \\id: "last-run-task"
+        \\jobs:
+        \\  noop:
+        \\    steps:
+        \\      - command: "sleep 0.2"
+    ;
+    const task_path = try std.fs.path.join(gpa, &.{ env.path, "last_run.yml" });
+    defer gpa.free(task_path);
+    try data.writeFile(io, task_path, task_file, .{ .truncate = true });
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 2, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+
+    const task = try task_manager.loadOrCreateWithPath(task_path, null);
+    const task_id = try gpa.dupe(u8, task.id.fmt());
+    defer gpa.free(task_id);
+
+    try task_manager.startWithOptions(.{ .remote = false });
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+
+    // Nothing is recorded before the task has run
+    var tasks = try task_manager.buildTaskList(arena_state.allocator());
+    try expect(findTask(tasks, task_id).?.last_run == null);
+    _ = arena_state.reset(.retain_capacity);
+
+    // Each finished run is recorded with its run id and status
+    var first_run_id: u64 = 0;
+    for (0..2) |i| {
+        try task_manager.beginTask(task_id, .{});
+
+        // The record of the previous finished run survives starting a rerun
+        if (i == 1) {
+            tasks = try task_manager.buildTaskList(arena_state.allocator());
+            try expect(findTask(tasks, task_id).?.last_run.?.run_id == first_run_id);
+            _ = arena_state.reset(.retain_capacity);
+        }
+
+        try task_manager.waitUntilIdle();
+
+        var detail: snap.UiTaskDetail = undefined;
+        var waited: usize = 0;
+        while (true) {
+            detail = try task_manager.buildTaskState(
+                arena_state.allocator(),
+                task_id,
+                .{},
+            );
+            if (detail.past_runs.len == i + 1) break;
+            waited += 1;
+            try expect(waited < 200);
+            try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+            _ = arena_state.reset(.retain_capacity);
+        }
+        const run_id = detail.past_runs[0].state.completed.run_id.?;
+
+        tasks = try task_manager.buildTaskList(arena_state.allocator());
+        const last_run = findTask(tasks, task_id).?.last_run.?;
+        try expect(last_run.run_id == run_id);
+        try expect(last_run.status == .success);
+        if (i == 0) first_run_id = run_id;
+        _ = arena_state.reset(.retain_capacity);
+    }
+
+    // A second finished run replaces the recorded first run
+    const tasks_final = try task_manager.buildTaskList(arena_state.allocator());
+    try expect(tasks_final.len == 1);
+    try expect(tasks_final[0].last_run.?.run_id != first_run_id);
+    try expect(tasks_final[0].last_run.?.status == .success);
 }
 
 test "examples" {

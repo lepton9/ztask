@@ -24,6 +24,7 @@ const COLOR_SELECTED: vaxis.Color = .{ .rgb = .{ 0, 255, 100 } };
 const COLOR_GREEN: vaxis.Color = .{ .rgb = .{ 0, 255, 0 } };
 const COLOR_RED: vaxis.Color = .{ .rgb = .{ 255, 0, 0 } };
 const COLOR_YELLOW: vaxis.Color = .{ .rgb = .{ 255, 255, 0 } };
+const COLOR_CYAN: vaxis.Color = .{ .rgb = .{ 0, 255, 255 } };
 
 const StatusText = struct {
     text: []const u8 = "",
@@ -62,6 +63,13 @@ pub const Model = struct {
         /// Version of the run history when the view was built.
         runs_version: u64 = 0,
     } = .{},
+
+    /// Run ids of the last finished runs the user has seen, per task.
+    /// A finished run whose id differs from the stored one is treated as
+    /// unchecked.
+    acked_runs: std.StringHashMapUnmanaged(u64) = .empty,
+    /// The run launched that the selected task view follows.
+    follow_run: ?struct { task_id: []u8 } = null,
 
     info: struct {
         text: ?[]const u8 = null,
@@ -104,6 +112,10 @@ pub const Model = struct {
         if (self.info.text) |t| self.gpa.free(t);
         self.deinitConfirm();
         self.clearBuiltTask();
+        self.clearFollowRun();
+        var it = self.acked_runs.iterator();
+        while (it.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.acked_runs.deinit(self.gpa);
         self.arena_task.deinit();
         self.arena_task_next.deinit();
         self.arena_list.deinit();
@@ -488,6 +500,13 @@ pub const Model = struct {
     /// Rebuild the data for the selected task from the task manager and
     /// update the selected task view.
     fn rebuildSelectedTask(self: *Model) !void {
+        return self.rebuildSelectedTaskInner(false);
+    }
+
+    /// Rebuild the data for the selected task. `settled` is true after a
+    /// selection transition so stale task-list state cannot immediately
+    /// undo the new selection on the follow-up build.
+    fn rebuildSelectedTaskInner(self: *Model, settled: bool) !void {
         const t = self.task_split.selectedTask() orelse {
             self.clearSelectedTask();
             return;
@@ -495,9 +514,27 @@ pub const Model = struct {
 
         const task_changed = self.built.task_id == null or
             !std.mem.eql(u8, self.built.task_id.?, t.meta.id);
-        if (task_changed) self.task_split.selected_task_view.resetView();
+        if (task_changed) {
+            self.task_split.selected_task_view.resetView();
+            // Auto-display the last finished run of the selected task that
+            // the user has not seen yet.
+            if (t.status != .running) if (self.unseenRun(t)) |last| {
+                self.task_split.selected_task_view.selected_run_id =
+                    last.run_id;
+                self.task_split.selected_task_view.auto_pinned = true;
+            };
+        }
 
-        const options = self.task_split.getState();
+        const view = &self.task_split.selected_task_view;
+        // Auto-display a finished run the user has not seen yet.
+        if (view.selected_run_id == null and t.status != .running) {
+            if (self.unseenRun(t)) |last| {
+                view.selected_run_id = last.run_id;
+                view.auto_pinned = true;
+            }
+        }
+
+        var options = self.task_split.getState();
         _ = self.arena_task_next.reset(.retain_capacity);
         // Retry on the next update if building the state fails
         errdefer self.clearBuiltTask();
@@ -507,17 +544,59 @@ pub const Model = struct {
             options,
         );
 
-        // Pin the followed active run if it moved into history
-        const finished_run_id = blk: {
-            if (options.selected_run_id != null) break :blk null;
-            const built_id = self.built.task_id orelse break :blk null;
-            if (!std.mem.eql(u8, built_id, t.meta.id)) break :blk null;
-            if (detail.active_run != null) break :blk null;
-            break :blk self.built.active_run_id;
+        // Resolve automatic pins from the current detail snapshot
+        if (!settled and view.auto_pinned) if (options.selected_run_id) |pinned_id| {
+            const selected_is_last = blk: {
+                const selected = detail.selected_run orelse break :blk false;
+                const last = t.last_run orelse break :blk false;
+                break :blk selected.state == .completed and
+                    selected.state.completed.run_id == last.run_id;
+            };
+            if (selected_is_last and self.followsTask(t.meta.id)) {
+                self.clearFollowRun();
+            } else if (detail.active_run != null or
+                newestRunId(&detail) != pinned_id)
+            {
+                view.detachRun();
+                return self.rebuildSelectedTaskInner(true);
+            }
         };
-        if (finished_run_id) |run_id| {
+
+        self.ackDisplayedRun(t, &detail);
+
+        // Pin the followed run once it moved into history
+        const pin_run_id: ?u64 = blk: {
+            if (options.selected_run_id != null) break :blk null;
+            if (detail.active_run != null) break :blk null;
+            if (self.built.active_run_id) |run_id| {
+                const built_id = self.built.task_id orelse break :blk null;
+                if (std.mem.eql(u8, built_id, t.meta.id)) break :blk run_id;
+                break :blk null;
+            }
+            // A launched run that was never observed running
+            if (self.followsTask(t.meta.id)) {
+                if (detail.past_runs.len > 0) {
+                    const newest = &detail.past_runs[0];
+                    if (newest.state == .completed) {
+                        break :blk newest.state.completed.run_id;
+                    }
+                }
+            }
+            break :blk null;
+        };
+        if (pin_run_id) |run_id| {
+            self.clearFollowRun();
             self.task_split.selected_task_view.selected_run_id = run_id;
-            return self.rebuildSelectedTask();
+            self.task_split.selected_task_view.auto_pinned = true;
+            return self.rebuildSelectedTaskInner(true);
+        }
+
+        // A pin can refer to either cached history or the active run.
+        if (options.selected_run_id) |pinned_id| {
+            if (!TaskView.pinnedRunDisplayed(&detail, pinned_id)) {
+                self.task_split.selected_task_view.detachRun();
+                options.selected_run_id = null;
+            }
         }
 
         // Swap to the built task state
@@ -600,7 +679,8 @@ pub const Model = struct {
             return false;
         };
         try self.setInfo("Started task {s}", .{task_id});
-        try self.requestSnapshot();
+        // Follow the new run
+        self.setFollowRun(task_id);
         return true;
     }
 
@@ -611,6 +691,73 @@ pub const Model = struct {
             .run => |run| run.run_id,
             .wait, .completed => null,
         };
+    }
+
+    /// Return the newest loaded historical run id, if any.
+    fn newestRunId(detail: *const snap.UiTaskDetail) ?u64 {
+        if (detail.past_runs.len == 0) return null;
+        return detail.past_runs[0].state.completed.run_id;
+    }
+
+    /// Check if the last finished run of a task has not been displayed.
+    fn runIsUnseen(acked: ?u64, last_run: ?snap.LastRun) bool {
+        const last = last_run orelse return false;
+        const seen = acked orelse return true;
+        return seen != last.run_id;
+    }
+
+    /// Return the last finished run of the task the user has not seen.
+    fn unseenRun(self: *const Model, task: *const snap.UiTaskSnap) ?snap.LastRun {
+        if (runIsUnseen(self.acked_runs.get(task.meta.id), task.last_run))
+            return task.last_run;
+        return null;
+    }
+
+    /// Mark the last finished run of a task as seen.
+    fn ackLastRun(self: *Model, task_id: []const u8, run_id: u64) void {
+        const gop = self.acked_runs.getOrPut(self.gpa, task_id) catch return;
+        gop.value_ptr.* = run_id;
+        if (!gop.found_existing) {
+            const key = self.gpa.dupe(u8, task_id) catch {
+                _ = self.acked_runs.remove(task_id);
+                return;
+            };
+            gop.key_ptr.* = key;
+        }
+    }
+
+    /// Mark the last finished run of a task as seen when it is the
+    /// displayed run.
+    fn ackDisplayedRun(
+        self: *Model,
+        task: *const snap.UiTaskSnap,
+        detail: *const snap.UiTaskDetail,
+    ) void {
+        const selected = detail.selected_run orelse return;
+        if (selected.state != .completed) return;
+        const last = task.last_run orelse return;
+        if (selected.state.completed.run_id != last.run_id) return;
+        self.ackLastRun(task.meta.id, last.run_id);
+    }
+
+    /// Follow the run launched for the task.
+    fn setFollowRun(self: *Model, task_id: []const u8) void {
+        self.clearFollowRun();
+        const id = self.gpa.dupe(u8, task_id) catch return;
+        self.follow_run = .{ .task_id = id };
+    }
+
+    /// Check if the followed launched run belongs to the task.
+    fn followsTask(self: *const Model, task_id: []const u8) bool {
+        const f = self.follow_run orelse return false;
+        return std.mem.eql(u8, f.task_id, task_id);
+    }
+
+    /// Stop following the launched run.
+    fn clearFollowRun(self: *Model) void {
+        const f = self.follow_run orelse return;
+        self.gpa.free(f.task_id);
+        self.follow_run = null;
     }
 
     /// Stop task from running
@@ -788,9 +935,10 @@ const TaskSplit = struct {
         self.tasks_models.items.len = 0;
         self.tasks_models.capacity = 0;
         try self.tasks_models.ensureTotalCapacity(arena, tasks_snap.len);
-        for (0..tasks_snap.len) |i| {
-            self.tasks_models.appendAssumeCapacity(.{ .task = &tasks_snap[i] });
-        }
+        for (0..tasks_snap.len) |i| self.tasks_models.appendAssumeCapacity(.{
+            .task = &tasks_snap[i],
+            .model = self.model,
+        });
         self.task_list_view.item_count = @intCast(self.tasks_models.items.len);
         self.task_list_view.cursor = @min(
             self.task_list_view.cursor,
@@ -817,8 +965,10 @@ const TaskSplit = struct {
         const selected = self.selectedTask() orelse return false;
         if (selected.status != .inactive) return false;
         if (!try self.model.dispatchTask(selected.meta.id)) return false;
+        // Detach the previous run selection before the first snapshot so
+        // a run that already finished is not selected and detached again.
         self.selected_task_view.detachRun();
-        try self.updateSelected();
+        try self.model.requestSnapshot();
         return true;
     }
 
@@ -862,6 +1012,9 @@ const TaskView = struct {
 
     /// Selected run from the past runs list
     selected_run_id: ?u64 = null,
+    /// True while `selected_run_id` was set by the model,
+    /// false for user-made pins.
+    auto_pinned: bool = false,
     selected_job: ?[]const u8 = null,
 
     log_view_state: struct {
@@ -1503,7 +1656,7 @@ const TaskView = struct {
                         .color = COLOR_RED,
                     },
                     .pending => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
-                    .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
+                    .running => |s| .{ .text = @tagName(s), .color = COLOR_CYAN },
                 };
 
                 segments[0] = .{
@@ -1646,6 +1799,7 @@ const TaskView = struct {
         self.display_job_log = false;
         self.log_view_state = .{};
         self.selected_run_id = null;
+        self.auto_pinned = false;
         self.task_runs_list_view.cursor = 0;
         self.job_list.cursor = 0;
     }
@@ -1701,6 +1855,7 @@ const TaskView = struct {
     fn resetSelectedRun(self: *@This()) void {
         if (self.selected_run_id == null) return;
         self.selected_run_id = null;
+        self.auto_pinned = false;
         self.job_list.item_count = 0;
         const task = self.task orelse return;
         if (task.details.active_run) |a| {
@@ -1713,6 +1868,7 @@ const TaskView = struct {
     /// Stop showing the selected run run.
     fn detachRun(self: *@This()) void {
         self.selected_run_id = null;
+        self.auto_pinned = false;
         self.display_job_log = false;
         self.log_view_state = .{};
         self.job_list.cursor = 0;
@@ -1723,9 +1879,11 @@ const TaskView = struct {
     fn selectRunFromList(self: *@This()) !void {
         const selected = self.selectedRunFromList() orelse {
             self.selected_run_id = null;
+            self.auto_pinned = false;
             return;
         };
         self.selected_run_id = selected.state.completed.run_id;
+        self.auto_pinned = false;
         try self.parent.updateSelected();
         self.job_list.cursor = 0;
     }
@@ -1761,8 +1919,14 @@ const TaskView = struct {
         // Pin the displayed run
         if (self.selected_run_id == null) {
             if (self.displayedRun()) |run| switch (run.state) {
-                .run => |r| self.selected_run_id = r.run_id,
-                .completed => |meta| self.selected_run_id = meta.run_id,
+                .run => |r| {
+                    self.selected_run_id = r.run_id;
+                    self.auto_pinned = false;
+                },
+                .completed => |meta| {
+                    self.selected_run_id = meta.run_id;
+                    self.auto_pinned = false;
+                },
                 .wait => {},
             };
         }
@@ -1791,6 +1955,7 @@ const TaskView = struct {
 
 const TaskListItem = struct {
     task: *const snap.UiTaskSnap,
+    model: *Model,
 
     fn widget(self: *@This()) Widget {
         return .{ .userdata = self, .drawFn = drawTypeErased };
@@ -1816,11 +1981,27 @@ const TaskListItem = struct {
         var segments = try ctx.arena.alloc(vxfw.RichText.TextSpan, 3);
         var text: vxfw.RichText = .{ .text = segments };
 
-        const tag: StatusText = switch (self.task.status) {
-            .inactive => .{},
-            .waiting => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
-            .running => |s| .{ .text = @tagName(s), .color = COLOR_GREEN },
-            else => |s| .{ .text = @tagName(s) },
+        const tag: StatusText = blk: {
+            // Unseen finished results are highlighted until the task is
+            // checked by selecting it.
+            if (self.task.status != .running) {
+                if (self.model.unseenRun(self.task)) |last| {
+                    break :blk .{
+                        .text = @tagName(last.status),
+                        .color = switch (last.status) {
+                            .success => COLOR_GREEN,
+                            .failed => COLOR_RED,
+                            else => COLOR_YELLOW,
+                        },
+                    };
+                }
+            }
+            break :blk switch (self.task.status) {
+                .inactive => .{},
+                .waiting => |s| .{ .text = @tagName(s), .color = COLOR_YELLOW },
+                .running => |s| .{ .text = @tagName(s), .color = COLOR_CYAN },
+                else => |s| .{ .text = @tagName(s) },
+            };
         };
 
         // Truncate name if there isn't enough space for the status
