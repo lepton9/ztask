@@ -118,6 +118,7 @@ pub const TaskManager = struct {
             err: anyerror,
             msg: ?[]const u8 = null,
         },
+        wake,
 
         pub const ErrorScope = enum {
             task_manager,
@@ -138,6 +139,7 @@ pub const TaskManager = struct {
                     .err = e.err,
                     .msg = if (e.msg) |msg| try gpa.dupe(u8, msg) else null,
                 } },
+                .wake => .wake,
             };
         }
 
@@ -146,6 +148,7 @@ pub const TaskManager = struct {
                 .run_finished => {},
                 .info => |e| gpa.free(e.msg),
                 .err => |e| if (e.msg) |msg| gpa.free(msg),
+                .wake => {},
             }
         }
     };

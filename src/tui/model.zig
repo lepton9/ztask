@@ -328,6 +328,7 @@ pub const Model = struct {
                     e.msg orelse @errorName(e.err),
                 });
             },
+            .wake => {},
         };
     }
 

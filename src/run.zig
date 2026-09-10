@@ -157,8 +157,6 @@ const SelectedTask = struct {
     /// Copy of the formatted task ID.
     id_buf: [Id.MAX_LEN]u8 = undefined,
     id_len: u8 = 0,
-    /// The task has a trigger and never finishes on its own.
-    has_trigger: bool = false,
     /// The task was started successfully.
     began: bool = true,
 
@@ -205,6 +203,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
 
     var start_failed = false;
     var any_remote_jobs: bool = false;
+    var any_trigger_tasks: bool = false;
 
     for (options.tasks) |select| {
         const task = switch (select) {
@@ -245,6 +244,8 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
             break :blk false;
         };
         if (has_remote_jobs) any_remote_jobs = true;
+        if (task.trigger != null) any_trigger_tasks = true;
+
         if (options.no_remote and has_remote_jobs) {
             if (single) return error.RemoteJobsWithNoRemote;
             fmtWriteErr(
@@ -270,19 +271,52 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         try selected.append(gpa, .{
             .id_value = task.id.value,
             .id_len = @intCast(id_str.len),
-            .has_trigger = task.trigger != null,
         });
         const sel = &selected.items[selected.items.len - 1];
         @memcpy(sel.id_buf[0..id_str.len], id_str);
     }
 
+    const Event = union(enum) {
+        key_press: if (builtin.is_test) void else vaxis.Key,
+        wake,
+    };
+
+    // Wake an event loop waiting for events.
+    const wakeLoop = struct {
+        fn f(ptr: *anyopaque) void {
+            const il: *InputLoop(Event) = @ptrCast(@alignCast(ptr));
+            il.postEvent(.wake) catch {};
+        }
+    }.f;
+
+    // Publish a wake event to the hub.
+    const wakeHub = struct {
+        fn f(ptr: *anyopaque) void {
+            const sub: *TaskManager.EventHub.Subscriber =
+                @ptrCast(@alignCast(ptr));
+            sub.hub.publish(.wake);
+        }
+    }.f;
+
     // Initialize event loop to handle input
-    const input_loop = blk: {
+    const input_loop: ?*InputLoop(Event) = blk: {
         if (!stdinIsTty(io) or builtin.is_test) break :blk null;
         if (options.attach_job != null) break :blk null;
-        break :blk try InputLoop(vaxis.Event).init(io, gpa, ctx.env);
+        const input_loop = try InputLoop(Event).init(io, gpa, ctx.env);
+        // Set a notification to drain the events
+        events.setNotify(.{ .ptr = input_loop, .callback = wakeLoop });
+        // Wake the blocked loop when an interrupt signal is received
+        tui_input.Sig.setNotify(.{ .ptr = input_loop, .callback = wakeLoop });
+        break :blk input_loop;
     };
+    if (input_loop == null) {
+        // Wake the blocked event queue when an interrupt signal is received
+        tui_input.Sig.setNotify(.{ .ptr = events, .callback = wakeHub });
+    }
     defer if (input_loop) |il| il.deinit(gpa);
+    defer tui_input.Sig.setNotify(null);
+    defer events.setNotify(null);
+
     // Handle interrupt signals
     tui_input.Sig.init();
 
@@ -310,45 +344,81 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
     const out = &stdout.interface;
-    var exit: bool = false;
 
     while (true) {
+        if (tui_input.Sig.seen.load(.seq_cst)) break;
+        if (!any_trigger_tasks and tasksInactive(task_manager, selected.items))
+            break;
+
         if (input_loop) |l| {
-            while (l.tryEvent() catch null) |event| {
-                if (event != .key_press) continue;
-                const key = event.key_press;
-                if (!key.matches('c', .{ .ctrl = true })) continue;
-                task_manager.stopAllTasks();
-                task_manager.waitUntilIdle() catch {};
-                exit = true;
-                break;
+            const event = l.nextEvent() catch break;
+            switch (event) {
+                .key_press => |key| {
+                    if (!key.matches('c', .{ .ctrl = true })) continue;
+                    break;
+                },
+                .wake => try drainRunEvents(
+                    gpa,
+                    events,
+                    out,
+                    selected.items,
+                    options.verbose,
+                ),
             }
-        }
-        if (tui_input.Sig.seen.load(.seq_cst)) {
-            tui_input.Sig.seen.store(false, .seq_cst);
-            task_manager.stopAllTasks();
-            task_manager.waitUntilIdle() catch {};
-            exit = true;
-        }
-
-        try drainRunEvents(gpa, events, out, selected.items, options.verbose);
-
-        if (!exit and autoExit(task_manager, selected.items)) exit = true;
-
-        if (exit) {
+        } else {
+            // Block until the next event arrives, then drain the rest
+            const event = events.next() orelse break;
+            try handleRunEvent(gpa, event, out, selected.items, options.verbose);
             try drainRunEvents(gpa, events, out, selected.items, options.verbose);
         }
         try out.flush();
+    }
 
-        if (exit) {
-            // Stop any tasks that might be still running
-            task_manager.stopAllTasks();
-            task_manager.waitUntilIdle() catch {};
-            if (start_failed) return error.TaskStartFailed;
-            return;
-        }
+    // Stop any tasks that might be still running
+    task_manager.stopAllTasks();
+    task_manager.waitUntilIdle() catch {};
+    try drainRunEvents(gpa, events, out, selected.items, options.verbose);
+    try out.flush();
+    if (start_failed) return error.TaskStartFailed;
+    return;
+}
 
-        std.Io.sleep(io, .fromNanoseconds(std.time.ns_per_ms * 25), .awake) catch {};
+/// Handle a single task event and print the verbose status lines.
+fn handleRunEvent(
+    gpa: std.mem.Allocator,
+    ev: TaskManager.Event,
+    out: *std.Io.Writer,
+    selected: []const SelectedTask,
+    verbose: bool,
+) !void {
+    switch (ev) {
+        .run_finished => |e| {
+            if (!verbose) return;
+            const sel = findSelectedTask(selected, e.task_id) orelse return;
+            try out.print(
+                "{s:<12} task={s} status={s}\n",
+                .{ "run_finished", sel.id(), @tagName(e.status) },
+            );
+        },
+        .info => |e| {
+            defer gpa.free(e.msg);
+            if (!verbose) return;
+            const sel = findSelectedTask(selected, e.task_id) orelse return;
+            try out.print(
+                "{s:<12} task={s} {s}\n",
+                .{ "info", sel.id(), e.msg },
+            );
+        },
+        .err => |e| {
+            defer if (e.msg) |m| gpa.free(m);
+            if (!verbose) return;
+            try out.print("{s:<12} scope={s} ({s})\n", .{
+                "error",
+                @tagName(e.scope),
+                e.msg orelse @errorName(e.err),
+            });
+        },
+        .wake => {},
     }
 }
 
@@ -360,49 +430,18 @@ fn drainRunEvents(
     selected: []const SelectedTask,
     verbose: bool,
 ) !void {
-    while (events.tryNext()) |ev| switch (ev) {
-        .run_finished => |e| {
-            if (!verbose) continue;
-            const sel = findSelectedTask(selected, e.task_id) orelse continue;
-            try out.print(
-                "{s:<12} task={s} status={s}\n",
-                .{ "run_finished", sel.id(), @tagName(e.status) },
-            );
-        },
-        .info => |e| {
-            defer gpa.free(e.msg);
-            if (!verbose) continue;
-            const sel = findSelectedTask(selected, e.task_id) orelse continue;
-            try out.print(
-                "{s:<12} task={s} {s}\n",
-                .{ "info", sel.id(), e.msg },
-            );
-        },
-        .err => |e| {
-            defer if (e.msg) |m| gpa.free(m);
-            if (!verbose) continue;
-            try out.print("{s:<12} scope={s} ({s})\n", .{
-                "error",
-                @tagName(e.scope),
-                e.msg orelse @errorName(e.err),
-            });
-        },
-    };
+    while (events.tryNext()) |ev|
+        try handleRunEvent(gpa, ev, out, selected, verbose);
 }
 
-/// Check if the run command should exit on its own.
-///
-/// Only when none of the started tasks has a trigger and all the pending
-/// tasks have finished.
-fn autoExit(task_manager: *TaskManager, selected: []const SelectedTask) bool {
-    var active_tasks: bool = false;
+/// Check if all the started tasks are inactive.
+fn tasksInactive(task_manager: *TaskManager, selected: []const SelectedTask) bool {
     for (selected) |*sel| {
         if (!sel.began) continue;
-        if (sel.has_trigger) return false;
         const active = task_manager.isTaskActive(sel.id()) catch continue;
-        if (active) active_tasks = true;
+        if (active) return false;
     }
-    return !active_tasks;
+    return true;
 }
 
 /// Report a task load error to stderr. Used when running multiple tasks.

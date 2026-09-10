@@ -1,5 +1,7 @@
 const std = @import("std");
-const MutexQueue = @import("queue.zig").MutexQueue;
+const queue = @import("queue.zig");
+const Notify = queue.Notify;
+const MutexQueue = queue.MutexQueue;
 
 /// `T` must provide functions:
 /// - `clone(Allocator) !T`
@@ -20,6 +22,10 @@ pub fn EventHub(comptime T: type) type {
             queue: MutexQueue(T),
             active: bool = true,
 
+            pub fn deinit(self: *Subscriber) void {
+                self.hub.unsubscribe(self);
+            }
+
             /// Pop the first event from the queue if there is one.
             pub fn tryNext(self: *Subscriber) ?T {
                 if (!self.active) return null;
@@ -38,8 +44,11 @@ pub fn EventHub(comptime T: type) type {
                 return self.queue.len();
             }
 
-            pub fn deinit(self: *Subscriber) void {
-                self.hub.unsubscribe(self);
+            /// Set a callback that is invoked on new events.
+            pub fn setNotify(self: *Subscriber, notify: ?Notify) void {
+                self.hub.mutex.lockUncancelable(self.hub.io);
+                defer self.hub.mutex.unlock(self.hub.io);
+                self.queue.setNotify(notify);
             }
         };
 

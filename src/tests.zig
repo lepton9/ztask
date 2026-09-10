@@ -157,6 +157,7 @@ test "force_interrupt" {
         .run_finished => |e| try std.testing.expect(e.status == .interrupted),
         .info => |e| gpa.free(e.msg),
         .err => |e| if (e.msg) |m| gpa.free(m),
+        .wake => {},
     };
 }
 
@@ -227,6 +228,7 @@ test "complete_tasks" {
         },
         .info => |e| gpa.free(e.msg),
         .err => |e| if (e.msg) |m| gpa.free(m),
+        .wake => {},
     };
 }
 

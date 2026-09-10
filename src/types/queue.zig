@@ -255,6 +255,8 @@ pub fn MutexQueue(comptime T: type) type {
         mutex: std.Io.Mutex = .init,
         cond: std.Io.Condition = .init,
         queue: Queue(T) = .{},
+        /// Optional callback to invoke when an item gets pushed
+        /// to the queue.
         notify: ?Notify = null,
 
         pub fn init(io: std.Io) @This() {

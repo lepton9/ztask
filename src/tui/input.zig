@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
+const Notify = @import("../types/queue.zig").Notify;
 
 /// Restore normal output behavior.
 fn setupInputTty(tty: *vaxis.Tty) !void {
@@ -72,14 +73,23 @@ pub fn InputLoop(T: type) type {
 /// Signal handler.
 pub const Sig = struct {
     pub var seen: std.atomic.Value(bool) = .init(false);
+    /// Optional callback invoked from the signal handler.
+    var notify: ?Notify = null;
 
     fn handler(_: std.posix.SIG) callconv(.c) void {
         seen.store(true, .seq_cst);
+        if (notify) |n| n.callback(n.ptr);
     }
 
     fn consoleHandler(_: std.os.windows.DWORD) callconv(.winapi) std.os.windows.BOOL {
         seen.store(true, .seq_cst);
+        if (notify) |n| n.callback(n.ptr);
         return std.os.windows.BOOL.TRUE;
+    }
+
+    /// Set a callback that is invoked from the signal handler.
+    pub fn setNotify(n: ?Notify) void {
+        notify = n;
     }
 
     pub fn init() void {
