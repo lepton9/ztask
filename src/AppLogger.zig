@@ -3,6 +3,9 @@ const date = @import("types/date.zig");
 
 pub const AppLogger = @This();
 
+const LOG_DIR_NAME = "logs";
+const LOG_FILE_NAME = "ztask.log";
+
 /// The global active logger.
 var active_logger: ?*AppLogger = null;
 
@@ -21,15 +24,16 @@ pub fn deactivate(self: *AppLogger) void {
 
 /// Initialize the logger and open the log file.
 pub fn init(io: std.Io, gpa: std.mem.Allocator, root_dir: []const u8) !AppLogger {
-    const log_dir = try std.fs.path.join(gpa, &.{ root_dir, "logs" });
+    const log_dir = try std.fs.path.join(gpa, &.{ root_dir, LOG_DIR_NAME });
     defer gpa.free(log_dir);
     try std.Io.Dir.cwd().createDirPath(io, log_dir);
 
-    const log_path = try std.fs.path.join(gpa, &.{ log_dir, "ztask.log" });
+    const log_path = try std.fs.path.join(gpa, &.{ log_dir, LOG_FILE_NAME });
     defer gpa.free(log_path);
 
     const file = try std.Io.Dir.cwd().createFile(io, log_path, .{
         .truncate = false,
+        .read = true,
     });
 
     return .{ .io = io, .log_file = file };
@@ -67,7 +71,8 @@ pub fn log(
     var writer_buffer: [1024]u8 = undefined;
     var writer = self.log_file.writer(self.io, &writer_buffer);
 
-    try writer.seekTo(try self.log_file.length(self.io));
+    const file_length = try self.log_file.length(self.io);
+    try writer.seekTo(file_length);
     try writer.interface.print("{s}.{d:0>3} {s:<5} ", .{
         try now.fmt(&date_buffer),
         now.time.ms,
