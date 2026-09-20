@@ -9,6 +9,7 @@ const task_types = @import("types/task.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 const testutil = @import("testing/utils.zig");
 
+const TestEnv = testutil.TestEnv;
 const TaskManager = manager.TaskManager;
 
 const expect = std.testing.expect;
@@ -26,8 +27,61 @@ fn findTask(tasks: []snap.UiTaskSnap, task_id: []const u8) ?*snap.UiTaskSnap {
     return null;
 }
 
-/// Shared test fixture over a temporary data directory.
-const TestEnv = testutil.TestEnv;
+test "task_to_yaml_parsed" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\name: "task: one"
+        \\id: "task-id"
+        \\cwd: "."
+        \\on:
+        \\  interval: "01:02:03.004"
+        \\
+        \\jobs:
+        \\  job-one:
+        \\    steps:
+        \\      - command: "echo hello"
+        \\    run_on:
+        \\      type: remote
+        \\      name: "runner:one"
+        \\    deps: ["job:zero"]
+        \\
+    ;
+
+    const original = try parse.parseTaskBuffer(io, gpa, source);
+    defer original.deinit(gpa);
+    const text = try original.toYaml(gpa);
+    defer gpa.free(text);
+    const round_trip = try parse.parseTaskBuffer(io, gpa, text);
+    defer round_trip.deinit(gpa);
+
+    try expect(std.mem.eql(u8, original.name, round_trip.name));
+    try expect(std.mem.eql(u8, original.id.fmt(), round_trip.id.fmt()));
+    try expect(std.mem.eql(u8, original.cwd.?, round_trip.cwd.?));
+    try expect(original.jobs.count() == round_trip.jobs.count());
+    switch (original.trigger.?) {
+        .interval => |time| switch (round_trip.trigger.?) {
+            .interval => |round_time| {
+                try expect(time.h == round_time.h);
+                try expect(time.min == round_time.min);
+                try expect(time.sec == round_time.sec);
+                try expect(time.ms == round_time.ms);
+            },
+            else => return error.TestExpectedEqual,
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const original_job = original.jobs.get("job-one").?;
+    const round_trip_job = round_trip.jobs.get("job-one").?;
+    try expect(round_trip_job.steps.len == original_job.steps.len);
+    try expect(std.mem.eql(u8, original_job.steps[0].value, round_trip_job.steps[0].value));
+    try expect(round_trip_job.deps.?.len == 1);
+    try expect(std.mem.eql(u8, round_trip_job.deps.?[0], "job:zero"));
+    try expect(round_trip_job.run_on == .remote);
+    try expect(std.mem.eql(u8, round_trip_job.run_on.remote.name, "runner:one"));
+    try expect(round_trip_job.run_on.remote.addr == null);
+}
 
 test "manager_simple" {
     const io = std.testing.io;

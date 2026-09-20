@@ -1,6 +1,8 @@
 const std = @import("std");
 const date = @import("date.zig");
 
+const yaml_indent_spaces = 2;
+
 pub const Task = struct {
     id: Id = .{},
     name: []const u8,
@@ -63,105 +65,119 @@ pub const Task = struct {
     }
 
     /// Convert a task to YAML.
-    pub fn toText(task: *const Task, gpa: std.mem.Allocator) ![]const u8 {
-        var buf: [256]u8 = undefined;
+    pub fn toYaml(task: *const Task, gpa: std.mem.Allocator) ![]const u8 {
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        const writer = &output.writer;
         var scratch: [256]u8 = undefined;
-        var file = try std.ArrayList(u8).initCapacity(gpa, 256);
-        const header = try std.fmt.bufPrint(&buf, "name: \"{s}\"\n", .{task.name});
-        try file.appendSlice(gpa, header);
-        // TODO: make a better indent handling
 
-        if (task.id.str) |id_str| {
-            const task_id = try std.fmt.bufPrint(&buf, "id: {s}\n", .{id_str});
-            try file.appendSlice(gpa, task_id);
-        }
+        try appendYamlField(writer, 0, "name", task.name);
+        if (task.id.str) |id_str| try appendYamlField(writer, 0, "id", id_str);
+        if (task.cwd) |cwd| try appendYamlField(writer, 0, "cwd", cwd);
 
         if (task.trigger) |tr| switch (tr) {
             .watch => |w| if (!w.recursive) {
-                try file.appendSlice(gpa, try std.fmt.bufPrint(
-                    &buf,
-                    "on:\n  watch: \"{s}\"\n",
-                    .{w.path},
-                ));
+                try writer.writeAll("on:\n");
+                try appendYamlField(writer, 1, "watch", w.path);
             } else {
-                try file.appendSlice(gpa, try std.fmt.bufPrint(
-                    &buf,
-                    "on:\n  watch:\n    path: \"{s}\"\n    recursive: true\n",
-                    .{w.path},
-                ));
+                try writer.writeAll("on:\n");
+                try appendYamlKey(writer, 1, "watch");
+                try appendYamlField(writer, 2, "path", w.path);
+                try writer.writeAll("    recursive: true\n");
             },
-            .interval => |i| try file.appendSlice(gpa, try std.fmt.bufPrint(
-                &buf,
-                "on:\n  interval: \"{s}\"\n",
-                .{try i.fmt(&scratch)},
-            )),
-            .time => |time| try file.appendSlice(gpa, try std.fmt.bufPrint(
-                &buf,
-                "on:\n  time: \"{s}\"\n",
-                .{try time.fmt(&scratch)},
-            )),
+            .interval => |i| {
+                try writer.writeAll("on:\n");
+                try appendYamlField(writer, 1, "interval", try i.fmt(&scratch));
+            },
+            .time => |time| {
+                try writer.writeAll("on:\n");
+                try appendYamlField(writer, 1, "time", try time.fmt(&scratch));
+            },
         };
 
-        // Convert jobs
         if (task.jobs.count() > 0) {
-            try file.appendSlice(gpa, "\njobs:\n");
+            try writer.writeAll("\njobs:\n");
             var it = task.jobs.iterator();
             while (it.next()) |e| {
                 const job = e.value_ptr.*;
-                try file.appendSlice(
-                    gpa,
-                    try std.fmt.bufPrint(&scratch, "  {s}:\n", .{job.name}),
-                );
+                try writer.writeAll("  ");
+                try writer.writeAll(job.name);
+                try writer.writeAll(":\n");
 
-                // Convert steps
                 if (job.steps.len == 0) {
-                    try file.appendSlice(gpa, "    steps: []\n");
+                    try writer.writeAll("    steps: []\n");
                 } else {
-                    try file.appendSlice(gpa, "    steps:\n");
-                    for (0..job.steps.len) |i| {
-                        const step = job.steps[i];
-                        try file.appendSlice(
-                            gpa,
-                            try std.fmt.bufPrint(&scratch, "      - {s}: \"{s}\"\n", .{
-                                @tagName(step.kind),
-                                step.value,
-                            }),
-                        );
+                    try writer.writeAll("    steps:\n");
+                    for (job.steps) |step| {
+                        try writer.print("      - {s}: ", .{@tagName(step.kind)});
+                        try appendYamlQuotedLine(writer, step.value);
                     }
                 }
+
                 switch (job.run_on) {
-                    .local => try file.appendSlice(gpa, "    run_on: local\n"),
+                    .local => try writer.writeAll("    run_on: local\n"),
                     .remote => |r| {
-                        try file.appendSlice(gpa, try std.fmt.bufPrint(&scratch,
-                            \\    run_on:
-                            \\      type: remote
-                            \\      name: {s}
-                            \\
-                        , .{r.name}));
-                        const addr = r.addr orelse continue;
-                        try file.appendSlice(
-                            gpa,
-                            try std.fmt.bufPrint(&scratch, "      addr: {s}\n", .{addr}),
-                        );
+                        try writer.writeAll("    run_on:\n      type: remote\n");
+                        try appendYamlField(writer, 3, "name", r.name);
+                        if (r.addr) |addr| try appendYamlField(writer, 3, "addr", addr);
                     },
                 }
 
                 if (job.deps) |deps| {
-                    try file.appendSlice(gpa, "    deps: [");
-                    for (deps, 0..) |dep, i| try file.appendSlice(
-                        gpa,
-                        try std.fmt.bufPrint(
-                            &scratch,
-                            "{s}{s}",
-                            .{ dep, if (i == deps.len - 1) "" else ", " },
-                        ),
-                    );
-                    try file.appendSlice(gpa, "]\n");
+                    try writer.writeAll("    deps: [");
+                    for (deps, 0..) |dep, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try appendYamlQuotedString(writer, dep);
+                    }
+                    try writer.writeAll("]\n");
                 }
             }
         }
 
-        return try file.toOwnedSlice(gpa);
+        return try output.toOwnedSlice();
+    }
+
+    fn appendYamlField(
+        writer: *std.Io.Writer,
+        indent_level: usize,
+        key: []const u8,
+        value: []const u8,
+    ) !void {
+        try writer.splatByteAll(' ', yaml_indent_spaces * indent_level);
+        try writer.writeAll(key);
+        try writer.writeAll(": ");
+        try appendYamlQuotedLine(writer, value);
+    }
+
+    fn appendYamlKey(
+        writer: *std.Io.Writer,
+        indent_level: usize,
+        key: []const u8,
+    ) !void {
+        try writer.splatByteAll(' ', yaml_indent_spaces * indent_level);
+        try writer.writeAll(key);
+        try writer.writeAll(":\n");
+    }
+
+    fn appendYamlQuotedLine(writer: *std.Io.Writer, value: []const u8) !void {
+        try appendYamlQuotedString(writer, value);
+        try writer.writeByte('\n');
+    }
+
+    fn appendYamlQuotedString(writer: *std.Io.Writer, value: []const u8) !void {
+        try writer.writeByte('"');
+        for (value) |char| switch (char) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0...8, 11...12, 14...31, 127 => {
+                try writer.print("\\x{x:0>2}", .{char});
+            },
+            else => try writer.writeByte(char),
+        };
+        try writer.writeByte('"');
     }
 };
 
@@ -303,7 +319,7 @@ pub const Id = struct {
     }
 };
 
-test "task_to_text" {
+test "task_to_yaml" {
     const gpa = std.testing.allocator;
     var t = try Task.init(gpa, "test");
     defer t.deinit(gpa);
@@ -356,7 +372,7 @@ test "task_to_text" {
 
     const expected_str =
         \\name: "test"
-        \\id: custom-id
+        \\id: "custom-id"
         \\on:
         \\  watch: "src/main.zig"
         \\
@@ -369,19 +385,66 @@ test "task_to_text" {
         \\      - command: "ls"
         \\      - command: "echo"
         \\    run_on: local
-        \\    deps: [job1]
+        \\    deps: ["job1"]
         \\  job3:
         \\    steps:
         \\      - command: "zig build"
         \\    run_on:
         \\      type: remote
-        \\      name: runner1
-        \\      addr: 127.0.0.1
-        \\    deps: [job1, job2]
+        \\      name: "runner1"
+        \\      addr: "127.0.0.1"
+        \\    deps: ["job1", "job2"]
         \\
     ;
 
-    const task_str = try t.toText(gpa);
+    const task_str = try t.toYaml(gpa);
     defer gpa.free(task_str);
-    try std.testing.expect(std.mem.eql(u8, task_str, expected_str));
+    try std.testing.expectEqualStrings(expected_str, task_str);
+}
+
+test "task_to_yaml_escaped" {
+    const gpa = std.testing.allocator;
+    var t = try Task.init(gpa, "task: \"quoted\"\\name");
+    defer t.deinit(gpa);
+    t.id = try .fromCustom(gpa, "id-value");
+    t.cwd = try gpa.dupe(u8, ".");
+    t.trigger = .{ .interval = .{ .h = 0, .min = 0, .sec = 1, .ms = 234 } };
+
+    var deps = try gpa.alloc([]const u8, 1);
+    deps[0] = try gpa.dupe(u8, "job:one");
+    var steps = try gpa.alloc(Step, 1);
+    steps[0] = .{
+        .kind = .command,
+        .value = try gpa.dupe(u8, "printf \\\"hello\\\"\\nnext"),
+    };
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job-one"),
+        .steps = steps,
+        .deps = deps,
+        .run_on = .{ .remote = .{
+            .name = try gpa.dupe(u8, "runner:one"),
+        } },
+    });
+
+    const expected =
+        \\name: "task: \"quoted\"\\name"
+        \\id: "id-value"
+        \\cwd: "."
+        \\on:
+        \\  interval: "00:00:01.234"
+        \\
+        \\jobs:
+        \\  job-one:
+        \\    steps:
+        \\      - command: "printf \\\"hello\\\"\\nnext"
+        \\    run_on:
+        \\      type: remote
+        \\      name: "runner:one"
+        \\    deps: ["job:one"]
+        \\
+    ;
+
+    const text = try t.toYaml(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(expected, text);
 }

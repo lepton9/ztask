@@ -1006,7 +1006,7 @@ pub const DataStore = struct {
             try new_task.addJob(gpa, job);
         };
 
-        const file = try new_task.toText(gpa);
+        const file = try new_task.toYaml(gpa);
         defer gpa.free(file);
         try writeFile(self.io, new_task.file_path.?, file, .{
             .make_path = true,

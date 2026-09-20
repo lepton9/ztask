@@ -33,10 +33,15 @@ pub const Time = struct {
     ms: u30 = 0,
 
     pub fn fmt(t: Time, buf: []u8) ![]u8 {
-        return try std.fmt.bufPrint(
+        if (t.ms == 0) return try std.fmt.bufPrint(
             buf,
             "{d:0>2}:{d:0>2}:{d:0>2}",
             .{ t.h, t.min, t.sec },
+        );
+        return try std.fmt.bufPrint(
+            buf,
+            "{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}",
+            .{ t.h, t.min, t.sec, t.ms },
         );
     }
 };
