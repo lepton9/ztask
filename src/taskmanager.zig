@@ -232,7 +232,8 @@ pub const TaskManager = struct {
     }
 
     pub fn deinit(self: *TaskManager) void {
-        self.stop() catch {};
+        self.stop() catch |err|
+            log.debug("Task manager stop during deinit: {s}", .{@errorName(err)});
         self.drainControlEvents();
         self.event_hub.deinit();
         self.gpa.destroy(self.event_hub);

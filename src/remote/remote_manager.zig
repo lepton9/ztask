@@ -53,9 +53,13 @@ const DeadlineTimer = struct {
         self.select.concurrent(.elapsed, sleepUntil, .{SleepContext{
             .io = self.io,
             .deadline_ms = deadline,
-        }}) catch return;
+        }}) catch |err| {
+            log.warn("Failed to arm dispatch deadline timer: {s}", .{@errorName(err)});
+            return;
+        };
         self.deadline_ms = deadline;
-        self.thread = std.Thread.spawn(.{}, wait, .{self}) catch {
+        self.thread = std.Thread.spawn(.{}, wait, .{self}) catch |err| {
+            log.warn("Failed to spawn dispatch deadline thread: {s}", .{@errorName(err)});
             self.select.cancelDiscard();
             self.deadline_ms = null;
             return;
@@ -121,22 +125,36 @@ const AgentReader = struct {
             self.io,
             self.gpa,
             self.stream,
-        ) catch return;
+        ) catch |err| {
+            log.warn("Failed to initialize remote agent reader: {s}", .{@errorName(err)});
+            return;
+        };
         defer reader.deinit();
         while (true) {
-            const frame = reader.readNextFrame() catch break;
-            const owned = self.gpa.dupe(u8, frame) catch break;
+            const frame = reader.readNextFrame() catch |err| {
+                if (err != error.EndOfStream)
+                    log.debug("Remote agent reader stopped: {s}", .{@errorName(err)});
+                break;
+            };
+            const owned = self.gpa.dupe(u8, frame) catch |err| {
+                log.err("Failed to buffer remote agent frame: {s}", .{@errorName(err)});
+                break;
+            };
             self.incoming_frames.append(self.gpa, .{ .frame = .{
                 .socket_handle = self.stream.socket.handle,
                 .data = owned,
-            } }) catch {
+            } }) catch |err| {
+                log.err("Failed to queue remote agent frame: {s}", .{@errorName(err)});
                 self.gpa.free(owned);
                 break;
             };
         }
         self.incoming_frames.append(self.gpa, .{
             .closed = self.stream.socket.handle,
-        }) catch {};
+        }) catch |err| log.warn(
+            "Failed to queue remote agent disconnect notice: {s}",
+            .{@errorName(err)},
+        );
     }
 };
 
@@ -154,7 +172,6 @@ pub const DispatchRequest = struct {
 pub const RemoteCommand = union(enum) {
     dispatch: DispatchRequest,
     cancel: struct { job_id: usize },
-    shutdown,
 };
 
 pub const EventSink = struct {
@@ -217,7 +234,8 @@ pub const RemoteManager = struct {
     work_pending: std.atomic.Value(bool) = .init(false),
     running: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
-    accept_thread: ?std.Thread = null,
+    /// Cancelable worker thread accepting incoming agent connections.
+    accept_future: ?std.Io.Future(void) = null,
     dispatch_timer: DeadlineTimer,
 
     /// Connected remote agents.
@@ -274,15 +292,36 @@ pub const RemoteManager = struct {
         self.server = try addr.listen(self.io, .{ .reuse_address = true });
         self.running.store(true, .seq_cst);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
-        self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
+        self.accept_future = try self.io.concurrent(acceptLoop, .{self});
     }
 
     /// Stop the server
     pub fn stop(self: *RemoteManager) void {
-        if (self.thread == null) return;
-        self.commands.append(self.gpa, .shutdown) catch {};
-        self.thread.?.join();
-        self.thread = null;
+        self.running.store(false, .seq_cst);
+        if (self.thread) |thread| {
+            self.mutex.lockUncancelable(self.io);
+            self.work_pending.store(true, .seq_cst);
+            self.cond.signal(self.io);
+            self.mutex.unlock(self.io);
+            thread.join();
+            self.thread = null;
+        }
+        self.teardown();
+    }
+
+    /// Release the accept worker, listener and agent connections.
+    fn teardown(self: *RemoteManager) void {
+        self.dispatch_timer.cancel();
+        if (self.accept_future) |*future| {
+            future.cancel(self.io);
+            self.accept_future = null;
+        }
+        if (self.server) |*server| {
+            server.deinit(self.io);
+            self.server = null;
+        }
+        var it = self.agents.valueIterator();
+        while (it.next()) |agent| agent.connection.shutdown();
     }
 
     pub fn setEventSink(self: *RemoteManager, sink: ?EventSink) void {
@@ -307,9 +346,12 @@ pub const RemoteManager = struct {
 
     fn run(self: *RemoteManager) void {
         while (self.running.load(.seq_cst)) {
-            self.drainCommands() catch {};
-            self.drainAgentInbox() catch {};
-            self.dispatchJobs() catch {};
+            self.drainCommands() catch |err|
+                log.err("Failed to process remote commands: {s}", .{@errorName(err)});
+            self.drainAgentInbox() catch |err|
+                log.err("Failed to process remote agent messages: {s}", .{@errorName(err)});
+            self.dispatchJobs() catch |err|
+                log.err("Failed to dispatch remote jobs: {s}", .{@errorName(err)});
 
             self.mutex.lockUncancelable(self.io);
             while (self.running.load(.seq_cst) and !self.work_pending.swap(false, .seq_cst)) {
@@ -317,29 +359,30 @@ pub const RemoteManager = struct {
             }
             self.mutex.unlock(self.io);
         }
-
-        if (self.server) |*server| {
-            const listener: std.Io.net.Stream = .{ .socket = server.socket };
-            listener.shutdown(self.io, .both) catch {};
-        }
-        if (self.accept_thread) |thread| thread.join();
-        self.accept_thread = null;
-        if (self.server) |*server| server.deinit(self.io);
-        self.server = null;
-
-        var it = self.agents.valueIterator();
-        while (it.next()) |agent| agent.connection.shutdown();
     }
 
-    /// Main loop for the accept thread.
+    /// Main loop for the accept worker.
     fn acceptLoop(self: *RemoteManager) void {
         var server = self.server orelse return;
         while (self.running.load(.seq_cst)) {
-            const stream = server.accept(self.io) catch break;
+            const stream = server.accept(self.io) catch |err| switch (err) {
+                error.Canceled => break,
+                else => {
+                    log.warn(
+                        "Remote manager failed to accept connection: {s}",
+                        .{@errorName(err)},
+                    );
+                    break;
+                },
+            };
             self.incoming_frames.append(self.gpa, .{ .accepted = .{
                 .stream = stream,
                 .address = stream.socket.address,
-            } }) catch {
+            } }) catch |err| {
+                log.err(
+                    "Failed to queue accepted remote connection: {s}",
+                    .{@errorName(err)},
+                );
                 stream.close(self.io);
                 break;
             };
@@ -365,10 +408,6 @@ pub const RemoteManager = struct {
                 try self.dispatch_queue.append(self.gpa, request);
             },
             .cancel => |request| try self.cancelJobNow(request.job_id),
-            .shutdown => {
-                self.dispatch_timer.cancel();
-                self.running.store(false, .seq_cst);
-            },
         };
     }
 
@@ -380,7 +419,11 @@ pub const RemoteManager = struct {
             .frame => |frame| {
                 defer self.gpa.free(frame.data);
                 const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
-                const parsed = self.parser.parse(frame.data) catch {
+                const parsed = self.parser.parse(frame.data) catch |err| {
+                    log.warn(
+                        "Discarding remote agent with malformed message: {s}",
+                        .{@errorName(err)},
+                    );
                     self.removeAgentByFd(frame.socket_handle);
                     continue;
                 };
@@ -411,7 +454,10 @@ pub const RemoteManager = struct {
                     });
                     defer self.gpa.free(payload);
 
-                    agent.connection.sendFrame(payload) catch {};
+                    agent.connection.sendFrame(payload) catch |err| log.debug(
+                        "Failed to notify agent of name conflict: {s}",
+                        .{@errorName(err)},
+                    );
                     agent.connection.close();
                     return error.ConnectionError;
                 }

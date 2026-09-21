@@ -2,6 +2,8 @@ const std = @import("std");
 
 const Connection = @This();
 
+const log = std.log.scoped(.connection);
+
 pub const ConnInfo = struct {
     stream: std.Io.net.Stream,
     address: std.Io.net.IpAddress,
@@ -50,7 +52,10 @@ pub fn close(self: *Connection) void {
 /// Interrupt a blocking reader without closing the socket handle.
 pub fn shutdown(self: *Connection) void {
     if (self.closed) return;
-    self.conn.stream.shutdown(self.io, .both) catch {};
+    self.conn.stream.shutdown(self.io, .both) catch |err| log.warn(
+        "Failed to interrupt connection reader: {s}",
+        .{@errorName(err)},
+    );
 }
 
 /// Get the address of the connection
