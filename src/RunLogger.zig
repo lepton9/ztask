@@ -119,7 +119,6 @@ pub fn initJobMeta(
     meta.status = .pending;
     meta.start_time_ms = null;
     meta.end_time_ms = null;
-    meta.exit_code = null;
 
     try self.logJobMetadata(gpa, meta);
 }

@@ -3,6 +3,7 @@ const task = @import("types/task.zig");
 const date = @import("types/date.zig");
 const yaml = @import("yaml");
 const expectEqual = std.testing.expectEqual;
+const expectError = std.testing.expectError;
 
 const Task = task.Task;
 
@@ -35,6 +36,7 @@ pub const ParseError = error{
     InvalidRunnerAddr,
     InvalidRunnerType,
     InvalidRunnerName,
+    InvalidExitCode,
 };
 
 const VALID_TASK_FIELDS = makeVoidSet(
@@ -51,6 +53,9 @@ const VALID_JOB_FIELDS = makeVoidSet(
 );
 const VALID_RUN_LOC_FIELDS = makeVoidSet(
     &[_][]const u8{ "type", "name", "addr" },
+);
+const VALID_STEP_FIELDS = makeVoidSet(
+    &[_][]const u8{ "value", "exit_code" },
 );
 
 /// Optional diagnostics for parsing.
@@ -542,11 +547,6 @@ fn parseJob(
     name: []const u8,
     map: yaml.Yaml.Map,
 ) !task.Job {
-    const step_values: []yaml.Yaml.Value = blk: {
-        const steps_value = map.get("steps") orelse break :blk &.{};
-        break :blk try requireList(cx.at("steps"), steps_value);
-    };
-
     // Parse run location
     const run_on: task.RunLocation = blk: {
         const on_val = map.get("run_on") orelse break :blk .local;
@@ -571,13 +571,19 @@ fn parseJob(
     };
 
     // Parse job steps
+    const cx_steps = cx.at("steps");
+    const step_values: []yaml.Yaml.Value = blk: {
+        const steps_value = map.get("steps") orelse break :blk &.{};
+        break :blk try requireList(cx_steps, steps_value);
+    };
+
     var steps = try std.ArrayList(task.Step).initCapacity(cx.gpa, 5);
     errdefer {
         for (steps.items) |step| step.deinit(cx.gpa);
         steps.deinit(cx.gpa);
     }
-    for (step_values) |step| {
-        const s = step.asMap() orelse return cx.at("steps").fail(
+    for (step_values) |v| {
+        const s = v.asMap() orelse return cx_steps.fail(
             ParseError.InvalidStep,
             null,
             "Step must be a map",
@@ -587,25 +593,73 @@ fn parseJob(
             const step_kind_str = step_e.key_ptr.*;
 
             const kind = std.meta.stringToEnum(
-                task.StepKind,
+                std.meta.Tag(task.Step),
                 step_kind_str,
-            ) orelse return cx.at("steps").failf(
+            ) orelse return cx_steps.failf(
                 ParseError.InvalidStepKind,
                 null,
                 "Unknown step kind '{s}'",
                 .{step_kind_str},
             );
 
-            const step_value = try requireScalarMsg(
-                cx.at("steps"),
-                step_e.value_ptr.*,
-                "Step value must be a string",
-            );
+            const value = step_e.value_ptr.*;
 
-            try steps.append(cx.gpa, .{
-                .kind = kind,
-                .value = try cx.gpa.dupe(u8, step_value),
-            });
+            const step: task.Step = blk: switch (kind) {
+                .command => {
+                    if (value.asScalar()) |scalar| {
+                        break :blk .{ .command = .{
+                            .value = try cx_steps.gpa.dupe(u8, scalar),
+                        } };
+                    }
+                    if (value.asMap()) |step_map| {
+                        try rejectUnknown(
+                            cx_steps,
+                            step_map,
+                            VALID_STEP_FIELDS,
+                            ParseError.InvalidFieldName,
+                        );
+
+                        const value_field = try requireField(cx_steps, step_map, "value");
+                        const step_value = try requireScalar(cx_steps, value_field);
+                        var command: task.Step.CommandStep = .{
+                            .value = try cx_steps.gpa.dupe(u8, step_value),
+                        };
+
+                        if (step_map.get("exit_code")) |exit_code| {
+                            const exit_value = try requireScalar(cx_steps, exit_code);
+                            const code = std.fmt.parseInt(i32, exit_value, 10) catch {
+                                cx_steps.gpa.free(command.value);
+                                return cx_steps.failf(
+                                    ParseError.InvalidExitCode,
+                                    null,
+                                    "Step exit_code must be an integer: '{s}'",
+                                    .{exit_value},
+                                );
+                            };
+                            if (code < 0 or code > 255) {
+                                cx_steps.gpa.free(command.value);
+                                return cx_steps.failf(
+                                    ParseError.InvalidExitCode,
+                                    null,
+                                    "Step exit_code must be between 0 and 255: '{s}'",
+                                    .{exit_value},
+                                );
+                            }
+                            command.exit_code = code;
+                        }
+
+                        break :blk .{ .command = command };
+                    }
+
+                    return cx_steps.fail(
+                        ParseError.InvalidFieldType,
+                        null,
+                        "Step value must be a string or a map",
+                    );
+                },
+            };
+
+            try steps.append(cx.gpa, step);
         }
     }
 
@@ -893,12 +947,89 @@ test "parse_task" {
     try std.testing.expect(t.jobs.count() == 3);
     const build_job = t.jobs.get("build").?;
     try std.testing.expect(build_job.steps.len == 2);
-    try std.testing.expect(build_job.steps[0].kind == task.StepKind.command);
+    try std.testing.expect(std.meta.activeTag(build_job.steps[0]) == .command);
     try std.testing.expect(build_job.run_on == .local);
     const test_job = t.jobs.get("test").?;
     try std.testing.expect(test_job.run_on == .remote);
     try std.testing.expect(std.mem.eql(u8, test_job.run_on.remote.name, "runner1"));
     try std.testing.expect(t.jobs.get("depend").?.deps.?.len == 2);
+}
+
+test "parse_step" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: step
+        \\ jobs:
+        \\   string:
+        \\     steps:
+        \\       - command: "ls"
+        \\       - command: "cmd"
+        \\   map:
+        \\     steps:
+        \\       - command:
+        \\           value: "ls"
+        \\           exit_code: 0
+        \\       - command:
+        \\           value: "cmd"
+        \\           exit_code: 1
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+
+    const job1 = t.jobs.get("string") orelse return error.NoJob;
+    const job2 = t.jobs.get("map") orelse return error.NoJob;
+
+    try std.testing.expect(
+        std.mem.eql(u8, job1.steps[0].command.value, job2.steps[0].command.value),
+    );
+    try std.testing.expect(
+        std.mem.eql(u8, job1.steps[1].command.value, job2.steps[1].command.value),
+    );
+
+    try std.testing.expect(std.meta.activeTag(job1.steps[0]) == .command);
+    try std.testing.expect(std.meta.activeTag(job1.steps[1]) == .command);
+
+    try std.testing.expect(job1.steps[0].command.exit_code == 0);
+    try std.testing.expect(job1.steps[1].command.exit_code == 0);
+
+    try std.testing.expect(job2.steps[0].command.exit_code == 0);
+    try std.testing.expect(job2.steps[1].command.exit_code == 1);
+}
+
+test "parse_step_invalid_exit_code" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const negative =
+        \\ name: step
+        \\ jobs:
+        \\   job:
+        \\     steps:
+        \\       - command:
+        \\           value: "cmd"
+        \\           exit_code: -1
+    ;
+    const non_integer =
+        \\ name: step
+        \\ jobs:
+        \\   job:
+        \\     steps:
+        \\       - command:
+        \\           value: "cmd"
+        \\           exit_code: "two"
+    ;
+    const out_of_range =
+        \\ name: step
+        \\ jobs:
+        \\   job:
+        \\     steps:
+        \\       - command:
+        \\           value: "cmd"
+        \\           exit_code: 256
+    ;
+    try expectError(error.InvalidExitCode, parseTaskBuffer(io, gpa, negative));
+    try expectError(error.InvalidExitCode, parseTaskBuffer(io, gpa, non_integer));
+    try expectError(error.InvalidExitCode, parseTaskBuffer(io, gpa, out_of_range));
 }
 
 test "parse_watch_recursive" {

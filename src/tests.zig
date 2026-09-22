@@ -41,6 +41,9 @@ test "task_to_yaml_parsed" {
         \\  job-one:
         \\    steps:
         \\      - command: "echo hello"
+        \\      - command:
+        \\          value: "grep -q match file.txt"
+        \\          exit_code: 1
         \\    run_on:
         \\      type: remote
         \\      name: "runner:one"
@@ -75,7 +78,15 @@ test "task_to_yaml_parsed" {
     const original_job = original.jobs.get("job-one").?;
     const round_trip_job = round_trip.jobs.get("job-one").?;
     try expect(round_trip_job.steps.len == original_job.steps.len);
-    try expect(std.mem.eql(u8, original_job.steps[0].value, round_trip_job.steps[0].value));
+    try expect(round_trip_job.steps.len == 2);
+    for (original_job.steps, round_trip_job.steps) |orig, round| {
+        try expect(std.meta.activeTag(orig) == std.meta.activeTag(round));
+        try expect(std.mem.eql(u8, orig.command.value, round.command.value));
+        try expect(orig.command.exit_code == round.command.exit_code);
+    }
+    try expect(original_job.steps[0].command.exit_code == 0);
+    try expect(original_job.steps[1].command.exit_code == 1);
+    try expect(round_trip_job.steps[1].command.exit_code == 1);
     try expect(round_trip_job.deps.?.len == 1);
     try expect(std.mem.eql(u8, round_trip_job.deps.?[0], "job:zero"));
     try expect(round_trip_job.run_on == .remote);
@@ -121,6 +132,37 @@ test "manager_simple" {
     try std.testing.expect(
         task_manager.schedulers.getEntry(task2).?.value_ptr.*.status == .completed,
     );
+}
+
+test "expected_step_exit_code_succeeds" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: expected-exit
+        \\ jobs:
+        \\   check:
+        \\     steps:
+        \\       - command:
+        \\           value: "false"
+        \\           exit_code: 1
+        \\       - command: "true"
+    ;
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 1, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
+    try task_manager.waitUntilIdle();
+
+    try std.testing.expect(task_manager.schedulers.count() == 0);
+    try std.testing.expect(task_manager.loaded_tasks.count() == 0);
 }
 
 test "begin_task_while_running" {

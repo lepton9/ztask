@@ -85,7 +85,6 @@ pub const JobRunMetadata = struct {
     job_name: []const u8,
     start_time_ms: ?i64 = null,
     end_time_ms: ?i64 = null,
-    exit_code: ?i32 = null,
     status: JobRunStatus = .pending,
 
     pub fn init(gpa: std.mem.Allocator, meta: JobRunMetadata) !JobRunMetadata {
@@ -1608,7 +1607,11 @@ fn parseMetaFile(
     var reader = file.reader(io, &.{});
     var buffer: [1024]u8 = undefined;
     const read = try reader.interface.readSliceShort(&buffer);
-    const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{}) catch
+    // Ignore unknown fields so metadata files written by older or newer
+    // versions still parse.
+    const json = std.json.parseFromSlice(T, gpa, buffer[0..read], .{
+        .ignore_unknown_fields = true,
+    }) catch
         return error.InvalidMetaDataFile;
     defer json.deinit();
     return try T.init(gpa, json.value);

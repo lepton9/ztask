@@ -51,7 +51,10 @@ pub const EventSink = struct {
         job_finished: struct {
             task_id: u64,
             job_name: []const u8,
-            exit_code: i32,
+            /// Whether all steps matched their expected exit codes.
+            success: bool,
+            /// Explains why the job failed, if available.
+            message: ?[]const u8 = null,
             duration_ms: ?i64,
         },
         job_error: struct {
@@ -199,13 +202,17 @@ pub const Scheduler = struct {
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
+
         self.result_queue.close(self.io);
+        while (true) {
+            var pending: [4]Result = undefined;
+            const n = self.result_queue.get(self.io, &pending, 0) catch break;
+            if (n == 0) break;
+            for (pending[0..n]) |*res| res.result.deinit(self.gpa);
+        }
         self.gpa.free(self.result_buffer);
-        while (self.log_queue.pop()) |event| switch (event) {
-            .job_started => |e| if (e.name) |name| self.gpa.free(name),
-            .job_output => |e| self.gpa.free(e.data),
-            .job_finished => |e| if (e.name) |name| self.gpa.free(name),
-        };
+
+        while (self.log_queue.pop()) |event| event.deinit(self.gpa);
         self.log_queue.deinit(self.gpa);
         self.run_logger.deinit(self.gpa);
         self.task_meta.deinit(self.gpa);
@@ -453,62 +460,65 @@ pub const Scheduler = struct {
             const n = self.result_queue.get(self.io, &results, 0) catch return;
             if (n == 0) return;
 
-            for (results[0..n]) |res| switch (res.result.runner) {
-                .local => {
-                    if (self.active_runners.fetchRemove(res.node)) |kv| {
-                        const runner = kv.value;
-                        runner.finishJob();
-                        self.pool.release(runner);
-                    }
-                    self.onJobCompleted(res.node, res.result);
-                },
-                .remote => {
-                    self.onJobCompleted(res.node, res.result);
-                },
-            };
+            for (results[0..n]) |*res| {
+                defer res.result.deinit(self.gpa);
+                switch (res.result.runner) {
+                    .local => {
+                        if (self.active_runners.fetchRemove(res.node)) |kv| {
+                            const runner = kv.value;
+                            runner.finishJob();
+                            self.pool.release(runner);
+                        }
+                        self.onJobCompleted(res.node, res.result);
+                    },
+                    .remote => {
+                        self.onJobCompleted(res.node, res.result);
+                    },
+                }
+            }
         }
     }
 
     /// Handle the job log events in the queue
     fn handleLogs(self: *Scheduler) void {
-        while (self.log_queue.pop()) |event| switch (event) {
-            .job_started => |e| {
-                defer if (e.name) |name| self.gpa.free(name);
-                var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
-                job_meta.start_time_ms = e.timestamp_ms;
-                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
+        while (self.log_queue.pop()) |event| {
+            defer event.deinit(self.gpa);
+            switch (event) {
+                .job_started => |e| {
+                    var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
+                    job_meta.start_time_ms = e.timestamp_ms;
+                    self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
-                self.emitEvent(.{ .job_started = .{
-                    .task_id = self.task.id.value,
-                    .job_name = job_meta.job_name,
-                } });
-            },
-            .job_output => |e| {
-                const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
-                defer self.gpa.free(e.data); // Allocated by runner or remote manager
-                self.run_logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
-            },
-            .job_finished => |e| {
-                defer if (e.name) |name| self.gpa.free(name);
-                var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
-                job_meta.end_time_ms = e.timestamp_ms;
-                job_meta.exit_code = e.exit_code;
-                job_meta.status = if (e.exit_code == 0) .success else .failed;
-                self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
+                    self.emitEvent(.{ .job_started = .{
+                        .task_id = self.task.id.value,
+                        .job_name = job_meta.job_name,
+                    } });
+                },
+                .job_output => |e| {
+                    const job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
+                    self.run_logger.appendJobLog(self.gpa, job_meta, e.data) catch {};
+                },
+                .job_finished => |e| {
+                    var job_meta = self.job_metas.getPtr(e.job_id) orelse unreachable;
+                    job_meta.end_time_ms = e.timestamp_ms;
+                    job_meta.status = if (e.success) .success else .failed;
+                    self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
-                self.emitEvent(.{ .job_finished = .{
-                    .task_id = self.task.id.value,
-                    .job_name = job_meta.job_name,
-                    .exit_code = e.exit_code,
-                    .duration_ms = if (job_meta.start_time_ms != null and e.timestamp_ms >= job_meta.start_time_ms.?) e.timestamp_ms - job_meta.start_time_ms.? else null,
-                } });
-            },
-        };
+                    self.emitEvent(.{ .job_finished = .{
+                        .task_id = self.task.id.value,
+                        .job_name = job_meta.job_name,
+                        .success = e.success,
+                        .message = e.message,
+                        .duration_ms = if (job_meta.start_time_ms != null and e.timestamp_ms >= job_meta.start_time_ms.?) e.timestamp_ms - job_meta.start_time_ms.? else null,
+                    } });
+                },
+            }
+        }
     }
 
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
-        var status: dag.Status = if (result.exit_code == 0) .success else .failed;
+        var status: dag.Status = if (result.success) .success else .failed;
         if (result.err) |err| {
             status = .failed;
             log.info("job '{s}' failed with error {}", .{ node.ptr.name, err });

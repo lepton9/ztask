@@ -3,6 +3,11 @@ const task = @import("../types/task.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+const expectEqual = std.testing.expectEqual;
+
+/// The protocol version.
+pub const VERSION: u16 = 2;
+
 pub const Msg = union(enum) {
     register: RegisterMsg,
     heartbeat: void,
@@ -95,6 +100,7 @@ fn initMsgPrefix(
 }
 
 pub const RegisterMsg = struct {
+    version: u16,
     hostname: []const u8,
 };
 
@@ -132,6 +138,7 @@ pub const RunJobMsg = struct {
 
 pub const ErrorCode = enum(u32) {
     NameTaken = 1,
+    VersionMismatch = 2,
 };
 
 pub const ErrorMsg = struct {
@@ -151,7 +158,10 @@ pub const JobStartMsg = struct {
 pub const JobEndMsg = struct {
     job_id: u64,
     timestamp: i64,
-    exit_code: i32,
+    /// Whether all steps matched their expected exit codes.
+    success: bool,
+    /// Explains why the job failed, if available.
+    message: ?[]const u8 = null,
 };
 
 pub const JobLogMsg = struct {
@@ -245,6 +255,14 @@ fn serializeField(
             std.mem.writeInt(u8, buf[0..1], @intFromBool(field), .little);
             try msg.appendSlice(gpa, buf[0..1]);
         },
+        .optional => |o| {
+            if (field) |val| {
+                try msg.append(gpa, 1);
+                try serializeField(gpa, o.child, val, msg);
+            } else {
+                try msg.append(gpa, 0);
+            }
+        },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
     }
@@ -301,6 +319,13 @@ fn deserializeField(
             const b = std.mem.readInt(u8, @ptrCast(buffer[pos.* .. pos.* + 1]), .little);
             pos.* += 1;
             return (b != 0);
+        },
+        .optional => |o| {
+            if (pos.* + 1 > buffer.len) return error.InvalidMsg;
+            const present = std.mem.readInt(u8, @ptrCast(buffer[pos.* .. pos.* + 1]), .little);
+            pos.* += 1;
+            if (present == 0) return null;
+            return try deserializeField(o.child, buffer, pos);
         },
         .void => return,
         else => @compileError("Unsupported field type" ++ @typeInfo(T)),
@@ -365,7 +390,7 @@ test "struct_mix_fields" {
 test "register" {
     const alloc = std.testing.allocator;
     var parser = MsgParser.init();
-    const msg: RegisterMsg = .{ .hostname = "test" };
+    const msg: RegisterMsg = .{ .version = VERSION, .hostname = "test" };
     const serialized = try parser.serialize(alloc, .{ .register = msg });
     defer alloc.free(serialized);
     const parsed_msg = try parser.parse(serialized);
@@ -405,7 +430,7 @@ test "job_end" {
     const msg: JobEndMsg = .{
         .job_id = 1337,
         .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
-        .exit_code = 0,
+        .success = true,
     };
     const serialized = try parser.serialize(alloc, .{ .job_finish = msg });
     defer alloc.free(serialized);
@@ -413,15 +438,29 @@ test "job_end" {
     const parsed: JobEndMsg = parsed_msg.job_finish;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
-    try std.testing.expect(msg.exit_code == parsed.exit_code);
+    try std.testing.expect(msg.success == parsed.success);
+
+    const null_msg: JobEndMsg = .{
+        .job_id = 7331,
+        .timestamp = 0,
+        .success = false,
+        .message = "Command exited with an unexpected exit code",
+    };
+    const null_serialized = try parser.serialize(alloc, .{ .job_finish = null_msg });
+    defer alloc.free(null_serialized);
+    const null_parsed_msg = try parser.parse(null_serialized);
+    const null_parsed: JobEndMsg = null_parsed_msg.job_finish;
+    try std.testing.expect(null_msg.job_id == null_parsed.job_id);
+    try std.testing.expect(!null_parsed.success);
+    try std.testing.expectEqualStrings(null_msg.message.?, null_parsed.message.?);
 }
 
 test "run_job" {
     const alloc = std.testing.allocator;
     var parser = MsgParser.init();
     var steps = [_]task.Step{
-        .{ .kind = .command, .value = "command" },
-        .{ .kind = .command, .value = "" },
+        .{ .command = .{ .value = "command" } },
+        .{ .command = .{ .value = "" } },
     };
     const msg: RunJobMsg = .{
         .job_id = 111,
@@ -442,8 +481,9 @@ test "run_job" {
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(std.mem.eql(u8, msg.steps, parsed.steps));
     for (0..steps.len) |i| {
-        try std.testing.expect(steps[i].kind == parsed_steps[i].kind);
-        try std.testing.expect(std.mem.eql(u8, steps[i].value, parsed_steps[i].value));
+        try std.testing.expect(std.meta.activeTag(steps[i]) == std.meta.activeTag(parsed_steps[i]));
+        try std.testing.expect(std.mem.eql(u8, steps[i].command.value, parsed_steps[i].command.value));
+        try std.testing.expect(steps[i].command.exit_code == parsed_steps[i].command.exit_code);
     }
 }
 

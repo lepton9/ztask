@@ -181,14 +181,25 @@ pub const EventSink = struct {
 
 pub const RemoteEvent = union(enum) {
     agent_changed,
-    job_started: struct { scheduler: *Scheduler, job_id: u64, name: []u8, timestamp_ms: i64 },
-    job_output: struct { scheduler: *Scheduler, job_id: u64, step: u32, data: []u8 },
+    job_started: struct {
+        scheduler: *Scheduler,
+        job_id: u64,
+        name: []u8,
+        timestamp_ms: i64,
+    },
+    job_output: struct {
+        scheduler: *Scheduler,
+        job_id: u64,
+        step: u32,
+        data: []u8,
+    },
     job_finished: struct {
         scheduler: *Scheduler,
         node: *JobNode,
         job_id: u64,
         name: []u8,
-        exit_code: i32,
+        /// Whether all steps matched their expected exit codes.
+        success: bool,
         timestamp_ms: i64,
         result: ExecResult,
     },
@@ -198,7 +209,11 @@ pub const RemoteEvent = union(enum) {
             .agent_changed => {},
             .job_started => |e| gpa.free(e.name),
             .job_output => |e| gpa.free(e.data),
-            .job_finished => |e| gpa.free(e.name),
+            .job_finished => |e| {
+                gpa.free(e.name);
+                var result = e.result;
+                result.deinit(gpa);
+            },
         }
     }
 };
@@ -435,6 +450,59 @@ pub const RemoteManager = struct {
         };
     }
 
+    /// Send an error message to an agent and disconnect it.
+    fn rejectAgent(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        code: protocol.ErrorCode,
+        message: []const u8,
+    ) error{ConnectionError} {
+        const err_msg: protocol.ErrorMsg = .{ .code = code, .message = message };
+        if (self.parser.serialize(self.gpa, .{ .error_msg = err_msg })) |payload| {
+            defer self.gpa.free(payload);
+            agent.connection.sendFrame(payload) catch |err| log.debug(
+                "Failed to notify agent of rejection: {s}",
+                .{@errorName(err)},
+            );
+        } else |err| log.debug(
+            "Failed to serialize agent rejection message: {s}",
+            .{@errorName(err)},
+        );
+        agent.connection.close();
+        return error.ConnectionError;
+    }
+
+    /// Allocate a `job_finished` remote event.
+    fn makeJobFinishedEvent(
+        self: *RemoteManager,
+        scheduler: *Scheduler,
+        node: *JobNode,
+        success: bool,
+        err: ?ResultError,
+        message: ?[]const u8,
+        timestamp_ms: i64,
+    ) !RemoteEvent {
+        const name = try self.gpa.dupe(u8, node.ptr.name);
+        errdefer self.gpa.free(name);
+        var msg: ?[]u8 = null;
+        if (message) |msg_src| msg = try self.gpa.dupe(u8, msg_src);
+        errdefer if (msg) |m| self.gpa.free(m);
+        return .{ .job_finished = .{
+            .scheduler = scheduler,
+            .node = node,
+            .job_id = node.id,
+            .name = name,
+            .success = success,
+            .timestamp_ms = timestamp_ms,
+            .result = .{
+                .success = success,
+                .err = err,
+                .runner = .remote,
+                .msg = msg,
+            },
+        } };
+    }
+
     /// Handle a parsed message sent to the manager
     fn handleMessage(
         self: *RemoteManager,
@@ -443,24 +511,10 @@ pub const RemoteManager = struct {
     ) !void {
         switch (msg) {
             .register => |m| {
-                if (self.isNameTaken(agent, m.hostname)) {
-                    // Send error to agent and disconnect
-                    const err_msg: protocol.ErrorMsg = .{
-                        .code = protocol.ErrorCode.NameTaken,
-                        .message = "Agent name already taken",
-                    };
-                    const payload = try self.parser.serialize(self.gpa, .{
-                        .error_msg = err_msg,
-                    });
-                    defer self.gpa.free(payload);
-
-                    agent.connection.sendFrame(payload) catch |err| log.debug(
-                        "Failed to notify agent of name conflict: {s}",
-                        .{@errorName(err)},
-                    );
-                    agent.connection.close();
-                    return error.ConnectionError;
-                }
+                if (m.version != protocol.VERSION)
+                    return self.rejectAgent(agent, .VersionMismatch, "Protocol version mismatch");
+                if (self.isNameTaken(agent, m.hostname))
+                    return self.rejectAgent(agent, .NameTaken, "Agent name already taken");
                 try agent.setName(self.gpa, m.hostname);
                 try self.emitEvent(.agent_changed);
             },
@@ -486,18 +540,15 @@ pub const RemoteManager = struct {
             .job_finish => |m| {
                 const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse return;
                 const req = kv.value;
-                try self.emitEvent(.{ .job_finished = .{
-                    .scheduler = req.scheduler,
-                    .node = req.job_node,
-                    .job_id = req.job_node.id,
-                    .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
-                    .exit_code = m.exit_code,
-                    .timestamp_ms = m.timestamp,
-                    .result = .{
-                        .exit_code = m.exit_code,
-                        .runner = .remote,
-                    },
-                } });
+                const event = try self.makeJobFinishedEvent(
+                    req.scheduler,
+                    req.job_node,
+                    m.success,
+                    null,
+                    m.message,
+                    m.timestamp,
+                );
+                try self.emitEvent(event);
             },
             else => {},
         }
@@ -548,20 +599,15 @@ pub const RemoteManager = struct {
             }
 
             // Failed to find matching agent
-            try self.emitEvent(.{ .job_finished = .{
-                .scheduler = req.scheduler,
-                .node = req.job_node,
-                .job_id = req.job_node.id,
-                .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
-                .exit_code = 1,
-                .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
-                .result = .{
-                    .err = ResultError.NoRunnerFound,
-                    .exit_code = 1,
-                    .runner = .remote,
-                    .msg = "No matching remote runner found",
-                },
-            } });
+            const event = try self.makeJobFinishedEvent(
+                req.scheduler,
+                req.job_node,
+                false,
+                error.NoRunnerFound,
+                "No matching remote runner found",
+                std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+            );
+            try self.emitEvent(event);
         }
         self.dispatch_timer.setDeadline(earliest_deadline_ms);
     }
@@ -591,19 +637,15 @@ pub const RemoteManager = struct {
         self.sendMessage(agent, msg) catch {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(req.job_node.id) orelse return;
-            try self.emitEvent(.{ .job_finished = .{
-                .scheduler = kv.value.scheduler,
-                .node = req.job_node,
-                .job_id = req.job_node.id,
-                .name = try self.gpa.dupe(u8, req.job_node.ptr.name),
-                .exit_code = 1,
-                .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
-                .result = .{
-                    .exit_code = 1,
-                    .err = ResultError.RunnerNotConnected,
-                    .runner = .remote,
-                },
-            } });
+            const event = try self.makeJobFinishedEvent(
+                kv.value.scheduler,
+                req.job_node,
+                false,
+                error.RunnerNotConnected,
+                "Failed to send job to remote runner",
+                std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+            );
+            try self.emitEvent(event);
         };
     }
 
@@ -694,18 +736,26 @@ pub const RemoteManager = struct {
     }
 
     fn failDisconnectedJob(self: *RemoteManager, req: DispatchRequest) void {
+        const name = self.gpa.dupe(u8, req.job_node.ptr.name) catch return;
+        const message = self.gpa.dupe(
+            u8,
+            "Remote runner disconnected while executing job",
+        ) catch {
+            self.gpa.free(name);
+            return;
+        };
         self.emitEvent(.{ .job_finished = .{
             .scheduler = req.scheduler,
             .node = req.job_node,
             .job_id = req.job_node.id,
-            .name = self.gpa.dupe(u8, req.job_node.ptr.name) catch return,
-            .exit_code = 1,
+            .name = name,
+            .success = false,
             .timestamp_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
             .result = .{
-                .exit_code = 1,
+                .success = false,
                 .err = ResultError.RunnerNotConnected,
                 .runner = .remote,
-                .msg = "Remote runner disconnected while executing job",
+                .msg = message,
             },
         } }) catch {};
         log.warn("Remote runner disconnected; failing job {x}", .{req.job_node.id});

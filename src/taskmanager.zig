@@ -353,8 +353,8 @@ pub const TaskManager = struct {
             ),
             .job_finished => |e| self.emitInfo(
                 e.task_id,
-                "job_finished: '{s}' exit={d} duration_ms={any}",
-                .{ e.job_name, e.exit_code, e.duration_ms },
+                "job_finished: '{s}' success={} message='{?s}' duration_ms={any}",
+                .{ e.job_name, e.success, e.message, e.duration_ms },
             ),
             .job_error => |e| self.emitInfo(
                 e.task_id,
@@ -706,18 +706,28 @@ pub const TaskManager = struct {
                                 .job_finished = .{
                                     .job_id = e.job_id,
                                     .name = e.name,
-                                    .exit_code = e.exit_code,
+                                    .success = e.success,
+                                    .message = if (e.result.msg) |message|
+                                        self.gpa.dupe(u8, message) catch null
+                                    else
+                                        null,
                                     .timestamp_ms = e.timestamp_ms,
                                 },
                             });
                             owned = false;
-                            try e.scheduler.result_queue.putOneUncancelable(
+                            e.scheduler.result_queue.putOneUncancelable(
                                 self.io,
                                 .{
                                     .node = e.node,
                                     .result = e.result,
                                 },
-                            );
+                            ) catch |err| {
+                                // Ownership of `result.msg` was not
+                                // transferred to the queue consumer.
+                                var result = e.result;
+                                result.deinit(self.gpa);
+                                return err;
+                            };
                         },
                     }
                 },
@@ -1142,7 +1152,6 @@ pub const TaskManager = struct {
                             job_meta.status,
                         .start_time_ms = job_meta.start_time_ms,
                         .end_time_ms = job_meta.end_time_ms,
-                        .exit_code = job_meta.exit_code,
                     };
                 }
                 break :jobs jobs;

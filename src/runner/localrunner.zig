@@ -14,12 +14,28 @@ pub const Result = struct {
 };
 
 pub const LogEvent = union(enum) {
-    /// Consumers must free the `name`.
     job_started: struct { job_id: u64, name: ?[]u8, timestamp_ms: i64 },
-    /// Consumers must free the `data`.
     job_output: struct { job_id: u64, step: u32, data: []u8 },
-    /// Consumers must free the `name`.
-    job_finished: struct { job_id: u64, name: ?[]u8, exit_code: i32, timestamp_ms: i64 },
+    job_finished: struct {
+        job_id: u64,
+        name: ?[]u8,
+        /// Whether all steps matched their expected outcomes.
+        success: bool,
+        /// Explains why the job failed, if available.
+        message: ?[]u8 = null,
+        timestamp_ms: i64,
+    },
+
+    pub fn deinit(self: LogEvent, gpa: std.mem.Allocator) void {
+        switch (self) {
+            .job_started => |e| if (e.name) |name| gpa.free(name),
+            .job_output => |e| gpa.free(e.data),
+            .job_finished => |e| {
+                if (e.name) |name| gpa.free(name);
+                if (e.message) |message| gpa.free(message);
+            },
+        }
+    }
 };
 
 pub const LogQueue = queue.MutexQueue(LogEvent);
@@ -30,10 +46,17 @@ pub const ResultError = error{
 };
 
 pub const ExecResult = struct {
-    exit_code: i32,
+    /// Whether the job ran without errors and all steps succeeded.
+    success: bool,
     runner: enum { local, remote } = .local,
     err: ?ResultError = null,
-    msg: ?[]const u8 = null,
+    /// Owned failure message. Call `deinit` once the result is consumed.
+    msg: ?[]u8 = null,
+
+    pub fn deinit(self: *ExecResult, gpa: std.mem.Allocator) void {
+        if (self.msg) |msg| gpa.free(msg);
+        self.msg = null;
+    }
 };
 
 /// Runner for one job
@@ -98,13 +121,14 @@ pub const LocalRunner = struct {
                 "Failed to spawn runner thread for job '{s}': {s}",
                 .{ job.ptr.name, @errorName(err) },
             );
+            const message = gpa.dupe(u8, "Failed to spawn thread") catch null;
             results.putOneUncancelable(self.io, .{
                 .node = job,
                 .result = .{
-                    .exit_code = 1,
-                    .msg = "Failed to spawn thread",
+                    .success = false,
+                    .msg = message,
                 },
-            }) catch {};
+            }) catch if (message) |msg| gpa.free(msg);
             if (notify) |work_notify| work_notify.callback(work_notify.ptr);
             return;
         };
@@ -134,54 +158,85 @@ pub const LocalRunner = struct {
             .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         } }) catch {};
 
-        var exit_code: i32 = 0;
-        var err_msg: ?[]const u8 = null;
+        var success = true;
+        var err_msg: ?[]u8 = null;
+        defer if (err_msg) |msg| gpa.free(msg);
 
         for (job.ptr.steps) |*step| {
             if (!self.running.load(.seq_cst)) {
-                exit_code = 1;
-                err_msg = "Interrupted";
+                success = false;
+                err_msg = gpa.dupe(u8, "Interrupted") catch null;
                 break;
             }
-            log.debug("{s}: step {s}", .{ job.ptr.name, step.value });
-            switch (step.kind) {
-                .command => exit_code =
-                    self.runCommandStep(gpa, step, logs, mode) catch |err| blk: {
-                        log.warn("Job '{s}' step '{s}' failed: {s}", .{
-                            job.ptr.name,
-                            step.value,
-                            @errorName(err),
-                        });
-                        err_msg = @errorName(err);
-                        break :blk 1;
-                    },
-                // else => @panic("TODO"),
-            }
+            log.debug("{s}: step {s}", .{ job.ptr.name, step.command.value });
 
-            if (exit_code != 0) break;
+            const step_result = switch (step.*) {
+                .command => self.runCommandStep(gpa, step, logs, mode) catch |err| blk: {
+                    log.warn("Job '{s}' step '{s}' failed: {s}", .{
+                        job.ptr.name,
+                        step.command.value,
+                        @errorName(err),
+                    });
+                    success = false;
+                    err_msg = gpa.dupe(u8, @errorName(err)) catch null;
+                    break :blk .failed_to_start;
+                },
+            };
+
+            switch (step_result) {
+                .exited => |code| if (!step.command.success(code)) {
+                    success = false;
+                    err_msg = std.fmt.allocPrint(
+                        gpa,
+                        "Command exited with {d}; expected {d}",
+                        .{ code, step.command.exit_code },
+                    ) catch null;
+                    break;
+                },
+                .signaled => {
+                    success = false;
+                    err_msg = gpa.dupe(u8, "Command was terminated by a signal") catch null;
+                    break;
+                },
+                .stopped => {
+                    success = false;
+                    err_msg = gpa.dupe(u8, "Command was stopped by a signal") catch null;
+                    break;
+                },
+                .unknown => {
+                    success = false;
+                    err_msg = gpa.dupe(u8, "Command ended with an unknown status") catch null;
+                    break;
+                },
+                .failed_to_start => break,
+            }
         }
 
         log.debug(
-            "Finish job: {s} ({d}, exit={d})",
-            .{ job.ptr.name, job.id, exit_code },
+            "Finish job: {s} ({d}, success={})",
+            .{ job.ptr.name, job.id, success },
         );
 
         // Already force interrupted
         if (!self.running.load(.seq_cst)) return;
 
+        const result_msg = err_msg;
+        err_msg = null;
+
         logs.append(gpa, .{ .job_finished = .{
             .job_id = job.id,
             .name = gpa.dupe(u8, job.ptr.name) catch null,
-            .exit_code = exit_code,
+            .success = success,
+            .message = if (result_msg) |msg| gpa.dupe(u8, msg) catch null else null,
             .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
         } }) catch {};
         results.putOneUncancelable(self.io, .{
             .node = job,
             .result = .{
-                .exit_code = exit_code,
-                .msg = err_msg,
+                .success = success,
+                .msg = result_msg,
             },
-        }) catch {};
+        }) catch if (result_msg) |msg| gpa.free(msg);
         if (notify) |work_notify| work_notify.callback(work_notify.ptr);
     }
 
@@ -250,12 +305,14 @@ pub const LocalRunner = struct {
         step: *task.Step,
         logs: *LogQueue,
         mode: ExecMode,
-    ) !i32 {
+    ) !CommandResult {
+        std.debug.assert(step.* == .command);
+
         const job = self.job orelse return error.NoJobRunning;
         // Create args for child process
         var argv = try std.ArrayList([]const u8).initCapacity(gpa, 5);
         defer argv.deinit(gpa);
-        var it = std.mem.splitScalar(u8, step.value, ' ');
+        var it = std.mem.splitScalar(u8, step.command.value, ' ');
         while (it.next()) |arg| try argv.append(gpa, arg);
 
         const step_index: usize = @divExact(
@@ -271,7 +328,7 @@ pub const LocalRunner = struct {
         log.debug("Spawn command for job '{s}', step={d}: {s}", .{
             job.ptr.name,
             step_index,
-            step.value,
+            step.command.value,
         });
 
         switch (mode) {
@@ -316,7 +373,7 @@ pub const LocalRunner = struct {
                 };
 
                 const term = try child.wait(self.io);
-                return termToExitCode(term);
+                return termToResult(term);
             },
             .piped => {
                 var child = std.process.spawn(self.io, .{
@@ -358,7 +415,7 @@ pub const LocalRunner = struct {
                 while (true) {
                     if (!self.running.load(.seq_cst)) {
                         child.kill(self.io);
-                        return 1;
+                        return .signaled;
                     }
 
                     mr.fill(4096, timeout) catch |err| switch (err) {
@@ -377,7 +434,7 @@ pub const LocalRunner = struct {
                 try mr.checkAnyError();
 
                 const term = try child.wait(self.io);
-                return termToExitCode(term);
+                return termToResult(term);
             },
         }
     }
@@ -483,11 +540,19 @@ fn readLogs(
     } }) catch {};
 }
 
-fn termToExitCode(term: std.process.Child.Term) i32 {
+const CommandResult = union(enum) {
+    exited: i32,
+    signaled,
+    stopped,
+    unknown,
+    failed_to_start,
+};
+
+fn termToResult(term: std.process.Child.Term) CommandResult {
     return switch (term) {
-        .exited => |code| @intCast(code),
-        .signal => |sig| @intCast(@intFromEnum(sig)),
-        .stopped => |sig| @intCast(@intFromEnum(sig)),
-        .unknown => 1,
+        .exited => |code| .{ .exited = @intCast(code) },
+        .signal => .signaled,
+        .stopped => .stopped,
+        .unknown => .unknown,
     };
 }

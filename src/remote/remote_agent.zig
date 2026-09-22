@@ -46,7 +46,7 @@ pub const RemoteAgent = struct {
     /// Error for exiting.
     exit_error: ?ExitError = null,
 
-    const ExitError = error{NameTaken};
+    const ExitError = error{ NameTaken, VersionMismatch };
 
     pub fn init(
         io: std.Io,
@@ -103,6 +103,12 @@ pub const RemoteAgent = struct {
         }
         self.jobs.deinit(self.gpa);
         self.result_queue.close(self.io);
+        while (true) {
+            var pending: [4]Result = undefined;
+            const n = self.result_queue.get(self.io, &pending, 0) catch break;
+            if (n == 0) break;
+            for (pending[0..n]) |*res| res.result.deinit(self.gpa);
+        }
         self.gpa.free(self.result_buffer);
         self.log_queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
@@ -250,10 +256,13 @@ pub const RemoteAgent = struct {
                     "Remote server error ({s}/{d}): {s}",
                     .{ @tagName(m.code), @intFromEnum(m.code), m.message },
                 );
-                if (m.code == protocol.ErrorCode.NameTaken) {
+                switch (m.code) {
+                    .NameTaken => self.exit_error = ExitError.NameTaken,
+                    .VersionMismatch => self.exit_error = ExitError.VersionMismatch,
+                }
+                if (self.exit_error != null) {
                     self.connection.close();
                     self.stop();
-                    self.exit_error = ExitError.NameTaken;
                 }
             },
             else => {}, // Not relevant for agent
@@ -311,7 +320,10 @@ pub const RemoteAgent = struct {
 
     /// Send a register packet
     fn register(self: *RemoteAgent) !void {
-        const reg = protocol.RegisterMsg{ .hostname = self.hostname };
+        const reg = protocol.RegisterMsg{
+            .version = protocol.VERSION,
+            .hostname = self.hostname,
+        };
         const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         self.sendMessage(payload);
@@ -339,7 +351,8 @@ pub const RemoteAgent = struct {
             const n = self.result_queue.get(self.io, &results, 0) catch return;
             if (n == 0) return;
 
-            for (results[0..n]) |res| {
+            for (results[0..n]) |*res| {
+                defer res.result.deinit(self.gpa);
                 // Release runner
                 if (self.active_runners.fetchRemove(res.node)) |kv| {
                     const runner = kv.value;
@@ -359,60 +372,61 @@ pub const RemoteAgent = struct {
 
     /// Handle the job log events in the queue
     fn handleLogs(self: *RemoteAgent) !void {
-        while (self.log_queue.pop()) |event| switch (event) {
-            .job_started => |e| {
-                defer if (e.name) |name| self.gpa.free(name);
-                const msg: protocol.JobStartMsg = .{
-                    .job_id = e.job_id,
-                    .timestamp = e.timestamp_ms,
-                };
-                const payload = try self.parser.serialize(self.gpa, .{
-                    .job_start = msg,
-                });
-                defer self.gpa.free(payload);
-                self.sendMessage(payload);
-                if (e.name) |name|
-                    self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name })
-                else
-                    self.writeStatus("{s:<12} job={x}\n", .{ "job_started", e.job_id });
-            },
-            .job_output => |e| {
-                defer self.gpa.free(e.data); // Allocated by runner
-                const msg: protocol.JobLogMsg = .{
-                    .job_id = e.job_id,
-                    .data = e.data,
-                    .step = e.step,
-                };
-                const payload = try self.parser.serialize(self.gpa, .{
-                    .job_log = msg,
-                });
-                defer self.gpa.free(payload);
-                self.sendMessage(payload);
-            },
-            .job_finished => |e| {
-                defer if (e.name) |name| self.gpa.free(name);
-                const msg: protocol.JobEndMsg = .{
-                    .job_id = e.job_id,
-                    .timestamp = e.timestamp_ms,
-                    .exit_code = e.exit_code,
-                };
-                const payload = try self.parser.serialize(self.gpa, .{
-                    .job_finish = msg,
-                });
-                defer self.gpa.free(payload);
-                self.sendMessage(payload);
-                if (e.name) |name|
-                    self.writeStatus(
-                        "{s:<12} job='{s}' exit={d}\n",
-                        .{ "job_finished", name, e.exit_code },
-                    )
-                else
-                    self.writeStatus(
-                        "{s:<12} job='{x}' exit={d}\n",
-                        .{ "job_finished", e.job_id, e.exit_code },
-                    );
-            },
-        };
+        while (self.log_queue.pop()) |event| {
+            defer event.deinit(self.gpa);
+            switch (event) {
+                .job_started => |e| {
+                    const msg: protocol.JobStartMsg = .{
+                        .job_id = e.job_id,
+                        .timestamp = e.timestamp_ms,
+                    };
+                    const payload = try self.parser.serialize(self.gpa, .{
+                        .job_start = msg,
+                    });
+                    defer self.gpa.free(payload);
+                    self.sendMessage(payload);
+                    if (e.name) |name|
+                        self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name })
+                    else
+                        self.writeStatus("{s:<12} job={x}\n", .{ "job_started", e.job_id });
+                },
+                .job_output => |e| {
+                    const msg: protocol.JobLogMsg = .{
+                        .job_id = e.job_id,
+                        .data = e.data,
+                        .step = e.step,
+                    };
+                    const payload = try self.parser.serialize(self.gpa, .{
+                        .job_log = msg,
+                    });
+                    defer self.gpa.free(payload);
+                    self.sendMessage(payload);
+                },
+                .job_finished => |e| {
+                    const msg: protocol.JobEndMsg = .{
+                        .job_id = e.job_id,
+                        .timestamp = e.timestamp_ms,
+                        .success = e.success,
+                        .message = e.message,
+                    };
+                    const payload = try self.parser.serialize(self.gpa, .{
+                        .job_finish = msg,
+                    });
+                    defer self.gpa.free(payload);
+                    self.sendMessage(payload);
+                    if (e.name) |name|
+                        self.writeStatus(
+                            "{s:<12} job='{s}' success={} message={?s}\n",
+                            .{ "job_finished", name, e.success, e.message },
+                        )
+                    else
+                        self.writeStatus(
+                            "{s:<12} job='{x}' success={} message={?s}\n",
+                            .{ "job_finished", e.job_id, e.success, e.message },
+                        );
+                },
+            }
+        }
     }
 
     /// Try to run the next job from the queue if there is one

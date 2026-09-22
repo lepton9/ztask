@@ -613,6 +613,10 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
                 opts.name, opts.connect.addr, opts.connect.port,
             },
         ),
+        error.VersionMismatch => ctx.fatal(
+            "Remote runner protocol is incompatible with the server at {s}:{d}. Update the runner to match the server version",
+            .{ opts.connect.addr, opts.connect.port },
+        ),
         else => {},
     };
 }

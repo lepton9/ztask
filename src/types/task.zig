@@ -108,10 +108,19 @@ pub const Task = struct {
                     try writer.writeAll("    steps: []\n");
                 } else {
                     try writer.writeAll("    steps:\n");
-                    for (job.steps) |step| {
-                        try writer.print("      - {s}: ", .{@tagName(step.kind)});
-                        try appendYamlQuotedLine(writer, step.value);
-                    }
+                    for (job.steps) |step| switch (step) {
+                        .command => |c| {
+                            if (c.exit_code == 0) {
+                                try writer.writeAll("      - command: ");
+                                try appendYamlQuotedLine(writer, c.value);
+                            } else {
+                                try writer.writeAll("      - command:\n");
+                                try writer.writeAll("          value: ");
+                                try appendYamlQuotedLine(writer, c.value);
+                                try writer.print("          exit_code: {d}\n", .{c.exit_code});
+                            }
+                        },
+                    };
                 }
 
                 switch (job.run_on) {
@@ -252,21 +261,34 @@ pub const Job = struct {
     }
 };
 
-pub const StepKind = enum { command };
+/// One step of a job.
+pub const Step = union(enum) {
+    command: CommandStep,
 
-pub const Step = struct {
-    kind: StepKind,
-    value: []const u8,
+    pub const CommandStep = struct {
+        value: []const u8,
+        /// The expected exit code of the command step.
+        exit_code: i32 = 0,
 
-    pub fn copy(step: Step, gpa: std.mem.Allocator) !Step {
-        return .{
-            .kind = step.kind,
-            .value = try gpa.dupe(u8, step.value),
-        };
-    }
+        /// Check if the given process exit code matches the expected exit code.
+        pub fn success(self: CommandStep, code: i32) bool {
+            return self.exit_code == code;
+        }
+    };
 
     pub fn deinit(self: Step, gpa: std.mem.Allocator) void {
-        gpa.free(self.value);
+        switch (self) {
+            .command => |c| gpa.free(c.value),
+        }
+    }
+
+    pub fn copy(self: Step, gpa: std.mem.Allocator) !Step {
+        return switch (self) {
+            .command => |c| .{ .command = .{
+                .value = try gpa.dupe(u8, c.value),
+                .exit_code = c.exit_code,
+            } },
+        };
     }
 };
 
@@ -336,14 +358,12 @@ test "task_to_yaml" {
         .steps = try steps.toOwnedSlice(gpa),
     });
 
-    try steps.append(gpa, .{
-        .kind = .command,
+    try steps.append(gpa, .{ .command = .{
         .value = try gpa.dupe(u8, "ls"),
-    });
-    try steps.append(gpa, .{
-        .kind = .command,
+    } });
+    try steps.append(gpa, .{ .command = .{
         .value = try gpa.dupe(u8, "echo"),
-    });
+    } });
     var deps1 = try gpa.alloc([]const u8, 1);
     deps1[0] = try gpa.dupe(u8, t.jobs.values()[0].name);
     try t.addJob(gpa, .{
@@ -353,10 +373,9 @@ test "task_to_yaml" {
         .deps = deps1,
     });
 
-    try steps.append(gpa, .{
-        .kind = .command,
+    try steps.append(gpa, .{ .command = .{
         .value = try gpa.dupe(u8, "zig build"),
-    });
+    } });
     var deps = try gpa.alloc([]const u8, 2);
     deps[0] = try gpa.dupe(u8, t.jobs.values()[0].name);
     deps[1] = try gpa.dupe(u8, t.jobs.values()[1].name);
@@ -413,10 +432,9 @@ test "task_to_yaml_escaped" {
     var deps = try gpa.alloc([]const u8, 1);
     deps[0] = try gpa.dupe(u8, "job:one");
     var steps = try gpa.alloc(Step, 1);
-    steps[0] = .{
-        .kind = .command,
+    steps[0] = .{ .command = .{
         .value = try gpa.dupe(u8, "printf \\\"hello\\\"\\nnext"),
-    };
+    } };
     try t.addJob(gpa, .{
         .name = try gpa.dupe(u8, "job-one"),
         .steps = steps,
@@ -441,6 +459,43 @@ test "task_to_yaml_escaped" {
         \\      type: remote
         \\      name: "runner:one"
         \\    deps: ["job:one"]
+        \\
+    ;
+
+    const text = try t.toYaml(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "task_to_yaml_exit_code" {
+    const gpa = std.testing.allocator;
+    var t = try Task.init(gpa, "exit-task");
+    defer t.deinit(gpa);
+
+    var steps = try gpa.alloc(Step, 2);
+    steps[0] = .{ .command = .{
+        .value = try gpa.dupe(u8, "echo"),
+    } };
+    steps[1] = .{ .command = .{
+        .value = try gpa.dupe(u8, "grep -q match file.txt"),
+        .exit_code = 1,
+    } };
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job1"),
+        .steps = steps,
+    });
+
+    const expected =
+        \\name: "exit-task"
+        \\
+        \\jobs:
+        \\  job1:
+        \\    steps:
+        \\      - command: "echo"
+        \\      - command:
+        \\          value: "grep -q match file.txt"
+        \\          exit_code: 1
+        \\    run_on: local
         \\
     ;
 
