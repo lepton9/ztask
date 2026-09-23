@@ -6,8 +6,12 @@ const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 const builtin = @import("builtin");
 const parse = @import("parse.zig");
+const task_types = @import("types/task.zig");
 
-const Id = @import("types/task.zig").Id;
+const Id = task_types.Id;
+const Task = task_types.Task;
+const Trigger = task_types.Trigger;
+
 const ParseDiag = parse.ParseDiag;
 const ParseError = parse.ParseError;
 const Model = @import("tui/model.zig").Model;
@@ -142,6 +146,8 @@ pub const RunOptions = struct {
     listen: ConnectOptions = .{},
     /// Tasks to run, selected by path or ID.
     tasks: []const TaskSelect = &.{},
+    /// Triggers injected from the command line.
+    triggers: []const TempTrigger = &.{},
     no_remote: bool = false,
     attach_job: ?manager.AttachJob = null,
     retrigger: bool = false,
@@ -149,6 +155,18 @@ pub const RunOptions = struct {
     runners_n: u8 = BASE_RUNNERS_N,
     /// Optional diagnostics for errors.
     diagnostics: ?*GenericDiagnostics = null,
+};
+
+/// A temporary trigger injected from the command line.
+pub const TempTrigger = union(enum) {
+    /// Run the task when the file or directory changes.
+    watch: []const u8,
+    /// Run when the file/directory or any subdirectory changes.
+    watch_recursive: []const u8,
+    /// Run daily at the given time (UTC).
+    time: []const u8,
+    /// Run at fixed intervals.
+    interval: []const u8,
 };
 
 /// A task tracked by the `runTask` event loop.
@@ -159,6 +177,8 @@ const SelectedTask = struct {
     id_len: u8 = 0,
     /// The task was started successfully.
     began: bool = true,
+    /// The task has at least one trigger.
+    has_trigger: bool = false,
 
     /// The formatted task ID.
     fn id(self: *const SelectedTask) []const u8 {
@@ -203,10 +223,10 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
 
     var start_failed = false;
     var any_remote_jobs: bool = false;
-    var any_trigger_tasks: bool = false;
+    var any_started_triggers: bool = false;
 
     for (options.tasks) |select| {
-        const task = switch (select) {
+        const task: *Task = switch (select) {
             .path => |path| task_manager.loadOrCreateWithPath(
                 path,
                 options.diagnostics,
@@ -244,7 +264,6 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
             break :blk false;
         };
         if (has_remote_jobs) any_remote_jobs = true;
-        if (task.trigger != null) any_trigger_tasks = true;
 
         if (options.no_remote and has_remote_jobs) {
             if (single) return error.RemoteJobsWithNoRemote;
@@ -267,10 +286,20 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
             continue;
         }
 
+        // Inject the command line triggers into the task
+        injectTriggers(io, gpa, task, options.triggers, options.diagnostics) catch |err| {
+            if (single) return err;
+            reportTaskError(io, select, options.diagnostics, err);
+            if (options.diagnostics) |d| d.deinit(gpa);
+            start_failed = true;
+            continue;
+        };
+
         const id_str = task.id.fmt();
         try selected.append(gpa, .{
             .id_value = task.id.value,
             .id_len = @intCast(id_str.len),
+            .has_trigger = task.hasTriggers(),
         });
         const sel = &selected.items[selected.items.len - 1];
         @memcpy(sel.id_buf[0..id_str.len], id_str);
@@ -326,6 +355,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         .listen_port = options.listen.port,
         .remote = !options.no_remote and any_remote_jobs,
     });
+
     for (selected.items) |*sel| {
         task_manager.beginTask(sel.id(), .{
             .attach_job = if (single) options.attach_job else null,
@@ -339,6 +369,7 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
             sel.began = false;
             start_failed = true;
         };
+        if (sel.began and sel.has_trigger) any_started_triggers = true;
     }
 
     var stdout_buffer: [1024]u8 = undefined;
@@ -347,8 +378,10 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
 
     while (true) {
         if (tui_input.Sig.seen.load(.seq_cst)) break;
-        if (!any_trigger_tasks and tasksInactive(task_manager, selected.items))
-            break;
+        if (!any_started_triggers and tasksInactive(
+            task_manager,
+            selected.items,
+        )) break;
 
         if (input_loop) |l| {
             const event = l.nextEvent() catch break;
@@ -381,6 +414,74 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
     try out.flush();
     if (start_failed) return error.TaskStartFailed;
     return;
+}
+
+/// Inject temporary triggers into the task.
+fn injectTriggers(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    task: *Task,
+    triggers: []const TempTrigger,
+    diagnostics: ?*GenericDiagnostics,
+) !void {
+    if (triggers.len == 0) return;
+    try task.resolveWatchPaths(io, gpa);
+
+    var staged: std.ArrayListUnmanaged(Trigger) = .empty;
+    defer staged.deinit(gpa);
+    errdefer for (staged.items) |t| t.deinit(gpa);
+
+    for (triggers) |cli_trigger| {
+        const trigger: Trigger = switch (cli_trigger) {
+            .watch, .watch_recursive => |raw_path| .{
+                .watch = .{
+                    // Resolve against the working directory
+                    .path = try task_types.normalizePath(io, gpa, raw_path, .{}),
+                    .recursive = cli_trigger == .watch_recursive,
+                },
+            },
+            .time, .interval => |str| blk: {
+                const value = parse.parseTime(str) catch |err| {
+                    const d = diagnostics orelse return err;
+                    return d.failf(
+                        gpa,
+                        err,
+                        "Invalid --{s} value '{s}' (expected hh:mm[:ss[.ms]])",
+                        .{ @tagName(std.meta.activeTag(cli_trigger)), str },
+                    );
+                };
+                break :blk if (cli_trigger == .time)
+                    Trigger{ .time = value }
+                else
+                    Trigger{ .interval = value };
+            },
+        };
+
+        // Reject triggers that duplicate the task's own triggers or other
+        // staged triggers of this call.
+        const duplicate = blk: {
+            for (task.triggers.items) |existing| {
+                if (existing.eql(trigger)) break :blk true;
+            }
+            for (staged.items) |existing| {
+                if (existing.eql(trigger)) break :blk true;
+            }
+            break :blk false;
+        };
+        if (duplicate) {
+            trigger.deinit(gpa);
+            if (diagnostics) |d| return d.failf(
+                gpa,
+                error.DuplicateTrigger,
+                "Task '{s}' already has the same trigger",
+                .{task.name},
+            );
+            return error.DuplicateTrigger;
+        }
+        try staged.append(gpa, trigger);
+    }
+
+    try task.triggers.appendSlice(gpa, staged.items);
 }
 
 /// Handle a single task event and print the verbose status lines.

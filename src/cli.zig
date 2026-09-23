@@ -76,6 +76,26 @@ const commands = &[_]zcli.Cmd{
                 .short_name = "t",
                 .desc = "Restart task if a trigger occurs while running",
             },
+            .{
+                .long_name = "watch",
+                .desc = "Add a watch trigger for the task",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
+            .{
+                .long_name = "watch-recursive",
+                .desc = "Add a recursive watch trigger for the task",
+                .arg = .{ .name = "PATH", .type = .Path },
+            },
+            .{
+                .long_name = "time",
+                .desc = "Add a daily time trigger (UTC) for the task",
+                .arg = .{ .name = "TIME", .type = .Text },
+            },
+            .{
+                .long_name = "interval",
+                .desc = "Add an interval trigger for the task",
+                .arg = .{ .name = "DURATION", .type = .Text },
+            },
             runner_n_option,
             verbose_option,
         },
@@ -517,9 +537,27 @@ fn cmdRunFn(ptr: *anyopaque) !void {
     var diagnostics: GenericDiagnostics = .{};
     defer diagnostics.deinit(gpa);
 
+    // Collect the trigger options
+    // TODO: make trigger options 'Opt.multiple'
+    var cli_triggers: std.ArrayList(run.TempTrigger) = .empty;
+    defer cli_triggers.deinit(gpa);
+    if (cli.findOption("watch")) |opt| {
+        try cli_triggers.append(gpa, .{ .watch = opt.value.?.string });
+    }
+    if (cli.findOption("watch-recursive")) |opt| {
+        try cli_triggers.append(gpa, .{ .watch_recursive = opt.value.?.string });
+    }
+    if (cli.findOption("time")) |opt| {
+        try cli_triggers.append(gpa, .{ .time = opt.value.?.string });
+    }
+    if (cli.findOption("interval")) |opt| {
+        try cli_triggers.append(gpa, .{ .interval = opt.value.?.string });
+    }
+
     var opts: run.RunOptions = .{
         .listen = getListenOptions(ctx),
         .tasks = tasks.items,
+        .triggers = cli_triggers.items,
         .no_remote = cli.findOption("no-remote") != null,
         .attach_job = blk: {
             const o = cli.findOption("attach") orelse break :blk null;
@@ -565,6 +603,10 @@ fn cmdRunFn(ptr: *anyopaque) !void {
             error.InvalidTaskFile => ctx.fatal("Invalid task file format", .{}),
             error.InvalidWatchPath => ctx.fatal("Invalid file path for watch trigger", .{}),
             error.WatchPathNotFound => ctx.fatal("File path for watch trigger not found", .{}),
+            error.DuplicateTrigger => ctx.fatal(
+                "The task already has the same trigger as the given trigger option",
+                .{},
+            ),
             error.NoTaskFileGiven => ctx.fatal("No task file given", .{}),
             error.RemoteJobsWithNoRemote => ctx.fatal(
                 "Task has remote jobs but --{s} was set",
