@@ -155,7 +155,7 @@ pub const Task = struct {
                                 try appendYamlQuotedLine(writer, c.value);
                             } else {
                                 try writer.writeAll("      - command:\n");
-                                try writer.writeAll("          value: ");
+                                try writer.writeAll("          run: ");
                                 try appendYamlQuotedLine(writer, c.value);
                                 try writer.print("          exit_code: {d}\n", .{c.exit_code});
                             }
@@ -673,7 +673,7 @@ test "task_to_yaml_exit_code" {
         \\    steps:
         \\      - command: "echo"
         \\      - command:
-        \\          value: "grep -q match file.txt"
+        \\          run: "grep -q match file.txt"
         \\          exit_code: 1
         \\    run_on: local
         \\

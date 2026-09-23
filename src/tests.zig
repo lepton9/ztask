@@ -42,7 +42,7 @@ test "task_to_yaml_parsed" {
         \\    steps:
         \\      - command: "echo hello"
         \\      - command:
-        \\          value: "grep -q match file.txt"
+        \\          run: "grep -q match file.txt"
         \\          exit_code: 1
         \\    run_on:
         \\      type: remote
@@ -64,8 +64,8 @@ test "task_to_yaml_parsed" {
     try expect(original.jobs.count() == round_trip.jobs.count());
     try expect(original.triggers.items.len == round_trip.triggers.items.len);
     for (original.triggers.items) |trigger| {
-        const found: bool = blk: for (round_trip.triggers.items) |round_trigger| {
-            if (trigger.eql(round_trigger)) break :blk true;
+        const found: bool = blk: for (round_trip.triggers.items) |rt| {
+            if (trigger.eql(rt)) break :blk true;
         } else false;
         try expect(found);
     }
@@ -141,7 +141,7 @@ test "expected_step_exit_code_succeeds" {
         \\   check:
         \\     steps:
         \\       - command:
-        \\           value: "false"
+        \\           run: "false"
         \\           exit_code: 1
         \\       - command: "true"
     ;

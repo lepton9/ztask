@@ -55,7 +55,7 @@ const VALID_RUN_LOC_FIELDS = makeVoidSet(
     &[_][]const u8{ "type", "name", "addr" },
 );
 const VALID_STEP_FIELDS = makeVoidSet(
-    &[_][]const u8{ "value", "exit_code" },
+    &[_][]const u8{ "run", "exit_code" },
 );
 
 /// Optional diagnostics for parsing.
@@ -225,7 +225,7 @@ const ParseCtx = struct {
     fn failIndex(
         self: ParseCtx,
         err: ParseError,
-        field: []const u8,
+        comptime field: []const u8,
         index: usize,
     ) ParseError {
         // Copy the previous message
@@ -269,7 +269,7 @@ const ParseCtx = struct {
 fn requireField(
     cx: ParseCtx,
     map: yaml.Yaml.Map,
-    field_name: []const u8,
+    comptime field_name: []const u8,
 ) !yaml.Yaml.Value {
     return requireFieldErr(cx, map, field_name, ParseError.MissingRequiredField);
 }
@@ -277,7 +277,7 @@ fn requireField(
 fn requireFieldErr(
     cx: ParseCtx,
     map: yaml.Yaml.Map,
-    field_name: []const u8,
+    comptime field_name: []const u8,
     err: ParseError,
 ) !yaml.Yaml.Value {
     return map.get(field_name) orelse cx.at(field_name).failf(
@@ -313,7 +313,7 @@ fn requireScalarMsg(
 fn rejectUnknown(
     cx: ParseCtx,
     map: yaml.Yaml.Map,
-    valid_fields: std.StaticStringMap(void),
+    comptime valid_fields: std.StaticStringMap(void),
     err: ParseError,
 ) !void {
     if (firstUnknownField(map, valid_fields)) |unknown| {
@@ -732,7 +732,7 @@ fn parseJob(
                             ParseError.InvalidFieldName,
                         );
 
-                        const value_field = try requireField(cx_steps, step_map, "value");
+                        const value_field = try requireField(cx_steps, step_map, "run");
                         const step_value = try requireScalar(cx_steps, value_field);
                         var command: task.Step.CommandStep = .{
                             .value = try cx_steps.gpa.dupe(u8, step_value),
@@ -767,7 +767,7 @@ fn parseJob(
                     return cx_steps.fail(
                         ParseError.InvalidFieldType,
                         null,
-                        "Step value must be a string or a map",
+                        "Command step must be a string or a map",
                     );
                 },
             };
@@ -1086,10 +1086,10 @@ test "parse_step" {
         \\   map:
         \\     steps:
         \\       - command:
-        \\           value: "ls"
+        \\           run: "ls"
         \\           exit_code: 0
         \\       - command:
-        \\           value: "cmd"
+        \\           run: "cmd"
         \\           exit_code: 1
     ;
     const t = try parseTaskBuffer(io, gpa, source);
@@ -1124,7 +1124,7 @@ test "parse_step_invalid_exit_code" {
         \\   job:
         \\     steps:
         \\       - command:
-        \\           value: "cmd"
+        \\           run: "cmd"
         \\           exit_code: -1
     ;
     const non_integer =
@@ -1133,7 +1133,7 @@ test "parse_step_invalid_exit_code" {
         \\   job:
         \\     steps:
         \\       - command:
-        \\           value: "cmd"
+        \\           run: "cmd"
         \\           exit_code: "two"
     ;
     const out_of_range =
@@ -1142,7 +1142,7 @@ test "parse_step_invalid_exit_code" {
         \\   job:
         \\     steps:
         \\       - command:
-        \\           value: "cmd"
+        \\           run: "cmd"
         \\           exit_code: 256
     ;
     try expectError(error.InvalidExitCode, parseTaskBuffer(io, gpa, negative));
