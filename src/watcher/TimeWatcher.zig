@@ -4,7 +4,8 @@ const date = @import("../types/date.zig");
 const TimeWatcher = @This();
 
 pub const TimeEvent = struct {
-    task_id: []const u8,
+    /// Registration id of the triggered time watch.
+    registration_id: u64,
 };
 
 const WatchType = union(enum) {
@@ -25,17 +26,14 @@ pub const addEventFn = *const fn (
 ) anyerror!void;
 
 io: std.Io,
-watch_list: std.StringHashMapUnmanaged(WatchType) = .empty,
+/// Maps registration ids to the watches.
+watch_list: std.AutoHashMapUnmanaged(u64, WatchType) = .empty,
 
 pub fn init(io: std.Io) TimeWatcher {
     return .{ .io = io };
 }
 
 pub fn deinit(self: *TimeWatcher, gpa: std.mem.Allocator) void {
-    var it = self.watch_list.iterator();
-    while (it.next()) |e| {
-        gpa.free(e.key_ptr.*);
-    }
     self.watch_list.deinit(gpa);
 }
 
@@ -44,17 +42,15 @@ pub fn watchCount(self: *TimeWatcher) u32 {
     return self.watch_list.count();
 }
 
-/// Add a new time time to watch.
+/// Add a new time watch with the given registration id.
 pub fn addWatch(
     self: *TimeWatcher,
     gpa: std.mem.Allocator,
-    task_id: []const u8,
+    registration_id: u64,
     time: WatchType,
 ) !void {
-    const gop = try self.watch_list.getOrPut(gpa, task_id);
+    const gop = try self.watch_list.getOrPut(gpa, registration_id);
     if (gop.found_existing) return error.WatchExists;
-    errdefer _ = self.watch_list.remove(task_id);
-    gop.key_ptr.* = try gpa.dupe(u8, task_id);
     gop.value_ptr.* = time;
 }
 
@@ -62,12 +58,12 @@ pub fn addWatch(
 pub fn addIntervalWatch(
     self: *TimeWatcher,
     gpa: std.mem.Allocator,
-    task_id: []const u8,
+    registration_id: u64,
     interval_ms: u64,
 ) !void {
     if (interval_ms == 0) return error.InvalidInterval;
     const now = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
-    return self.addWatch(gpa, task_id, .{ .interval = .{
+    return self.addWatch(gpa, registration_id, .{ .interval = .{
         .interval_ms = interval_ms,
         .next_due_ms = now + @as(i64, @intCast(interval_ms)),
     } });
@@ -77,7 +73,7 @@ pub fn addIntervalWatch(
 pub fn addTimeOfDayWatch(
     self: *TimeWatcher,
     gpa: std.mem.Allocator,
-    task_id: []const u8,
+    registration_id: u64,
     time: date.Time,
 ) !void {
     var last_triggered: i64 = -1;
@@ -89,20 +85,15 @@ pub fn addTimeOfDayWatch(
         const target_ms: i64 = date.timeToMs(time);
         if (ms_since_midnight > target_ms) last_triggered = today;
     }
-    return self.addWatch(gpa, task_id, .{ .time = .{
+    return self.addWatch(gpa, registration_id, .{ .time = .{
         .time = time,
         .last_triggered_day = last_triggered,
     } });
 }
 
 /// Remove a time watch from being tracked.
-pub fn removeWatch(
-    self: *TimeWatcher,
-    gpa: std.mem.Allocator,
-    task_id: []const u8,
-) void {
-    const kv = self.watch_list.fetchRemove(task_id) orelse return;
-    gpa.free(kv.key);
+pub fn removeWatch(self: *TimeWatcher, registration_id: u64) void {
+    _ = self.watch_list.remove(registration_id);
 }
 
 /// Poll for time events.
@@ -119,7 +110,7 @@ pub fn pollEvents(
             const now_ms = now.toMilliseconds();
             if (now_ms < i.next_due_ms) continue;
             i.next_due_ms = now_ms + @as(i64, @intCast(i.interval_ms));
-            try addEvent(gpa, queue, .{ .task_id = e.key_ptr.* });
+            try addEvent(gpa, queue, .{ .registration_id = e.key_ptr.* });
         },
         .time => |*t| {
             const now = std.Io.Timestamp.now(self.io, .real);
@@ -135,7 +126,7 @@ pub fn pollEvents(
             if (t.last_triggered_day == today) continue;
 
             t.last_triggered_day = today;
-            try addEvent(gpa, queue, .{ .task_id = e.key_ptr.* });
+            try addEvent(gpa, queue, .{ .registration_id = e.key_ptr.* });
         },
     };
 }
@@ -191,7 +182,7 @@ test "interval_watch" {
         }
     }.add;
 
-    try tw.addIntervalWatch(gpa, "task1", 25);
+    try tw.addIntervalWatch(gpa, 1, 25);
     try tw.pollEvents(gpa, &events, add);
     try std.testing.expectEqual(@as(usize, 0), events.items.len);
 

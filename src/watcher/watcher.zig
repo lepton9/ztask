@@ -5,8 +5,6 @@ const date = @import("../types/date.zig");
 const FileWatcher = @import("FileWatcher.zig");
 const TimeWatcher = @import("TimeWatcher.zig");
 
-pub const normalizeWatchPath = FileWatcher.normalizeWatchPath;
-
 const log = std.log.scoped(.watcher);
 
 pub const WatchEvent = union(enum) {
@@ -138,39 +136,50 @@ pub const Watcher = struct {
         self: *Watcher,
         path: []const u8,
         options: FileWatcher.WatchOptions,
-    ) error{Canceled}!void {
-        try self.mutex.lock(self.io);
+    ) void {
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.file_watcher.removeWatch(path, options) catch {};
+        self.file_watcher.removeWatch(path, options) catch |err| log.err(
+            "Failed to remove file watch '{s}': {any}",
+            .{ path, err },
+        );
     }
 
     /// Add an interval time watch for `TimeWatcher` to watch for.
     pub fn addIntervalWatch(
         self: *Watcher,
-        task_id: []const u8,
+        registration_id: u64,
         interval: date.Time,
     ) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         const ms_i64 = date.timeToMs(interval);
         if (ms_i64 <= 0) return error.InvalidInterval;
-        try self.time_watcher.addIntervalWatch(self.gpa, task_id, @intCast(ms_i64));
+        try self.time_watcher.addIntervalWatch(
+            self.gpa,
+            registration_id,
+            @intCast(ms_i64),
+        );
         self.cond.signal(self.io);
     }
 
     /// Add a time of day watch for `TimeWatcher` to watch for.
-    pub fn addTimeWatch(self: *Watcher, task_id: []const u8, time: date.Time) !void {
+    pub fn addTimeWatch(
+        self: *Watcher,
+        registration_id: u64,
+        time: date.Time,
+    ) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
-        try self.time_watcher.addTimeOfDayWatch(self.gpa, task_id, time);
+        try self.time_watcher.addTimeOfDayWatch(self.gpa, registration_id, time);
         self.cond.signal(self.io);
     }
 
-    /// Remove a time watch for a task.
-    pub fn removeTimeWatch(self: *Watcher, task_id: []const u8) error{Canceled}!void {
-        try self.mutex.lock(self.io);
+    /// Remove a time watch registration.
+    pub fn removeTimeWatch(self: *Watcher, registration_id: u64) void {
+        self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.time_watcher.removeWatch(self.gpa, task_id);
+        self.time_watcher.removeWatch(registration_id);
     }
 };
 
@@ -310,9 +319,9 @@ test "file_watch_add" {
     try std.testing.expect(watcher.file_watcher.watchCount() == 2);
 
     // Remove from watched
-    try watcher.removeFileWatch(dir_path, .{});
+    watcher.removeFileWatch(dir_path, .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 1);
-    try watcher.removeFileWatch(file_path, .{});
+    watcher.removeFileWatch(file_path, .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 0);
 }
 
@@ -327,7 +336,7 @@ test "file_watch_add_relative_path" {
 
     try watcher.addFileWatch("src/main.zig", .{});
     try std.testing.expectEqual(@as(u32, 1), watcher.file_watcher.watchCount());
-    try watcher.removeFileWatch("src/main.zig", .{});
+    watcher.removeFileWatch("src/main.zig", .{});
     try std.testing.expectEqual(@as(u32, 0), watcher.file_watcher.watchCount());
 }
 
@@ -350,9 +359,9 @@ test "file_watch_add_duplicate" {
     try std.testing.expect(watcher.file_watcher.watchCount() == 1);
     try watcher.addFileWatch(dir_path, .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 1);
-    try watcher.removeFileWatch(dir_path, .{});
+    watcher.removeFileWatch(dir_path, .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 1);
-    try watcher.removeFileWatch(dir_path, .{});
+    watcher.removeFileWatch(dir_path, .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 0);
 }
 
@@ -556,6 +565,6 @@ test "file_watch_remove_not_existing" {
     defer watcher.stop() catch {};
 
     try std.testing.expect(watcher.file_watcher.watchCount() == 0);
-    try watcher.removeFileWatch("file_not_existing.txt", .{});
+    watcher.removeFileWatch("file_not_existing.txt", .{});
     try std.testing.expect(watcher.file_watcher.watchCount() == 0);
 }

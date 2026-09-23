@@ -4,11 +4,17 @@ const date = @import("date.zig");
 const yaml_indent_spaces = 2;
 
 pub const Task = struct {
+    /// ID of the task.
     id: Id = .{},
+    /// Name of the task.
     name: []const u8,
+    /// Current working directory for the task run.
     cwd: ?[]const u8 = null,
+    /// Path of the task file for this task.
     file_path: ?[]const u8 = null,
-    trigger: ?Trigger = null,
+    /// All task triggers. Any trigger firing runs the task.
+    triggers: std.ArrayListUnmanaged(Trigger) = .empty,
+    /// All the jobs for the task. Mapped by the job names.
     jobs: std.StringArrayHashMapUnmanaged(Job),
 
     pub fn init(gpa: std.mem.Allocator, name: []const u8) !*Task {
@@ -28,9 +34,22 @@ pub const Task = struct {
 
         if (self.cwd) |path| gpa.free(path);
         if (self.file_path) |path| gpa.free(path);
-        if (self.trigger) |trigger| trigger.deinit(gpa);
+        for (self.triggers.items) |trigger| trigger.deinit(gpa);
+        self.triggers.deinit(gpa);
         gpa.free(self.name);
         gpa.destroy(self);
+    }
+
+    /// Check if the task has any triggers.
+    pub fn hasTriggers(self: *const Task) bool {
+        return self.triggers.items.len > 0;
+    }
+
+    /// Add a new trigger for the task. The trigger fields should be
+    /// allocated before.
+    pub fn addTrigger(self: *Task, gpa: std.mem.Allocator, trigger: Trigger) !void {
+        errdefer trigger.deinit(gpa);
+        try self.triggers.append(gpa, trigger);
     }
 
     pub fn findJob(self: *Task, job_name: []const u8) ?*Job {
@@ -44,24 +63,18 @@ pub const Task = struct {
         gop.value_ptr.* = job;
     }
 
-    /// Resolve the watch trigger path if a working directory is set.
-    /// Does nothing if the trigger is not of type `watch`.
-    pub fn resolveWatchPath(self: *Task, io: std.Io, gpa: std.mem.Allocator) !void {
-        const t = if (self.trigger) |*t| t else return;
-        if (t.* != .watch) return;
-        const watch = &t.watch;
-        const cwd = self.cwd orelse return;
-        if (std.fs.path.isAbsolute(watch.path)) return;
-        var path = try std.fs.path.join(gpa, &.{ cwd, watch.path });
-        var abs_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const abs_n = std.Io.Dir.cwd().realPathFile(io, path, &abs_buf) catch null;
-        if (abs_n) |n| {
-            const a = try gpa.dupe(u8, abs_buf[0..n]);
-            gpa.free(path);
-            path = a;
+    /// Resolve the watch trigger paths to absolute paths.
+    ///
+    /// A path resolves against the task `cwd`, or against the current
+    /// working directory when the task has none. Does nothing for
+    /// triggers that are not of type `watch`.
+    pub fn resolveWatchPaths(self: *Task, io: std.Io, gpa: std.mem.Allocator) !void {
+        for (self.triggers.items) |*t| {
+            if (t.* != .watch) continue;
+            const resolved = try normalizePath(io, gpa, t.watch.path, .{ .base = self.cwd });
+            gpa.free(t.watch.path);
+            t.watch.path = resolved;
         }
-        gpa.free(watch.path);
-        watch.path = path;
     }
 
     /// Convert a task to YAML.
@@ -69,31 +82,58 @@ pub const Task = struct {
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
         const writer = &output.writer;
-        var scratch: [256]u8 = undefined;
 
         try appendYamlField(writer, 0, "name", task.name);
         if (task.id.str) |id_str| try appendYamlField(writer, 0, "id", id_str);
         if (task.cwd) |cwd| try appendYamlField(writer, 0, "cwd", cwd);
 
-        if (task.trigger) |tr| switch (tr) {
-            .watch => |w| if (!w.recursive) {
-                try writer.writeAll("on:\n");
-                try appendYamlField(writer, 1, "watch", w.path);
-            } else {
-                try writer.writeAll("on:\n");
-                try appendYamlKey(writer, 1, "watch");
-                try appendYamlField(writer, 2, "path", w.path);
-                try writer.writeAll("    recursive: true\n");
-            },
-            .interval => |i| {
-                try writer.writeAll("on:\n");
-                try appendYamlField(writer, 1, "interval", try i.fmt(&scratch));
-            },
-            .time => |time| {
-                try writer.writeAll("on:\n");
-                try appendYamlField(writer, 1, "time", try time.fmt(&scratch));
-            },
-        };
+        if (task.triggers.items.len > 0) {
+            try writer.writeAll("on:\n");
+            // Group triggers by kind
+            var scratch: [64]u8 = undefined;
+            const kinds = std.meta.tags(Trigger.Kind);
+            inline for (kinds) |kind| {
+                const count = countKind(task.triggers.items, kind);
+                if (count != 0) blk: {
+                    const key = @tagName(kind);
+                    if (count == 1) {
+                        // Find the single trigger of this kind
+                        for (task.triggers.items) |trigger| {
+                            if (trigger != kind) continue;
+                            switch (trigger) {
+                                .watch => |w| if (!w.recursive) {
+                                    try appendYamlField(writer, 1, key, w.path);
+                                } else {
+                                    try appendYamlKey(writer, 1, key);
+                                    try appendYamlField(writer, 2, "path", w.path);
+                                    try writer.writeAll("    recursive: true\n");
+                                },
+                                .interval => |i| try appendYamlField(
+                                    writer,
+                                    1,
+                                    key,
+                                    try i.fmt(&scratch),
+                                ),
+                                .time => |time| try appendYamlField(
+                                    writer,
+                                    1,
+                                    key,
+                                    try time.fmt(&scratch),
+                                ),
+                            }
+                            break;
+                        }
+                    } else {
+                        try appendYamlKey(writer, 1, key);
+                        for (task.triggers.items) |trigger| {
+                            if (trigger != kind) continue;
+                            try appendYamlTriggerListValue(writer, 2, trigger);
+                        }
+                    }
+                    break :blk;
+                }
+            }
+        }
 
         if (task.jobs.count() > 0) {
             try writer.writeAll("\njobs:\n");
@@ -168,6 +208,41 @@ pub const Task = struct {
         try writer.writeAll(":\n");
     }
 
+    /// Write a list item value of a trigger under its key.
+    fn appendYamlTriggerListValue(
+        writer: *std.Io.Writer,
+        indent_level: usize,
+        trigger: Trigger,
+    ) !void {
+        var scratch: [64]u8 = undefined;
+        try writer.splatByteAll(' ', yaml_indent_spaces * indent_level);
+        switch (trigger) {
+            .watch => |w| {
+                if (!w.recursive) {
+                    try writer.writeAll("- ");
+                    try appendYamlQuotedLine(writer, w.path);
+                } else {
+                    // Map item
+                    try writer.writeAll("- ");
+                    try appendYamlField(writer, 0, "path", w.path);
+                    try writer.splatByteAll(
+                        ' ',
+                        yaml_indent_spaces * (indent_level + 1),
+                    );
+                    try writer.writeAll("recursive: true\n");
+                }
+            },
+            .interval => |i| {
+                try writer.writeAll("- ");
+                try appendYamlQuotedLine(writer, try i.fmt(&scratch));
+            },
+            .time => |time| {
+                try writer.writeAll("- ");
+                try appendYamlQuotedLine(writer, try time.fmt(&scratch));
+            },
+        }
+    }
+
     fn appendYamlQuotedLine(writer: *std.Io.Writer, value: []const u8) !void {
         try appendYamlQuotedString(writer, value);
         try writer.writeByte('\n');
@@ -195,12 +270,38 @@ pub const Trigger = union(enum) {
     interval: date.Time,
     time: date.Time,
 
+    pub const Kind = std.meta.Tag(@This());
+
     pub const WatchSpec = struct {
         /// File path or directory to watch.
         path: []const u8,
         /// If `path` is a directory, watch all subdirectories too.
         recursive: bool = false,
     };
+
+    /// Check if the two triggers are equal. Watch paths are compared
+    /// literally.
+    pub fn eql(self: Trigger, other: Trigger) bool {
+        if (std.meta.activeTag(self) != std.meta.activeTag(other)) return false;
+        switch (self) {
+            .watch => |w| return w.recursive == other.watch.recursive and
+                std.mem.eql(u8, w.path, other.watch.path),
+            .interval => |i| return std.meta.eql(i, other.interval),
+            .time => |t| return std.meta.eql(t, other.time),
+        }
+    }
+
+    /// Allocate a copy of the trigger.
+    pub fn dupe(self: Trigger, gpa: std.mem.Allocator) !Trigger {
+        switch (self) {
+            .watch => |w| return .{ .watch = .{
+                .path = try gpa.dupe(u8, w.path),
+                .recursive = w.recursive,
+            } },
+            .interval => |i| return .{ .interval = i },
+            .time => |t| return .{ .time = t },
+        }
+    }
 
     pub fn deinit(self: Trigger, gpa: std.mem.Allocator) void {
         switch (self) {
@@ -209,6 +310,52 @@ pub const Trigger = union(enum) {
         }
     }
 };
+
+pub const NormalizePathOptions = struct {
+    /// Directory that relative paths resolve against. Defaults to the
+    /// current working directory.
+    base: ?[]const u8 = null,
+};
+
+/// Normalize a path to an absolute path.
+pub fn normalizePath(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    options: NormalizePathOptions,
+) ![]u8 {
+    const lexical: []u8 = blk: {
+        if (std.fs.path.isAbsolute(path)) {
+            break :blk try std.fs.path.resolve(gpa, &.{path});
+        }
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const base_dir: []const u8 = options.base orelse cwd: {
+            const n = std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buf) catch
+                return error.CwdUnavailable;
+            break :cwd cwd_buf[0..n];
+        };
+        const joined = try std.fs.path.join(gpa, &.{ base_dir, path });
+        defer gpa.free(joined);
+        break :blk try std.fs.path.resolve(gpa, &.{joined});
+    };
+    errdefer gpa.free(lexical);
+
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_len = std.Io.Dir.cwd().realPathFile(io, lexical, &real_buf) catch
+        return lexical;
+    const real = try gpa.dupe(u8, real_buf[0..real_len]);
+    gpa.free(lexical);
+    return real;
+}
+
+/// Count the triggers of the given kind.
+fn countKind(triggers: []const Trigger, kind: Trigger.Kind) usize {
+    var count: usize = 0;
+    for (triggers) |trigger| {
+        if (trigger == kind) count += 1;
+    }
+    return count;
+}
 
 pub const RemoteRunSpec = struct {
     /// Registered agent name.
@@ -346,9 +493,9 @@ test "task_to_yaml" {
     var t = try Task.init(gpa, "test");
     defer t.deinit(gpa);
     t.id = try .fromCustom(gpa, "custom-id");
-    t.trigger = .{
+    try t.addTrigger(gpa, .{
         .watch = .{ .path = try gpa.dupe(u8, "src/main.zig") },
-    };
+    });
 
     var steps = try std.ArrayList(Step).initCapacity(gpa, 2);
 
@@ -427,7 +574,7 @@ test "task_to_yaml_escaped" {
     defer t.deinit(gpa);
     t.id = try .fromCustom(gpa, "id-value");
     t.cwd = try gpa.dupe(u8, ".");
-    t.trigger = .{ .interval = .{ .h = 0, .min = 0, .sec = 1, .ms = 234 } };
+    try t.addTrigger(gpa, .{ .interval = .{ .h = 0, .min = 0, .sec = 1, .ms = 234 } });
 
     var deps = try gpa.alloc([]const u8, 1);
     deps[0] = try gpa.dupe(u8, "job:one");
@@ -462,6 +609,39 @@ test "task_to_yaml_escaped" {
         \\
     ;
 
+    const text = try t.toYaml(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+test "task_to_yaml_multiple_triggers" {
+    const gpa = std.testing.allocator;
+    var t = try Task.init(gpa, "multi");
+    defer t.deinit(gpa);
+    try t.addTrigger(gpa, .{ .time = .{ .h = 8, .min = 30, .sec = 0, .ms = 0 } });
+    try t.addTrigger(gpa, .{ .time = .{ .h = 17, .min = 45, .sec = 0, .ms = 0 } });
+    try t.addTrigger(gpa, .{
+        .watch = .{ .path = try gpa.dupe(u8, "src") },
+    });
+    try t.addTrigger(gpa, .{
+        .watch = .{
+            .path = try gpa.dupe(u8, "docs"),
+            .recursive = true,
+        },
+    });
+
+    const expected =
+        \\name: "multi"
+        \\on:
+        \\  watch:
+        \\    - "src"
+        \\    - path: "docs"
+        \\      recursive: true
+        \\  time:
+        \\    - "08:30:00"
+        \\    - "17:45:00"
+        \\
+    ;
     const text = try t.toYaml(gpa);
     defer gpa.free(text);
     try std.testing.expectEqualStrings(expected, text);

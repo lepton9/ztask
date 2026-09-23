@@ -937,8 +937,6 @@ pub const DataStore = struct {
         path: ?[]const u8 = null,
         /// Custom task ID
         id: ?[]const u8 = null,
-        /// Task trigger
-        trigger: ?task.Trigger = null,
         /// Task jobs
         jobs: ?[]task.Job = null,
         /// Optional diagnostics to report errors.
@@ -985,7 +983,6 @@ pub const DataStore = struct {
             }
         };
         const file_path = new_task.file_path orelse unreachable;
-        new_task.trigger = options.trigger;
         new_task.id = if (options.id) |id|
             task.Id.fromCustom(gpa, id) catch |err| {
                 const d = options.diagnostics orelse return err;

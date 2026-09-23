@@ -1,5 +1,6 @@
 const std = @import("std");
 const nightwatch = @import("nightwatch");
+const task_types = @import("../types/task.zig");
 
 const log = std.log.scoped(.file_watcher);
 
@@ -156,29 +157,7 @@ fn stopWatcher(self: *FileWatcher) void {
 }
 
 fn normalizePath(self: *FileWatcher, path: []const u8) ![]u8 {
-    return normalizeWatchPath(self.io, self.gpa, path);
-}
-
-/// Allocate a absolute path.
-pub fn normalizeWatchPath(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    path: []const u8,
-) ![]u8 {
-    var absolute_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const absolute_path = if (std.fs.path.isAbsolute(path))
-        path
-    else blk: {
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd_len = std.Io.Dir.cwd().realPathFile(io, ".", &cwd_buf) catch
-            return error.FileWatchCwdFailed;
-        break :blk try std.fmt.bufPrint(
-            &absolute_buf,
-            "{s}{c}{s}",
-            .{ cwd_buf[0..cwd_len], std.fs.path.sep, path },
-        );
-    };
-    return std.fs.path.resolve(gpa, &.{absolute_path});
+    return task_types.normalizePath(self.io, self.gpa, path, .{});
 }
 
 const PathRelation = enum {

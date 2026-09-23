@@ -217,6 +217,38 @@ const ParseCtx = struct {
         return err;
     }
 
+    /// Allocate error diagnostics at the given list index of a field.
+    /// Returns the same error.
+    ///
+    /// The field path is pointed at the failing list item. An error message
+    /// recorded while parsing the item itself is preserved.
+    fn failIndex(
+        self: ParseCtx,
+        err: ParseError,
+        field: []const u8,
+        index: usize,
+    ) ParseError {
+        // Copy the previous message
+        const message: ?[]u8 = if (self.diag) |d|
+            (if (d.message) |m| self.gpa.dupe(u8, m) catch null else null)
+        else
+            null;
+        defer if (message) |m| self.gpa.free(m);
+
+        const leaf = std.fmt.allocPrint(
+            self.gpa,
+            "{s}[{d}]",
+            .{ field, index },
+        ) catch return self.fail(err, field, message orelse "");
+        defer self.gpa.free(leaf);
+
+        const tmp = self.joinAlloc(leaf) catch null;
+        defer if (tmp) |t| self.gpa.free(t);
+        const field_path: ?[]const u8 = if (tmp) |t| t else leaf;
+        diagSet(self.diag, self.gpa, err, field_path, message);
+        return err;
+    }
+
     /// Allocate error diagnostics at the current location if `diag` is not null.
     /// Returns the same error.
     fn failf(
@@ -309,7 +341,10 @@ fn firstUnknownField(
     return null;
 }
 
-fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
+fn parseTask(
+    cx: ParseCtx,
+    map: yaml.Yaml.Map,
+) (ParseError || error{OutOfMemory})!*Task {
     try rejectUnknown(cx, map, VALID_TASK_FIELDS, ParseError.InvalidFieldName);
 
     // Task name
@@ -328,80 +363,17 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
 
     const cwd_maybe: ?[]const u8 = try parseTaskCwd(cx, map);
 
-    // Trigger
-    const trigger: ?task.Trigger = blk: {
-        const on_val = map.get("on") orelse break :blk null;
+    // Triggers
+    var triggers: std.ArrayList(task.Trigger) = .empty;
+    errdefer {
+        for (triggers.items) |t| t.deinit(cx.gpa);
+        triggers.deinit(cx.gpa);
+    }
+    if (map.get("on")) |on_val| {
         const on_cx = cx.at("on");
         const on = try requireMap(on_cx, on_val);
-        try rejectUnknown(on_cx, on, VALID_TRIGGER_FIELDS, ParseError.InvalidTrigger);
-
-        if (on.get("watch")) |watch| {
-            const watch_cx = on_cx.at("watch");
-
-            const spec: task.Trigger.WatchSpec = spec_blk: {
-                if (watch.asScalar()) |path_str| {
-                    break :spec_blk .{ .path = path_str, .recursive = false };
-                }
-
-                const wm = watch.asMap() orelse return watch_cx.fail(
-                    ParseError.InvalidFieldType,
-                    null,
-                    "Field 'watch' must be a string or map",
-                );
-
-                try rejectUnknown(watch_cx, wm, VALID_WATCH_FIELDS, ParseError.InvalidTrigger);
-                const path_val = try requireField(watch_cx, wm, "path");
-                const path_str = try requireScalar(watch_cx.at("path"), path_val);
-
-                var recursive: bool = false;
-                if (wm.get("recursive")) |rval| {
-                    const rstr = try requireScalarMsg(
-                        watch_cx.at("recursive"),
-                        rval,
-                        "Must be a bool",
-                    );
-                    const trimmed = std.mem.trim(u8, rstr, " \t\r\n");
-                    if (std.ascii.eqlIgnoreCase(trimmed, "true") or
-                        std.mem.eql(u8, trimmed, "1"))
-                    {
-                        recursive = true;
-                    } else if (std.ascii.eqlIgnoreCase(trimmed, "false") or
-                        std.mem.eql(u8, trimmed, "0"))
-                    {
-                        recursive = false;
-                    } else {
-                        return watch_cx.at("recursive").failf(
-                            ParseError.InvalidFieldValue,
-                            null,
-                            "Invalid bool value '{s}' (expected true/false)",
-                            .{rstr},
-                        );
-                    }
-                }
-                break :spec_blk .{ .path = path_str, .recursive = recursive };
-            };
-            break :blk .{ .watch = .{
-                .path = try cx.gpa.dupe(u8, spec.path),
-                .recursive = spec.recursive,
-            } };
-        }
-        if (on.get("time")) |time_val| {
-            const time_str = try requireScalar(on_cx.at("time"), time_val);
-            const t = try parseTimeDiag(time_str, on_cx.at("time"));
-            break :blk .{ .time = t };
-        }
-        if (on.get("interval")) |interval_val| {
-            const interval_str = try requireScalar(on_cx.at("interval"), interval_val);
-            const t = try parseTimeDiag(interval_str, on_cx.at("interval"));
-            break :blk .{ .interval = t };
-        }
-        return on_cx.fail(
-            ParseError.InvalidTrigger,
-            null,
-            "Trigger must specify one of: watch, time, interval",
-        );
-    };
-    errdefer if (trigger) |t| t.deinit(cx.gpa);
+        triggers = try parseTriggers(on_cx, on);
+    }
 
     // Parse all jobs
     var jobs = try parseJobs(cx, map);
@@ -422,9 +394,150 @@ fn parseTask(cx: ParseCtx, map: yaml.Yaml.Map) !*Task {
         );
     };
     t.cwd = if (cwd_maybe) |cwd| try cx.gpa.dupe(u8, cwd) else null;
-    t.trigger = trigger;
+    t.triggers = triggers;
     t.jobs = jobs;
     return t;
+}
+
+/// Parse the task triggers.
+fn parseTriggers(
+    cx: ParseCtx,
+    map: yaml.Yaml.Map,
+) (ParseError || error{OutOfMemory})!std.ArrayListUnmanaged(task.Trigger) {
+    var triggers: std.ArrayList(task.Trigger) = .empty;
+    errdefer {
+        for (triggers.items) |t| t.deinit(cx.gpa);
+        triggers.deinit(cx.gpa);
+    }
+
+    try rejectUnknown(cx, map, VALID_TRIGGER_FIELDS, ParseError.InvalidTrigger);
+    var kinds_seen: usize = 0;
+
+    if (map.get("watch")) |watch_val| {
+        kinds_seen += 1;
+        const watch_cx = cx.at("watch");
+        if (watch_val.asList()) |list| {
+            if (list.len == 0) return watch_cx.fail(
+                ParseError.InvalidTrigger,
+                null,
+                "Trigger list must not be empty",
+            );
+            for (list, 0..) |item, i| {
+                const spec = parseWatchSpec(cx.gpa, watch_cx, item) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return cx.failIndex(@errorCast(err), "watch", i),
+                };
+                errdefer cx.gpa.free(spec.path);
+                try triggers.append(cx.gpa, .{ .watch = spec });
+            }
+        } else {
+            const spec = try parseWatchSpec(cx.gpa, watch_cx, watch_val);
+            errdefer cx.gpa.free(spec.path);
+            try triggers.append(cx.gpa, .{ .watch = spec });
+        }
+    }
+    if (map.get("time")) |time_val| {
+        kinds_seen += 1;
+        const time_cx = cx.at("time");
+        if (time_val.asList()) |list| {
+            if (list.len == 0) return time_cx.fail(
+                ParseError.InvalidTrigger,
+                null,
+                "Trigger list must not be empty",
+            );
+            for (list, 0..) |item, i| {
+                const str = item.asScalar() orelse
+                    return cx.failIndex(ParseError.InvalidFieldType, "time", i);
+                const t = parseTimeDiag(str, time_cx) catch |err|
+                    return cx.failIndex(err, "time", i);
+                try triggers.append(cx.gpa, .{ .time = t });
+            }
+        } else {
+            const str = try requireScalar(time_cx, time_val);
+            const t = try parseTimeDiag(str, time_cx);
+            try triggers.append(cx.gpa, .{ .time = t });
+        }
+    }
+    if (map.get("interval")) |interval_val| {
+        kinds_seen += 1;
+        const interval_cx = cx.at("interval");
+        if (interval_val.asList()) |list| {
+            if (list.len == 0) return interval_cx.fail(
+                ParseError.InvalidTrigger,
+                null,
+                "Trigger list must not be empty",
+            );
+            for (list, 0..) |item, i| {
+                const str = item.asScalar() orelse
+                    return cx.failIndex(ParseError.InvalidFieldType, "interval", i);
+                const t = parseTimeDiag(str, interval_cx) catch |err|
+                    return cx.failIndex(err, "interval", i);
+                try triggers.append(cx.gpa, .{ .interval = t });
+            }
+        } else {
+            const str = try requireScalar(interval_cx, interval_val);
+            const t = try parseTimeDiag(str, interval_cx);
+            try triggers.append(cx.gpa, .{ .interval = t });
+        }
+    }
+
+    if (kinds_seen == 0) {
+        return cx.fail(
+            ParseError.InvalidTrigger,
+            null,
+            "Trigger must specify one of: watch, time, interval",
+        );
+    }
+    return triggers;
+}
+
+/// Parse one watch trigger value. Either a path scalar or a map.
+fn parseWatchSpec(
+    gpa: std.mem.Allocator,
+    watch_cx: ParseCtx,
+    value: yaml.Yaml.Value,
+) (ParseError || error{OutOfMemory})!task.Trigger.WatchSpec {
+    if (value.asScalar()) |path_str| {
+        return .{ .path = try gpa.dupe(u8, path_str), .recursive = false };
+    }
+
+    const wm = value.asMap() orelse return watch_cx.fail(
+        ParseError.InvalidFieldType,
+        null,
+        "Field 'watch' must be a string, list or map",
+    );
+
+    try rejectUnknown(watch_cx, wm, VALID_WATCH_FIELDS, ParseError.InvalidTrigger);
+    const path_val = try requireField(watch_cx, wm, "path");
+    const path_str = try requireScalar(watch_cx.at("path"), path_val);
+    _ = try parseStringFieldDiag(path_str, watch_cx.at("path"));
+
+    var recursive: bool = false;
+    if (wm.get("recursive")) |rval| {
+        const rstr = try requireScalarMsg(
+            watch_cx.at("recursive"),
+            rval,
+            "Must be a bool",
+        );
+        const trimmed = std.mem.trim(u8, rstr, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, "true") or
+            std.mem.eql(u8, trimmed, "1"))
+        {
+            recursive = true;
+        } else if (std.ascii.eqlIgnoreCase(trimmed, "false") or
+            std.mem.eql(u8, trimmed, "0"))
+        {
+            recursive = false;
+        } else {
+            return watch_cx.at("recursive").failf(
+                ParseError.InvalidFieldValue,
+                null,
+                "Invalid bool value '{s}' (expected true/false)",
+                .{rstr},
+            );
+        }
+    }
+    return .{ .path = try gpa.dupe(u8, path_str), .recursive = recursive };
 }
 
 /// Parse task working directory and check if it's a directory.
@@ -457,7 +570,7 @@ fn parseTaskCwd(cx: ParseCtx, map: yaml.Yaml.Map) !?[]const u8 {
 /// - HH:MM
 /// - HH:MM:SS
 /// - HH:MM:SS.mmm
-fn parseTime(str: []const u8) ParseError!date.Time {
+pub fn parseTime(str: []const u8) ParseError!date.Time {
     var it = std.mem.splitScalar(u8, str, ':');
     const h_str = it.next() orelse return ParseError.InvalidTriggerHour;
     const m_str = it.next() orelse return ParseError.InvalidTriggerMin;
@@ -801,7 +914,7 @@ pub fn parseTaskBufferDiag(
     gpa: std.mem.Allocator,
     buf: []const u8,
     diag: ?*ParseDiag,
-) !*Task {
+) (ParseError || error{OutOfMemory})!*Task {
     const cx = ParseCtx.init(io, gpa, diag);
     var yaml_parser: yaml.Yaml = .{ .source = buf };
     defer yaml_parser.deinit(gpa);
@@ -943,7 +1056,12 @@ test "parse_task" {
     try std.testing.expect(t.id.str != null);
     try std.testing.expect(std.mem.eql(u8, t.id.str.?, "123"));
     try std.testing.expect(std.mem.eql(u8, t.name, "test"));
-    try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src/main.zig"));
+    try std.testing.expect(t.triggers.items.len == 1);
+    try std.testing.expect(t.triggers.items[0] == .watch);
+    try std.testing.expectEqualStrings(
+        "src/main.zig",
+        t.triggers.items[0].watch.path,
+    );
     try std.testing.expect(t.jobs.count() == 3);
     const build_job = t.jobs.get("build").?;
     try std.testing.expect(build_job.steps.len == 2);
@@ -1044,9 +1162,164 @@ test "parse_watch_recursive" {
     ;
     const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
-    try std.testing.expect(t.trigger.? == .watch);
-    try std.testing.expect(std.mem.eql(u8, t.trigger.?.watch.path, "src"));
-    try std.testing.expect(t.trigger.?.watch.recursive);
+    try std.testing.expect(t.triggers.items.len == 1);
+    try std.testing.expect(t.triggers.items[0] == .watch);
+    try std.testing.expectEqualStrings("src", t.triggers.items[0].watch.path);
+    try std.testing.expect(t.triggers.items[0].watch.recursive);
+}
+
+test "parse_watch_list" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   watch:
+        \\     - "src/main.zig"
+        \\     - path: "src"
+        \\       recursive: true
+        \\     - path: "docs"
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.triggers.items.len == 3);
+    try std.testing.expect(t.triggers.items[0] == .watch);
+    try std.testing.expectEqualStrings(
+        "src/main.zig",
+        t.triggers.items[0].watch.path,
+    );
+    try std.testing.expect(!t.triggers.items[0].watch.recursive);
+    try std.testing.expectEqualStrings("src", t.triggers.items[1].watch.path);
+    try std.testing.expect(t.triggers.items[1].watch.recursive);
+    try std.testing.expectEqualStrings("docs", t.triggers.items[2].watch.path);
+    try std.testing.expect(!t.triggers.items[2].watch.recursive);
+}
+
+test "parse_multiple_triggers" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   time:
+        \\     - "08:30"
+        \\     - "17:45:30.123"
+        \\   interval: "00:01:00"
+        \\   watch:
+        \\     - "src"
+        \\     - "docs"
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+    try std.testing.expect(t.triggers.items.len == 5);
+    // Watch triggers come first, then time, then interval
+    try std.testing.expect(t.triggers.items[0] == .watch);
+    try std.testing.expectEqualStrings("src", t.triggers.items[0].watch.path);
+    try std.testing.expectEqualStrings("docs", t.triggers.items[1].watch.path);
+    try std.testing.expect(t.triggers.items[2] == .time);
+    try std.testing.expectEqual(@as(u5, 8), t.triggers.items[2].time.h);
+    try std.testing.expectEqual(@as(u6, 30), t.triggers.items[2].time.min);
+    try std.testing.expectEqual(@as(u5, 17), t.triggers.items[3].time.h);
+    try std.testing.expectEqual(@as(u6, 45), t.triggers.items[3].time.min);
+    try std.testing.expectEqual(@as(u6, 30), t.triggers.items[3].time.sec);
+    try std.testing.expectEqual(@as(u30, 123), t.triggers.items[3].time.ms);
+    try std.testing.expect(t.triggers.items[4] == .interval);
+    try std.testing.expectEqual(@as(u6, 1), t.triggers.items[4].interval.min);
+}
+
+test "parse_empty_watch_list" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   watch: []
+    ;
+    try std.testing.expect(
+        parseTaskBuffer(io, gpa, source) == ParseError.InvalidTrigger,
+    );
+}
+
+test "parse_empty_time_list" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   time: []
+    ;
+    try std.testing.expect(
+        parseTaskBuffer(io, gpa, source) == ParseError.InvalidTrigger,
+    );
+}
+
+test "parse_empty_trigger_list" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   interval: []
+    ;
+    try std.testing.expect(
+        parseTaskBuffer(io, gpa, source) == ParseError.InvalidTrigger,
+    );
+}
+
+test "parse_time_list_item_diagnostics" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   time:
+        \\     - "08:30"
+        \\     - "25:99"
+    ;
+    var diag: ParseDiag = .{};
+    defer diag.deinit(gpa);
+    try expectError(
+        ParseError.InvalidTriggerHour,
+        parseTaskBufferDiag(io, gpa, source, &diag),
+    );
+    try std.testing.expectEqualStrings("on.time[1]", diag.field.?);
+}
+
+test "parse_interval_list_item_diagnostics" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   interval:
+        \\     - "xx"
+    ;
+    var diag: ParseDiag = .{};
+    defer diag.deinit(gpa);
+    try expectError(
+        ParseError.InvalidTriggerMin,
+        parseTaskBufferDiag(io, gpa, source, &diag),
+    );
+    try std.testing.expectEqualStrings("on.interval[0]", diag.field.?);
+}
+
+test "parse_time_list_item_type_diagnostics" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ on:
+        \\   time:
+        \\     - "08:30"
+        \\     - path: "not-a-time"
+    ;
+    var diag: ParseDiag = .{};
+    defer diag.deinit(gpa);
+    try expectError(
+        ParseError.InvalidFieldType,
+        parseTaskBufferDiag(io, gpa, source, &diag),
+    );
+    try std.testing.expectEqualStrings("on.time[1]", diag.field.?);
 }
 
 test "parse_run_on" {
@@ -1095,8 +1368,9 @@ test "parse_trigger_time" {
     ;
     const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
-    try std.testing.expect(t.trigger.? == .time);
-    const time = t.trigger.?.time;
+    try std.testing.expect(t.triggers.items.len == 1);
+    try std.testing.expect(t.triggers.items[0] == .time);
+    const time = t.triggers.items[0].time;
     try std.testing.expectEqual(@as(u5, 17), time.h);
     try std.testing.expectEqual(@as(u6, 38), time.min);
     try std.testing.expectEqual(@as(u6, 0), time.sec);
@@ -1113,8 +1387,9 @@ test "parse_trigger_interval" {
     ;
     const t = try parseTaskBuffer(io, gpa, source);
     defer t.deinit(gpa);
-    try std.testing.expect(t.trigger.? == .interval);
-    const interval = t.trigger.?.interval;
+    try std.testing.expect(t.triggers.items.len == 1);
+    try std.testing.expect(t.triggers.items[0] == .interval);
+    const interval = t.triggers.items[0].interval;
     try std.testing.expectEqual(@as(u5, 0), interval.h);
     try std.testing.expectEqual(@as(u6, 1), interval.min);
     try std.testing.expectEqual(@as(u6, 15), interval.sec);

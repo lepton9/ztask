@@ -66,6 +66,17 @@ pub const EventSink = struct {
     };
 };
 
+/// A single registered trigger of a scheduler.
+pub const TriggerRegistration = union(enum) {
+    /// Registered file watch.
+    watch: struct {
+        path: []const u8,
+        recursive: bool,
+    },
+    /// Time watcher registration id.
+    time: u64,
+};
+
 pub const InterruptReason = enum { user_interrupt, retrigger };
 
 /// Scheduler for executing one task
@@ -116,10 +127,10 @@ pub const Scheduler = struct {
     event_sink: ?EventSink = null,
     work_notify: ?queue_zig.Notify = null,
     last_trigger_event_ns: i96 = 0,
-    /// Watch path list used for file watch triggers.
+    /// Active trigger registrations of the task.
     /// Managed and allocated by `TaskManager`.
-    /// Used to keep track of paths that are connected to this scheduler.
-    watch_paths: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Used to keep track of the registrations connected to this scheduler.
+    registrations: std.ArrayListUnmanaged(TriggerRegistration) = .empty,
 
     const SchedulerTaskStatus = enum {
         running,
@@ -197,7 +208,7 @@ pub const Scheduler = struct {
     pub fn deinit(self: *Scheduler) void {
         if (self.status == .running) return;
 
-        self.watch_paths.deinit(self.gpa);
+        self.registrations.deinit(self.gpa);
         for (self.nodes) |*node| node.deinit(self.gpa);
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);

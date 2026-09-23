@@ -62,17 +62,12 @@ test "task_to_yaml_parsed" {
     try expect(std.mem.eql(u8, original.id.fmt(), round_trip.id.fmt()));
     try expect(std.mem.eql(u8, original.cwd.?, round_trip.cwd.?));
     try expect(original.jobs.count() == round_trip.jobs.count());
-    switch (original.trigger.?) {
-        .interval => |time| switch (round_trip.trigger.?) {
-            .interval => |round_time| {
-                try expect(time.h == round_time.h);
-                try expect(time.min == round_time.min);
-                try expect(time.sec == round_time.sec);
-                try expect(time.ms == round_time.ms);
-            },
-            else => return error.TestExpectedEqual,
-        },
-        else => return error.TestExpectedEqual,
+    try expect(original.triggers.items.len == round_trip.triggers.items.len);
+    for (original.triggers.items) |trigger| {
+        const found: bool = blk: for (round_trip.triggers.items) |round_trigger| {
+            if (trigger.eql(round_trigger)) break :blk true;
+        } else false;
+        try expect(found);
     }
 
     const original_job = original.jobs.get("job-one").?;

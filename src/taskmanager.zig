@@ -11,6 +11,7 @@ const event_hub = @import("types/event_hub.zig");
 const Task = task_zig.Task;
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
+const TriggerRegistration = scheduler.TriggerRegistration;
 const Watcher = watcher_zig.Watcher;
 const ParseDiag = parse.ParseDiag;
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
@@ -93,6 +94,12 @@ pub const TaskManager = struct {
     watcher: *Watcher,
     /// Maps paths to active schedulers by their watch scope.
     watch_map: std.StringHashMapUnmanaged(WatchEntry),
+
+    /// Maps time watcher registration ids to active schedulers.
+    time_registrations: std.AutoHashMapUnmanaged(u64, *Scheduler),
+    /// Source of new time watcher registration ids. Ids are unique for the
+    /// lifetime of the process and never reused.
+    next_registration_id: std.atomic.Value(u64) = .init(1),
 
     control_events: MutexQueue(ControlEvent),
 
@@ -223,6 +230,7 @@ pub const TaskManager = struct {
             .loaded_tasks = .{},
             .to_unload = to_unload,
             .watch_map = .{},
+            .time_registrations = .{},
             .remote_manager = remote_manager,
             .watcher = watcher,
         };
@@ -244,6 +252,7 @@ pub const TaskManager = struct {
         self.loaded_tasks.deinit(self.gpa);
         self.to_unload.deinit(self.gpa);
         self.schedulers.deinit(self.gpa);
+        self.time_registrations.deinit(self.gpa);
         self.pool.deinit();
         self.remote_manager.deinit();
         self.watcher.deinit();
@@ -522,11 +531,11 @@ pub const TaskManager = struct {
         switch (s.*.status) {
             .running => {
                 s.*.forceStop(.user_interrupt);
-                try self.removeFromWatchList(s);
+                self.unregisterAll(s);
             },
             .waiting, .completed => {
                 s.*.status = .inactive;
-                try self.removeFromWatchList(s);
+                self.unregisterAll(s);
                 s.update();
                 self.tasks_changed.store(true, .seq_cst);
             },
@@ -534,62 +543,61 @@ pub const TaskManager = struct {
         }
     }
 
-    /// Remove scheduler from watch list if the task trigger is being watched
-    fn removeFromWatchList(self: *TaskManager, s: *Scheduler) error{Canceled}!void {
-        const t = s.task.trigger orelse return;
-        switch (t) {
+    /// Get a unique registration id.
+    fn nextRegistrationId(self: *TaskManager) u64 {
+        return self.next_registration_id.fetchAdd(1, .monotonic);
+    }
+
+    /// Unregister all trigger registrations of the scheduler.
+    fn unregisterAll(self: *TaskManager, s: *Scheduler) void {
+        for (s.registrations.items) |reg| switch (reg) {
             .watch => |w| {
-                const paths: []const []const u8 = blk: {
-                    if (s.watch_paths.items.len > 0) break :blk s.watch_paths.items;
-                    break :blk &.{w.path};
-                };
+                const e = self.watch_map.getEntry(w.path) orelse continue;
 
-                // Remove paths that are associated with the scheduler
-                for (paths) |path| {
-                    const e = self.watch_map.getEntry(path) orelse continue;
-
-                    const list_ptr = if (w.recursive)
-                        &e.value_ptr.recursive
-                    else
-                        &e.value_ptr.direct;
-
-                    // Remove scheduler.
-                    var removed_scheduler = false;
-                    for (0..list_ptr.items.len) |i| {
-                        if (@intFromPtr(list_ptr.items[i]) == @intFromPtr(s)) {
-                            _ = list_ptr.orderedRemove(i);
-                            removed_scheduler = true;
-                            break;
-                        }
-                    }
-                    if (!removed_scheduler) continue;
-
-                    try self.watcher.removeFileWatch(e.key_ptr.*, .{
-                        .recursive = w.recursive,
-                    });
-
-                    // No more schedulers that have the same watch path.
-                    if (e.value_ptr.direct.items.len == 0 and
-                        e.value_ptr.recursive.items.len == 0)
-                    {
-                        if (self.watch_map.fetchRemove(path)) |kv| {
-                            var entry = kv.value;
-                            entry.direct.deinit(self.gpa);
-                            entry.recursive.deinit(self.gpa);
-                            self.gpa.free(kv.key);
-                        }
+                // Remove the scheduler from the scope list of the entry.
+                const list_ptr = if (w.recursive)
+                    &e.value_ptr.recursive
+                else
+                    &e.value_ptr.direct;
+                var removed_scheduler = false;
+                for (0..list_ptr.items.len) |i| {
+                    if (@intFromPtr(list_ptr.items[i]) == @intFromPtr(s)) {
+                        _ = list_ptr.orderedRemove(i);
+                        removed_scheduler = true;
+                        break;
                     }
                 }
-                s.watch_paths.clearRetainingCapacity();
+                if (!removed_scheduler) continue;
+
+                self.watcher.removeFileWatch(e.key_ptr.*, .{
+                    .recursive = w.recursive,
+                });
+
+                // No more schedulers that have the same watch path.
+                if (e.value_ptr.direct.items.len == 0 and
+                    e.value_ptr.recursive.items.len == 0)
+                {
+                    if (self.watch_map.fetchRemove(w.path)) |kv| {
+                        var entry = kv.value;
+                        entry.direct.deinit(self.gpa);
+                        entry.recursive.deinit(self.gpa);
+                        self.gpa.free(kv.key);
+                    }
+                }
             },
-            .interval, .time => {
-                try self.watcher.removeTimeWatch(s.task.id.fmt());
+            .time => |registration_id| {
+                _ = self.time_registrations.remove(registration_id);
+                self.watcher.removeTimeWatch(registration_id);
             },
-        }
+        };
+        s.registrations.clearRetainingCapacity();
     }
 
     /// Add a file or directory path to the watch list.
     /// Allocates the paths in `TaskManager.watch_map`.
+    ///
+    /// Exact duplicate registrations of the same scheduler are
+    /// skipped, so the same trigger registered twice is watched once.
     fn addWatchPath(
         self: *TaskManager,
         s: *Scheduler,
@@ -597,11 +605,23 @@ pub const TaskManager = struct {
         recursive: bool,
         diagnostics: ?*GenericDiagnostics,
     ) !void {
-        const normalized_path = try watcher_zig.normalizeWatchPath(
+        const normalized_path = try task_zig.normalizePath(
             self.io,
             self.gpa,
             path,
+            .{},
         );
+
+        // Skip exact duplicate (path, scope) registrations of the scheduler.
+        for (s.registrations.items) |reg| switch (reg) {
+            .watch => |w| if (w.recursive == recursive and
+                std.mem.eql(u8, w.path, normalized_path))
+            {
+                self.gpa.free(normalized_path);
+                return;
+            },
+            else => {},
+        };
 
         const gop = blk: {
             errdefer self.gpa.free(normalized_path);
@@ -635,9 +655,16 @@ pub const TaskManager = struct {
                 else => err,
             };
         };
-        errdefer self.watcher.removeFileWatch(key, .{
-            .recursive = recursive,
-        }) catch {};
+        // Undo the whole registration on any failure below
+        errdefer {
+            self.watcher.removeFileWatch(key, .{ .recursive = recursive });
+            if (new_entry) if (self.watch_map.fetchRemove(key)) |kv| {
+                var entry = kv.value;
+                entry.direct.deinit(self.gpa);
+                entry.recursive.deinit(self.gpa);
+                self.gpa.free(kv.key);
+            };
+        }
 
         const list = if (recursive)
             &gop.value_ptr.recursive
@@ -645,7 +672,59 @@ pub const TaskManager = struct {
             &gop.value_ptr.direct;
         try list.append(self.gpa, s);
         errdefer _ = list.pop();
-        try s.watch_paths.append(self.gpa, key);
+        try s.registrations.append(self.gpa, .{ .watch = .{
+            .path = key,
+            .recursive = recursive,
+        } });
+    }
+
+    /// Register a single trigger for the scheduler.
+    fn registerTrigger(
+        self: *TaskManager,
+        s: *Scheduler,
+        trigger: task_zig.Trigger,
+        diagnostics: ?*GenericDiagnostics,
+    ) !void {
+        switch (trigger) {
+            .watch => |w| {
+                try self.addWatchPath(s, w.path, w.recursive, diagnostics);
+            },
+            .interval, .time => {
+                const registration_id = self.nextRegistrationId();
+                try switch (trigger) {
+                    .interval => |interval| self.watcher.addIntervalWatch(
+                        registration_id,
+                        interval,
+                    ),
+                    .time => |time| self.watcher.addTimeWatch(
+                        registration_id,
+                        time,
+                    ),
+                    else => unreachable,
+                };
+                errdefer self.watcher.removeTimeWatch(registration_id);
+                try self.time_registrations.put(self.gpa, registration_id, s);
+                errdefer _ = self.time_registrations.remove(registration_id);
+                try s.registrations.append(self.gpa, .{ .time = registration_id });
+            },
+        }
+    }
+
+    /// Register all triggers of the task for the scheduler.
+    ///
+    /// If any trigger fails to register, all registrations
+    /// made by this call are undone.
+    fn registerTriggers(
+        self: *TaskManager,
+        s: *Scheduler,
+        task: *Task,
+        diagnostics: ?*GenericDiagnostics,
+    ) !void {
+        self.unregisterAll(s);
+        errdefer self.unregisterAll(s);
+        for (task.triggers.items) |trigger| {
+            try self.registerTrigger(s, trigger, diagnostics);
+        }
     }
 
     /// Handle a bounded batch of incoming control events.
@@ -660,110 +739,109 @@ pub const TaskManager = struct {
             const event = self.control_events.pop() orelse break;
             processed += 1;
             switch (event) {
-                .watcher => |watcher_event| switch (watcher_event) {
-                    .fileEvent => |fe| {
-                        defer fe.deinit(self.gpa);
-                        const entry = self.watch_map.get(fe.watched_path) orelse continue;
-                        const schedulers = switch (fe.scope) {
-                            .direct => entry.direct.items,
-                            .recursive => entry.recursive.items,
-                        };
-                        for (schedulers) |s| try self.handleFileTriggerEvent(s);
-                    },
-                    .timeEvent => |te| {
-                        const s = self.getScheduler(te.task_id) orelse continue;
-                        try self.handleTimeTriggerEvent(s);
-                    },
-                },
-                .remote => |remote_event| {
-                    var owned = true;
-                    defer if (owned) remote_event.deinit(self.gpa);
-
-                    switch (remote_event) {
-                        .agent_changed => self.tasks_changed.store(true, .seq_cst),
-                        .job_started => |e| {
-                            try e.scheduler.log_queue.append(self.gpa, .{
-                                .job_started = .{
-                                    .job_id = e.job_id,
-                                    .name = e.name,
-                                    .timestamp_ms = e.timestamp_ms,
-                                },
-                            });
-                            owned = false;
-                        },
-                        .job_output => |e| {
-                            try e.scheduler.log_queue.append(self.gpa, .{
-                                .job_output = .{
-                                    .job_id = e.job_id,
-                                    .step = e.step,
-                                    .data = e.data,
-                                },
-                            });
-                            owned = false;
-                        },
-                        .job_finished => |e| {
-                            try e.scheduler.log_queue.append(self.gpa, .{
-                                .job_finished = .{
-                                    .job_id = e.job_id,
-                                    .name = e.name,
-                                    .success = e.success,
-                                    .message = if (e.result.msg) |message|
-                                        self.gpa.dupe(u8, message) catch null
-                                    else
-                                        null,
-                                    .timestamp_ms = e.timestamp_ms,
-                                },
-                            });
-                            owned = false;
-                            e.scheduler.result_queue.putOneUncancelable(
-                                self.io,
-                                .{
-                                    .node = e.node,
-                                    .result = e.result,
-                                },
-                            ) catch |err| {
-                                // Ownership of `result.msg` was not
-                                // transferred to the queue consumer.
-                                var result = e.result;
-                                result.deinit(self.gpa);
-                                return err;
-                            };
-                        },
-                    }
-                },
+                .watcher => |watcher_event| try self.handleWatcherEvent(watcher_event),
+                .remote => |remote_event| try self.handleRemoteEvent(remote_event),
             }
         }
 
         if (!self.control_events.empty()) self.signalWork();
     }
 
-    /// Handle a file-watch event for a scheduler.
-    fn handleFileTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
+    /// Handle a watcher event by triggering the schedulers it targets.
+    fn handleWatcherEvent(self: *TaskManager, event: watcher_zig.WatchEvent) !void {
+        defer switch (event) {
+            .fileEvent => |fe| fe.deinit(self.gpa),
+            .timeEvent => {},
+        };
+
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
-        const now_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
-        if (s.last_trigger_event_ns != 0 and
-            now_ns - s.last_trigger_event_ns < WATCH_DEDUPE_NS)
-            return;
-        s.last_trigger_event_ns = now_ns;
+        switch (event) {
+            .fileEvent => |fe| {
+                const entry = self.watch_map.get(fe.watched_path) orelse return;
+                const schedulers = switch (fe.scope) {
+                    .direct => entry.direct.items,
+                    .recursive => entry.recursive.items,
+                };
+                const now_ns = std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
+                for (schedulers) |s| {
+                    // Suppress rapid re-triggers of the same scheduler
+                    if (s.last_trigger_event_ns != 0 and
+                        now_ns - s.last_trigger_event_ns < WATCH_DEDUPE_NS)
+                        continue;
+                    s.last_trigger_event_ns = now_ns;
 
-        switch (s.status) {
-            .waiting => {
-                try s.trigger();
+                    try triggerScheduler(s);
+                }
             },
-            else => {
-                if (!s.retrigger) return;
-                s.forceStop(.retrigger);
-                try s.trigger();
+            .timeEvent => |te| {
+                const s = self.time_registrations.get(te.registration_id) orelse return;
+                try triggerScheduler(s);
             },
         }
     }
 
-    /// Handle a time trigger event for a scheduler.
-    fn handleTimeTriggerEvent(self: *TaskManager, s: *Scheduler) !void {
-        try self.mutex.lock(self.io);
-        defer self.mutex.unlock(self.io);
+    /// Handle a remote manager event.
+    fn handleRemoteEvent(self: *TaskManager, event: remotemanager.RemoteEvent) !void {
+        var owned = true;
+        defer if (owned) event.deinit(self.gpa);
+
+        switch (event) {
+            .agent_changed => self.tasks_changed.store(true, .seq_cst),
+            .job_started => |e| {
+                try e.scheduler.log_queue.append(self.gpa, .{
+                    .job_started = .{
+                        .job_id = e.job_id,
+                        .name = e.name,
+                        .timestamp_ms = e.timestamp_ms,
+                    },
+                });
+                owned = false;
+            },
+            .job_output => |e| {
+                try e.scheduler.log_queue.append(self.gpa, .{
+                    .job_output = .{
+                        .job_id = e.job_id,
+                        .step = e.step,
+                        .data = e.data,
+                    },
+                });
+                owned = false;
+            },
+            .job_finished => |e| {
+                try e.scheduler.log_queue.append(self.gpa, .{
+                    .job_finished = .{
+                        .job_id = e.job_id,
+                        .name = e.name,
+                        .success = e.success,
+                        .message = if (e.result.msg) |message|
+                            self.gpa.dupe(u8, message) catch null
+                        else
+                            null,
+                        .timestamp_ms = e.timestamp_ms,
+                    },
+                });
+                owned = false;
+                e.scheduler.result_queue.putOneUncancelable(
+                    self.io,
+                    .{
+                        .node = e.node,
+                        .result = e.result,
+                    },
+                ) catch |err| {
+                    // Ownership of `result.msg` was not
+                    // transferred to the queue consumer.
+                    var result = e.result;
+                    result.deinit(self.gpa);
+                    return err;
+                };
+            },
+        }
+    }
+
+    /// Start a run of the scheduler for a trigger event.
+    fn triggerScheduler(s: *Scheduler) !void {
         switch (s.status) {
             .waiting => try s.trigger(),
             else => {
@@ -794,7 +872,7 @@ pub const TaskManager = struct {
             },
             .completed => {
                 s.*.update();
-                if (s.*.task.trigger) |_| {
+                if (s.*.task.hasTriggers()) {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
 
@@ -846,7 +924,7 @@ pub const TaskManager = struct {
         _ = self.loaded_tasks.swapRemove(t.id.fmt());
         if (self.schedulers.fetchRemove(t)) |kv| {
             var s = kv.value;
-            self.removeFromWatchList(s) catch {};
+            self.unregisterAll(s);
             s.deinit(); // Free scheduler
             kv.key.deinit(self.gpa); // Free task
         }
@@ -923,34 +1001,15 @@ pub const TaskManager = struct {
             break :blk s;
         };
 
-        // Add trigger
-        if (task.trigger) |*t| {
+        // Register the triggers
+        if (task.hasTriggers()) {
             task_scheduler.status = .waiting;
-            switch (t.*) {
-                .watch => |*watch| {
-                    try task.resolveWatchPath(self.io, self.gpa);
-                    task_scheduler.watch_paths.clearRetainingCapacity();
-
-                    self.addWatchPath(
-                        task_scheduler,
-                        watch.path,
-                        watch.recursive,
-                        diagnostics,
-                    ) catch |err| {
-                        self.removeFromWatchList(task_scheduler) catch {};
-                        return err;
-                    };
-                },
-                .interval => |interval| {
-                    try self.watcher.addIntervalWatch(task.id.fmt(), interval);
-                },
-                .time => |time| {
-                    try self.watcher.addTimeWatch(task.id.fmt(), time);
-                },
-            }
+            try task.resolveWatchPaths(self.io, self.gpa);
+            // Drop stale registrations from a previous begin of the task
+            self.unregisterAll(task_scheduler);
+            try self.registerTriggers(task_scheduler, task, diagnostics);
         } else try task_scheduler.trigger();
 
-        unload_on_error = false;
         self.tasks_changed.store(true, .seq_cst);
         self.signalWork();
     }
