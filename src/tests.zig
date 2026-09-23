@@ -1,13 +1,13 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const parse = @import("parse.zig");
 const manager = @import("taskmanager.zig");
 const data = @import("data.zig");
 const snap = @import("tui/snapshot.zig");
 const run = @import("run.zig");
-const task_types = @import("types/task.zig");
 const remote_agent = @import("remote/remote_agent.zig");
 const testutil = @import("testing/utils.zig");
+const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
+const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
 
 const TestEnv = testutil.TestEnv;
 const TaskManager = manager.TaskManager;
@@ -17,6 +17,7 @@ const expectError = std.testing.expectError;
 
 test {
     _ = manager;
+    _ = run;
 }
 
 /// Find a task in the task list snapshot by its id.
@@ -421,215 +422,6 @@ test "remote_job_addr" {
     try std.testing.expect(finished.status == .success);
 }
 
-fn overwriteTaskFile(io: std.Io, abs_path: []const u8, name: []const u8, id: ?[]const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(io, abs_path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [256]u8 = undefined;
-    const content = if (id) |new_id|
-        try std.fmt.bufPrint(&buf, "name: {s}\nid: \"{s}\"\n", .{ name, new_id })
-    else
-        try std.fmt.bufPrint(&buf, "name: {s}\n", .{name});
-    var writer = file.writer(io, &.{});
-    try writer.interface.writeAll(content);
-    try writer.flush();
-}
-
-test "sync_tasks_id_change" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    var store = try data.DataStore.init(io, gpa, .{ .data_dir = env.data_dir });
-    defer store.deinit(gpa);
-
-    const a_meta = try store.newTask(gpa, .{ .name = "task-a", .id = "a" });
-    const b_meta = try store.newTask(gpa, .{ .name = "task-b", .id = "b" });
-
-    try overwriteTaskFile(io, a_meta.file_path, "task-a-new", "a-new");
-    try overwriteTaskFile(io, b_meta.file_path, "task-b-new", null);
-
-    try run.syncTasks(
-        .{ .io = io, .gpa = gpa, .env = &env.env, .data_dir = env.data_dir },
-        false,
-    );
-
-    var repaired = try data.DataStore.init(io, gpa, .{
-        .data_dir = env.data_dir,
-        .load = .{ .tasks = true },
-    });
-    defer repaired.deinit(gpa);
-
-    var id_b = task_types.Id.fromPath(b_meta.file_path);
-
-    try expect(
-        repaired.tasks.get("a") == null and repaired.tasks.get("a-new") != null,
-    );
-    try expect(
-        repaired.tasks.get("b") == null and repaired.tasks.get(id_b.fmt()) != null,
-    );
-
-    const meta_a_new = repaired.tasks.get("a-new") orelse unreachable;
-    const meta_b_new = repaired.tasks.get(id_b.fmt()) orelse unreachable;
-    try expect(std.mem.eql(u8, meta_a_new.name, "task-a-new"));
-    try expect(std.mem.eql(u8, meta_b_new.name, "task-b-new"));
-
-    // Check that the metafile paths have moved
-    const old_meta_path_a = try repaired.taskMetaPath(gpa, "a");
-    defer gpa.free(old_meta_path_a);
-    const new_meta_path_a = try repaired.taskMetaPath(gpa, meta_a_new.id);
-    defer gpa.free(new_meta_path_a);
-
-    const old_meta_path_b = try repaired.taskMetaPath(gpa, "b");
-    defer gpa.free(old_meta_path_b);
-    const new_meta_path_b = try repaired.taskMetaPath(gpa, meta_b_new.id);
-    defer gpa.free(new_meta_path_b);
-
-    try expect(!(data.fileExists(io, old_meta_path_a)));
-    try expect(data.fileExists(io, new_meta_path_a));
-    try expect(!(data.fileExists(io, old_meta_path_b)));
-    try expect(data.fileExists(io, new_meta_path_b));
-}
-
-test "sync_dedup_same_task_file_path" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-    const cwd = env.dir;
-
-    var store = try data.DataStore.init(io, gpa, .{
-        .data_dir = env.data_dir,
-        .load = .{ .tasks = true },
-    });
-    defer store.deinit(gpa);
-
-    const tasks_dir = try store.tasksPath(gpa);
-    defer gpa.free(tasks_dir);
-
-    // Create task file and add the task
-    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "python.yml" });
-    defer gpa.free(task_path);
-    const task_id = "task-a-id";
-    try data.writeFile(
-        io,
-        task_path,
-        "name: taskA\nid: " ++ task_id ++ "\n",
-        .{ .make_path = true, .truncate = true },
-    );
-    const real_task_path = try cwd.realPathFileAlloc(io, task_path, gpa);
-    defer gpa.free(real_task_path);
-    _ = try store.addTask(gpa, task_path, .{});
-    try std.testing.expect(store.getTaskMetadata(task_id) != null);
-
-    // Create a duplicate meta dir with a different id but the same file_path.
-    const dup_id = "duplicate-task-id";
-    const dup_task_dir = try store.taskDataPath(gpa, dup_id);
-    defer gpa.free(dup_task_dir);
-    try cwd.createDirPath(io, dup_task_dir);
-    const dup_meta_path = try store.taskMetaPath(gpa, dup_id);
-    defer gpa.free(dup_meta_path);
-    const dup_meta_json = try data.toJson(gpa, data.TaskMetadata{
-        .id = dup_id,
-        .file_path = real_task_path,
-        .name = "taskB",
-    });
-    defer gpa.free(dup_meta_json);
-    try data.writeFile(io, dup_meta_path, dup_meta_json, .{
-        .truncate = true,
-        .make_path = true,
-    });
-
-    // Add run 1 for the real task.
-    const run1_dir = try std.fs.path.join(
-        gpa,
-        &.{ env.data_dir, "data", task_id, "runs", "1" },
-    );
-    defer gpa.free(run1_dir);
-    try cwd.createDirPath(io, run1_dir);
-    const run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
-        .task_id = task_id,
-        .run_id = 1,
-        .start_time = 0,
-        .end_time = 1,
-        .status = .success,
-        .jobs_total = 0,
-        .jobs_completed = 0,
-    });
-    defer gpa.free(run1_meta);
-    const run1_meta_path = try std.fs.path.join(gpa, &.{ run1_dir, "meta.json" });
-    defer gpa.free(run1_meta_path);
-    try data.writeFile(io, run1_meta_path, run1_meta, .{
-        .truncate = true,
-        .make_path = true,
-    });
-
-    // Add run 1 for duplicate id (will need to be moved to avoid collision).
-    const dup_run1_dir = try std.fs.path.join(
-        gpa,
-        &.{ env.data_dir, "data", dup_id, "runs", "1" },
-    );
-    defer gpa.free(dup_run1_dir);
-    try cwd.createDirPath(io, dup_run1_dir);
-    const dup_run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
-        .task_id = dup_id,
-        .run_id = 1,
-        .start_time = 2,
-        .end_time = 3,
-        .status = .failed,
-        .jobs_total = 0,
-        .jobs_completed = 0,
-    });
-    defer gpa.free(dup_run1_meta);
-    const dup_run1_meta_path = try std.fs.path.join(gpa, &.{
-        dup_run1_dir,
-        "meta.json",
-    });
-    defer gpa.free(dup_run1_meta_path);
-    try data.writeFile(io, dup_run1_meta_path, dup_run1_meta, .{
-        .truncate = true,
-        .make_path = true,
-    });
-
-    // Set wrong run counter for the real task
-    const counter_path = try std.fs.path.join(
-        gpa,
-        &.{ env.data_dir, "data", task_id, "run_counter" },
-    );
-    defer gpa.free(counter_path);
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, 1, .little);
-    try data.writeFile(io, counter_path, buf[0..], .{
-        .truncate = true,
-        .make_path = true,
-    });
-
-    // Run sync
-    try run.syncTasks(.{
-        .io = io,
-        .gpa = gpa,
-        .env = &env.env,
-        .data_dir = env.data_dir,
-    }, false);
-    var repaired = try data.DataStore.init(io, gpa, .{
-        .data_dir = env.data_dir,
-        .load = .{ .tasks = true, .runs = true },
-    });
-    defer repaired.deinit(gpa);
-
-    // Duplicate was removed
-    try std.testing.expect(repaired.getTaskMetadata(dup_id) == null);
-    try std.testing.expect(repaired.getTaskMetadata(task_id) != null);
-
-    const runs = try repaired.getTaskRuns(gpa, task_id);
-    try std.testing.expect(runs.runs.count() == 2);
-    try std.testing.expect(runs.runs.get(1) != null);
-    try std.testing.expect(runs.runs.get(2) != null);
-
-    const next = try repaired.nextRunId(gpa, task_id);
-    try std.testing.expect(next >= 3);
-}
-
 test "manager_run_history_prefetch" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -857,157 +649,383 @@ test "examples" {
         _ = try task_manager.loadOrCreateWithPath(task_path, null);
     }
 }
-
-/// Count the runs recorded on disk for the task.
-fn taskRunCount(env: *const TestEnv, gpa: std.mem.Allocator, id: []const u8) !usize {
-    var datastore = try env.initDataStore(gpa, .{});
-    defer datastore.deinit(gpa);
-    try datastore.loadTaskRuns(gpa, id, .{ .limit = 0 });
-    return datastore.totalRuns(id);
+/// Check that a scheduler is registered for a watched path with the given
+/// scope.
+fn expectWatchRegistration(
+    task_manager: *TaskManager,
+    s: *Scheduler,
+    path: []const u8,
+    recursive: bool,
+) !void {
+    const e = task_manager.watch_map.get(path) orelse return error.TestUnexpectedResult;
+    const list = if (recursive) &e.recursive else &e.direct;
+    for (list.items) |item| {
+        if (item == s) return;
+    }
+    return error.TestUnexpectedResult;
 }
 
-test "run_multiple_tasks" {
+test "manager_multi_watch_register_remove" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
     var env: TestEnv = try .init(gpa);
     defer env.deinit(gpa);
 
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
-        \\ name: task1
-        \\ id: 101
-    );
-    defer gpa.free(path1);
-    const path2 = try env.createTaskFile(gpa, "task2.yml",
-        \\ name: task2
-        \\ id: 102
-    );
-    defer gpa.free(path2);
-    const path3 = try env.createTaskFile(gpa, "task3.yml",
-        \\ name: task3
-        \\ id: 103
-    );
-    defer gpa.free(path3);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try tmp.dir.createFile(io, "main.zig", .{});
+    try tmp.dir.createDirPath(io, "src/nested");
+    _ = try tmp.dir.createFile(io, "src/lib.zig", .{});
+    const watch_dir = try tmp.dir.realPathFileAlloc(io, "src", gpa);
+    defer gpa.free(watch_dir);
+    const watch_file = try tmp.dir.realPathFileAlloc(io, "main.zig", gpa);
+    defer gpa.free(watch_file);
 
-    const run_ctx: run.RunCtx = .{
-        .io = io,
-        .gpa = gpa,
-        .env = &env.env,
-        .data_dir = env.data_dir,
-    };
-
-    // Single task
-    try run.runTask(run_ctx, .{
-        .tasks = &.{.{ .path = path3 }},
-    });
-    try expect(try taskRunCount(&env, gpa, "103") == 1);
-
-    // Multiple tasks run and the same task selected twice runs only once
-    try run.runTask(run_ctx, .{
-        .tasks = &.{ .{ .path = path1 }, .{ .path = path1 }, .{ .path = path2 } },
-    });
-
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
-    try expect(try taskRunCount(&env, gpa, "102") == 1);
-}
-
-test "run_task_failures" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
-        \\ name: task1
-        \\ id: 101
-    );
-    defer gpa.free(path1);
-    const missing_path = try std.fs.path.join(gpa, &.{ env.path, "missing.yml" });
-    defer gpa.free(missing_path);
-
-    const run_ctx: run.RunCtx = .{
-        .io = io,
-        .gpa = gpa,
-        .env = &env.env,
-        .data_dir = env.data_dir,
-    };
-
-    // The valid task is run even when another task fails to load
-    try expectError(error.TaskStartFailed, run.runTask(run_ctx, .{
-        .tasks = &.{ .{ .path = missing_path }, .{ .path = path1 } },
-    }));
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
-
-    // All tasks failing to load does not start the event loop
-    try expectError(error.TaskStartFailed, run.runTask(run_ctx, .{
-        .tasks = &.{ .{ .path = missing_path }, .{ .path = missing_path } },
-    }));
-
-    // A single missing task keeps the mapped error
-    try expectError(error.TaskNotFoundPath, run.runTask(run_ctx, .{
-        .tasks = &.{.{ .path = missing_path }},
-    }));
-}
-
-test "run_waits_for_triggered_task" {
-    if (builtin.os.tag != .linux) return;
-
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
-        \\ name: task1
-        \\ id: 101
-    );
-    defer gpa.free(path1);
-    const path2 = try env.createTaskFile(gpa, "task2.yml",
-        \\ name: task2
-        \\ id: 102
+    const task_file_fmt = try std.fmt.allocPrint(gpa,
+        \\ name: multi-watch
+        \\ id: 200
         \\ on:
-        \\   interval: "00:00:30"
+        \\   watch:
+        \\     -
+        \\       path: "{s}"
+        \\       recursive: true
+        \\     - "{s}"
         \\ jobs:
         \\   noop:
-        \\     steps:
-        \\       - command: "true"
-    );
-    defer gpa.free(path2);
+        \\     steps: []
+    , .{ watch_dir, watch_file });
+    defer gpa.free(task_file_fmt);
+    // The manager owns the parsed task once it is put into `loaded_tasks`
+    const task = try parse.parseTaskBuffer(io, gpa, task_file_fmt);
+    try expect(task.triggers.items.len == 2);
+    try expect(task.triggers.items[0].watch.recursive);
 
-    const run_ctx: run.RunCtx = .{
-        .io = io,
-        .gpa = gpa,
-        .env = &env.env,
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
         .data_dir = env.data_dir,
-    };
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
 
-    const Runner = struct {
-        err: ?anyerror = null,
-        done: std.atomic.Value(bool) = .init(false),
+    const sched = task_manager.schedulers.get(task).?;
+    try expect(sched.registrations.items.len == 2);
+    try std.testing.expectEqual(@as(usize, 2), task_manager.watch_map.count());
+    try expectWatchRegistration(task_manager, sched, watch_dir, true);
+    try expectWatchRegistration(task_manager, sched, watch_file, false);
+    try expect(task_manager.watcher.file_watcher.watchCount() == 2);
 
-        fn exec(self: *@This(), ctx: run.RunCtx, options: run.RunOptions) void {
-            run.runTask(ctx, options) catch |err| {
-                self.err = err;
-            };
-            self.done.store(true, .seq_cst);
-        }
-    };
-    var runner: Runner = .{};
-    const start = std.Io.Clock.Timestamp.now(io, .real);
-    const run_opts: run.RunOptions = .{
-        .tasks = &.{ .{ .path = path1 }, .{ .path = path2 } },
-    };
-    const thread = try std.Thread.spawn(.{}, Runner.exec, .{
-        &runner, run_ctx, run_opts,
+    // Stop the task: all registrations are removed
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
+    try expect(task_manager.watcher.file_watcher.watchCount() == 0);
+    try std.testing.expectEqual(@as(u32, 0), task_manager.watcher.time_watcher.watchCount());
+}
+
+test "manager_multi_watch_mixed_scopes_cleanup" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    const watch_dir = try tmp.dir.realPathFileAlloc(io, "src", gpa);
+    defer gpa.free(watch_dir);
+
+    // Same path watched both directly and recursively by the same task
+    const task_file_fmt = try std.fmt.allocPrint(gpa,
+        \\ name: mixed-scope
+        \\ id: 201
+        \\ on:
+        \\   watch:
+        \\     - "{s}"
+        \\     - path: "{s}"
+        \\       recursive: true
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    , .{ watch_dir, watch_dir });
+    defer gpa.free(task_file_fmt);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file_fmt);
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
+
+    const sched = task_manager.schedulers.get(task).?;
+    try expect(sched.registrations.items.len == 2);
+    try std.testing.expectEqual(@as(usize, 1), task_manager.watch_map.count());
+    try expectWatchRegistration(task_manager, sched, watch_dir, true);
+    try expectWatchRegistration(task_manager, sched, watch_dir, false);
+
+    // Both scopes are removed on stop
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
+    try expect(task_manager.watcher.file_watcher.watchCount() == 0);
+}
+
+test "manager_watch_duplicate_roots_deduped" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    const watch_dir = try tmp.dir.realPathFileAlloc(io, "src", gpa);
+    defer gpa.free(watch_dir);
+
+    // The same root listed twice with the same scope
+    const task_file_fmt = try std.fmt.allocPrint(gpa,
+        \\ name: duplicate-roots
+        \\ id: 202
+        \\ on:
+        \\   watch:
+        \\     - "{s}"
+        \\     - "{s}"
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    , .{ watch_dir, watch_dir });
+    defer gpa.free(task_file_fmt);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file_fmt);
+    try expect(task.triggers.items.len == 2);
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
+
+    const sched = task_manager.schedulers.get(task).?;
+    // Only one registration for the duplicate roots
+    try expect(sched.registrations.items.len == 1);
+    try std.testing.expectEqual(@as(usize, 1), task_manager.watch_map.count());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        task_manager.watch_map.get(watch_dir).?.direct.items.len,
+    );
+    try expect(task_manager.watcher.file_watcher.watchCount() == 1);
+
+    // Stopping once removes the single registration
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
+    try expect(task_manager.watcher.file_watcher.watchCount() == 0);
+}
+
+test "manager_watch_registration_rollback" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    const watch_dir = try tmp.dir.realPathFileAlloc(io, "src", gpa);
+    defer gpa.free(watch_dir);
+    const missing_path = try std.fs.path.join(gpa, &.{ watch_dir, "missing" });
+    defer gpa.free(missing_path);
+
+    const task_file_fmt = try std.fmt.allocPrint(gpa,
+        \\ name: rollback
+        \\ id: 203
+        \\ on:
+        \\   watch: "{s}"
+        \\   interval: "01:00:00"
+        \\   time: "08:00:00"
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    , .{watch_dir});
+    defer gpa.free(task_file_fmt);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file_fmt);
+
+    // Append a trigger that fails to register
+    try task.addTrigger(gpa, .{
+        .watch = .{ .path = try gpa.dupe(u8, missing_path) },
     });
 
-    // Give the command time to run the tasks. It must still be waiting.
-    std.Io.sleep(io, .fromNanoseconds(300 * std.time.ns_per_ms), .awake) catch {};
-    try std.posix.raise(std.posix.SIG.INT);
-    thread.join();
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
 
-    // The command did not exit before the interrupt
-    const elapsed_ms = start.durationTo(.now(io, .real)).raw.toMilliseconds();
-    try expect(elapsed_ms >= 250);
-    try expect(runner.err == null);
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
+    var diagnostics: GenericDiagnostics = .{};
+    defer diagnostics.deinit(gpa);
+    try expectError(
+        error.WatchPathNotFound,
+        task_manager.beginTask(task.id.fmt(), .{ .diagnostics = &diagnostics }),
+    );
+    try expect(diagnostics.err != null);
+    try std.testing.expectEqual(error.WatchPathNotFound, diagnostics.err.?);
+
+    // All partial registrations were undone
+    try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        task_manager.watcher.file_watcher.watchCount(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), task_manager.time_registrations.count());
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        task_manager.watcher.time_watcher.watchCount(),
+    );
+    try expect(task_manager.schedulers.get(task) == null);
+    try expect(task_manager.loaded_tasks.get(task.id.fmt()) == null);
+}
+
+test "manager_timer_registration_lifecycle" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: timer
+        \\ id: 204
+        \\ on:
+        \\   interval: "01:00:00"
+        \\   time: "08:00:00"
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    ;
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
+
+    const sched = task_manager.schedulers.get(task).?;
+    try expect(sched.registrations.items.len == 2);
+    try std.testing.expectEqual(@as(usize, 2), task_manager.time_registrations.count());
+    try std.testing.expectEqual(@as(u32, 2), task_manager.watcher.time_watcher.watchCount());
+
+    // Both registrations map to the scheduler
+    var old_ids: [2]u64 = undefined;
+    for (sched.registrations.items, 0..) |reg, i| switch (reg) {
+        .time => |id| {
+            try expect(task_manager.time_registrations.get(id) == sched);
+            old_ids[i] = id;
+        },
+        .watch => return error.TestUnexpectedResult,
+    };
+
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), task_manager.time_registrations.count());
+    try std.testing.expectEqual(@as(u32, 0), task_manager.watcher.time_watcher.watchCount());
+
+    // Stale queued events of removed registrations are ignored: the ids are
+    // no longer tracked and never reused
+    for (old_ids) |id| {
+        try expect(task_manager.time_registrations.get(id) == null);
+    }
+    try std.testing.expectEqual(@as(u32, 0), task_manager.watcher.time_watcher.watchCount());
+}
+
+test "manager_interval_and_watch_combo" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    _ = try tmp.dir.createFile(io, "watch.txt", .{});
+    const watch_file = try tmp.dir.realPathFileAlloc(io, "watch.txt", gpa);
+    defer gpa.free(watch_file);
+
+    const task_file_fmt = try std.fmt.allocPrint(gpa,
+        \\ name: combo
+        \\ id: 205
+        \\ on:
+        \\   interval: "01:00:00"
+        \\   watch: "{s}"
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    , .{watch_file});
+    defer gpa.free(task_file_fmt);
+    const task = try parse.parseTaskBuffer(io, gpa, task_file_fmt);
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.start();
+    try task_manager.beginTask(task.id.fmt(), .{});
+
+    const sched = task_manager.schedulers.get(task).?;
+    try expect(sched.registrations.items.len == 2);
+    var watch_regs: usize = 0;
+    var time_regs: usize = 0;
+    for (sched.registrations.items) |reg| switch (reg) {
+        .watch => watch_regs += 1,
+        .time => time_regs += 1,
+    };
+    try expect(watch_regs == 1);
+    try expect(time_regs == 1);
+
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
+    try std.testing.expectEqual(@as(usize, 0), task_manager.time_registrations.count());
+}
+
+test "roundtrip_multi_trigger_yaml" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\name: "multi"
+        \\id: "208"
+        \\on:
+        \\  watch:
+        \\    - "src"
+        \\    - path: "docs"
+        \\      recursive: true
+        \\  time:
+        \\    - "08:30:00"
+        \\    - "17:45:00"
+        \\  interval: "00:01:00"
+        \\
+        \\jobs:
+        \\  noop:
+        \\    steps: []
+        \\
+    ;
+    const original = try parse.parseTaskBuffer(io, gpa, source);
+    defer original.deinit(gpa);
+    const text = try original.toYaml(gpa);
+    defer gpa.free(text);
+    const round_trip = try parse.parseTaskBuffer(io, gpa, text);
+    defer round_trip.deinit(gpa);
+
+    try expect(original.triggers.items.len == round_trip.triggers.items.len);
+    for (original.triggers.items) |trigger| {
+        const found: bool = blk: for (round_trip.triggers.items) |rt| {
+            if (trigger.eql(rt)) break :blk true;
+        } else false;
+        try expect(found);
+    }
 }

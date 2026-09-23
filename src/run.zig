@@ -1520,3 +1520,405 @@ pub fn inErrorSet(err: anyerror, comptime E: type) bool {
     };
     return false;
 }
+
+const TestEnv = @import("testing/utils.zig").TestEnv;
+
+const expect = std.testing.expect;
+const expectError = std.testing.expectError;
+
+fn overwriteTaskFile(io: std.Io, abs_path: []const u8, name: []const u8, id: ?[]const u8) !void {
+    var file = try std.Io.Dir.createFileAbsolute(io, abs_path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [256]u8 = undefined;
+    const content = if (id) |new_id|
+        try std.fmt.bufPrint(&buf, "name: {s}\nid: \"{s}\"\n", .{ name, new_id })
+    else
+        try std.fmt.bufPrint(&buf, "name: {s}\n", .{name});
+    var writer = file.writer(io, &.{});
+    try writer.interface.writeAll(content);
+    try writer.flush();
+}
+
+test "sync_tasks_id_change" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    var store = try data.DataStore.init(io, gpa, .{ .data_dir = env.data_dir });
+    defer store.deinit(gpa);
+
+    const a_meta = try store.newTask(gpa, .{ .name = "task-a", .id = "a" });
+    const b_meta = try store.newTask(gpa, .{ .name = "task-b", .id = "b" });
+
+    try overwriteTaskFile(io, a_meta.file_path, "task-a-new", "a-new");
+    try overwriteTaskFile(io, b_meta.file_path, "task-b-new", null);
+
+    try syncTasks(
+        .{ .io = io, .gpa = gpa, .env = &env.env, .data_dir = env.data_dir },
+        false,
+    );
+
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer repaired.deinit(gpa);
+
+    var id_b = task_types.Id.fromPath(b_meta.file_path);
+
+    try expect(
+        repaired.tasks.get("a") == null and repaired.tasks.get("a-new") != null,
+    );
+    try expect(
+        repaired.tasks.get("b") == null and repaired.tasks.get(id_b.fmt()) != null,
+    );
+
+    const meta_a_new = repaired.tasks.get("a-new") orelse unreachable;
+    const meta_b_new = repaired.tasks.get(id_b.fmt()) orelse unreachable;
+    try expect(std.mem.eql(u8, meta_a_new.name, "task-a-new"));
+    try expect(std.mem.eql(u8, meta_b_new.name, "task-b-new"));
+
+    // Check that the metafile paths have moved
+    const old_meta_path_a = try repaired.taskMetaPath(gpa, "a");
+    defer gpa.free(old_meta_path_a);
+    const new_meta_path_a = try repaired.taskMetaPath(gpa, meta_a_new.id);
+    defer gpa.free(new_meta_path_a);
+
+    const old_meta_path_b = try repaired.taskMetaPath(gpa, "b");
+    defer gpa.free(old_meta_path_b);
+    const new_meta_path_b = try repaired.taskMetaPath(gpa, meta_b_new.id);
+    defer gpa.free(new_meta_path_b);
+
+    try expect(!(data.fileExists(io, old_meta_path_a)));
+    try expect(data.fileExists(io, new_meta_path_a));
+    try expect(!(data.fileExists(io, old_meta_path_b)));
+    try expect(data.fileExists(io, new_meta_path_b));
+}
+
+test "sync_dedup_same_task_file_path" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+    const cwd = env.dir;
+
+    var store = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
+        .load = .{ .tasks = true },
+    });
+    defer store.deinit(gpa);
+
+    const tasks_dir = try store.tasksPath(gpa);
+    defer gpa.free(tasks_dir);
+
+    // Create task file and add the task
+    const task_path = try std.fs.path.join(gpa, &.{ tasks_dir, "python.yml" });
+    defer gpa.free(task_path);
+    const task_id = "task-a-id";
+    try data.writeFile(
+        io,
+        task_path,
+        "name: taskA\nid: " ++ task_id ++ "\n",
+        .{ .make_path = true, .truncate = true },
+    );
+    const real_task_path = try cwd.realPathFileAlloc(io, task_path, gpa);
+    defer gpa.free(real_task_path);
+    _ = try store.addTask(gpa, task_path, .{});
+    try std.testing.expect(store.getTaskMetadata(task_id) != null);
+
+    // Create a duplicate meta dir with a different id but the same file_path.
+    const dup_id = "duplicate-task-id";
+    const dup_task_dir = try store.taskDataPath(gpa, dup_id);
+    defer gpa.free(dup_task_dir);
+    try cwd.createDirPath(io, dup_task_dir);
+    const dup_meta_path = try store.taskMetaPath(gpa, dup_id);
+    defer gpa.free(dup_meta_path);
+    const dup_meta_json = try data.toJson(gpa, data.TaskMetadata{
+        .id = dup_id,
+        .file_path = real_task_path,
+        .name = "taskB",
+    });
+    defer gpa.free(dup_meta_json);
+    try data.writeFile(io, dup_meta_path, dup_meta_json, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Add run 1 for the real task.
+    const run1_dir = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", task_id, "runs", "1" },
+    );
+    defer gpa.free(run1_dir);
+    try cwd.createDirPath(io, run1_dir);
+    const run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
+        .task_id = task_id,
+        .run_id = 1,
+        .start_time = 0,
+        .end_time = 1,
+        .status = .success,
+        .jobs_total = 0,
+        .jobs_completed = 0,
+    });
+    defer gpa.free(run1_meta);
+    const run1_meta_path = try std.fs.path.join(gpa, &.{ run1_dir, "meta.json" });
+    defer gpa.free(run1_meta_path);
+    try data.writeFile(io, run1_meta_path, run1_meta, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Add run 1 for duplicate id (will need to be moved to avoid collision).
+    const dup_run1_dir = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", dup_id, "runs", "1" },
+    );
+    defer gpa.free(dup_run1_dir);
+    try cwd.createDirPath(io, dup_run1_dir);
+    const dup_run1_meta = try data.toJson(gpa, data.TaskRunMetadata{
+        .task_id = dup_id,
+        .run_id = 1,
+        .start_time = 2,
+        .end_time = 3,
+        .status = .failed,
+        .jobs_total = 0,
+        .jobs_completed = 0,
+    });
+    defer gpa.free(dup_run1_meta);
+    const dup_run1_meta_path = try std.fs.path.join(gpa, &.{
+        dup_run1_dir,
+        "meta.json",
+    });
+    defer gpa.free(dup_run1_meta_path);
+    try data.writeFile(io, dup_run1_meta_path, dup_run1_meta, .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Set wrong run counter for the real task
+    const counter_path = try std.fs.path.join(
+        gpa,
+        &.{ env.data_dir, "data", task_id, "run_counter" },
+    );
+    defer gpa.free(counter_path);
+    var buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &buf, 1, .little);
+    try data.writeFile(io, counter_path, buf[0..], .{
+        .truncate = true,
+        .make_path = true,
+    });
+
+    // Run sync
+    try syncTasks(.{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    }, false);
+    var repaired = try data.DataStore.init(io, gpa, .{
+        .data_dir = env.data_dir,
+        .load = .{ .tasks = true, .runs = true },
+    });
+    defer repaired.deinit(gpa);
+
+    // Duplicate was removed
+    try std.testing.expect(repaired.getTaskMetadata(dup_id) == null);
+    try std.testing.expect(repaired.getTaskMetadata(task_id) != null);
+
+    const runs = try repaired.getTaskRuns(gpa, task_id);
+    try std.testing.expect(runs.runs.count() == 2);
+    try std.testing.expect(runs.runs.get(1) != null);
+    try std.testing.expect(runs.runs.get(2) != null);
+
+    const next = try repaired.nextRunId(gpa, task_id);
+    try std.testing.expect(next >= 3);
+}
+/// Count the runs recorded on disk for the task.
+fn taskRunCount(env: *const TestEnv, gpa: std.mem.Allocator, id: []const u8) !usize {
+    var datastore = try env.initDataStore(gpa, .{});
+    defer datastore.deinit(gpa);
+    try datastore.loadTaskRuns(gpa, id, .{ .limit = 0 });
+    return datastore.totalRuns(id);
+}
+
+test "run_multiple_tasks" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const path2 = try env.createTaskFile(gpa, "task2.yml",
+        \\ name: task2
+        \\ id: 102
+    );
+    defer gpa.free(path2);
+    const path3 = try env.createTaskFile(gpa, "task3.yml",
+        \\ name: task3
+        \\ id: 103
+    );
+    defer gpa.free(path3);
+
+    const run_ctx: RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    // Single task
+    try runTask(run_ctx, .{
+        .tasks = &.{.{ .path = path3 }},
+    });
+    try expect(try taskRunCount(&env, gpa, "103") == 1);
+
+    // Multiple tasks run and the same task selected twice runs only once
+    try runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = path1 }, .{ .path = path1 }, .{ .path = path2 } },
+    });
+
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
+    try expect(try taskRunCount(&env, gpa, "102") == 1);
+}
+
+test "run_task_failures" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const missing_path = try std.fs.path.join(gpa, &.{ env.path, "missing.yml" });
+    defer gpa.free(missing_path);
+
+    const run_ctx: RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    // The valid task is run even when another task fails to load
+    try expectError(error.TaskStartFailed, runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = missing_path }, .{ .path = path1 } },
+    }));
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
+
+    // All tasks failing to load does not start the event loop
+    try expectError(error.TaskStartFailed, runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = missing_path }, .{ .path = missing_path } },
+    }));
+
+    // A single missing task keeps the mapped error
+    try expectError(error.TaskNotFoundPath, runTask(run_ctx, .{
+        .tasks = &.{.{ .path = missing_path }},
+    }));
+}
+
+test "run_waits_for_triggered_task" {
+    if (builtin.os.tag != .linux) return;
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 101
+    );
+    defer gpa.free(path1);
+    const path2 = try env.createTaskFile(gpa, "task2.yml",
+        \\ name: task2
+        \\ id: 102
+        \\ on:
+        \\   interval: "00:00:30"
+        \\ jobs:
+        \\   noop:
+        \\     steps:
+        \\       - command: "true"
+    );
+    defer gpa.free(path2);
+
+    const run_ctx: RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    const Runner = struct {
+        err: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+
+        fn exec(self: *@This(), ctx: RunCtx, options: RunOptions) void {
+            runTask(ctx, options) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .seq_cst);
+        }
+    };
+    var runner: Runner = .{};
+    const start = std.Io.Clock.Timestamp.now(io, .real);
+    const run_opts: RunOptions = .{
+        .tasks = &.{ .{ .path = path1 }, .{ .path = path2 } },
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.exec, .{
+        &runner, run_ctx, run_opts,
+    });
+
+    // Give the command time to run the tasks. It must still be waiting.
+    std.Io.sleep(io, .fromNanoseconds(300 * std.time.ns_per_ms), .awake) catch {};
+    try std.posix.raise(std.posix.SIG.INT);
+    thread.join();
+
+    // The command did not exit before the interrupt
+    const elapsed_ms = start.durationTo(.now(io, .real)).raw.toMilliseconds();
+    try expect(elapsed_ms >= 250);
+    try expect(runner.err == null);
+    try expect(try taskRunCount(&env, gpa, "101") == 1);
+}
+test "run_keepalive_failed_triggered_task" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const path1 = try env.createTaskFile(gpa, "task1.yml",
+        \\ name: task1
+        \\ id: 209
+    );
+    defer gpa.free(path1);
+    const path2 = try env.createTaskFile(gpa, "task2.yml",
+        \\ name: task2
+        \\ id: 210
+        \\ on:
+        \\   watch: "path/does/not/exist"
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    );
+    defer gpa.free(path2);
+
+    const run_ctx: RunCtx = .{
+        .io = io,
+        .gpa = gpa,
+        .env = &env.env,
+        .data_dir = env.data_dir,
+    };
+
+    try expectError(error.TaskStartFailed, runTask(run_ctx, .{
+        .tasks = &.{ .{ .path = path1 }, .{ .path = path2 } },
+    }));
+    // The valid task without a trigger ran to completion
+    try expect(try taskRunCount(&env, gpa, "209") == 1);
+}
