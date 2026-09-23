@@ -104,6 +104,9 @@ pub const Scheduler = struct {
     queue: Queue(*JobNode),
     /// Runners currently running jobs
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
+    /// Remote jobs dispatched in the current run, keyed by the
+    /// unique dispatch id.
+    remote_jobs: std.AutoHashMapUnmanaged(u64, *JobNode) = .{},
     /// Queue for completed jobs
     result_queue: std.Io.Queue(Result),
     /// Buffer for the `result_queue`.
@@ -213,6 +216,7 @@ pub const Scheduler = struct {
         self.gpa.free(self.nodes);
         self.queue.deinit(self.gpa);
         self.active_runners.deinit(self.gpa);
+        self.remote_jobs.deinit(self.gpa);
 
         self.result_queue.close(self.io);
         while (true) {
@@ -303,6 +307,8 @@ pub const Scheduler = struct {
         }
         self.status = .running;
 
+        self.cancelAllRemoteJobs();
+
         // Reset job nodes
         for (self.nodes) |*node| {
             node.reset();
@@ -365,11 +371,36 @@ pub const Scheduler = struct {
         job_meta.status = .running;
         self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
-        self.remote_manager.pushDispatch(.{
-            .agent = node.ptr.run_on.remote,
-            .job_node = node,
-            .scheduler = self,
-        }) catch {};
+        const dispatch_id = self.remote_manager.pushDispatch(
+            self.task_meta.task_id,
+            node.ptr.name,
+            node.ptr.run_on.remote,
+            node.ptr.steps,
+        ) catch |err| {
+            log.warn(
+                "Failed to queue remote dispatch of job '{s}': {s}",
+                .{ node.ptr.name, @errorName(err) },
+            );
+            self.onJobCompleted(node, .{
+                .success = false,
+                .runner = .remote,
+                .err = localrunner.ResultError.RunnerNotConnected,
+            });
+            return;
+        };
+        self.remote_jobs.put(self.gpa, dispatch_id, node) catch |err| {
+            log.warn(
+                "Failed to track remote dispatch of job '{s}': {s}",
+                .{ node.ptr.name, @errorName(err) },
+            );
+            self.remote_manager.cancelJob(dispatch_id) catch {};
+            self.onJobCompleted(node, .{
+                .success = false,
+                .runner = .remote,
+                .err = localrunner.ResultError.RunnerNotConnected,
+            });
+            return;
+        };
     }
 
     /// Request a runner from the pool
@@ -399,6 +430,8 @@ pub const Scheduler = struct {
             .task_id = self.task.id.value,
             .reason = reason,
         } });
+
+        self.cancelAllRemoteJobs();
 
         // Force stop running local runners
         var it = self.active_runners.iterator();
@@ -441,11 +474,36 @@ pub const Scheduler = struct {
             .pending, .ready => self.skipJob(node),
             .running => {
                 if (node.ptr.run_on == .local) continue;
-                self.remote_manager.cancelJob(node.id) catch {};
+                self.cancelRemoteJob(node);
                 self.skipJob(node);
             },
             else => {},
         };
+    }
+
+    /// Get the job node tracked for a remote dispatch id.
+    pub fn remoteJobNode(self: *Scheduler, dispatch_id: u64) ?*JobNode {
+        return self.remote_jobs.get(dispatch_id);
+    }
+
+    /// Cancel the remote dispatches of a job node and untrack them.
+    fn cancelRemoteJob(self: *Scheduler, node: *JobNode) void {
+        var it = self.remote_jobs.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != node) continue;
+            const dispatch_id = entry.key_ptr.*;
+            self.remote_manager.cancelJob(dispatch_id) catch {};
+            _ = self.remote_jobs.remove(dispatch_id);
+        }
+    }
+
+    /// Cancel all the pending remote dispatches.
+    fn cancelAllRemoteJobs(self: *Scheduler) void {
+        var remote_it = self.remote_jobs.iterator();
+        while (remote_it.next()) |entry| {
+            self.remote_manager.cancelJob(entry.key_ptr.*) catch {};
+        }
+        self.remote_jobs.clearRetainingCapacity();
     }
 
     /// Mark the job as skipped and log the metadata
@@ -529,6 +587,16 @@ pub const Scheduler = struct {
 
     /// Handle a completed job
     fn onJobCompleted(self: *Scheduler, node: *JobNode, result: ExecResult) void {
+        // Untrack the remote dispatch of the job if there is one
+        if (result.runner == .remote) {
+            var it = self.remote_jobs.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != node) continue;
+                const dispatch_id = entry.key_ptr.*;
+                _ = self.remote_jobs.remove(dispatch_id);
+            }
+        }
+
         var status: dag.Status = if (result.success) .success else .failed;
         if (result.err) |err| {
             status = .failed;

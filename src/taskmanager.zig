@@ -783,37 +783,47 @@ pub const TaskManager = struct {
     }
 
     /// Handle a remote manager event.
+    ///
+    /// Events for tasks or dispatches that no longer exist are dropped.
     fn handleRemoteEvent(self: *TaskManager, event: remotemanager.RemoteEvent) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
         var owned = true;
         defer if (owned) event.deinit(self.gpa);
-
         switch (event) {
             .agent_changed => self.tasks_changed.store(true, .seq_cst),
             .job_started => |e| {
-                try e.scheduler.log_queue.append(self.gpa, .{
+                const sched = self.getScheduler(e.task_id) orelse return;
+                const node = sched.remoteJobNode(e.dispatch_id) orelse return;
+                try sched.log_queue.append(self.gpa, .{
                     .job_started = .{
-                        .job_id = e.job_id,
-                        .name = e.name,
+                        .job_id = node.id,
+                        .name = null,
                         .timestamp_ms = e.timestamp_ms,
                     },
                 });
-                owned = false;
             },
             .job_output => |e| {
-                try e.scheduler.log_queue.append(self.gpa, .{
+                const sched = self.getScheduler(e.task_id) orelse return;
+                const node = sched.remoteJobNode(e.dispatch_id) orelse return;
+                try sched.log_queue.append(self.gpa, .{
                     .job_output = .{
-                        .job_id = e.job_id,
+                        .job_id = node.id,
                         .step = e.step,
                         .data = e.data,
                     },
                 });
+                self.gpa.free(e.task_id);
                 owned = false;
             },
             .job_finished => |e| {
-                try e.scheduler.log_queue.append(self.gpa, .{
+                const sched = self.getScheduler(e.task_id) orelse return;
+                const node = sched.remoteJobNode(e.dispatch_id) orelse return;
+                try sched.log_queue.append(self.gpa, .{
                     .job_finished = .{
-                        .job_id = e.job_id,
-                        .name = e.name,
+                        .job_id = node.id,
+                        .name = null,
                         .success = e.success,
                         .message = if (e.result.msg) |message|
                             self.gpa.dupe(u8, message) catch null
@@ -822,20 +832,15 @@ pub const TaskManager = struct {
                         .timestamp_ms = e.timestamp_ms,
                     },
                 });
-                owned = false;
-                e.scheduler.result_queue.putOneUncancelable(
+                try sched.result_queue.putOneUncancelable(
                     self.io,
                     .{
-                        .node = e.node,
+                        .node = node,
                         .result = e.result,
                     },
-                ) catch |err| {
-                    // Ownership of `result.msg` was not
-                    // transferred to the queue consumer.
-                    var result = e.result;
-                    result.deinit(self.gpa);
-                    return err;
-                };
+                );
+                self.gpa.free(e.task_id);
+                owned = false;
             },
         }
     }

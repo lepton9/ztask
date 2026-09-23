@@ -422,6 +422,40 @@ test "remote_job_addr" {
     try std.testing.expect(finished.status == .success);
 }
 
+test "remote_dispatch_survives_task_unload" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: unload-remote
+        \\ id: "unload-remote"
+        \\ jobs:
+        \\   jobremote:
+        \\     steps:
+        \\       - command: "zig version"
+        \\     run_on: remote:never-connected
+    ;
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    const task = try parse.parseTaskBuffer(io, gpa, task_file);
+    try task_manager.loaded_tasks.put(gpa, task.id.fmt(), task);
+    try task_manager.startWithOptions(.{ .listen_port = 0 });
+
+    try task_manager.beginTask(task.id.fmt(), .{});
+
+    try task_manager.stopTask(task.id.fmt());
+    try task_manager.waitUntilIdle();
+    try expect(task_manager.schedulers.count() == 0);
+
+    task_manager.remote_manager.wake();
+
+    try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+}
+
 test "manager_run_history_prefetch" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;

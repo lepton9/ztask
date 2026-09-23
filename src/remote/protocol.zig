@@ -23,7 +23,7 @@ pub const Msg = union(enum) {
 
 const MsgUnionInfo = @typeInfo(Msg).@"union";
 const ParseFn = *const fn ([]const u8) anyerror!Msg;
-const SerializeFn = *const fn (std.mem.Allocator, Msg) anyerror![]const u8;
+const SerializeFn = *const fn (std.mem.Allocator, Msg) anyerror![]u8;
 
 pub const MsgParser = struct {
     parse_table: [MsgUnionInfo.fields.len]ParseFn,
@@ -48,7 +48,7 @@ pub const MsgParser = struct {
         self: *MsgParser,
         gpa: std.mem.Allocator,
         msg: Msg,
-    ) ![]const u8 {
+    ) ![]u8 {
         const tag = std.meta.activeTag(msg);
         return self.serialize_table[@intFromEnum(tag)](gpa, msg);
     }
@@ -80,7 +80,7 @@ fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
         const T = field.type;
 
         table[@intFromEnum(tag)] = struct {
-            fn f(gpa: std.mem.Allocator, value: Msg) anyerror![]const u8 {
+            fn f(gpa: std.mem.Allocator, value: Msg) anyerror![]u8 {
                 const value_field = @field(value, field.name);
                 return try serializePayload(T, tag, gpa, value_field);
             }
@@ -109,7 +109,7 @@ pub const RunJobMsg = struct {
     steps: []const u8, // JSON
 
     /// Serialize the step slice to a JSON string
-    pub fn serializeSteps(gpa: std.mem.Allocator, steps: []task.Step) ![]const u8 {
+    pub fn serializeSteps(gpa: std.mem.Allocator, steps: []const task.Step) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(gpa);
         try std.json.Stringify.value(steps, .{}, &out.writer);
         return try out.toOwnedSlice();
@@ -176,7 +176,7 @@ pub fn serializePayload(
     comptime M: Msg.Tag,
     gpa: std.mem.Allocator,
     value: T,
-) ![]const u8 {
+) ![]u8 {
     var msg = try initMsgPrefix(gpa, M);
     const serialized = try serializeAlloc(T, gpa, value);
     defer gpa.free(serialized);
@@ -189,7 +189,7 @@ pub fn serializeAlloc(
     comptime T: type,
     gpa: std.mem.Allocator,
     value: T,
-) ![]const u8 {
+) ![]u8 {
     const info = comptime @typeInfo(T);
     var msg = try std.ArrayList(u8).initCapacity(gpa, 128);
 
