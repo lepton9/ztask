@@ -39,52 +39,6 @@ Task selection for task-specific commands can be performed using either the
 `--path` or `--id` options, which are mutually exclusive. Additionally, the path 
 can be provided as a positional argument.
 
-### Running tasks
-
-Added tasks can be ran using `ztask run` or from the TUI. Existing tasks can be 
-seen using `ztask list` or in the TUI.
-
-Multiple tasks can be run at once by providing multiple paths:
-```bash
-ztask run <task>... 
-```
-
-Tasks without a trigger run once and the command exits after all of them have 
-finished. If any task has a trigger, the command keeps running and exits only
-when interrupted.
-
-Tasks can be executed in either normal mode or attach mode. In normal mode, the 
-job outputs are piped to a log file, and the jobs run in the background. You can 
-view the logs of task runs from the TUI. In attach mode, the attached job's 
-outputs are inherited and displayed on the console. If the attached job is 
-interactive, user input is also forwarded to the command. You can only attach to 
-one job at a time, so `--attach` can only be used when running a single task.
-
-You can attach to a job run with `--attach` option:
-```bash
-ztask run <task> --attach <job_name>
-```
-If the job name is not specified, the first job of the task will be selected by 
-default.
-
-The number of runners that can be active simultaneously can be set using the 
-`--runners` option. This determines how many jobs can run in parallel using 
-threads. By default, the maximum number of runners is set to 10.
-
-### Triggers
-
-If a task has a trigger, it is executed when the specified trigger event 
-occurs. Without a trigger, the task executes immediately.
-
-A trigger can be:
-
-- `watch: "src/main.zig"`
-  - Watches for file or directory changes.
-- `interval: "hh:mm:ss"`
-  - Executes the task at specified intervals.
-- `time: "hh:mm:ss"`
-  - Executes the task at a certain time of the day (UTC).
-
 Example:
 
 ```yaml
@@ -108,6 +62,98 @@ jobs:
       - command: "zig fmt --check . src"
       - command: "zig build test"
 ```
+
+### Running tasks
+
+Added tasks can be ran using `ztask run` or from the TUI. Existing tasks can be 
+seen using `ztask list` or in the TUI.
+
+Multiple tasks can be run at once by providing multiple paths:
+```bash
+ztask run <task>... 
+```
+
+Tasks without a trigger run once and the command exits after all of them have 
+finished. If any started task has a trigger, the command keeps running and 
+exits only when interrupted.
+
+Tasks can be executed in either normal mode or attach mode. In normal mode, the 
+job outputs are piped to a log file, and the jobs run in the background. You can 
+view the logs of task runs from the TUI. In attach mode, the attached job's 
+outputs are inherited and displayed on the console. If the attached job is 
+interactive, user input is also forwarded to the command. You can only attach to 
+one job at a time, so `--attach` can only be used when running a single task.
+
+You can attach to a job run with `--attach` option:
+```bash
+ztask run <task> --attach <job_name>
+```
+If the job name is not specified, the first job of the task will be selected by 
+default.
+
+The number of runners that can be active simultaneously can be set using the 
+`--runners` option. This determines how many jobs can run in parallel using 
+threads. By default, the maximum number of runners is set to 10.
+
+### Triggers
+
+If a task has a trigger, it is executed when the specified trigger event 
+occurs. Without a trigger, the task executes immediately. A task with 
+triggers does not run right away: the first run waits for the first trigger 
+event.
+
+A trigger can be:
+
+- `watch: "src/main.zig"`
+  - Watches for file or directory changes.
+- `interval: "hh:mm:ss"`
+  - Executes the task at specified intervals.
+- `time: "hh:mm:ss"`
+  - Executes the task at a certain time of the day (UTC).
+
+#### Multiple triggers
+
+Tasks can have multiple triggers. Each trigger key accepts either a single
+value (as above) or a list of values. Triggers act independently: the task
+runs when any of them fires.
+
+```yaml
+name: "multi trigger example"
+
+on:
+  watch:
+    - "src"
+    - path: "docs"
+      recursive: true # Watch all the subdirectories recursively
+  time:
+    - "08:30:00" # Run every morning
+    - "17:45:00" # ...and in the afternoon
+  interval: "01:00:00" # ...and every hour
+
+jobs:
+  build:
+    steps:
+      - command: "zig build"
+```
+
+Watch trigger paths are resolved against the task `cwd` when it is set.
+
+#### Temporary triggers on the CLI
+
+The `ztask run` command can add triggers to the selected tasks without
+editing the task file:
+
+```bash
+ztask run <task> --watch src --time "08:30:00"
+```
+
+- `--watch <PATH>` and `--watch-recursive <PATH>` add file watch triggers.
+- `--time <TIME>` and `--interval <DURATION>` add time and interval
+  triggers.
+
+The triggers are appended to the task's own triggers and only apply to this
+run. CLI watch paths are always resolved against the current working directory
+of the invoking shell, even for tasks that define a `cwd`.
 
 ### Runners
 
