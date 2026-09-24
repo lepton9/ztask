@@ -640,7 +640,7 @@ pub const RemoteManager = struct {
         var it = self.agents.valueIterator();
         while (it.next()) |a| {
             if (@intFromPtr(a) == @intFromPtr(agent)) continue;
-            if (a.connection.closed) continue;
+            if (a.connection.isClosed()) continue;
             if (std.mem.eql(u8, a.name orelse continue, name))
                 return true;
         }

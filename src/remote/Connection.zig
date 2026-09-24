@@ -13,19 +13,31 @@ io: std.Io,
 conn: ConnInfo = undefined,
 /// Timestamp of the last read or sent message
 last_msg: i64 = 0,
-closed: bool = true,
+/// Teardown state of the socket handle.
+state: std.atomic.Value(State) = .init(.closed),
+
+/// Connection teardown state.
+const State = enum(u8) {
+    /// Socket is connected and usable.
+    open,
+    /// A shutdown syscall is in flight. The handle is still open.
+    shutting_down,
+    /// The socket handle has been closed.
+    closed,
+};
 
 /// Initialize with an already connected TCP connection
 pub fn initConn(io: std.Io, conn: ConnInfo) !Connection {
-    return .{
-        .io = io,
-        .conn = conn,
-        .closed = false,
-    };
+    return .{ .io = io, .conn = conn, .state = .init(.open) };
 }
 
 pub fn init(io: std.Io) !Connection {
-    return .{ .io = io, .closed = true };
+    return .{ .io = io };
+}
+
+/// Whether the connection can no longer be used.
+pub fn isClosed(self: *const Connection) bool {
+    return self.state.load(.acquire) != .open;
 }
 
 pub fn deinit(self: *Connection) void {
@@ -34,33 +46,46 @@ pub fn deinit(self: *Connection) void {
 
 /// Try to connect to the address
 pub fn connect(self: *Connection, addr: std.Io.net.IpAddress) !void {
-    if (!self.closed) return error.AlreadyConnected;
+    if (self.state.load(.acquire) != .closed) return error.AlreadyConnected;
     var a = addr;
     const stream = try a.connect(self.io, .{ .mode = .stream, .protocol = .tcp });
     self.conn = .{ .stream = stream, .address = addr };
-    self.closed = false;
+    self.state.store(.open, .release);
     self.setLastAccessed();
 }
 
-/// Close the connection
+/// Close the connection.
 pub fn close(self: *Connection) void {
-    if (self.closed) return;
-    self.closed = true;
-    self.conn.stream.close(self.io);
+    while (true) {
+        const state = self.state.load(.acquire);
+        if (state == .closed) return;
+        if (state == .shutting_down) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+        if (self.state.cmpxchgWeak(state, .closed, .acq_rel, .acquire) == null) {
+            self.conn.stream.close(self.io);
+            return;
+        }
+    }
 }
 
 /// Interrupt a blocking reader without closing the socket handle.
 pub fn shutdown(self: *Connection) void {
-    if (self.closed) return;
-    self.conn.stream.shutdown(self.io, .both) catch |err| log.warn(
-        "Failed to interrupt connection reader: {s}",
-        .{@errorName(err)},
-    );
+    if (self.state.cmpxchgStrong(.open, .shutting_down, .acq_rel, .acquire) != null) return;
+    self.conn.stream.shutdown(self.io, .both) catch |err| switch (err) {
+        error.SocketUnconnected => {},
+        else => log.warn(
+            "Failed to interrupt connection reader: {s}",
+            .{@errorName(err)},
+        ),
+    };
+    self.state.store(.open, .release);
 }
 
 /// Get the address of the connection
 pub fn getAddress(self: *Connection) !std.Io.net.IpAddress {
-    if (self.closed) return error.NotConnected;
+    if (self.isClosed()) return error.NotConnected;
     return self.conn.address;
 }
 
@@ -73,7 +98,7 @@ pub fn setLastAccessed(self: *Connection) void {
 /// Frame format:
 /// [[4 bytes: length N]][[1 byte: msg type]][[N-1 bytes: payload]]
 pub fn sendFrame(self: *Connection, msg: []const u8) !void {
-    if (self.closed) return error.NotConnected;
+    if (self.isClosed()) return error.NotConnected;
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
 

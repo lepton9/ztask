@@ -125,7 +125,7 @@ pub const RemoteAgent = struct {
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
-            if (self.connection.closed) {
+            if (self.connection.isClosed()) {
                 self.tryReconnect();
             }
             self.heartbeat() catch |err|
