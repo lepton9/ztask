@@ -1,0 +1,17 @@
+name: "Multi trigger"
+id: multi-trigger
+
+on:
+  watch:
+    - "src"
+    - path: "docs"
+      recursive: true
+  time:
+    - "08:30:00"
+    - "17:45:00"
+  interval: "01:00:00"
+
+jobs:
+  build:
+    steps:
+      - command: "zig build"
