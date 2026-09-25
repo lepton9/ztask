@@ -13,8 +13,8 @@
             .hash = "zcli-0.4.2-Of3s8bBEAgA2c5Vdqf1gPqwAa44tCjZ4eoDV404EqdvM",
         },
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis#a367b89da09bfe5e1b628501940de5b4f858f5f3",
-            .hash = "vaxis-0.6.0-BWNV_HHwCQB451KS7A8SMykALblPmGwHnzSfiJHjN3_9",
+            .url = "git+https://github.com/rockorager/libvaxis#173a890d1394946b5d7623c66cd34bcd36d8eeb8",
+            .hash = "vaxis-0.6.0-BWNV_OybDABnzf12gCPzy_IgAjkKkonDJF-2O_7XyLtD",
         },
         .nightwatch = .{
             .url = "git+https://github.com/neurocyte/nightwatch#cac3b9edb3a59f5b3a290cf3b76044ad9b09ef28",

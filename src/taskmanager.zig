@@ -931,8 +931,8 @@ pub const TaskManager = struct {
             var s = kv.value;
             self.unregisterAll(s);
             s.deinit(); // Free scheduler
-            kv.key.deinit(self.gpa); // Free task
         }
+        t.deinit(self.gpa); // Free task
     }
 
     /// Wait until the idle condition is signaled
@@ -1121,6 +1121,59 @@ pub const TaskManager = struct {
         try self.datastore.deleteTask(self.gpa, task_id);
         self.clearLastFinished(task_id);
         self.tasks_changed.store(true, .seq_cst);
+    }
+
+    /// Get and allocate the task file path of the task with the given ID.
+    pub fn getTaskFilePath(self: *TaskManager, task_id: []const u8) !?[]u8 {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        const meta = self.datastore.tasks.get(task_id) orelse return null;
+        return try self.gpa.dupe(u8, meta.file_path);
+    }
+
+    /// Apply the metadata changes of an externally edited task file.
+    pub fn applyEditedTask(
+        self: *TaskManager,
+        old_id: []const u8,
+        new_id: []const u8,
+        new_name: []const u8,
+    ) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+
+        // Prevent saving while the task is active
+        if (self.loaded_tasks.get(old_id)) |task| {
+            if (self.schedulers.get(task)) |s| switch (s.status) {
+                .running, .waiting => return error.TaskActive,
+                else => {},
+            };
+            self.unloadTask(task) catch {};
+        }
+
+        _ = try self.datastore.applyEditedTaskMeta(self.gpa, old_id, new_id, new_name);
+        self.moveLastFinished(old_id, new_id);
+        self.tasks_changed.store(true, .seq_cst);
+    }
+
+    /// Move the last finished run summary of a task to a new task ID.
+    fn moveLastFinished(
+        self: *TaskManager,
+        old_id: []const u8,
+        new_id: []const u8,
+    ) void {
+        if (std.mem.eql(u8, old_id, new_id)) return;
+        const kv = self.last_finished.fetchRemove(old_id) orelse return;
+        self.gpa.free(kv.key);
+
+        const gop = self.last_finished.getOrPut(self.gpa, new_id) catch return;
+        gop.value_ptr.* = kv.value;
+        if (!gop.found_existing) {
+            const key = self.gpa.dupe(u8, new_id) catch {
+                _ = self.last_finished.remove(new_id);
+                return;
+            };
+            gop.key_ptr.* = key;
+        }
     }
 
     /// Get a scheduler for a task based on task id if loaded

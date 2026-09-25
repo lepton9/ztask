@@ -106,10 +106,7 @@ fn editFile(
     editor_name: ?[]const u8,
 ) !EditorSpawnResult {
     if (editor_name) |explicit| {
-        return runEditorCommand(io, gpa, explicit, path) catch |err| switch (err) {
-            error.FileNotFound => return error.EditorNotFound,
-            else => return err,
-        };
+        return try runEditorCommand(io, gpa, explicit, path);
     }
 
     // Try to find and use a default editor
@@ -119,7 +116,7 @@ fn editFile(
 
     for (candidates.items) |cmd| {
         const res = runEditorCommand(io, gpa, cmd, path) catch |err| switch (err) {
-            error.FileNotFound => continue,
+            error.EditorNotFound => continue,
             else => return err,
         };
         return res;
@@ -147,12 +144,15 @@ fn runEditorCommand(
     const start = std.Io.Clock.awake.now(io);
 
     // Spawn the editor child process
-    var child = try std.process.spawn(io, .{
+    var child = std.process.spawn(io, .{
         .argv = argv.items,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
-    });
+    }) catch |err| return switch (err) {
+        error.FileNotFound => error.EditorNotFound,
+        else => err,
+    };
     const term = try child.wait(io);
     const elapsed_ns = start.untilNow(io, .awake).toNanoseconds();
     const wait_treshold_ns = std.time.ns_per_s;
@@ -174,8 +174,11 @@ fn collectDefaultEditors(
     env: *std.process.Environ.Map,
     out: *std.ArrayList([]const u8),
 ) !void {
-    if (env.get("VISUAL")) |v| if (v.len != 0) try out.append(gpa, v);
-    if (env.get("EDITOR")) |v| if (v.len != 0) try out.append(gpa, v);
+    const env_vars = .{ "VISUAL", "EDITOR" };
+    inline for (env_vars) |key| if (env.get(key)) |value| {
+        const e = std.mem.trim(u8, value, " \t\r\n");
+        if (e.len != 0) try out.append(gpa, e);
+    };
 
     switch (builtin.os.tag) {
         .linux => {

@@ -79,6 +79,11 @@ pub const Model = struct {
     /// Confirmation state
     confirm: ?ConfirmState = null,
 
+    /// Pending request to edit a task file with an external editor.
+    edit_request: ?[]u8 = null,
+    /// Info text set while the app was not running. Shown on startup.
+    pending_info: ?[]u8 = null,
+
     const ActiveArea = enum { status, info, task_list, task_view };
 
     const ConfirmAction = union(enum) {
@@ -110,6 +115,8 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         self.events.deinit();
         if (self.info.text) |t| self.gpa.free(t);
+        if (self.edit_request) |id| self.gpa.free(id);
+        if (self.pending_info) |t| self.gpa.free(t);
         self.deinitConfirm();
         self.clearBuiltTask();
         self.clearFollowRun();
@@ -193,8 +200,8 @@ pub const Model = struct {
             };
             if (self.info.text) |t| break :blk .{ t, .{ .fg = .default } };
             break :blk .{ switch (self.active) {
-                .task_view => " j/k move r run  s stop tab switch  enter open  esc back  q quit",
-                .task_list => " j/k move  r run  s stop  d delete  enter open  q quit",
+                .task_view => " j/k move r run  s stop e edit tab switch  enter open  esc back  q quit",
+                .task_list => " j/k move  r run  s stop  d delete  e edit  enter open  q quit",
                 else => " q quit",
             }, dim };
         };
@@ -221,6 +228,10 @@ pub const Model = struct {
         switch (event) {
             .init => {
                 try ctx.tick(UPDATE_TICK_MS, self.widget());
+                if (self.pending_info) |msg| {
+                    self.pending_info = null;
+                    self.setInfoOwned(msg);
+                }
                 try self.requestSnapshot();
                 try ctx.requestFocus(self.task_split.widget());
             },
@@ -388,6 +399,50 @@ pub const Model = struct {
         self.active = .info;
         try ctx.requestFocus(self.widget());
         ctx.consumeAndRedraw();
+    }
+
+    /// Request editing the task file of the task with the given ID.
+    ///
+    /// The app is quit for the edit so the external editor can use
+    /// the terminal directly.
+    fn requestEditTask(
+        self: *Model,
+        ctx: *vxfw.EventContext,
+        task_id: []const u8,
+    ) !void {
+        // Check the task file exists
+        if (try self.taskmanager.getTaskFilePath(task_id)) |file_path| {
+            defer self.gpa.free(file_path);
+            if (!data.fileExists(self.taskmanager.io, file_path)) {
+                try self.setInfo("Task file not found: {s}", .{file_path});
+                ctx.consumeAndRedraw();
+                return;
+            }
+        } else {
+            try self.setInfo("Task {s} not found", .{task_id});
+            ctx.consumeAndRedraw();
+            return;
+        }
+
+        const id = try self.gpa.dupe(u8, task_id);
+        // The task ID can change during the edit, so forget the state
+        self.clearBuiltTask();
+        self.clearFollowRun();
+        self.edit_request = id;
+        ctx.quit = true;
+    }
+
+    /// Take the pending edit request, if any.
+    pub fn takeEditRequest(self: *Model) ?[]u8 {
+        const req = self.edit_request orelse return null;
+        self.edit_request = null;
+        return req;
+    }
+
+    /// Set the info text to display when the app starts again.
+    pub fn setPendingInfo(self: *Model, comptime fmt: []const u8, args: anytype) !void {
+        if (self.pending_info) |t| self.gpa.free(t);
+        self.pending_info = try std.fmt.allocPrint(self.gpa, fmt, args);
     }
 
     /// Make a task delete confirmation request
@@ -773,6 +828,17 @@ pub const Model = struct {
         self.info.timestamp = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
     }
 
+    /// Set info text from owned data, taking over the ownership.
+    fn setInfoOwned(self: *Model, msg: []u8) void {
+        if (self.confirm != null) {
+            self.gpa.free(msg);
+            return;
+        }
+        if (self.info.text) |t| self.gpa.free(t);
+        self.info.text = msg;
+        self.info.timestamp = std.Io.Timestamp.now(self.taskmanager.io, .real).toSeconds();
+    }
+
     /// Reset info text if it has been displayed longer than the threshold time
     fn checkInfo(self: *Model) void {
         if (self.confirm != null) return;
@@ -869,6 +935,21 @@ const TaskSplit = struct {
                         return;
                     }
                     try self.model.requestDeleteTask(ctx, selected.meta.id, selected.meta.name);
+                    return;
+                }
+                // Edit the selected task file with an external editor
+                else if (key.matches('e', .{})) {
+                    const selected = self.selectedTask() orelse return;
+                    if (selected.status != .inactive) {
+                        try self.model.setInfo(
+                            "Task must be inactive to edit (press 's' to stop)",
+                            .{},
+                        );
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    try self.model.requestEditTask(ctx, selected.meta.id);
+                    ctx.consumeEvent();
                     return;
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     if (self.tasks_models.items.len > 0) {
@@ -1082,13 +1163,28 @@ const TaskView = struct {
                 }
             },
             .key_press => |key| {
+                if (self.display_job_log) {
+                    self.handleJobLogKey(ctx, key);
+                    return;
+                }
                 if (key.matches('r', .{})) {
                     _ = try self.parent.dispatchSelectedTask();
                     ctx.consumeAndRedraw();
                     return;
                 }
-                if (self.display_job_log) {
-                    self.handleJobLogKey(ctx, key);
+                // Edit the task file with an external editor
+                if (key.matches('e', .{})) {
+                    const task = self.task orelse return;
+                    if (task.data.status != .inactive) {
+                        try self.parent.model.setInfo(
+                            "Task must be inactive to edit (press 's' to stop)",
+                            .{},
+                        );
+                        ctx.consumeAndRedraw();
+                        return;
+                    }
+                    try self.parent.model.requestEditTask(ctx, task.data.meta.id);
+                    ctx.consumeEvent();
                     return;
                 }
                 if (keyDown(key)) {

@@ -55,10 +55,6 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
     const io = ctx.io;
     const gpa = ctx.gpa;
 
-    var buffer: [1024]u8 = undefined;
-    var app = try vxfw.App.init(io, gpa, ctx.env, &buffer);
-    defer app.deinit();
-
     const task_manager: *TaskManager =
         try .initWithOptions(io, gpa, options.runners_n, .{
             .data_dir = ctx.data_dir,
@@ -75,8 +71,74 @@ pub fn runTui(ctx: RunCtx, options: TuiOptions) !void {
     const model = try Model.init(gpa, task_manager);
     defer model.deinit();
 
-    try app.run(model.widget(), .{});
+    // The app is recreated between task edits so the editor and its
+    // prompts can use the terminal while the TUI is not active.
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        {
+            var app = try vxfw.App.init(io, gpa, ctx.env, &buffer);
+            defer app.deinit();
+            try app.run(model.widget(), .{});
+        }
+
+        const edit_task_id = model.takeEditRequest() orelse break;
+        defer gpa.free(edit_task_id);
+        try editTaskFromTui(ctx, model, edit_task_id);
+    }
     try task_manager.stop();
+}
+
+/// Edit the file of the task requested by the TUI.
+fn editTaskFromTui(
+    ctx: RunCtx,
+    model: *Model,
+    task_id: []const u8,
+) !void {
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+
+    const file_path = (try model.taskmanager.getTaskFilePath(task_id)) orelse {
+        try model.setPendingInfo("Task {s} not found", .{task_id});
+        return;
+    };
+    defer gpa.free(file_path);
+
+    const res = editTaskFile(io, gpa, ctx.env, file_path, null, false) catch |err| {
+        const desc: []const u8 = switch (err) {
+            error.EditorNotFound => "no editor found (set $EDITOR or $VISUAL)",
+            else => @errorName(err),
+        };
+        try model.setPendingInfo("Failed to edit task {s}: {s}", .{
+            task_id, desc,
+        });
+        return;
+    };
+    switch (res) {
+        .success => |s| {
+            defer {
+                gpa.free(s.id);
+                gpa.free(s.name);
+            }
+            model.taskmanager.applyEditedTask(task_id, s.id, s.name) catch |err| {
+                try model.setPendingInfo("Failed to save task {s}: {s}", .{
+                    s.id, @errorName(err),
+                });
+                return;
+            };
+            try model.setPendingInfo("Saved task {s}", .{s.id});
+        },
+        .err => |err| {
+            if (err.message) |msg| {
+                defer gpa.free(msg);
+                try model.setPendingInfo("{s}", .{msg});
+            } else {
+                try model.setPendingInfo(
+                    "Invalid task file format: {s}",
+                    .{@errorName(err.err)},
+                );
+            }
+        },
+    }
 }
 
 pub const AgentOptions = struct {

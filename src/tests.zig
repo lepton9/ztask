@@ -1063,3 +1063,94 @@ test "roundtrip_multi_trigger_yaml" {
         try expect(found);
     }
 }
+
+test "apply_edited_task" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var env: TestEnv = try .init(gpa);
+    defer env.deinit(gpa);
+
+    const task_file =
+        \\ name: task-edit
+        \\ id: 501
+        \\ jobs:
+        \\   noop:
+        \\     steps: []
+    ;
+    const path = try env.createTaskFile(gpa, "task-edit.yml", task_file);
+    defer gpa.free(path);
+
+    const triggered_file =
+        \\ name: task-triggered
+        \\ id: 502
+        \\ on:
+        \\   interval: "00:01:00"
+        \\ jobs:
+        \\   noop:
+        \\     steps:
+        \\       - command: "true"
+    ;
+    const triggered_path = try env.createTaskFile(gpa, "task-triggered.yml", triggered_file);
+    defer gpa.free(triggered_path);
+
+    const task_manager = try TaskManager.initWithOptions(io, gpa, 1, .{
+        .data_dir = env.data_dir,
+    });
+    defer task_manager.deinit();
+    try task_manager.start();
+
+    _ = try task_manager.loadOrCreateWithPath(path, null);
+    _ = try task_manager.loadOrCreateWithPath(triggered_path, null);
+
+    // The task file path is found with the task ID
+    const stored_path = (try task_manager.getTaskFilePath("501")).?;
+    defer gpa.free(stored_path);
+    try expect(std.mem.eql(u8, stored_path, path));
+
+    // Unknown tasks have no file path
+    try expect((try task_manager.getTaskFilePath("unknown")) == null);
+
+    // The edit cannot be saved while the task is waiting on a trigger
+    try task_manager.beginTask("502", .{});
+    try expectError(error.TaskActive, task_manager.applyEditedTask("502", "502", "x"));
+    try task_manager.stopTask("502");
+    try task_manager.waitUntilIdle();
+
+    // A name change applies and the task is unloaded for reload
+    try task_manager.applyEditedTask("501", "501", "task-renamed");
+    try expect(task_manager.tasksModified());
+    try expect(std.mem.eql(
+        u8,
+        task_manager.datastore.tasks.get("501").?.name,
+        "task-renamed",
+    ));
+    try expect(task_manager.loaded_tasks.get("501") == null);
+
+    // The edited task is loaded again on the next use
+    try task_manager.beginTask("501", .{});
+    try task_manager.waitUntilIdle();
+
+    // An ID change drops the old ID and moves the task data
+    try data.writeFile(
+        io,
+        path,
+        "name: task-edit\nid: 503\n",
+        .{ .truncate = true },
+    );
+    // The last finished run of the old ID moves with it
+    try expect(task_manager.last_finished.get("501") != null);
+    try task_manager.applyEditedTask("501", "503", "task-edit");
+
+    try expect((try task_manager.getTaskFilePath("501")) == null);
+    const new_path = (try task_manager.getTaskFilePath("503")).?;
+    defer gpa.free(new_path);
+    try expect(std.mem.eql(u8, new_path, path));
+    try expect(task_manager.loaded_tasks.get("503") == null);
+    try expect(task_manager.last_finished.get("501") == null);
+    try expect(task_manager.last_finished.get("503") != null);
+
+    // The edited task runs with the new ID
+    try task_manager.beginTask("503", .{});
+    try task_manager.waitUntilIdle();
+    try expect(task_manager.datastore.tasks.get("503") != null);
+}
