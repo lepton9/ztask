@@ -457,7 +457,7 @@ pub const RemoteManager = struct {
         job_name: []const u8,
         agent: RemoteRunSpec,
         steps: []const task.Step,
-    ) !u64 {
+    ) error{ OutOfMemory, FailedSerialize, FrameTooLarge }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
 
         const run_job_payload = blk: {
@@ -469,6 +469,7 @@ pub const RemoteManager = struct {
             } });
         };
         errdefer self.gpa.free(run_job_payload);
+        if (run_job_payload.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
 
         const task_id_copy = try self.gpa.dupe(u8, task_id);
         errdefer self.gpa.free(task_id_copy);
@@ -627,6 +628,14 @@ pub const RemoteManager = struct {
                 );
                 try self.emitEvent(event);
             },
+            .sync_ack,
+            .file_req,
+            .sync_begin,
+            .manifest,
+            .file_chunk,
+            .file_done,
+            .sync_end,
+            => @panic("TODO:"),
             else => {},
         }
     }
@@ -708,17 +717,21 @@ pub const RemoteManager = struct {
             return err;
         };
         // Send the pre-serialized job message to the agent
-        self.sendMessage(agent, dispatched.run_job_payload) catch {
+        self.sendMessage(agent, dispatched.run_job_payload) catch |err| {
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(dispatched.dispatch_id) orelse return;
             var failed = kv.value;
             defer failed.deinit(self.gpa);
+            const frame_too_large = err == error.FrameTooLarge;
             const event = self.makeJobFinishedEvent(
                 failed.task_id,
                 failed.dispatch_id,
                 false,
-                error.RunnerNotConnected,
-                "Failed to send job to remote runner",
+                if (frame_too_large) error.MessageTooLarge else error.RunnerNotConnected,
+                if (frame_too_large)
+                    "Remote job message exceeds the frame limit"
+                else
+                    "Failed to send job to remote runner",
                 std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
             ) catch return;
             self.emitEvent(event) catch {};
@@ -764,7 +777,8 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         message: []const u8,
     ) !void {
-        agent.connection.sendFrame(message) catch {
+        agent.connection.sendFrame(message) catch |err| {
+            if (err == error.FrameTooLarge) return err;
             self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
             return error.NotConnected;
         };

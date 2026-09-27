@@ -3,10 +3,40 @@ const task = @import("../types/task.zig");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
 /// The protocol version.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
+
+/// Maximum serialized size of one message frame, excluding the 4-byte
+/// length header.
+pub const MAX_FRAME_SIZE: usize = 65535;
+
+/// Wire size of a `file_chunk` message excluding the path and chunk
+/// payload. The message tag count as the +1.
+const FILE_CHUNK_FIXED_SIZE: usize = 1 + minSerializedLen(FileChunkMsg);
+
+/// Maximum payload of a `file_chunk` message.
+pub const SYNC_CHUNK_SIZE: usize = (MAX_FRAME_SIZE - FILE_CHUNK_FIXED_SIZE) / 2;
+
+/// Maximum workspace-relative path length of a `file_chunk` message:
+/// the headroom a frame has left after a full-size chunk.
+pub const SYNC_MAX_PATH_LEN: usize =
+    MAX_FRAME_SIZE - FILE_CHUNK_FIXED_SIZE - SYNC_CHUNK_SIZE;
+
+comptime {
+    if (MAX_FRAME_SIZE == 0)
+        @compileError("MAX_FRAME_SIZE must be positive");
+    if (MAX_FRAME_SIZE > std.math.maxInt(u32))
+        @compileError("MAX_FRAME_SIZE must fit the u32 frame length header");
+    if (FILE_CHUNK_FIXED_SIZE + SYNC_CHUNK_SIZE + SYNC_MAX_PATH_LEN > MAX_FRAME_SIZE)
+        @compileError("`file_chunk` frame budget exceeds MAX_FRAME_SIZE");
+    if (SYNC_CHUNK_SIZE == 0)
+        @compileError("SYNC_CHUNK_SIZE must be positive");
+    if (SYNC_CHUNK_SIZE > std.math.maxInt(u32))
+        @compileError("SYNC_CHUNK_SIZE must fit the u32 data length prefix");
+}
 
 pub const Msg = union(enum) {
     register: RegisterMsg,
@@ -17,13 +47,20 @@ pub const Msg = union(enum) {
     run_job: RunJobMsg,
     cancel_job: CancelJobMsg,
     error_msg: ErrorMsg,
+    sync_begin: SyncBeginMsg,
+    manifest: ManifestMsg,
+    file_req: FileReqMsg,
+    file_chunk: FileChunkMsg,
+    file_done: FileDoneMsg,
+    sync_end: SyncEndMsg,
+    sync_ack: SyncAckMsg,
 
     const Tag = std.meta.Tag(Msg);
 };
 
 const MsgUnionInfo = @typeInfo(Msg).@"union";
 const ParseFn = *const fn ([]const u8) anyerror!Msg;
-const SerializeFn = *const fn (std.mem.Allocator, Msg) anyerror![]u8;
+const SerializeFn = *const fn (std.mem.Allocator, Msg) error{ OutOfMemory, FailedSerialize }![]u8;
 
 pub const MsgParser = struct {
     parse_table: [MsgUnionInfo.fields.len]ParseFn,
@@ -48,7 +85,7 @@ pub const MsgParser = struct {
         self: *MsgParser,
         gpa: std.mem.Allocator,
         msg: Msg,
-    ) ![]u8 {
+    ) error{ OutOfMemory, FailedSerialize }![]u8 {
         const tag = std.meta.activeTag(msg);
         return self.serialize_table[@intFromEnum(tag)](gpa, msg);
     }
@@ -80,13 +117,36 @@ fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
         const T = field.type;
 
         table[@intFromEnum(tag)] = struct {
-            fn f(gpa: std.mem.Allocator, value: Msg) anyerror![]u8 {
+            fn f(gpa: std.mem.Allocator, value: Msg) error{ OutOfMemory, FailedSerialize }![]u8 {
                 const value_field = @field(value, field.name);
                 return try serializePayload(T, tag, gpa, value_field);
             }
         }.f;
     }
     return table;
+}
+
+/// Minimum wire size of a serialized `T`: all slice fields empty and
+/// optional fields absent.
+fn minSerializedLen(comptime T: type) usize {
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            var total: usize = 0;
+            inline for (s.fields) |field| total += minSerializedLen(field.type);
+            return total;
+        },
+        .int => |i| return @divExact(i.bits, 8),
+        .@"enum" => |e| return @divExact(@typeInfo(e.tag_type).int.bits, 8),
+        .bool => return 1,
+        .optional => return 1, // null marker only
+        .void => return 0,
+        .pointer => |p| {
+            if (p.size != .slice or p.child != u8)
+                @compileError("Only []const u8 slices supported");
+            return @sizeOf(u32); // length prefix
+        },
+        else => @compileError("Unsupported field type"),
+    }
 }
 
 /// Initializes a message prefixed with the given type
@@ -109,9 +169,13 @@ pub const RunJobMsg = struct {
     steps: []const u8, // JSON
 
     /// Serialize the step slice to a JSON string
-    pub fn serializeSteps(gpa: std.mem.Allocator, steps: []const task.Step) ![]u8 {
+    pub fn serializeSteps(
+        gpa: std.mem.Allocator,
+        steps: []const task.Step,
+    ) error{ OutOfMemory, FailedSerialize }![]u8 {
         var out: std.Io.Writer.Allocating = .init(gpa);
-        try std.json.Stringify.value(steps, .{}, &out.writer);
+        std.json.Stringify.value(steps, .{}, &out.writer) catch
+            return error.FailedSerialize;
         return try out.toOwnedSlice();
     }
 
@@ -136,7 +200,7 @@ pub const RunJobMsg = struct {
     }
 };
 
-pub const ErrorCode = enum(u32) {
+pub const ErrorCode = enum(u8) {
     NameTaken = 1,
     VersionMismatch = 2,
 };
@@ -168,6 +232,94 @@ pub const JobLogMsg = struct {
     job_id: u64,
     step: u32,
     data: []const u8,
+};
+
+pub const SyncMode = enum(u8) {
+    /// Full transfer into a per-run staging dir.
+    static = 1,
+    /// Reused workspace root updated incrementally against a manifest.
+    incremental = 2,
+};
+
+pub const SyncDirection = enum(u8) {
+    /// Manager sends the workspace to the agent before the job runs.
+    push = 1,
+    /// Agent sends workspace results back to the manager.
+    pull = 2,
+    /// Bidirectional sync.
+    both = 3,
+};
+
+/// Start a workspace transfer for a dispatched job.
+pub const SyncBeginMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// Sanitized workspace key: `<task_id>/<job_name>`.
+    workspace_key: []const u8,
+    /// Workspace-relative directory the job runs in.
+    root: []const u8,
+    /// Workspace mode.
+    mode: SyncMode,
+    /// Which way data flows for this transfer.
+    direction: SyncDirection,
+    /// JSON-encoded sync config (exclude globs).
+    config_json: []const u8,
+};
+
+/// Manifest of the workspace being transferred.
+pub const ManifestMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// JSON-encoded manifest entries for the workspace.
+    manifest_json: []const u8,
+};
+
+/// Request file data starting at an offset.
+pub const FileReqMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// Workspace-relative path of the requested file.
+    path: []const u8,
+    /// Offset to resume the transfer from.
+    offset: u64,
+};
+
+/// One chunk of file data, sent by whichever side owns the files.
+pub const FileChunkMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// Workspace-relative path the chunk belongs to.
+    path: []const u8,
+    /// Offset of `data` within the file.
+    offset: u64,
+    /// Chunk payload, at most `SYNC_CHUNK_SIZE` bytes.
+    data: []const u8,
+};
+
+/// All chunks of a file were sent.
+pub const FileDoneMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// Workspace-relative path of the completed file.
+    path: []const u8,
+    /// POSIX permission bits for the file.
+    permissions: u32,
+};
+
+/// The transfer is complete; validate and commit.
+pub const SyncEndMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+};
+
+/// The workspace was validated and committed (or not).
+pub const SyncAckMsg = struct {
+    /// Globally unique dispatch id the transfer belongs to.
+    job_id: u64,
+    /// Whether the workspace was committed successfully.
+    ok: bool,
+    /// Failure description when `ok` is false.
+    message: ?[]const u8 = null,
 };
 
 /// Serialize a struct to a payload with message type prefix
@@ -506,6 +658,148 @@ test "error_message" {
     const parsed = try parser.parse(serialized);
     try std.testing.expect(msg.code == parsed.error_msg.code);
     try std.testing.expect(std.mem.eql(u8, msg.message, parsed.error_msg.message));
+}
+
+test "sync_begin" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: SyncBeginMsg = .{
+        .job_id = 42,
+        .workspace_key = "task-id/build",
+        .root = "src",
+        .mode = .static,
+        .direction = .push,
+        .config_json = "{\"exclude\":[\".zig-cache\",\"node_modules\"]}",
+    };
+    const serialized = try parser.serialize(alloc, .{ .sync_begin = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: SyncBeginMsg = parsed_msg.sync_begin;
+    try expect(msg.job_id == parsed.job_id);
+    try expectEqual(msg.mode, parsed.mode);
+    try expectEqual(msg.direction, parsed.direction);
+    try std.testing.expectEqualStrings(msg.workspace_key, parsed.workspace_key);
+    try std.testing.expectEqualStrings(msg.root, parsed.root);
+    try std.testing.expectEqualStrings(msg.config_json, parsed.config_json);
+}
+
+test "manifest" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: ManifestMsg = .{
+        .job_id = 7,
+        .manifest_json = "[{\"path\":\"src/main.zig\",\"size\":123}]",
+    };
+    const serialized = try parser.serialize(alloc, .{ .manifest = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: ManifestMsg = parsed_msg.manifest;
+    try expect(msg.job_id == parsed.job_id);
+    try std.testing.expectEqualStrings(msg.manifest_json, parsed.manifest_json);
+}
+
+test "file_req" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: FileReqMsg = .{ .job_id = 9, .path = "src/lib.zig", .offset = 4096 };
+    const serialized = try parser.serialize(alloc, .{ .file_req = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: FileReqMsg = parsed_msg.file_req;
+    try expect(msg.job_id == parsed.job_id);
+    try expect(msg.offset == parsed.offset);
+    try std.testing.expectEqualStrings(msg.path, parsed.path);
+}
+
+test "file_chunk" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
+    defer alloc.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i);
+    const msg: FileChunkMsg = .{
+        .job_id = 11,
+        .path = "assets/blob.bin",
+        .offset = 2048,
+        .data = data,
+    };
+    const serialized = try parser.serialize(alloc, .{ .file_chunk = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: FileChunkMsg = parsed_msg.file_chunk;
+    try expect(msg.job_id == parsed.job_id);
+    try expect(msg.offset == parsed.offset);
+    try std.testing.expectEqualStrings(msg.path, parsed.path);
+    try expect(parsed.data.len == SYNC_CHUNK_SIZE);
+    try std.testing.expectEqualSlices(u8, msg.data, parsed.data);
+}
+
+test "file_done" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: FileDoneMsg = .{ .job_id = 3, .path = "scripts/run.sh", .permissions = 0o755 };
+    const serialized = try parser.serialize(alloc, .{ .file_done = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: FileDoneMsg = parsed_msg.file_done;
+    try expect(msg.job_id == parsed.job_id);
+    try expect(msg.permissions == parsed.permissions);
+    try std.testing.expectEqualStrings(msg.path, parsed.path);
+}
+
+test "sync_end" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: SyncEndMsg = .{ .job_id = 5 };
+    const serialized = try parser.serialize(alloc, .{ .sync_end = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: SyncEndMsg = parsed_msg.sync_end;
+    try expect(msg.job_id == parsed.job_id);
+}
+
+test "sync_ack" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const msg: SyncAckMsg = .{ .job_id = 1337, .ok = true };
+    const serialized = try parser.serialize(alloc, .{ .sync_ack = msg });
+    defer alloc.free(serialized);
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: SyncAckMsg = parsed_msg.sync_ack;
+    try expect(msg.job_id == parsed.job_id);
+    try expect(parsed.ok);
+    try expect(parsed.message == null);
+
+    const fail_msg: SyncAckMsg = .{
+        .job_id = 7331,
+        .ok = false,
+        .message = "File chunk rejected: path escapes the workspace",
+    };
+    const fail_serialized = try parser.serialize(alloc, .{ .sync_ack = fail_msg });
+    defer alloc.free(fail_serialized);
+    const fail_parsed_msg = try parser.parse(fail_serialized);
+    const fail_parsed: SyncAckMsg = fail_parsed_msg.sync_ack;
+    try expect(fail_parsed.job_id == fail_msg.job_id);
+    try expect(!fail_parsed.ok);
+    try std.testing.expectEqualStrings(fail_msg.message.?, fail_parsed.message.?);
+}
+
+test "sync_chunk_frame_budget" {
+    const alloc = std.testing.allocator;
+    var parser = MsgParser.init();
+    const path = "a" ** SYNC_MAX_PATH_LEN;
+    const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
+    defer alloc.free(data);
+    @memset(data, 0xab);
+    const msg: FileChunkMsg = .{ .job_id = 1, .path = path, .offset = 0, .data = data };
+    const serialized = try parser.serialize(alloc, .{ .file_chunk = msg });
+    defer alloc.free(serialized);
+    try expect(serialized.len == MAX_FRAME_SIZE);
+
+    const parsed_msg = try parser.parse(serialized);
+    const parsed: FileChunkMsg = parsed_msg.file_chunk;
+    try expect(parsed.path.len == SYNC_MAX_PATH_LEN);
+    try expect(parsed.data.len == SYNC_CHUNK_SIZE);
 }
 
 test "heartbeat" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const protocol = @import("protocol.zig");
 
 const Connection = @This();
 
@@ -99,6 +100,7 @@ pub fn setLastAccessed(self: *Connection) void {
 /// [[4 bytes: length N]][[1 byte: msg type]][[N-1 bytes: payload]]
 pub fn sendFrame(self: *Connection, msg: []const u8) !void {
     if (self.isClosed()) return error.NotConnected;
+    if (msg.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
     var header: [4]u8 = undefined;
     std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
 
@@ -175,7 +177,7 @@ pub const Reader = struct {
         const header = self.read_buf.items[self.cursor .. self.cursor + 4];
         const payload_len = std.mem.readInt(u32, header[0..4], .little);
         if (payload_len == 0) return error.InvalidFrame;
-        if (payload_len > 65535) return error.FrameTooLarge;
+        if (payload_len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
         const total_len = 4 + payload_len;
         if (available < total_len) return null;
 

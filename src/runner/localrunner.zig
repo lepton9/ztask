@@ -43,6 +43,7 @@ pub const LogQueue = queue.MutexQueue(LogEvent);
 pub const ResultError = error{
     NoRunnerFound,
     RunnerNotConnected,
+    MessageTooLarge,
 };
 
 pub const ExecResult = struct {

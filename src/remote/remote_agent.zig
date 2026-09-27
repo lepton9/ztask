@@ -265,6 +265,14 @@ pub const RemoteAgent = struct {
                     self.stop();
                 }
             },
+            .sync_begin,
+            .manifest,
+            .file_chunk,
+            .file_done,
+            .sync_end,
+            .sync_ack,
+            .file_req,
+            => @panic("TODO:"),
             else => {}, // Not relevant for agent
         }
     }

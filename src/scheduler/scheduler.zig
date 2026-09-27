@@ -384,7 +384,10 @@ pub const Scheduler = struct {
             self.onJobCompleted(node, .{
                 .success = false,
                 .runner = .remote,
-                .err = localrunner.ResultError.RunnerNotConnected,
+                .err = if (err == error.FrameTooLarge)
+                    localrunner.ResultError.MessageTooLarge
+                else
+                    localrunner.ResultError.RunnerNotConnected,
             });
             return;
         };
