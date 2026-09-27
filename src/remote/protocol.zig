@@ -58,38 +58,34 @@ pub const Msg = union(enum) {
     const Tag = std.meta.Tag(Msg);
 };
 
-const MsgUnionInfo = @typeInfo(Msg).@"union";
-const ParseFn = *const fn ([]const u8) anyerror!Msg;
-const SerializeFn = *const fn (std.mem.Allocator, Msg) error{ OutOfMemory, FailedSerialize }![]u8;
-
-pub const MsgParser = struct {
-    parse_table: [MsgUnionInfo.fields.len]ParseFn,
-    serialize_table: [MsgUnionInfo.fields.len]SerializeFn,
-
-    pub fn init() MsgParser {
-        return .{
-            .parse_table = comptime initParseTable(),
-            .serialize_table = comptime initSerializeTable(),
-        };
-    }
-
-    pub fn parse(self: *MsgParser, payload: []const u8) !Msg {
-        if (payload.len == 0) return error.EmptyMessage;
-        const msg_type = std.enums.fromInt(Msg.Tag, payload[0]) orelse
-            return error.InvalidMsgType;
-        const msg = payload[1..];
-        return self.parse_table[@intFromEnum(msg_type)](msg);
-    }
-
-    pub fn serialize(
-        self: *MsgParser,
-        gpa: std.mem.Allocator,
-        msg: Msg,
-    ) error{ OutOfMemory, FailedSerialize }![]u8 {
-        const tag = std.meta.activeTag(msg);
-        return self.serialize_table[@intFromEnum(tag)](gpa, msg);
-    }
+pub const ParseError = error{
+    EmptyMessage,
+    InvalidMsgType,
+    InvalidMsg,
+    InvalidEnumValue,
 };
+
+const MsgUnionInfo = @typeInfo(Msg).@"union";
+const ParseFn = *const fn ([]const u8) ParseError!Msg;
+const SerializeFn = *const fn (std.mem.Allocator, Msg) error{OutOfMemory}![]u8;
+
+const parse_table: [MsgUnionInfo.fields.len]ParseFn = initParseTable();
+const serialize_table: [MsgUnionInfo.fields.len]SerializeFn = initSerializeTable();
+
+/// Parse a payload into a protocol message type.
+pub fn parse(payload: []const u8) ParseError!Msg {
+    if (payload.len == 0) return error.EmptyMessage;
+    const msg_type = std.enums.fromInt(Msg.Tag, payload[0]) orelse
+        return error.InvalidMsgType;
+    const msg = payload[1..];
+    return parse_table[@intFromEnum(msg_type)](msg);
+}
+
+/// Serialize a message to an owned payload string.
+pub fn serialize(gpa: std.mem.Allocator, msg: Msg) error{OutOfMemory}![]u8 {
+    const tag = std.meta.activeTag(msg);
+    return serialize_table[@intFromEnum(tag)](gpa, msg);
+}
 
 /// Initialize function table for message parse functions
 fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
@@ -100,7 +96,7 @@ fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
         const T = field.type;
 
         table[@intFromEnum(tag)] = struct {
-            fn f(msg: []const u8) anyerror!Msg {
+            fn f(msg: []const u8) error{ InvalidMsg, InvalidEnumValue }!Msg {
                 return @unionInit(Msg, field.name, try deserialize(T, msg));
             }
         }.f;
@@ -117,7 +113,7 @@ fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
         const T = field.type;
 
         table[@intFromEnum(tag)] = struct {
-            fn f(gpa: std.mem.Allocator, value: Msg) error{ OutOfMemory, FailedSerialize }![]u8 {
+            fn f(gpa: std.mem.Allocator, value: Msg) error{OutOfMemory}![]u8 {
                 const value_field = @field(value, field.name);
                 return try serializePayload(T, tag, gpa, value_field);
             }
@@ -328,7 +324,7 @@ pub fn serializePayload(
     comptime M: Msg.Tag,
     gpa: std.mem.Allocator,
     value: T,
-) ![]u8 {
+) error{OutOfMemory}![]u8 {
     var msg = try initMsgPrefix(gpa, M);
     const serialized = try serializeAlloc(T, gpa, value);
     defer gpa.free(serialized);
@@ -341,7 +337,7 @@ pub fn serializeAlloc(
     comptime T: type,
     gpa: std.mem.Allocator,
     value: T,
-) ![]u8 {
+) error{OutOfMemory}![]u8 {
     const info = comptime @typeInfo(T);
     var msg = try std.ArrayList(u8).initCapacity(gpa, 128);
 
@@ -356,7 +352,10 @@ pub fn serializeAlloc(
 }
 
 /// Deserialize a string to a type
-pub fn deserialize(comptime T: type, msg: []const u8) !T {
+pub fn deserialize(
+    comptime T: type,
+    msg: []const u8,
+) error{ InvalidMsg, InvalidEnumValue }!T {
     var out: T = undefined;
     var pos: usize = 0;
 
@@ -379,7 +378,7 @@ fn serializeField(
     comptime T: type,
     field: T,
     msg: *std.ArrayList(u8),
-) !void {
+) error{OutOfMemory}!void {
     var buf: [64]u8 = undefined;
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
@@ -428,7 +427,7 @@ fn deserializeField(
     comptime T: type,
     buffer: []const u8,
     pos: *usize,
-) !T {
+) error{ InvalidMsg, InvalidEnumValue }!T {
     switch (@typeInfo(T)) {
         .@"enum" => |e| {
             const Tag = e.tag_type;
@@ -541,22 +540,20 @@ test "struct_mix_fields" {
 
 test "register" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: RegisterMsg = .{ .version = VERSION, .hostname = "test" };
-    const serialized = try parser.serialize(alloc, .{ .register = msg });
+    const serialized = try serialize(alloc, .{ .register = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: RegisterMsg = parsed_msg.register;
     try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
 }
 
 test "job_start" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: JobStartMsg = .{ .job_id = 1, .timestamp = 0 };
-    const serialized = try parser.serialize(alloc, .{ .job_start = msg });
+    const serialized = try serialize(alloc, .{ .job_start = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: JobStartMsg = parsed_msg.job_start;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -564,11 +561,10 @@ test "job_start" {
 
 test "job_log" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
-    const serialized = try parser.serialize(alloc, .{ .job_log = msg });
+    const serialized = try serialize(alloc, .{ .job_log = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: JobLogMsg = parsed_msg.job_log;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.step == parsed.step);
@@ -578,15 +574,14 @@ test "job_log" {
 test "job_end" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: JobEndMsg = .{
         .job_id = 1337,
         .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
         .success = true,
     };
-    const serialized = try parser.serialize(alloc, .{ .job_finish = msg });
+    const serialized = try serialize(alloc, .{ .job_finish = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: JobEndMsg = parsed_msg.job_finish;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -598,9 +593,9 @@ test "job_end" {
         .success = false,
         .message = "Command exited with an unexpected exit code",
     };
-    const null_serialized = try parser.serialize(alloc, .{ .job_finish = null_msg });
+    const null_serialized = try serialize(alloc, .{ .job_finish = null_msg });
     defer alloc.free(null_serialized);
-    const null_parsed_msg = try parser.parse(null_serialized);
+    const null_parsed_msg = try parse(null_serialized);
     const null_parsed: JobEndMsg = null_parsed_msg.job_finish;
     try std.testing.expect(null_msg.job_id == null_parsed.job_id);
     try std.testing.expect(!null_parsed.success);
@@ -609,7 +604,6 @@ test "job_end" {
 
 test "run_job" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     var steps = [_]task.Step{
         .{ .command = .{ .value = "command" } },
         .{ .command = .{ .value = "" } },
@@ -620,9 +614,9 @@ test "run_job" {
     };
     defer alloc.free(msg.steps);
 
-    const serialized = try parser.serialize(alloc, .{ .run_job = msg });
+    const serialized = try serialize(alloc, .{ .run_job = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
     const parsed_steps = try parsed.parseSteps(alloc);
     defer {
@@ -641,28 +635,25 @@ test "run_job" {
 
 test "cancel_job" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: CancelJobMsg = .{ .job_id = 1 };
-    const serialized = try parser.serialize(alloc, .{ .cancel_job = msg });
+    const serialized = try serialize(alloc, .{ .cancel_job = msg });
     defer alloc.free(serialized);
-    const parsed = try parser.parse(serialized);
+    const parsed = try parse(serialized);
     try std.testing.expect(msg.job_id == parsed.cancel_job.job_id);
 }
 
 test "error_message" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: ErrorMsg = .{ .code = ErrorCode.NameTaken, .message = "taken" };
-    const serialized = try parser.serialize(alloc, .{ .error_msg = msg });
+    const serialized = try serialize(alloc, .{ .error_msg = msg });
     defer alloc.free(serialized);
-    const parsed = try parser.parse(serialized);
+    const parsed = try parse(serialized);
     try std.testing.expect(msg.code == parsed.error_msg.code);
     try std.testing.expect(std.mem.eql(u8, msg.message, parsed.error_msg.message));
 }
 
 test "sync_begin" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: SyncBeginMsg = .{
         .job_id = 42,
         .workspace_key = "task-id/build",
@@ -671,9 +662,9 @@ test "sync_begin" {
         .direction = .push,
         .config_json = "{\"exclude\":[\".zig-cache\",\"node_modules\"]}",
     };
-    const serialized = try parser.serialize(alloc, .{ .sync_begin = msg });
+    const serialized = try serialize(alloc, .{ .sync_begin = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: SyncBeginMsg = parsed_msg.sync_begin;
     try expect(msg.job_id == parsed.job_id);
     try expectEqual(msg.mode, parsed.mode);
@@ -685,14 +676,13 @@ test "sync_begin" {
 
 test "manifest" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: ManifestMsg = .{
         .job_id = 7,
         .manifest_json = "[{\"path\":\"src/main.zig\",\"size\":123}]",
     };
-    const serialized = try parser.serialize(alloc, .{ .manifest = msg });
+    const serialized = try serialize(alloc, .{ .manifest = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: ManifestMsg = parsed_msg.manifest;
     try expect(msg.job_id == parsed.job_id);
     try std.testing.expectEqualStrings(msg.manifest_json, parsed.manifest_json);
@@ -700,11 +690,10 @@ test "manifest" {
 
 test "file_req" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: FileReqMsg = .{ .job_id = 9, .path = "src/lib.zig", .offset = 4096 };
-    const serialized = try parser.serialize(alloc, .{ .file_req = msg });
+    const serialized = try serialize(alloc, .{ .file_req = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: FileReqMsg = parsed_msg.file_req;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.offset == parsed.offset);
@@ -713,7 +702,6 @@ test "file_req" {
 
 test "file_chunk" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
     defer alloc.free(data);
     for (data, 0..) |*byte, i| byte.* = @truncate(i);
@@ -723,9 +711,9 @@ test "file_chunk" {
         .offset = 2048,
         .data = data,
     };
-    const serialized = try parser.serialize(alloc, .{ .file_chunk = msg });
+    const serialized = try serialize(alloc, .{ .file_chunk = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: FileChunkMsg = parsed_msg.file_chunk;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.offset == parsed.offset);
@@ -736,11 +724,10 @@ test "file_chunk" {
 
 test "file_done" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: FileDoneMsg = .{ .job_id = 3, .path = "scripts/run.sh", .permissions = 0o755 };
-    const serialized = try parser.serialize(alloc, .{ .file_done = msg });
+    const serialized = try serialize(alloc, .{ .file_done = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: FileDoneMsg = parsed_msg.file_done;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.permissions == parsed.permissions);
@@ -749,22 +736,20 @@ test "file_done" {
 
 test "sync_end" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: SyncEndMsg = .{ .job_id = 5 };
-    const serialized = try parser.serialize(alloc, .{ .sync_end = msg });
+    const serialized = try serialize(alloc, .{ .sync_end = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: SyncEndMsg = parsed_msg.sync_end;
     try expect(msg.job_id == parsed.job_id);
 }
 
 test "sync_ack" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const msg: SyncAckMsg = .{ .job_id = 1337, .ok = true };
-    const serialized = try parser.serialize(alloc, .{ .sync_ack = msg });
+    const serialized = try serialize(alloc, .{ .sync_ack = msg });
     defer alloc.free(serialized);
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: SyncAckMsg = parsed_msg.sync_ack;
     try expect(msg.job_id == parsed.job_id);
     try expect(parsed.ok);
@@ -775,9 +760,9 @@ test "sync_ack" {
         .ok = false,
         .message = "File chunk rejected: path escapes the workspace",
     };
-    const fail_serialized = try parser.serialize(alloc, .{ .sync_ack = fail_msg });
+    const fail_serialized = try serialize(alloc, .{ .sync_ack = fail_msg });
     defer alloc.free(fail_serialized);
-    const fail_parsed_msg = try parser.parse(fail_serialized);
+    const fail_parsed_msg = try parse(fail_serialized);
     const fail_parsed: SyncAckMsg = fail_parsed_msg.sync_ack;
     try expect(fail_parsed.job_id == fail_msg.job_id);
     try expect(!fail_parsed.ok);
@@ -786,17 +771,16 @@ test "sync_ack" {
 
 test "sync_chunk_frame_budget" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     const path = "a" ** SYNC_MAX_PATH_LEN;
     const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
     defer alloc.free(data);
     @memset(data, 0xab);
     const msg: FileChunkMsg = .{ .job_id = 1, .path = path, .offset = 0, .data = data };
-    const serialized = try parser.serialize(alloc, .{ .file_chunk = msg });
+    const serialized = try serialize(alloc, .{ .file_chunk = msg });
     defer alloc.free(serialized);
     try expect(serialized.len == MAX_FRAME_SIZE);
 
-    const parsed_msg = try parser.parse(serialized);
+    const parsed_msg = try parse(serialized);
     const parsed: FileChunkMsg = parsed_msg.file_chunk;
     try expect(parsed.path.len == SYNC_MAX_PATH_LEN);
     try expect(parsed.data.len == SYNC_CHUNK_SIZE);
@@ -804,19 +788,17 @@ test "sync_chunk_frame_budget" {
 
 test "heartbeat" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     var payload = try initMsgPrefix(alloc, .heartbeat);
     defer payload.deinit(alloc);
-    const parsed = try parser.parse(payload.items);
+    const parsed = try parse(payload.items);
     try std.testing.expect(payload.items.len == 1);
     try std.testing.expect(parsed == .heartbeat);
 }
 
 test "invalid_message_type" {
     const alloc = std.testing.allocator;
-    var parser = MsgParser.init();
     var payload = try std.ArrayList(u8).initCapacity(alloc, 1);
     defer payload.deinit(alloc);
     payload.appendAssumeCapacity(255);
-    try std.testing.expect(parser.parse(payload.items) == error.InvalidMsgType);
+    try std.testing.expect(parse(payload.items) == error.InvalidMsgType);
 }

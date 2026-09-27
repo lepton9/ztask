@@ -36,7 +36,6 @@ pub const RemoteAgent = struct {
     /// Jobs currently running
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
 
-    parser: protocol.MsgParser = .init(),
     connection: Connection,
     /// Incoming frames from the server.
     incoming_frames: MutexQueue([]u8),
@@ -198,7 +197,7 @@ pub const RemoteAgent = struct {
     fn listen(self: *RemoteAgent) !void {
         while (self.incoming_frames.pop()) |msg| {
             defer self.gpa.free(msg);
-            const parsed = try self.parser.parse(msg);
+            const parsed = try protocol.parse(msg);
             try self.handleMessage(parsed);
         }
     }
@@ -332,7 +331,7 @@ pub const RemoteAgent = struct {
             .version = protocol.VERSION,
             .hostname = self.hostname,
         };
-        const payload = try self.parser.serialize(self.gpa, .{ .register = reg });
+        const payload = try protocol.serialize(self.gpa, .{ .register = reg });
         defer self.gpa.free(payload);
         self.sendMessage(payload);
         self.writeStatus("Connected as {s}\n", .{reg.hostname});
@@ -388,7 +387,7 @@ pub const RemoteAgent = struct {
                         .job_id = e.job_id,
                         .timestamp = e.timestamp_ms,
                     };
-                    const payload = try self.parser.serialize(self.gpa, .{
+                    const payload = try protocol.serialize(self.gpa, .{
                         .job_start = msg,
                     });
                     defer self.gpa.free(payload);
@@ -404,7 +403,7 @@ pub const RemoteAgent = struct {
                         .data = e.data,
                         .step = e.step,
                     };
-                    const payload = try self.parser.serialize(self.gpa, .{
+                    const payload = try protocol.serialize(self.gpa, .{
                         .job_log = msg,
                     });
                     defer self.gpa.free(payload);
@@ -417,7 +416,7 @@ pub const RemoteAgent = struct {
                         .success = e.success,
                         .message = e.message,
                     };
-                    const payload = try self.parser.serialize(self.gpa, .{
+                    const payload = try protocol.serialize(self.gpa, .{
                         .job_finish = msg,
                     });
                     defer self.gpa.free(payload);

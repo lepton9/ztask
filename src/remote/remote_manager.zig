@@ -261,7 +261,6 @@ pub const AgentHandle = struct {
 pub const RemoteManager = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    parser: protocol.MsgParser = .init(),
     server: ?std.Io.net.Server = null,
 
     mutex: std.Io.Mutex = .init,
@@ -463,7 +462,7 @@ pub const RemoteManager = struct {
         const run_job_payload = blk: {
             const steps_json = try protocol.RunJobMsg.serializeSteps(self.gpa, steps);
             defer self.gpa.free(steps_json);
-            break :blk try self.parser.serialize(self.gpa, .{ .run_job = .{
+            break :blk try protocol.serialize(self.gpa, .{ .run_job = .{
                 .job_id = dispatch_id,
                 .steps = steps_json,
             } });
@@ -511,7 +510,7 @@ pub const RemoteManager = struct {
             .frame => |frame| {
                 defer self.gpa.free(frame.data);
                 const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
-                const parsed = self.parser.parse(frame.data) catch |err| {
+                const parsed = protocol.parse(frame.data) catch |err| {
                     log.warn(
                         "Discarding remote agent with malformed message: {s}",
                         .{@errorName(err)},
@@ -535,7 +534,7 @@ pub const RemoteManager = struct {
         message: []const u8,
     ) error{ConnectionError} {
         const err_msg: protocol.ErrorMsg = .{ .code = code, .message = message };
-        if (self.parser.serialize(self.gpa, .{ .error_msg = err_msg })) |payload| {
+        if (protocol.serialize(self.gpa, .{ .error_msg = err_msg })) |payload| {
             defer self.gpa.free(payload);
             agent.connection.sendFrame(payload) catch |err| log.debug(
                 "Failed to notify agent of rejection: {s}",
@@ -751,7 +750,7 @@ pub const RemoteManager = struct {
             defer req.deinit(self.gpa);
             const agent = self.findAgent(req.agent) orelse return;
             const msg: protocol.CancelJobMsg = .{ .job_id = req.dispatch_id };
-            const payload = try self.parser.serialize(self.gpa, .{
+            const payload = try protocol.serialize(self.gpa, .{
                 .cancel_job = msg,
             });
             defer self.gpa.free(payload);
