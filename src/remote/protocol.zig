@@ -250,8 +250,10 @@ pub const SyncDirection = enum(u8) {
 pub const SyncBeginMsg = struct {
     /// Globally unique dispatch id the transfer belongs to.
     job_id: u64,
-    /// Sanitized workspace key: `<task_id>/<job_name>`.
-    workspace_key: []const u8,
+    /// Id of the task the workspace belongs to.
+    task_id: []const u8,
+    /// Job name the workspace belongs to.
+    job_name: []const u8,
     /// Workspace-relative directory the job runs in.
     root: []const u8,
     /// Workspace mode.
@@ -656,7 +658,8 @@ test "sync_begin" {
     const alloc = std.testing.allocator;
     const msg: SyncBeginMsg = .{
         .job_id = 42,
-        .workspace_key = "task-id/build",
+        .task_id = "task-id",
+        .job_name = "build",
         .root = "src",
         .mode = .static,
         .direction = .push,
@@ -669,7 +672,8 @@ test "sync_begin" {
     try expect(msg.job_id == parsed.job_id);
     try expectEqual(msg.mode, parsed.mode);
     try expectEqual(msg.direction, parsed.direction);
-    try std.testing.expectEqualStrings(msg.workspace_key, parsed.workspace_key);
+    try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
+    try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
     try std.testing.expectEqualStrings(msg.root, parsed.root);
     try std.testing.expectEqualStrings(msg.config_json, parsed.config_json);
 }

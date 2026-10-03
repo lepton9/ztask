@@ -1,6 +1,5 @@
 //! Bounded FIFO of owned frames between producers and a consumer.
 const std = @import("std");
-const protocol = @import("protocol.zig");
 const queue = @import("../types/queue.zig");
 
 const Queue = queue.Queue;
@@ -74,8 +73,7 @@ pub fn enqueue(
     self: *OutboundFrameQueue,
     gpa: std.mem.Allocator,
     frame: []u8,
-) error{ Closed, FrameTooLarge, OutOfMemory }!void {
-    if (frame.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+) error{ Closed, OutOfMemory }!void {
     {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -94,8 +92,7 @@ pub fn tryEnqueue(
     self: *OutboundFrameQueue,
     gpa: std.mem.Allocator,
     frame: []u8,
-) error{ Closed, FrameTooLarge, Backpressure, OutOfMemory }!void {
-    if (frame.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+) error{ Closed, Backpressure, OutOfMemory }!void {
     {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -238,11 +235,6 @@ test "backpressure" {
     const over = try gpa.dupe(u8, "xyz");
     defer gpa.free(over);
     try expectError(error.Backpressure, q.tryEnqueue(gpa, over));
-
-    // Size validation happens before the budget check
-    const oversized = try gpa.dupe(u8, "x" ** 70000);
-    defer gpa.free(oversized);
-    try expectError(error.FrameTooLarge, q.tryEnqueue(gpa, oversized));
 
     // Draining to the resume threshold resumes production
     const popped = q.pop().?;

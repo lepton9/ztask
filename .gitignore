@@ -2,5 +2,3 @@
 zig-out/
 zig-pkg/
 .ztask/
-
-temp

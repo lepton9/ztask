@@ -1,5 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
+const OutboundFrameQueue = @import("OutboundFrameQueue.zig");
+const Notify = @import("../types/queue.zig").Notify;
 
 const Connection = @This();
 
@@ -51,9 +53,9 @@ pub fn reader(self: *Connection, gpa: std.mem.Allocator) !Reader {
 /// Create a writer for the connection.
 ///
 /// The writer is invalid once the connection is closed or reconnected.
-pub fn writer(self: *Connection) !Writer {
+pub fn writer(self: *Connection, gpa: std.mem.Allocator) !Writer {
     if (self.isClosed()) return error.NotConnected;
-    return .init(self.io, self.conn.stream);
+    return .init(self.io, gpa, self.conn.stream);
 }
 
 /// Whether the connection can no longer be used.
@@ -188,13 +190,77 @@ pub const Reader = struct {
     }
 };
 
-/// Blocking frame writer for the socket connection.
+/// Frame writer for the socket connection.
 pub const Writer = struct {
     io: std.Io,
+    gpa: std.mem.Allocator,
     stream: std.Io.net.Stream,
+    /// Frames queued for delivery by the drain loop.
+    send_queue: OutboundFrameQueue,
 
-    pub fn init(io: std.Io, stream: std.Io.net.Stream) Writer {
-        return .{ .io = io, .stream = stream };
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        stream: std.Io.net.Stream,
+    ) Writer {
+        return .{
+            .io = io,
+            .gpa = gpa,
+            .stream = stream,
+            .send_queue = .init(io),
+        };
+    }
+
+    /// Free the queued frame memory. Call after the drain loop exited.
+    pub fn deinit(self: *Writer) void {
+        self.send_queue.deinit(self.gpa);
+    }
+
+    /// Queue a copy of `msg` for delivery by the drain loop.
+    pub fn enqueue(
+        self: *Writer,
+        msg: []const u8,
+    ) error{ Closed, FrameTooLarge, OutOfMemory }!void {
+        if (msg.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+        const frame = try self.gpa.dupe(u8, msg);
+        errdefer self.gpa.free(frame);
+        try self.send_queue.enqueue(self.gpa, frame);
+    }
+
+    /// Queue an already allocated frame for delivery by the drain loop,
+    /// taking ownership on success.
+    pub fn enqueueOwned(
+        self: *Writer,
+        frame: []u8,
+    ) error{ Closed, FrameTooLarge, OutOfMemory }!void {
+        if (frame.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+        try self.send_queue.enqueue(self.gpa, frame);
+    }
+
+    /// Set the callback fired when bulk production can resume.
+    pub fn setNotify(self: *Writer, notify: ?Notify) void {
+        self.send_queue.setNotify(notify);
+    }
+
+    /// Stop accepting new frames. Queued frames are still delivered.
+    pub fn finish(self: *Writer) void {
+        self.send_queue.finish();
+    }
+
+    /// Stop accepting new frames and drop the queued ones.
+    pub fn closeQueue(self: *Writer) void {
+        self.send_queue.close(self.gpa);
+    }
+
+    /// Send the next queued frame, blocking while the queue is empty.
+    ///
+    /// Returns false once the queue is closed and drained.
+    pub fn sendNext(self: *Writer) !bool {
+        const frame = self.send_queue.pop() orelse return false;
+        defer self.gpa.free(frame);
+        try self.sendFrame(frame);
+        self.send_queue.resumeIfDrained();
+        return true;
     }
 
     /// Block until `msg` is fully written or an error occurs.
@@ -235,7 +301,22 @@ test "reader compacts buffered frames" {
 }
 
 test "writer rejects oversized frames" {
-    var w: Writer = .init(std.testing.io, undefined);
+    const gpa = std.testing.allocator;
+    var w: Writer = .init(std.testing.io, gpa, undefined);
+    defer w.deinit();
     const oversized = [_]u8{0} ** (protocol.MAX_FRAME_SIZE + 1);
     try std.testing.expectError(error.FrameTooLarge, w.sendFrame(&oversized));
+    try std.testing.expectError(error.FrameTooLarge, w.enqueue(&oversized));
+    try std.testing.expectError(error.FrameTooLarge, w.enqueueOwned(@constCast(&oversized)));
+}
+
+test "writer queue close drops pending frames" {
+    const gpa = std.testing.allocator;
+    var w: Writer = .init(std.testing.io, gpa, undefined);
+    defer w.deinit();
+
+    try w.enqueue("pending");
+    w.closeQueue();
+    try std.testing.expectError(error.Closed, w.enqueue("late"));
+    try std.testing.expect(!(try w.sendNext()));
 }

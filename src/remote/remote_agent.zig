@@ -41,6 +41,10 @@ pub const RemoteAgent = struct {
     incoming_frames: MutexQueue([]u8),
     /// Worker thread for reading incoming frames from the server.
     reader_thread: ?std.Thread = null,
+    /// Queueing writer for outgoing frames. Drained by the writer thread.
+    connection_writer: ?Connection.Writer = null,
+    /// Worker thread for writing outgoing frames to the server.
+    writer_thread: ?std.Thread = null,
 
     /// Error for exiting.
     exit_error: ?ExitError = null,
@@ -86,6 +90,7 @@ pub const RemoteAgent = struct {
 
     pub fn deinit(self: *RemoteAgent) void {
         self.stopReader();
+        self.stopWriter();
         self.running.store(false, .seq_cst);
         self.pool.cancelWaiter(self);
         var active = self.active_runners.iterator();
@@ -160,8 +165,14 @@ pub const RemoteAgent = struct {
     /// Try to connect to the server at the address
     pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
         self.stopReader();
+        self.stopWriter();
         try self.connection.connect(addr);
+        self.connection_writer = try self.connection.writer(self.gpa);
         self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
+        self.writer_thread = std.Thread.spawn(.{}, writeLoop, .{self}) catch |err| {
+            self.stopReader();
+            return err;
+        };
         try self.register();
     }
 
@@ -241,6 +252,32 @@ pub const RemoteAgent = struct {
         self.connection.close();
     }
 
+    /// Loop for writing outgoing frames to the server.
+    fn writeLoop(self: *RemoteAgent) void {
+        const writer = if (self.connection_writer) |*w| w else return;
+        while (true) {
+            const sent = writer.sendNext() catch |err| {
+                log.warn("Failed to send remote message: {s}", .{@errorName(err)});
+                self.connection.close();
+                return;
+            };
+            if (!sent) break;
+            self.connection.setLastAccessed();
+        }
+    }
+
+    /// Stop the write worker thread and release the connection writer.
+    fn stopWriter(self: *RemoteAgent) void {
+        if (self.connection_writer) |*w| w.closeQueue();
+        self.connection.shutdown();
+        if (self.writer_thread) |thread| thread.join();
+        self.writer_thread = null;
+        if (self.connection_writer) |*w| {
+            w.deinit();
+            self.connection_writer = null;
+        }
+    }
+
     /// Handle parsed message
     fn handleMessage(self: *RemoteAgent, msg: protocol.Msg) !void {
         switch (msg) {
@@ -293,13 +330,30 @@ pub const RemoteAgent = struct {
         try self.queue.append(self.gpa, &res.value_ptr.node);
     }
 
-    /// Send a message to the server
+    /// Queue a message for delivery by the writer thread.
     fn sendMessage(self: *RemoteAgent, message: []const u8) void {
-        self.connection.sendFrame(message) catch |err| {
-            log.warn("Failed to send remote message: {s}", .{@errorName(err)});
-            if (self.running.load(.seq_cst)) {
+        const frame = self.gpa.dupe(u8, message) catch |err| {
+            log.err("Failed to allocate remote message frame: {s}", .{@errorName(err)});
+            return;
+        };
+        self.sendMessageOwned(frame);
+    }
+
+    /// Queue an owned message for delivery by the writer thread.
+    ///
+    /// Takes ownership of `message`.
+    fn sendMessageOwned(self: *RemoteAgent, message: []u8) void {
+        const writer = if (self.connection_writer) |*w| w else {
+            self.gpa.free(message);
+            log.warn("Failed to queue remote message: connection closed", .{});
+            if (self.running.load(.seq_cst)) self.tryReconnect();
+            return;
+        };
+        writer.enqueueOwned(message) catch |err| {
+            self.gpa.free(message);
+            log.warn("Failed to queue remote message: {s}", .{@errorName(err)});
+            if (err == error.Closed and self.running.load(.seq_cst))
                 self.tryReconnect();
-            }
         };
     }
 
@@ -332,8 +386,7 @@ pub const RemoteAgent = struct {
             .hostname = self.hostname,
         };
         const payload = try protocol.serialize(self.gpa, .{ .register = reg });
-        defer self.gpa.free(payload);
-        self.sendMessage(payload);
+        self.sendMessageOwned(payload);
         self.writeStatus("Connected as {s}\n", .{reg.hostname});
     }
 
@@ -348,7 +401,7 @@ pub const RemoteAgent = struct {
     /// Return true if last message was long ago
     fn shouldSendHeartbeat(self: *RemoteAgent) bool {
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-        return (now - self.connection.last_msg > HEARTBEAT_FREQ_S);
+        return (now - self.connection.last_msg.load(.monotonic) > HEARTBEAT_FREQ_S);
     }
 
     /// Handle the completed job results
@@ -390,8 +443,7 @@ pub const RemoteAgent = struct {
                     const payload = try protocol.serialize(self.gpa, .{
                         .job_start = msg,
                     });
-                    defer self.gpa.free(payload);
-                    self.sendMessage(payload);
+                    self.sendMessageOwned(payload);
                     if (e.name) |name|
                         self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name })
                     else
@@ -406,8 +458,7 @@ pub const RemoteAgent = struct {
                     const payload = try protocol.serialize(self.gpa, .{
                         .job_log = msg,
                     });
-                    defer self.gpa.free(payload);
-                    self.sendMessage(payload);
+                    self.sendMessageOwned(payload);
                 },
                 .job_finished => |e| {
                     const msg: protocol.JobEndMsg = .{
@@ -419,8 +470,7 @@ pub const RemoteAgent = struct {
                     const payload = try protocol.serialize(self.gpa, .{
                         .job_finish = msg,
                     });
-                    defer self.gpa.free(payload);
-                    self.sendMessage(payload);
+                    self.sendMessageOwned(payload);
                     if (e.name) |name|
                         self.writeStatus(
                             "{s:<12} job='{s}' success={} message={?s}\n",

@@ -21,7 +21,6 @@ pub const DEFAULT_PORT = 5555;
 const InboundFrame = union(enum) {
     accepted: Connection.ConnInfo,
     frame: struct { socket_handle: std.Io.net.Socket.Handle, data: []u8 },
-    closed: std.Io.net.Socket.Handle,
 };
 
 const DeadlineEvent = union(enum) { elapsed: u8 };
@@ -92,20 +91,27 @@ const AgentReader = struct {
     gpa: std.mem.Allocator,
     stream: std.Io.net.Stream,
     incoming_frames: *MutexQueue(InboundFrame),
+    /// Set once the reader exited.
+    closed: std.atomic.Value(bool) = .init(false),
+    /// Wakes the manager loop when the reader exited.
+    notify: Notify,
     thread: std.Thread,
 
     fn start(
         io: std.Io,
         gpa: std.mem.Allocator,
-        stream: std.Io.net.Stream,
         incoming_frames: *MutexQueue(InboundFrame),
+        notify: Notify,
+        stream: std.Io.net.Stream,
     ) !*AgentReader {
         const reader = try gpa.create(AgentReader);
+        errdefer gpa.destroy(reader);
         reader.* = .{
             .io = io,
             .gpa = gpa,
             .stream = stream,
             .incoming_frames = incoming_frames,
+            .notify = notify,
             .thread = undefined,
         };
         reader.thread = try std.Thread.spawn(.{}, run, .{reader});
@@ -116,6 +122,11 @@ const AgentReader = struct {
     fn deinit(self: *AgentReader) void {
         self.thread.join();
         self.gpa.destroy(self);
+    }
+
+    /// Whether the reader worker exited.
+    pub fn isClosed(self: *AgentReader) bool {
+        return self.closed.load(.acquire);
     }
 
     fn run(self: *AgentReader) void {
@@ -147,12 +158,62 @@ const AgentReader = struct {
                 break;
             };
         }
-        self.incoming_frames.append(self.gpa, .{
-            .closed = self.stream.socket.handle,
-        }) catch |err| log.warn(
-            "Failed to queue remote agent disconnect notice: {s}",
-            .{@errorName(err)},
-        );
+        self.closed.store(true, .release);
+        self.notify.callback(self.notify.ptr);
+    }
+};
+
+/// Worker thread draining the connection writer's outbound queue to the socket.
+const AgentWriter = struct {
+    /// Queueing writer. The manager loop enqueues through `outbox`.
+    outbox: Connection.Writer,
+    /// Set once the writer exited.
+    closed: std.atomic.Value(bool) = .init(false),
+    /// Wakes the manager loop when the writer exited.
+    notify: Notify,
+    thread: std.Thread,
+
+    fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        notify: Notify,
+        stream: std.Io.net.Stream,
+    ) !*AgentWriter {
+        const writer = try gpa.create(AgentWriter);
+        errdefer gpa.destroy(writer);
+        writer.* = .{
+            .outbox = .init(io, gpa, stream),
+            .notify = notify,
+            .thread = undefined,
+        };
+        writer.thread = try std.Thread.spawn(.{}, run, .{writer});
+        return writer;
+    }
+
+    /// Stop the writer and join its thread, dropping queued frames.
+    /// The caller must have shut down the socket first.
+    fn deinit(self: *AgentWriter, gpa: std.mem.Allocator) void {
+        self.outbox.closeQueue();
+        self.thread.join();
+        self.outbox.deinit();
+        gpa.destroy(self);
+    }
+
+    /// Whether the writer worker exited.
+    pub fn isClosed(self: *AgentWriter) bool {
+        return self.closed.load(.acquire);
+    }
+
+    fn run(self: *AgentWriter) void {
+        while (true) {
+            const sent = self.outbox.sendNext() catch |err| {
+                log.debug("Remote agent writer stopped: {s}", .{@errorName(err)});
+                break;
+            };
+            if (!sent) break;
+        }
+        self.closed.store(true, .release);
+        self.notify.callback(self.notify.ptr);
     }
 };
 
@@ -166,9 +227,8 @@ pub const DispatchRequest = struct {
     job_name: []u8,
     /// Owned copy of the agent matching spec.
     agent: RemoteRunSpec,
-    /// Serialized `run_job` message, built while the task memory was
-    /// still valid.
-    run_job_payload: []u8,
+    /// Serialized `run_job` message.
+    run_job_payload: ?[]u8 = null,
     agent_fd: ?std.Io.net.Socket.Handle = null,
     /// Absolute time after which an unavailable dispatch fails.
     deadline_ms: ?i64 = null,
@@ -180,7 +240,7 @@ pub const DispatchRequest = struct {
         gpa.free(self.job_name);
         gpa.free(self.agent.name);
         if (self.agent.addr) |addr| gpa.free(addr);
-        gpa.free(self.run_job_payload);
+        if (self.run_job_payload) |payload| gpa.free(payload);
     }
 };
 
@@ -242,6 +302,7 @@ pub const AgentHandle = struct {
     name: ?[]const u8 = null,
     connection: Connection,
     reader: *AgentReader,
+    writer: *AgentWriter,
     last_heartbeat: i64,
 
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
@@ -252,6 +313,7 @@ pub const AgentHandle = struct {
     fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
         self.connection.shutdown();
         self.reader.deinit();
+        self.writer.deinit(gpa);
         self.connection.close();
         if (self.name) |name| gpa.free(name);
         self.connection.deinit();
@@ -317,7 +379,6 @@ pub const RemoteManager = struct {
         while (self.incoming_frames.pop()) |item| switch (item) {
             .accepted => |conn| conn.stream.close(self.io),
             .frame => |frame| self.gpa.free(frame.data),
-            .closed => {},
         };
         self.incoming_frames.deinit(self.gpa);
         while (self.commands.pop()) |command| switch (command) {
@@ -399,6 +460,8 @@ pub const RemoteManager = struct {
                 log.err("Failed to process remote commands: {s}", .{@errorName(err)});
             self.drainAgentInbox() catch |err|
                 log.err("Failed to process remote agent messages: {s}", .{@errorName(err)});
+            self.reapDeadAgents() catch |err|
+                log.err("Failed to remove dead remote agents: {s}", .{@errorName(err)});
             self.dispatchJobs() catch |err|
                 log.err("Failed to dispatch remote jobs: {s}", .{@errorName(err)});
 
@@ -502,11 +565,25 @@ pub const RemoteManager = struct {
         };
     }
 
+    /// Remove agents whose reader or writer worker exited.
+    fn reapDeadAgents(self: *RemoteManager) !void {
+        while (true) {
+            var dead_fd: ?std.Io.net.Socket.Handle = null;
+            var it = self.agents.iterator();
+            dead_fd = blk: while (it.next()) |entry| {
+                if (entry.value_ptr.reader.isClosed() or
+                    entry.value_ptr.writer.isClosed())
+                    break :blk entry.key_ptr.*;
+            } else null;
+            const fd = dead_fd orelse return;
+            self.removeAgentByFd(fd);
+        }
+    }
+
     /// Process frames read by the blocking per-agent reader workers.
     fn drainAgentInbox(self: *RemoteManager) !void {
         while (self.incoming_frames.pop()) |item| switch (item) {
             .accepted => |conn| try self.newAgent(conn),
-            .closed => |socket_handle| self.removeAgentByFd(socket_handle),
             .frame => |frame| {
                 defer self.gpa.free(frame.data);
                 const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
@@ -518,10 +595,7 @@ pub const RemoteManager = struct {
                     self.removeAgentByFd(frame.socket_handle);
                     continue;
                 };
-                self.handleMessage(agent, parsed) catch |err| switch (err) {
-                    error.ConnectionError => self.removeAgentByFd(frame.socket_handle),
-                    else => return err,
-                };
+                self.handleMessage(agent, parsed) catch |err| return err;
             },
         };
     }
@@ -532,20 +606,26 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         code: protocol.ErrorCode,
         message: []const u8,
-    ) error{ConnectionError} {
+    ) void {
         const err_msg: protocol.ErrorMsg = .{ .code = code, .message = message };
-        if (protocol.serialize(self.gpa, .{ .error_msg = err_msg })) |payload| {
-            defer self.gpa.free(payload);
-            agent.connection.sendFrame(payload) catch |err| log.debug(
-                "Failed to notify agent of rejection: {s}",
+        const payload = protocol.serialize(self.gpa, .{ .error_msg = err_msg }) catch |err| {
+            log.debug(
+                "Failed to serialize agent rejection message: {s}",
                 .{@errorName(err)},
             );
-        } else |err| log.debug(
-            "Failed to serialize agent rejection message: {s}",
-            .{@errorName(err)},
-        );
-        agent.connection.close();
-        return error.ConnectionError;
+            agent.connection.close();
+            return;
+        };
+        agent.writer.outbox.enqueueOwned(payload) catch |err| {
+            self.gpa.free(payload);
+            log.debug(
+                "Failed to queue agent rejection message: {s}",
+                .{@errorName(err)},
+            );
+            agent.connection.close();
+            return;
+        };
+        agent.writer.outbox.finish();
     }
 
     /// Allocate a `job_finished` remote event.
@@ -585,10 +665,22 @@ pub const RemoteManager = struct {
     ) !void {
         switch (msg) {
             .register => |m| {
-                if (m.version != protocol.VERSION)
-                    return self.rejectAgent(agent, .VersionMismatch, "Protocol version mismatch");
-                if (self.isNameTaken(agent, m.hostname))
-                    return self.rejectAgent(agent, .NameTaken, "Agent name already taken");
+                if (m.version != protocol.VERSION) {
+                    self.rejectAgent(
+                        agent,
+                        .VersionMismatch,
+                        "Protocol version mismatch",
+                    );
+                    return;
+                }
+                if (self.isNameTaken(agent, m.hostname)) {
+                    self.rejectAgent(
+                        agent,
+                        .NameTaken,
+                        "Agent name already taken",
+                    );
+                    return;
+                }
                 try agent.setName(self.gpa, m.hostname);
                 try self.emitEvent(.agent_changed);
             },
@@ -716,7 +808,12 @@ pub const RemoteManager = struct {
             return err;
         };
         // Send the pre-serialized job message to the agent
-        self.sendMessage(agent, dispatched.run_job_payload) catch |err| {
+        const entry = self.dispatched_jobs.getPtr(dispatched.dispatch_id) orelse
+            return;
+        const payload = entry.run_job_payload orelse return;
+        entry.run_job_payload = null;
+        self.sendMessageOwned(agent, payload) catch |err| {
+            self.gpa.free(payload);
             // Remove runner and send an error to scheduler
             const kv = self.dispatched_jobs.fetchRemove(dispatched.dispatch_id) orelse return;
             var failed = kv.value;
@@ -753,8 +850,8 @@ pub const RemoteManager = struct {
             const payload = try protocol.serialize(self.gpa, .{
                 .cancel_job = msg,
             });
-            defer self.gpa.free(payload);
-            try self.sendMessage(agent, payload);
+            errdefer self.gpa.free(payload);
+            try self.sendMessageOwned(agent, payload);
             return;
         }
         // Cancel queued requests that were not dispatched yet
@@ -769,17 +866,22 @@ pub const RemoteManager = struct {
         }
     }
 
-    /// Send a message to the agent.
-    /// Remove agent if not connected.
-    fn sendMessage(
+    /// Queue a message for delivery to the agent by its writer thread,
+    /// transferring ownership of `message` to the writer queue on success.
+    ///
+    /// Remove agent if the connection can no longer accept frames.
+    fn sendMessageOwned(
         self: *RemoteManager,
         agent: *AgentHandle,
-        message: []const u8,
+        message: []u8,
     ) !void {
-        agent.connection.sendFrame(message) catch |err| {
-            if (err == error.FrameTooLarge) return err;
-            self.removeAgentByFd(agent.connection.conn.stream.socket.handle);
-            return error.NotConnected;
+        const fd = agent.connection.conn.stream.socket.handle;
+        agent.writer.outbox.enqueueOwned(message) catch |err| switch (err) {
+            error.FrameTooLarge => return err,
+            else => {
+                self.removeAgentByFd(fd);
+                return error.NotConnected;
+            },
         };
     }
 
@@ -813,23 +915,52 @@ pub const RemoteManager = struct {
         return true;
     }
 
-    /// Save new agent
+    /// Save a new remote agent.
     fn newAgent(self: *RemoteManager, conn: Connection.ConnInfo) !void {
-        const res = try self.agents.getOrPut(self.gpa, conn.stream.socket.handle);
-        if (!res.found_existing) {
-            res.value_ptr.* = .{
-                .connection = try .initConn(self.io, conn),
-                .reader = try AgentReader.start(
-                    self.io,
-                    self.gpa,
-                    conn.stream,
-                    &self.incoming_frames,
-                ),
-                .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
-            };
+        const fd = conn.stream.socket.handle;
+        const res = try self.agents.getOrPut(self.gpa, fd);
+        if (res.found_existing) return;
+        errdefer {
+            _ = self.agents.remove(fd);
             self.agent_count.store(self.agents.count(), .seq_cst);
-            try self.emitEvent(.agent_changed);
         }
+
+        var connection: Connection = try .initConn(self.io, conn);
+        errdefer connection.deinit();
+
+        const reader = try AgentReader.start(
+            self.io,
+            self.gpa,
+            &self.incoming_frames,
+            .{ .ptr = self, .callback = notify },
+            conn.stream,
+        );
+        errdefer {
+            connection.shutdown();
+            reader.deinit();
+        }
+
+        const writer = try AgentWriter.start(
+            self.io,
+            self.gpa,
+            .{ .ptr = self, .callback = notify },
+            conn.stream,
+        );
+        errdefer {
+            connection.shutdown();
+            writer.deinit(self.gpa);
+        }
+        writer.outbox.setNotify(.{ .ptr = self, .callback = notify });
+
+        res.value_ptr.* = .{
+            .connection = connection,
+            .reader = reader,
+            .writer = writer,
+            .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
+        };
+        self.agent_count.store(self.agents.count(), .seq_cst);
+        self.emitEvent(.agent_changed) catch |err|
+            log.warn("Failed to emit agent_changed: {s}", .{@errorName(err)});
     }
 
     fn failDisconnectedJob(self: *RemoteManager, req: DispatchRequest) void {
