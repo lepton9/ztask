@@ -12,8 +12,8 @@ pub const ConnInfo = struct {
 
 io: std.Io,
 conn: ConnInfo = undefined,
-/// Timestamp of the last read or sent message
-last_msg: i64 = 0,
+/// Timestamp of the last read or sent message.
+last_msg: std.atomic.Value(i64) = .init(0),
 /// Teardown state of the socket handle.
 state: std.atomic.Value(State) = .init(.closed),
 
@@ -27,7 +27,7 @@ const State = enum(u8) {
     closed,
 };
 
-/// Initialize with an already connected TCP connection
+/// Initialize with an already connected TCP connection.
 pub fn initConn(io: std.Io, conn: ConnInfo) !Connection {
     return .{ .io = io, .conn = conn, .state = .init(.open) };
 }
@@ -36,16 +36,32 @@ pub fn init(io: std.Io) !Connection {
     return .{ .io = io };
 }
 
+pub fn deinit(self: *Connection) void {
+    self.close();
+}
+
+/// Create a reader for the connection.
+///
+/// The reader is invalid once the connection is closed or reconnected.
+pub fn reader(self: *Connection, gpa: std.mem.Allocator) !Reader {
+    if (self.isClosed()) return error.NotConnected;
+    return .init(self.io, gpa, self.conn.stream);
+}
+
+/// Create a writer for the connection.
+///
+/// The writer is invalid once the connection is closed or reconnected.
+pub fn writer(self: *Connection) !Writer {
+    if (self.isClosed()) return error.NotConnected;
+    return .init(self.io, self.conn.stream);
+}
+
 /// Whether the connection can no longer be used.
 pub fn isClosed(self: *const Connection) bool {
     return self.state.load(.acquire) != .open;
 }
 
-pub fn deinit(self: *Connection) void {
-    self.close();
-}
-
-/// Try to connect to the address
+/// Try to connect to the address.
 pub fn connect(self: *Connection, addr: std.Io.net.IpAddress) !void {
     if (self.state.load(.acquire) != .closed) return error.AlreadyConnected;
     var a = addr;
@@ -84,33 +100,18 @@ pub fn shutdown(self: *Connection) void {
     self.state.store(.open, .release);
 }
 
-/// Get the address of the connection
+/// Get the address of the connection.
 pub fn getAddress(self: *Connection) !std.Io.net.IpAddress {
     if (self.isClosed()) return error.NotConnected;
     return self.conn.address;
 }
 
-/// Set a timestamp for last message sent or received
+/// Set a timestamp for last message sent or received.
 pub fn setLastAccessed(self: *Connection) void {
-    self.last_msg = std.Io.Timestamp.now(self.io, .real).toSeconds();
-}
-
-/// Send a message
-/// Frame format:
-/// [[4 bytes: length N]][[1 byte: msg type]][[N-1 bytes: payload]]
-pub fn sendFrame(self: *Connection, msg: []const u8) !void {
-    if (self.isClosed()) return error.NotConnected;
-    if (msg.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
-    var header: [4]u8 = undefined;
-    std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
-
-    errdefer self.close();
-    var buffer: [1024]u8 = undefined;
-    var writer = self.conn.stream.writer(self.io, &buffer);
-    try writer.interface.writeAll(&header);
-    try writer.interface.writeAll(msg);
-    try writer.interface.flush();
-    self.setLastAccessed();
+    self.last_msg.store(
+        std.Io.Timestamp.now(self.io, .real).toSeconds(),
+        .monotonic,
+    );
 }
 
 /// Blocking frame reader for the socket connection.
@@ -187,10 +188,36 @@ pub const Reader = struct {
     }
 };
 
+/// Blocking frame writer for the socket connection.
+pub const Writer = struct {
+    io: std.Io,
+    stream: std.Io.net.Stream,
+
+    pub fn init(io: std.Io, stream: std.Io.net.Stream) Writer {
+        return .{ .io = io, .stream = stream };
+    }
+
+    /// Block until `msg` is fully written or an error occurs.
+    ///
+    /// Frame format:
+    /// [[4 bytes: length N]][[1 byte: msg type]][[N-1 bytes: payload]]
+    pub fn sendFrame(self: *Writer, msg: []const u8) !void {
+        if (msg.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+        var header: [4]u8 = undefined;
+        std.mem.writeInt(u32, &header, @intCast(msg.len), .little);
+
+        var buffer: [1024]u8 = undefined;
+        var w = self.stream.writer(self.io, &buffer);
+        try w.interface.writeAll(&header);
+        try w.interface.writeAll(msg);
+        try w.interface.flush();
+    }
+};
+
 test "reader compacts buffered frames" {
     const gpa = std.testing.allocator;
-    var reader: Reader = try .initWithSize(std.testing.io, gpa, undefined, 0);
-    defer reader.deinit();
+    var r: Reader = try .initWithSize(std.testing.io, gpa, undefined, 0);
+    defer r.deinit();
 
     const first = "first";
     const second = "second";
@@ -199,10 +226,16 @@ test "reader compacts buffered frames" {
     @memcpy(frames[4..9], first);
     std.mem.writeInt(u32, frames[9..13], second.len, .little);
     @memcpy(frames[13..19], second);
-    try reader.read_buf.appendSlice(gpa, &frames);
+    try r.read_buf.appendSlice(gpa, &frames);
 
-    const frame1 = (try reader.popFrame()).?;
+    const frame1 = (try r.popFrame()).?;
     try std.testing.expectEqualStrings(first, frame1);
-    const frame2 = (try reader.popFrame()).?;
+    const frame2 = (try r.popFrame()).?;
     try std.testing.expectEqualStrings(second, frame2);
+}
+
+test "writer rejects oversized frames" {
+    var w: Writer = .init(std.testing.io, undefined);
+    const oversized = [_]u8{0} ** (protocol.MAX_FRAME_SIZE + 1);
+    try std.testing.expectError(error.FrameTooLarge, w.sendFrame(&oversized));
 }
