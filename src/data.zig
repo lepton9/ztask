@@ -10,6 +10,7 @@ pub const APP_DATA_SUBDIR: []const u8 = "ztask";
 const RUN_COUNTER_FILE: []const u8 = "run_counter";
 const DATA_DIR_NAME: []const u8 = "data";
 const TASKS_DIR_NAME: []const u8 = "tasks";
+const AGENT_DIR_NAME: []const u8 = "agent";
 const TMP_TASK_BASE_NAME: []const u8 = ".ztask-tmp";
 const EDIT_TASK_BASE_NAME: []const u8 = ".ztask-edit";
 const DATA_DIR_ENV_VAR: []const u8 = "ZTASK_DATA_DIR";
@@ -256,6 +257,11 @@ pub const DataStore = struct {
     /// Get and allocate the directory path for task files
     pub fn tasksPath(self: *const DataStore, gpa: std.mem.Allocator) ![]u8 {
         return std.fs.path.join(gpa, &.{ self.root_dir, TASKS_DIR_NAME });
+    }
+
+    /// Get and allocate the directory path for remote agent workspaces.
+    pub fn agentDataPath(gpa: std.mem.Allocator, root_dir: []const u8) ![]u8 {
+        return std.fs.path.join(gpa, &.{ root_dir, AGENT_DIR_NAME });
     }
 
     /// Get and allocate the directory path for a task data

@@ -145,6 +145,8 @@ pub const AgentOptions = struct {
     name: []const u8,
     connect: ConnectOptions = .{},
     runners_n: u8 = BASE_RUNNERS_N,
+    /// Optional diagnostics for errors.
+    diagnostics: ?*GenericDiagnostics = null,
 };
 
 /// Run the remote runner
@@ -153,12 +155,28 @@ pub fn runAgent(ctx: RunCtx, options: AgentOptions) !void {
     const gpa = ctx.gpa;
     var stdout_buffer: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &stdout_buffer);
+
+    const agent_data_dir = try data.DataStore.agentDataPath(gpa, ctx.data_dir);
+    defer gpa.free(agent_data_dir);
+
+    var agent_dir = data.openDir(io, agent_data_dir, .{ .create = true }) catch |err| {
+        const diag = options.diagnostics orelse return err;
+        return diag.failf(
+            gpa,
+            err,
+            "Failed to create agent data directory '{s}': {s}",
+            .{ agent_data_dir, @errorName(err) },
+        );
+    };
+    agent_dir.close(io);
+
     var agent: *RemoteAgent = try .init(
         ctx.io,
         gpa,
         options.name,
         options.runners_n,
         &stdout.interface,
+        agent_data_dir,
     );
     defer agent.deinit();
     const address: std.Io.net.IpAddress = try .parseIp4(

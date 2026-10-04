@@ -21,7 +21,7 @@ pub const cli_spec: zcli.CliApp = .{
         .name = options.PROGRAM_NAME,
         .auto_help = true,
         .auto_version = true,
-        .help_max_width = 80,
+        .help_max_width = 90,
         .exclusive_group_mode = .combined,
     },
     .commands = commands,
@@ -641,25 +641,30 @@ fn cmdRunnerFn(ptr: *anyopaque) !void {
             break :blk @truncate(@as(u64, @intCast(port)));
         } else break :blk null;
     };
-    var opts: run.AgentOptions = .{ .name = name };
+    var diagnostics: GenericDiagnostics = .{};
+    defer diagnostics.deinit(ctx.run_ctx.gpa);
+    var opts: run.AgentOptions = .{ .name = name, .diagnostics = &diagnostics };
 
     if (addr) |a| opts.connect.addr = a.value.?.string;
     if (port) |p| opts.connect.port = p;
 
     if (getRunnerAmount(ctx)) |n| opts.runners_n = n;
 
-    return run.runAgent(ctx.run_ctx, opts) catch |err| switch (err) {
-        error.NameTaken => ctx.fatal(
-            "Another remote runner with name '{s}' already connected to {s}:{d}",
-            .{
-                opts.name, opts.connect.addr, opts.connect.port,
-            },
-        ),
-        error.VersionMismatch => ctx.fatal(
-            "Remote runner protocol is incompatible with the server at {s}:{d}. Update the runner to match the server version",
-            .{ opts.connect.addr, opts.connect.port },
-        ),
-        else => {},
+    return run.runAgent(ctx.run_ctx, opts) catch |err| {
+        if (diagnostics.message) |msg| ctx.fatal("{s}", .{msg});
+        switch (err) {
+            error.NameTaken => ctx.fatal(
+                "Another remote runner with name '{s}' already connected to {s}:{d}",
+                .{
+                    opts.name, opts.connect.addr, opts.connect.port,
+                },
+            ),
+            error.VersionMismatch => ctx.fatal(
+                "Remote runner protocol is incompatible with the server at {s}:{d}. Update the runner to match the server version",
+                .{ opts.connect.addr, opts.connect.port },
+            ),
+            else => ctx.fatal("Error: {any}", .{err}),
+        }
     };
 }
 

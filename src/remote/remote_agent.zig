@@ -4,6 +4,7 @@ const runnerpool = @import("../runner/runnerpool.zig");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
 const Connection = @import("Connection.zig");
+const workspace = @import("workspace.zig");
 
 const Queue = @import("../types/queue.zig").Queue;
 const MutexQueue = @import("../types/queue.zig").MutexQueue;
@@ -45,6 +46,8 @@ pub const RemoteAgent = struct {
     connection_writer: ?Connection.Writer = null,
     /// Worker thread for writing outgoing frames to the server.
     writer_thread: ?std.Thread = null,
+    /// Filesystem layout for sync workspaces.
+    workspaces: workspace.Store,
 
     /// Error for exiting.
     exit_error: ?ExitError = null,
@@ -57,23 +60,40 @@ pub const RemoteAgent = struct {
         name: []const u8,
         runners_n: u16,
         output: *std.Io.Writer,
+        agent_data_dir: []const u8,
     ) !*RemoteAgent {
-        const agent = try gpa.create(RemoteAgent);
         const result_buffer = try gpa.alloc(Result, runners_n);
+        errdefer gpa.free(result_buffer);
+
+        const hostname = try gpa.dupe(u8, name);
+        errdefer gpa.free(hostname);
+
+        var pool = try runnerpool.RunnerPool.init(io, gpa, runners_n);
+        errdefer pool.deinit();
+
+        var connection = try Connection.init(io);
+        errdefer connection.deinit();
+
+        var workspaces = try workspace.Store.init(io, gpa, agent_data_dir);
+        errdefer workspaces.deinit(gpa);
+
+        const agent = try gpa.create(RemoteAgent);
+        errdefer gpa.destroy(agent);
         agent.* = .{
             .io = io,
             .gpa = gpa,
             .output = output,
-            .hostname = try gpa.dupe(u8, name),
-            .pool = try .init(io, gpa, runners_n),
+            .hostname = hostname,
+            .pool = pool,
             .result_queue = .init(result_buffer),
             .result_buffer = result_buffer,
             .log_queue = .init(io),
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
-            .connection = try .init(io),
+            .connection = connection,
             .incoming_frames = .init(io),
+            .workspaces = workspaces,
         };
         try agent.active_runners.ensureTotalCapacity(gpa, runners_n);
         return agent;
@@ -118,6 +138,7 @@ pub const RemoteAgent = struct {
         self.active_runners.deinit(self.gpa);
         self.queue.deinit(self.gpa);
         self.pool.deinit();
+        self.workspaces.deinit(self.gpa);
         self.connection.deinit();
         while (self.incoming_frames.pop()) |frame| self.gpa.free(frame);
         self.incoming_frames.deinit(self.gpa);

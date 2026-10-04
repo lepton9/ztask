@@ -18,6 +18,8 @@ const expectError = std.testing.expectError;
 test {
     _ = manager;
     _ = run;
+    _ = @import("remote/glob.zig");
+    _ = @import("remote/workspace.zig");
 }
 
 /// Find a task in the task list snapshot by its id.
@@ -363,7 +365,7 @@ test "remote_job" {
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
     var output: std.Io.Writer.Discarding = .init(&.{});
-    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer);
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
@@ -406,7 +408,7 @@ test "remote_job_addr" {
     try task_manager.startWithOptions(.{ .listen_port = 0 });
 
     var output: std.Io.Writer.Discarding = .init(&.{});
-    var agent = try remote_agent.RemoteAgent.init(io, gpa, "agent", 5, &output.writer);
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "agent", 5, &output.writer, env.data_dir);
     defer agent.deinit();
     try agent.connect(task_manager.remote_manager.getAddress().?);
     var t = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
