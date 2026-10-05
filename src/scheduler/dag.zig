@@ -21,7 +21,7 @@ pub fn Node(comptime T: type) type {
         id: u64 = 0,
         status: Status = .pending,
         /// Nodes that depend on this node
-        dependents: std.ArrayList(*@This()),
+        dependents: std.ArrayList(*@This()) = .empty,
         /// Total number of dependencies
         dependencies: usize = 0,
         /// Number of dependencies not yet finished

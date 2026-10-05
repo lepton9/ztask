@@ -719,14 +719,12 @@ pub const RemoteManager = struct {
                 );
                 try self.emitEvent(event);
             },
-            .sync_ack,
-            .file_req,
-            .sync_begin,
-            .manifest,
-            .file_chunk,
-            .file_done,
-            .sync_end,
-            => @panic("TODO:"),
+            // TODO: implement handling
+            .sync_ack, .file_req, .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
+                log.debug("Ignoring manager-side sync message '{s}'", .{
+                    @tagName(std.meta.activeTag(msg)),
+                });
+            },
             else => {},
         }
     }

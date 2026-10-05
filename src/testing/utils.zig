@@ -13,7 +13,11 @@ pub const TestEnv = struct {
     /// Handle to the temporary directory.
     dir: std.Io.Dir,
 
+    pub const LOG_LEVEL: std.log.Level = .err;
+
     pub fn init(gpa: std.mem.Allocator) !TestEnv {
+        std.testing.log_level = LOG_LEVEL;
+
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
         const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);

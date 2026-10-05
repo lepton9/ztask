@@ -5,6 +5,7 @@ const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
 const Connection = @import("Connection.zig");
 const workspace = @import("workspace.zig");
+const sync = @import("sync.zig");
 
 const Queue = @import("../types/queue.zig").Queue;
 const MutexQueue = @import("../types/queue.zig").MutexQueue;
@@ -16,6 +17,18 @@ const LogQueue = localrunner.LogQueue;
 const log = std.log.scoped(.agent);
 
 const HEARTBEAT_FREQ_S = 10;
+
+/// A dispatched job owned by the agent.
+const JobEntry = struct {
+    job: task.Job,
+    node: JobNode,
+    /// Owned workspace directory the job runs in.
+    cwd: ?[]u8 = null,
+    /// Set while the job waits for its workspace transfer to finish.
+    awaiting_sync: bool = false,
+    /// Set once the job was appended to the run queue.
+    queued: bool = false,
+};
 
 pub const RemoteAgent = struct {
     io: std.Io,
@@ -30,12 +43,14 @@ pub const RemoteAgent = struct {
     result_buffer: []Result,
     log_queue: LogQueue,
 
-    /// All currently loaded jobs
-    jobs: std.AutoHashMapUnmanaged(u64, struct { job: task.Job, node: JobNode }),
-    /// Queue of jobs to run
+    /// All currently loaded jobs.
+    jobs: std.AutoHashMapUnmanaged(u64, *JobEntry),
+    /// Queue of jobs to run.
     queue: Queue(*JobNode),
-    /// Jobs currently running
+    /// Jobs currently running.
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
+    /// In-flight workspace transfers, keyed by job dispatch id.
+    syncs: std.AutoHashMapUnmanaged(u64, *sync.Receiver),
 
     connection: Connection,
     /// Incoming frames from the server.
@@ -91,6 +106,7 @@ pub const RemoteAgent = struct {
             .jobs = .{},
             .queue = .{},
             .active_runners = .{},
+            .syncs = .{},
             .connection = connection,
             .incoming_frames = .init(io),
             .workspaces = workspaces,
@@ -120,12 +136,14 @@ pub const RemoteAgent = struct {
         }
         self.active_runners.clearRetainingCapacity();
         var it = self.jobs.iterator();
-        while (it.next()) |e| {
-            e.value_ptr.node.deinit(self.gpa);
-            const job = e.value_ptr.job;
-            job.deinit(self.gpa);
-        }
+        while (it.next()) |e| self.destroyJobEntry(e.value_ptr.*);
         self.jobs.deinit(self.gpa);
+        var syncs_it = self.syncs.valueIterator();
+        while (syncs_it.next()) |recv| {
+            recv.*.deinit();
+            self.gpa.destroy(recv.*);
+        }
+        self.syncs.deinit(self.gpa);
         self.result_queue.close(self.io);
         while (true) {
             var pending: [4]Result = undefined;
@@ -180,7 +198,8 @@ pub const RemoteAgent = struct {
         return self.active_runners.count() == 0 and
             self.queue.empty() and
             self.log_queue.empty() and
-            self.jobs.count() == 0;
+            self.jobs.count() == 0 and
+            self.syncs.count() == 0;
     }
 
     /// Try to connect to the server at the address
@@ -322,33 +341,200 @@ pub const RemoteAgent = struct {
                     self.stop();
                 }
             },
-            .sync_begin,
-            .manifest,
-            .file_chunk,
-            .file_done,
-            .sync_end,
-            .sync_ack,
-            .file_req,
-            => @panic("TODO:"),
+            .sync_begin => |m| self.beginSync(m),
+            .manifest => |m| self.handleManifest(m),
+            .file_chunk => |m| self.handleSyncChunk(m),
+            .file_done => |m| self.handleSyncFileDone(m),
+            .sync_end => |m| self.handleSyncEnd(m),
+            .sync_ack, .file_req => {},
             else => {}, // Not relevant for agent
         }
     }
 
-    /// Add a job to the back of the run queue
-    fn queueJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
-        const res = try self.jobs.getOrPut(self.gpa, msg.job_id);
-        if (res.found_existing) return error.JobRunning;
+    /// Start receiving a workspace transfer.
+    fn beginSync(self: *RemoteAgent, msg: protocol.SyncBeginMsg) void {
+        if (self.syncs.contains(msg.job_id)) {
+            log.warn("Ignoring duplicate sync_begin for job {x}", .{msg.job_id});
+            return;
+        }
+        const recv = sync.Receiver.init(
+            self.io,
+            self.gpa,
+            &self.workspaces,
+            msg,
+        ) catch |err| {
+            log.warn("Rejected workspace sync for job {x}: {s}", .{
+                msg.job_id,
+                @errorName(err),
+            });
+            self.sendSyncAck(msg.job_id, false, @errorName(err));
+            return;
+        };
+        self.syncs.put(self.gpa, msg.job_id, recv) catch |err| {
+            log.err("Failed to track workspace sync for job {x}: {s}", .{
+                msg.job_id,
+                @errorName(err),
+            });
+            recv.deinit();
+            self.gpa.destroy(recv);
+            self.sendSyncAck(msg.job_id, false, "out of memory");
+            return;
+        };
+    }
 
-        res.value_ptr.*.job = .{
-            .name = try std.fmt.allocPrint(self.gpa, "{x}", .{msg.job_id}),
-            .steps = try msg.parseSteps(self.gpa),
+    /// Accept the workspace manifest.
+    fn handleManifest(self: *RemoteAgent, msg: protocol.ManifestMsg) void {
+        if (!self.syncs.contains(msg.job_id)) {
+            log.debug("Ignoring manifest for unknown sync {x}", .{msg.job_id});
+            return;
+        }
+        log.debug("Received manifest for sync {x} ({d} bytes)", .{
+            msg.job_id,
+            msg.manifest_json.len,
+        });
+        // TODO: handle manifest
+    }
+
+    /// Write one file chunk of an in-flight transfer.
+    fn handleSyncChunk(self: *RemoteAgent, msg: protocol.FileChunkMsg) void {
+        const recv = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring file chunk for unknown sync {x}", .{msg.job_id});
+            return;
         };
-        res.value_ptr.*.node = .{
-            .ptr = &res.value_ptr.*.job,
-            .id = msg.job_id,
-            .dependents = .empty,
+        recv.receiveChunk(msg.path, msg.offset, msg.data);
+    }
+
+    /// Complete one file of an in-flight transfer.
+    fn handleSyncFileDone(self: *RemoteAgent, msg: protocol.FileDoneMsg) void {
+        const recv = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
+            return;
         };
-        try self.queue.append(self.gpa, &res.value_ptr.node);
+        recv.finishFile(msg.path, msg.permissions);
+    }
+
+    /// Validate and commit a finished transfer, then run any job waiting on it.
+    fn handleSyncEnd(self: *RemoteAgent, msg: protocol.SyncEndMsg) void {
+        const recv = self.syncs.get(msg.job_id) orelse {
+            self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
+            return;
+        };
+
+        if (!recv.commit()) {
+            const message = recv.failureMessage();
+            self.sendSyncAck(msg.job_id, false, message);
+            self.abortPendingJob(msg.job_id);
+            self.destroySync(msg.job_id);
+            return;
+        }
+
+        // A job that arrived before the transfer finished is released now.
+        if (self.jobs.get(msg.job_id)) |entry| {
+            if (entry.awaiting_sync) {
+                entry.awaiting_sync = false;
+                self.enqueueJob(entry);
+            }
+        }
+        self.sendSyncAck(msg.job_id, true, null);
+    }
+
+    /// Queue a sync acknowledgment for delivery.
+    fn sendSyncAck(self: *RemoteAgent, job_id: u64, ok: bool, message: ?[]const u8) void {
+        const msg: protocol.SyncAckMsg = .{ .job_id = job_id, .ok = ok, .message = message };
+        const payload = protocol.serialize(self.gpa, .{ .sync_ack = msg }) catch |err| {
+            log.err("Failed to serialize sync ack for job {x}: {s}", .{
+                job_id,
+                @errorName(err),
+            });
+            return;
+        };
+        self.sendMessageOwned(payload);
+    }
+
+    /// Load a dispatched job and either queue it or hold it for its sync.
+    fn queueJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
+        if (self.jobs.contains(msg.job_id)) return error.JobRunning;
+
+        const entry = try self.gpa.create(JobEntry);
+        errdefer self.gpa.destroy(entry);
+        const job_name = try std.fmt.allocPrint(self.gpa, "{x}", .{msg.job_id});
+        errdefer self.gpa.free(job_name);
+        const steps = try msg.parseSteps(self.gpa);
+        errdefer {
+            for (steps) |step| step.deinit(self.gpa);
+            self.gpa.free(steps);
+        }
+        const cwd = if (self.syncs.get(msg.job_id)) |recv|
+            try self.gpa.dupe(u8, recv.rootDir())
+        else
+            null;
+        errdefer if (cwd) |path| self.gpa.free(path);
+
+        entry.* = .{
+            .job = .{ .name = job_name, .steps = steps },
+            .node = .{ .ptr = undefined, .id = msg.job_id },
+            .cwd = cwd,
+        };
+        entry.node.ptr = &entry.job;
+        try self.jobs.put(self.gpa, msg.job_id, entry);
+
+        const recv = self.syncs.get(msg.job_id) orelse {
+            self.enqueueJob(entry);
+            return;
+        };
+        if (recv.failed) {
+            // The transfer already failed. The remote manager learns through
+            // the negative ack and must not expect this job to run.
+            self.removeJob(msg.job_id);
+            return;
+        }
+        if (recv.committed) {
+            self.enqueueJob(entry);
+        } else {
+            entry.awaiting_sync = true;
+        }
+    }
+
+    /// Append a job to the run queue once.
+    fn enqueueJob(self: *RemoteAgent, entry: *JobEntry) void {
+        if (entry.queued) return;
+        self.queue.append(self.gpa, &entry.node) catch |err| {
+            log.err("Failed to queue remote job {x}: {s}", .{
+                entry.node.id,
+                @errorName(err),
+            });
+            return;
+        };
+        entry.queued = true;
+    }
+
+    /// Free a dispatched job and its owned fields.
+    fn destroyJobEntry(self: *RemoteAgent, entry: *JobEntry) void {
+        entry.node.deinit(self.gpa);
+        entry.job.deinit(self.gpa);
+        if (entry.cwd) |cwd| self.gpa.free(cwd);
+        self.gpa.destroy(entry);
+    }
+
+    /// Remove and free a dispatched job if it exists.
+    fn removeJob(self: *RemoteAgent, job_id: u64) void {
+        const kv = self.jobs.fetchRemove(job_id) orelse return;
+        self.destroyJobEntry(kv.value);
+    }
+
+    /// Remove a job that only existed to wait on a failed transfer.
+    fn abortPendingJob(self: *RemoteAgent, job_id: u64) void {
+        const entry = self.jobs.get(job_id) orelse return;
+        if (!entry.awaiting_sync) return;
+        self.removeJob(job_id);
+    }
+
+    /// Delete a transfer's staging dir and free the receiver.
+    fn destroySync(self: *RemoteAgent, job_id: u64) void {
+        const kv = self.syncs.fetchRemove(job_id) orelse return;
+        const recv = kv.value;
+        recv.deinit();
+        self.gpa.destroy(recv);
     }
 
     /// Queue a message for delivery by the writer thread.
@@ -379,25 +565,27 @@ pub const RemoteAgent = struct {
     }
 
     /// Cancel a job from running.
-    /// Force stop the runner if active, otherwise remove from the queue.
+    ///
+    /// Force stops the runner if active, otherwise removes the job from the
+    /// queue or its pending transfer. Always tears down a matching transfer.
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
-        const e = self.jobs.getPtr(msg.job_id) orelse return;
-        if (self.active_runners.fetchRemove(&e.node)) |kv| {
-            kv.value.forceStop();
-            self.pool.release(kv.value);
-            log.info("Cancelled remote job {x} while running", .{msg.job_id});
-        } else {
-            var it = self.queue.iterator();
-            while (it.next()) |node| {
-                if (@intFromPtr(node.value) == @intFromPtr(&e.node)) {
+        if (self.jobs.get(msg.job_id)) |entry| {
+            if (self.active_runners.fetchRemove(&entry.node)) |kv| {
+                kv.value.forceStop();
+                self.pool.release(kv.value);
+                log.info("Cancelled remote job {x} while running", .{msg.job_id});
+                self.handleResults();
+            } else {
+                var it = self.queue.iterator();
+                while (it.next()) |node| {
+                    if (@intFromPtr(node.value) != @intFromPtr(&entry.node)) continue;
                     self.queue.remove(node);
                     break;
                 }
             }
+            self.removeJob(msg.job_id);
         }
-        var kv = self.jobs.fetchRemove(msg.job_id) orelse unreachable;
-        kv.value.node.deinit(self.gpa);
-        kv.value.job.deinit(self.gpa);
+        self.destroySync(msg.job_id);
     }
 
     /// Send a register packet
@@ -434,6 +622,7 @@ pub const RemoteAgent = struct {
 
             for (results[0..n]) |*res| {
                 defer res.result.deinit(self.gpa);
+                const job_id = res.node.id;
                 // Release runner
                 if (self.active_runners.fetchRemove(res.node)) |kv| {
                     const runner = kv.value;
@@ -442,11 +631,10 @@ pub const RemoteAgent = struct {
                 }
 
                 // Free the job
-                if (self.jobs.fetchRemove(res.node.id)) |kv| {
-                    var value = kv.value;
-                    value.node.deinit(self.gpa);
-                    value.job.deinit(self.gpa);
+                if (self.jobs.fetchRemove(job_id)) |kv| {
+                    self.destroyJobEntry(kv.value);
                 }
+                self.destroySync(job_id);
             }
         }
     }
@@ -520,7 +708,21 @@ pub const RemoteAgent = struct {
             return;
         };
         self.active_runners.putAssumeCapacity(node, runner);
-        runner.runJob(self.gpa, node, &self.result_queue, &self.log_queue);
+        // Synced jobs run inside their workspace
+        // TODO: resolve relative cwd from the root of the workspace?
+        const cwd: ?[]const u8 = if (self.jobs.get(node.id)) |entry|
+            entry.cwd
+        else
+            null;
+        runner.runJobWithMode(
+            self.gpa,
+            node,
+            &self.result_queue,
+            &self.log_queue,
+            .piped,
+            cwd,
+            null,
+        );
     }
 
     /// Request a runner from the pool
