@@ -5,6 +5,9 @@ const data = @import("data.zig");
 const snap = @import("tui/snapshot.zig");
 const run = @import("run.zig");
 const remote_agent = @import("remote/remote_agent.zig");
+const task_types = @import("types/task.zig");
+const protocol = @import("remote/protocol.zig");
+const Connection = @import("remote/Connection.zig");
 const testutil = @import("testing/utils.zig");
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
 const Scheduler = @import("scheduler/scheduler.zig").Scheduler;
@@ -20,6 +23,7 @@ test {
     _ = run;
     _ = @import("remote/glob.zig");
     _ = @import("remote/workspace.zig");
+    _ = @import("remote/sync.zig");
 }
 
 /// Find a task in the task list snapshot by its id.
@@ -93,10 +97,10 @@ test "task_to_yaml_parsed" {
 }
 
 test "manager_simple" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task1_file =
         \\ name: task1
@@ -133,10 +137,10 @@ test "manager_simple" {
 }
 
 test "expected_step_exit_code_succeeds" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: expected-exit
@@ -164,10 +168,10 @@ test "expected_step_exit_code_succeeds" {
 }
 
 test "begin_task_while_running" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: task
@@ -225,10 +229,10 @@ test "begin_task_while_running" {
 }
 
 test "force_interrupt" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: task
@@ -265,10 +269,10 @@ test "force_interrupt" {
 }
 
 test "complete_tasks" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task1_file =
         \\ name: task1
@@ -336,10 +340,10 @@ test "complete_tasks" {
 }
 
 test "remote_job" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: task6
@@ -381,10 +385,10 @@ test "remote_job" {
 }
 
 test "remote_job_addr" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: task7
@@ -424,11 +428,225 @@ test "remote_job_addr" {
     try std.testing.expect(finished.status == .success);
 }
 
+/// Serialize and send one protocol message over a test connection.
+fn sendProtocolMsg(
+    writer: *Connection.Writer,
+    gpa: std.mem.Allocator,
+    msg: protocol.Msg,
+) !void {
+    const payload = try protocol.serialize(gpa, msg);
+    defer gpa.free(payload);
+    try writer.sendFrame(payload);
+}
+
+/// Read frames until one with the given tag arrives, returning it.
+fn readMsg(
+    reader: *Connection.Reader,
+    comptime tag: std.meta.Tag(protocol.Msg),
+) !protocol.Msg {
+    while (true) {
+        const frame = try reader.readNextFrame();
+        const msg = try protocol.parse(frame);
+        if (std.meta.activeTag(msg) == tag) return msg;
+    }
+}
+
+/// Read exactly one frame and require it to carry `tag`.
+fn expectNextMsg(
+    reader: *Connection.Reader,
+    comptime tag: std.meta.Tag(protocol.Msg),
+) !protocol.Msg {
+    const frame = try reader.readNextFrame();
+    const msg = try protocol.parse(frame);
+    if (std.meta.activeTag(msg) != tag) return error.UnexpectedMessage;
+    return msg;
+}
+
+/// Poll until the path no longer exists.
+fn waitRemoved(io: std.Io, path: []const u8) !void {
+    var waited_ts = std.Io.Timestamp.now(io, .awake);
+    while (true) {
+        _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
+        expect(waited_ts.untilNow(io, .awake).toMilliseconds() <
+            std.Io.Duration.fromMilliseconds(100).toMilliseconds()) catch
+            return error.WaitedTooLong;
+        try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+    }
+}
+
+test "remote_sync_agent_transfer" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const bind = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(
+        io,
+        gpa,
+        "runner1",
+        2,
+        &output.writer,
+        env.data_dir,
+    );
+    defer agent.deinit();
+    try agent.connect(server.socket.address);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+    defer {
+        agent.stop();
+        agent_thread.join();
+    }
+
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var reader = try Connection.Reader.init(io, gpa, stream);
+    defer reader.deinit();
+    var writer = Connection.Writer.init(io, gpa, stream);
+    defer writer.deinit();
+
+    _ = try readMsg(&reader, .register);
+
+    const job_id: u64 = 1;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = job_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .root = ".",
+        .mode = .static,
+        .direction = .push,
+        .config_json = "{}",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = job_id,
+        .path = "marker.txt",
+        .offset = 0,
+        .data = "hello\n",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_done = .{
+        .job_id = job_id,
+        .path = "marker.txt",
+        .permissions = 0o644,
+    } });
+
+    // The job arrives before the transfer is committed: the agent must hold
+    // it and only run it after `sync_end`.
+    const steps = [_]task_types.Step{.{ .command = .{
+        .value = "grep -q hello marker.txt",
+    } }};
+    const steps_json = try protocol.RunJobMsg.serializeSteps(gpa, &steps);
+    defer gpa.free(steps_json);
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = job_id,
+        .steps = steps_json,
+    } });
+
+    try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = job_id } });
+
+    const ack = (try readMsg(&reader, .sync_ack)).sync_ack;
+    try expect(ack.job_id == job_id);
+    try expect(ack.ok);
+
+    const finish = (try readMsg(&reader, .job_finish)).job_finish;
+    try expect(finish.job_id == job_id);
+    try expect(finish.success);
+
+    // The ephemeral staging workspace is removed once the job has finished.
+    const staging = try std.fs.path.join(gpa, &.{
+        env.data_dir, "workspaces", "sync-agent", "build", "runs", "1",
+    });
+    defer gpa.free(staging);
+    try waitRemoved(io, staging);
+
+    const bad_id: u64 = 2;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = bad_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .root = ".",
+        .mode = .static,
+        .direction = .push,
+        .config_json = "{}",
+    } });
+    // The job arrives while the transfer is still in flight.
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = bad_id,
+        .steps = steps_json,
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = bad_id,
+        .path = "../evil.txt",
+        .offset = 0,
+        .data = "nope",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = bad_id } });
+
+    const bad_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    try expect(bad_ack.job_id == bad_id);
+    try expect(!bad_ack.ok);
+
+    const bad_staging = try std.fs.path.join(gpa, &.{
+        env.data_dir, "workspaces", "sync-agent", "build", "runs", "2",
+    });
+    defer gpa.free(bad_staging);
+    try waitRemoved(io, bad_staging);
+    const runs_dir = std.fs.path.dirname(bad_staging) orelse unreachable;
+    const escaped = try std.fs.path.join(gpa, &.{ runs_dir, "evil.txt" });
+    defer gpa.free(escaped);
+    try expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, escaped, .{}));
+
+    // A job dispatched after its transfer already failed is dropped
+    const drop_id: u64 = 3;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = drop_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .root = ".",
+        .mode = .static,
+        .direction = .push,
+        .config_json = "{}",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = drop_id,
+        .path = "../evil.txt",
+        .offset = 0,
+        .data = "nope",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = drop_id,
+        .steps = steps_json,
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = drop_id } });
+
+    const drop_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    try expect(drop_ack.job_id == drop_id);
+    try expect(!drop_ack.ok);
+
+    const probe_id: u64 = 4;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = probe_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .root = ".",
+        .mode = .static,
+        .direction = .push,
+        .config_json = "{}",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = probe_id } });
+
+    const probe_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    try expect(probe_ack.job_id == probe_id);
+    try expect(probe_ack.ok);
+}
+
 test "remote_dispatch_survives_task_unload" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: unload-remote
@@ -459,10 +677,10 @@ test "remote_dispatch_survives_task_unload" {
 }
 
 test "manager_run_history_prefetch" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\name: history
@@ -537,10 +755,10 @@ test "manager_run_history_prefetch" {
 }
 
 test "manager_no_prefetch_by_default" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\name: history
@@ -575,10 +793,10 @@ test "manager_no_prefetch_by_default" {
 }
 
 test "manager_last_finished_run" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\name: last-run
@@ -657,10 +875,10 @@ test "manager_last_finished_run" {
 }
 
 test "examples" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
     const cwd = std.Io.Dir.cwd();
 
     const task_manager = try TaskManager.initWithOptions(io, gpa, 5, .{
@@ -702,10 +920,10 @@ fn expectWatchRegistration(
 }
 
 test "manager_multi_watch_register_remove" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -760,10 +978,10 @@ test "manager_multi_watch_register_remove" {
 }
 
 test "manager_multi_watch_mixed_scopes_cleanup" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -809,10 +1027,10 @@ test "manager_multi_watch_mixed_scopes_cleanup" {
 }
 
 test "manager_watch_duplicate_roots_deduped" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -862,10 +1080,10 @@ test "manager_watch_duplicate_roots_deduped" {
 }
 
 test "manager_watch_registration_rollback" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -926,10 +1144,10 @@ test "manager_watch_registration_rollback" {
 }
 
 test "manager_timer_registration_lifecycle" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: timer
@@ -980,10 +1198,10 @@ test "manager_timer_registration_lifecycle" {
 }
 
 test "manager_interval_and_watch_combo" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1067,10 +1285,10 @@ test "roundtrip_multi_trigger_yaml" {
 }
 
 test "apply_edited_task" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const task_file =
         \\ name: task-edit
@@ -1079,7 +1297,7 @@ test "apply_edited_task" {
         \\   noop:
         \\     steps: []
     ;
-    const path = try env.createTaskFile(gpa, "task-edit.yml", task_file);
+    const path = try env.createTaskFile("task-edit.yml", task_file);
     defer gpa.free(path);
 
     const triggered_file =
@@ -1092,7 +1310,7 @@ test "apply_edited_task" {
         \\     steps:
         \\       - command: "true"
     ;
-    const triggered_path = try env.createTaskFile(gpa, "task-triggered.yml", triggered_file);
+    const triggered_path = try env.createTaskFile("task-triggered.yml", triggered_file);
     defer gpa.free(triggered_path);
 
     const task_manager = try TaskManager.initWithOptions(io, gpa, 1, .{

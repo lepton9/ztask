@@ -386,10 +386,10 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
 }
 
 test "receiver_writes_and_commits" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -421,10 +421,10 @@ test "receiver_writes_and_commits" {
 }
 
 test "receiver_empty_file" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -447,10 +447,10 @@ test "receiver_empty_file" {
 }
 
 test "receiver_rejects_traversal" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -472,10 +472,10 @@ test "receiver_rejects_traversal" {
 }
 
 test "receiver_rejects_interleaved_files" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -492,10 +492,10 @@ test "receiver_rejects_interleaved_files" {
 }
 
 test "receiver_rejects_impossible_offsets" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -523,10 +523,10 @@ test "receiver_rejects_impossible_offsets" {
 }
 
 test "receiver_rejects_oversized_chunk" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -545,10 +545,10 @@ test "receiver_rejects_oversized_chunk" {
 }
 
 test "receiver_rejects_unsupported_mode_and_direction" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -563,10 +563,10 @@ test "receiver_rejects_unsupported_mode_and_direction" {
 }
 
 test "receiver_abort_removes_staging" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -584,10 +584,10 @@ test "receiver_abort_removes_staging" {
 }
 
 test "directory_read_write_roundtrip" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const root = try std.fs.path.join(gpa, &.{ env.path, "ws" });
     defer gpa.free(root);
@@ -641,10 +641,10 @@ test "directory_read_write_roundtrip" {
 }
 
 test "directory_root_is_canonical" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     // A root reached through a symlinked parent is stored as the real path.
     try env.dir.createDirPath(io, "real/ws");

@@ -1397,8 +1397,8 @@ fn overwriteTaskFile(io: std.Io, abs_path: []const u8, name: []const u8, id: ?[]
 test "sync_tasks_id_change" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
 
     var store = try data.DataStore.init(io, gpa, .{ .data_dir = env.data_dir });
     defer store.deinit(gpa);
@@ -1454,8 +1454,8 @@ test "sync_tasks_id_change" {
 test "sync_dedup_same_task_file_path" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
     const cwd = env.dir;
 
     var store = try data.DataStore.init(io, gpa, .{
@@ -1590,30 +1590,30 @@ test "sync_dedup_same_task_file_path" {
     try std.testing.expect(next >= 3);
 }
 /// Count the runs recorded on disk for the task.
-fn taskRunCount(env: *const TestEnv, gpa: std.mem.Allocator, id: []const u8) !usize {
-    var datastore = try env.initDataStore(gpa, .{});
-    defer datastore.deinit(gpa);
-    try datastore.loadTaskRuns(gpa, id, .{ .limit = 0 });
+fn taskRunCount(env: *const TestEnv, id: []const u8) !usize {
+    var datastore = try env.initDataStore(.{});
+    defer datastore.deinit(env.gpa);
+    try datastore.loadTaskRuns(env.gpa, id, .{ .limit = 0 });
     return datastore.totalRuns(id);
 }
 
 test "run_multiple_tasks" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
 
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
+    const path1 = try env.createTaskFile("task1.yml",
         \\ name: task1
         \\ id: 101
     );
     defer gpa.free(path1);
-    const path2 = try env.createTaskFile(gpa, "task2.yml",
+    const path2 = try env.createTaskFile("task2.yml",
         \\ name: task2
         \\ id: 102
     );
     defer gpa.free(path2);
-    const path3 = try env.createTaskFile(gpa, "task3.yml",
+    const path3 = try env.createTaskFile("task3.yml",
         \\ name: task3
         \\ id: 103
     );
@@ -1630,24 +1630,24 @@ test "run_multiple_tasks" {
     try runTask(run_ctx, .{
         .tasks = &.{.{ .path = path3 }},
     });
-    try expect(try taskRunCount(&env, gpa, "103") == 1);
+    try expect(try taskRunCount(&env, "103") == 1);
 
     // Multiple tasks run and the same task selected twice runs only once
     try runTask(run_ctx, .{
         .tasks = &.{ .{ .path = path1 }, .{ .path = path1 }, .{ .path = path2 } },
     });
 
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
-    try expect(try taskRunCount(&env, gpa, "102") == 1);
+    try expect(try taskRunCount(&env, "101") == 1);
+    try expect(try taskRunCount(&env, "102") == 1);
 }
 
 test "run_task_failures" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
 
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
+    const path1 = try env.createTaskFile("task1.yml",
         \\ name: task1
         \\ id: 101
     );
@@ -1666,7 +1666,7 @@ test "run_task_failures" {
     try expectError(error.TaskStartFailed, runTask(run_ctx, .{
         .tasks = &.{ .{ .path = missing_path }, .{ .path = path1 } },
     }));
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
+    try expect(try taskRunCount(&env, "101") == 1);
 
     // All tasks failing to load does not start the event loop
     try expectError(error.TaskStartFailed, runTask(run_ctx, .{
@@ -1684,15 +1684,15 @@ test "run_waits_for_triggered_task" {
 
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
 
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
+    const path1 = try env.createTaskFile("task1.yml",
         \\ name: task1
         \\ id: 101
     );
     defer gpa.free(path1);
-    const path2 = try env.createTaskFile(gpa, "task2.yml",
+    const path2 = try env.createTaskFile("task2.yml",
         \\ name: task2
         \\ id: 102
         \\ on:
@@ -1740,20 +1740,20 @@ test "run_waits_for_triggered_task" {
     const elapsed_ms = start.durationTo(.now(io, .real)).raw.toMilliseconds();
     try expect(elapsed_ms >= 250);
     try expect(runner.err == null);
-    try expect(try taskRunCount(&env, gpa, "101") == 1);
+    try expect(try taskRunCount(&env, "101") == 1);
 }
 test "run_keepalive_failed_triggered_task" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
 
-    const path1 = try env.createTaskFile(gpa, "task1.yml",
+    const path1 = try env.createTaskFile("task1.yml",
         \\ name: task1
         \\ id: 209
     );
     defer gpa.free(path1);
-    const path2 = try env.createTaskFile(gpa, "task2.yml",
+    const path2 = try env.createTaskFile("task2.yml",
         \\ name: task2
         \\ id: 210
         \\ on:
@@ -1775,5 +1775,5 @@ test "run_keepalive_failed_triggered_task" {
         .tasks = &.{ .{ .path = path1 }, .{ .path = path2 } },
     }));
     // The valid task without a trigger ran to completion
-    try expect(try taskRunCount(&env, gpa, "209") == 1);
+    try expect(try taskRunCount(&env, "209") == 1);
 }

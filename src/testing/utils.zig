@@ -4,6 +4,9 @@ const std = @import("std");
 const data = @import("../data.zig");
 
 pub const TestEnv = struct {
+    io: std.Io = std.testing.io,
+    gpa: std.mem.Allocator = std.testing.allocator,
+
     tmp: std.testing.TmpDir,
     /// Real path of the temporary directory.
     path: [:0]u8,
@@ -13,16 +16,21 @@ pub const TestEnv = struct {
     /// Handle to the temporary directory.
     dir: std.Io.Dir,
 
-    pub const LOG_LEVEL: std.log.Level = .err;
+    pub const DEFAULT_LOG_LEVEL: std.log.Level = .err;
 
-    pub fn init(gpa: std.mem.Allocator) !TestEnv {
-        std.testing.log_level = LOG_LEVEL;
+    pub fn init() !TestEnv {
+        std.testing.log_level = DEFAULT_LOG_LEVEL;
+
+        const io: std.Io = std.testing.io;
+        const gpa: std.mem.Allocator = std.testing.allocator;
 
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const dir_path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", gpa);
+        const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
         errdefer gpa.free(dir_path);
         return .{
+            .io = io,
+            .gpa = gpa,
             .tmp = tmp,
             .path = dir_path,
             .data_dir = try std.fs.path.join(gpa, &.{ dir_path, "ztask-data" }),
@@ -31,20 +39,19 @@ pub const TestEnv = struct {
         };
     }
 
-    pub fn deinit(self: *TestEnv, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *TestEnv) void {
         self.tmp.cleanup();
-        gpa.free(self.path);
-        gpa.free(self.data_dir);
+        self.gpa.free(self.path);
+        self.gpa.free(self.data_dir);
         self.env.deinit();
     }
 
     /// Initialize a `DataStore` over the environment's data directory.
     pub fn initDataStore(
         self: *const TestEnv,
-        gpa: std.mem.Allocator,
         options: struct { runs: bool = false },
     ) !data.DataStore {
-        return data.DataStore.init(std.testing.io, gpa, .{
+        return data.DataStore.init(self.io, self.gpa, .{
             .data_dir = self.data_dir,
             .load = .{ .tasks = true, .runs = options.runs },
         });
@@ -54,13 +61,12 @@ pub const TestEnv = struct {
     /// Returns the allocated path of the file.
     pub fn createTaskFile(
         self: *const TestEnv,
-        gpa: std.mem.Allocator,
         file_name: []const u8,
         content: []const u8,
     ) ![]u8 {
-        const path = try std.fs.path.join(gpa, &.{ self.path, file_name });
-        errdefer gpa.free(path);
-        try data.writeFile(std.testing.io, path, content, .{
+        const path = try std.fs.path.join(self.gpa, &.{ self.path, file_name });
+        errdefer self.gpa.free(path);
+        try data.writeFile(self.io, path, content, .{
             .make_path = true,
             .truncate = true,
         });

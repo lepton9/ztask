@@ -1875,13 +1875,12 @@ fn getAppDataDir(
 }
 
 test "move_task" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var env: @import("testing/utils.zig").TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -1918,13 +1917,12 @@ test "move_task" {
 }
 
 test "move_task_repair" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var env: @import("testing/utils.zig").TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -1975,13 +1973,12 @@ test "move_task_repair" {
 }
 
 test "edit_task_updates_id" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var env: @import("testing/utils.zig").TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2023,14 +2020,13 @@ test "edit_task_updates_id" {
 }
 
 test "task_runs_pagination" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     const testutil = @import("testing/utils.zig");
-    var env: testutil.TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: testutil.TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2099,14 +2095,13 @@ test "task_runs_pagination" {
 }
 
 test "task_runs_pagination_limit_zero" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
     const testutil = @import("testing/utils.zig");
-    var env: testutil.TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: testutil.TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const tasks_dir = try store.tasksPath(gpa);
@@ -2143,13 +2138,12 @@ test "task_runs_pagination_limit_zero" {
 }
 
 test "task_runs_unknown_task" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
+    var env: @import("testing/utils.zig").TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
-    var env: @import("testing/utils.zig").TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
-
-    var store = try env.initDataStore(gpa, .{});
+    var store = try env.initDataStore(.{});
     defer store.deinit(gpa);
 
     const unknown_id = "unknown-id";

@@ -314,10 +314,10 @@ test "contains_path" {
 }
 
 test "store_layout" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     var store = try Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
@@ -357,10 +357,10 @@ test "store_layout" {
 }
 
 test "symlink_escape" {
-    const io = std.testing.io;
-    const gpa = std.testing.allocator;
-    var env: TestEnv = try .init(gpa);
-    defer env.deinit(gpa);
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
 
     const root = try std.fs.path.join(gpa, &.{ env.path, "ws" });
     defer gpa.free(root);
