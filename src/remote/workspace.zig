@@ -125,6 +125,23 @@ pub fn validateRelPath(path: []const u8) PathError!void {
     while (it.next()) |comp| try validateComponent(comp);
 }
 
+/// Join a `/`-separated workspace-relative path onto `base` using the
+/// platform's native separators.
+pub fn nativeRelPath(
+    gpa: std.mem.Allocator,
+    base: []const u8,
+    rel: []const u8,
+) error{OutOfMemory}![]u8 {
+    if (rel.len == 0) return gpa.dupe(u8, base);
+    const out = try gpa.alloc(u8, base.len + 1 + rel.len);
+    errdefer gpa.free(out);
+    const sep = std.fs.path.sep;
+    @memcpy(out[0..base.len], base);
+    out[base.len] = sep;
+    for (rel, 0..) |c, i| out[base.len + 1 + i] = if (c == '/') sep else c;
+    return out;
+}
+
 /// Lightly sanitize a display name into a single safe path component.
 pub fn sanitizeComponent(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]u8 {
     const mapped = try gpa.alloc(u8, name.len);
@@ -149,14 +166,15 @@ pub fn sanitizeComponent(gpa: std.mem.Allocator, name: []const u8) error{OutOfMe
 ///
 /// Both paths must be absolute and free of `.`/`..` components.
 pub fn containsPath(base: []const u8, path: []const u8) bool {
-    var comps = std.mem.splitScalar(u8, path, '/');
+    var comps = std.mem.splitAny(u8, path, "/\\");
     while (comps.next()) |comp| {
         if (std.mem.eql(u8, comp, ".") or std.mem.eql(u8, comp, "..")) return false;
     }
     if (std.mem.eql(u8, base, path)) return true;
     if (!std.mem.startsWith(u8, path, base)) return false;
-    if (base.len == 1 and base[0] == '/') return true;
-    return path.len > base.len and path[base.len] == '/';
+    if (base.len == 1 and (base[0] == '/' or base[0] == '\\')) return true;
+    return path.len > base.len and
+        (path[base.len] == '/' or path[base.len] == '\\');
 }
 
 /// Verify that `rel_path` cannot escape `root_dir` through symlinks.
@@ -173,17 +191,34 @@ pub fn ensureNoSymlinkEscape(
 
     const root_real = try std.Io.Dir.cwd().realPathFileAlloc(io, root_dir, gpa);
     defer gpa.free(root_real);
+    return ensureNoSymlinkEscapeReal(io, gpa, root_real, rel_path);
+}
+
+/// Verify that `rel_path` cannot escape a resolved root through symlinks.
+pub fn ensureNoSymlinkEscapeReal(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    root_real: []const u8,
+    rel_path: []const u8,
+) !void {
+    try validateRelPath(rel_path);
 
     var prefix: std.ArrayListUnmanaged(u8) = .empty;
     defer prefix.deinit(gpa);
+    var full: std.ArrayListUnmanaged(u8) = .empty;
+    defer full.deinit(gpa);
+    const sep = std.fs.path.sep;
     var it = std.mem.splitScalar(u8, rel_path, '/');
     while (it.next()) |comp| {
         if (prefix.items.len != 0) try prefix.append(gpa, '/');
         try prefix.appendSlice(gpa, comp);
 
-        const full = try std.fs.path.join(gpa, &.{ root_real, prefix.items });
-        defer gpa.free(full);
-        if (std.Io.Dir.cwd().realPathFileAlloc(io, full, gpa)) |real| {
+        full.clearRetainingCapacity();
+        try full.appendSlice(gpa, root_real);
+        try full.append(gpa, sep);
+        try full.appendSlice(gpa, prefix.items);
+
+        if (std.Io.Dir.cwd().realPathFileAlloc(io, full.items, gpa)) |real| {
             defer gpa.free(real);
             if (!containsPath(root_real, real)) return error.SymlinkEscape;
             continue;
@@ -195,7 +230,7 @@ pub fn ensureNoSymlinkEscape(
         // TODO: handle dangling symlinks that end up inside the root
         // The component does not resolve
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        _ = std.Io.Dir.cwd().readLink(io, full, &link_buf) catch |err| switch (err) {
+        _ = std.Io.Dir.cwd().readLink(io, full.items, &link_buf) catch |err| switch (err) {
             error.FileNotFound, error.NotLink => break,
             else => return err,
         };
@@ -269,6 +304,13 @@ test "contains_path" {
     try expect(!containsPath("/ws", "/ws2"));
     try expect(!containsPath("/ws", "/x/ws"));
     try expect(!containsPath("/ws", "/ws/../x"));
+
+    // Windows-style real paths (backslash separators)
+    try expect(containsPath("C:\\ws", "C:\\ws"));
+    try expect(containsPath("C:\\ws", "C:\\ws\\a"));
+    try expect(containsPath("C:\\ws", "C:\\ws\\a\\b.txt"));
+    try expect(!containsPath("C:\\ws", "C:\\ws2"));
+    try expect(!containsPath("C:\\ws", "C:\\ws\\..\\x"));
 }
 
 test "store_layout" {
