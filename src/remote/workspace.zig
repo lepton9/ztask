@@ -157,6 +157,16 @@ pub fn nativeRelPath(
     return out;
 }
 
+/// Convert a native path to `/`-separated form.
+pub fn toWireRelPath(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const out = try gpa.dupe(u8, path);
+    if (std.fs.path.sep == '/') return out;
+    for (out) |*c| {
+        if (c.* == std.fs.path.sep) c.* = '/';
+    }
+    return out;
+}
+
 /// Lightly sanitize a display name into a single safe path component.
 pub fn sanitizeComponent(gpa: std.mem.Allocator, name: []const u8) error{OutOfMemory}![]u8 {
     const mapped = try gpa.alloc(u8, name.len);

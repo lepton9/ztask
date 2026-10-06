@@ -1,104 +1,18 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const workspace = @import("workspace.zig");
+const glob = @import("glob.zig");
 
 const log = std.log.scoped(.sync);
 
-/// The capabilities the agent currently supports.
+/// Upper bound on a single received file.
+pub const MAX_FILE_SIZE: u64 = 1 << 40; // 1 TiB
+
+/// The capabilities currently supported.
 pub fn validate(msg: protocol.SyncBeginMsg) error{ UnsupportedMode, UnsupportedDirection }!void {
     if (msg.mode != .ephemeral) return error.UnsupportedMode;
     if (msg.direction != .push) return error.UnsupportedDirection;
 }
-
-/// A workspace root directory with validated, `/`-separated access.
-pub const Directory = struct {
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    /// Canonical real path of the root directory. Owned.
-    root: [:0]u8,
-
-    pub fn init(io: std.Io, gpa: std.mem.Allocator, root: []const u8) !Directory {
-        const real = try std.Io.Dir.cwd().realPathFileAlloc(io, root, gpa);
-        return .{ .io = io, .gpa = gpa, .root = real };
-    }
-
-    pub fn deinit(self: *Directory) void {
-        self.gpa.free(self.root);
-    }
-
-    /// Open a workspace-relative file for reading.
-    pub fn openRead(self: *const Directory, rel_path: []const u8) !File {
-        const full = try self.resolve(rel_path);
-        defer self.gpa.free(full);
-
-        const cwd = std.Io.Dir.cwd();
-        const handle = try cwd.openFile(self.io, full, .{ .mode = .read_only });
-        errdefer handle.close(self.io);
-        const stat = try handle.stat(self.io);
-
-        return self.makeFile(rel_path, handle, .read, stat.size);
-    }
-
-    /// Create or reopen a workspace-relative file for writing.
-    ///
-    /// Creates parent directories and does not truncate.
-    pub fn openWrite(self: *const Directory, rel_path: []const u8) !File {
-        const full = try self.resolve(rel_path);
-        defer self.gpa.free(full);
-
-        const cwd = std.Io.Dir.cwd();
-        if (std.fs.path.dirname(full)) |dir| try cwd.createDirPath(self.io, dir);
-        const handle = try cwd.createFile(self.io, full, .{ .truncate = false });
-        errdefer handle.close(self.io);
-
-        return self.makeFile(rel_path, handle, .write, 0);
-    }
-
-    /// Validate `rel_path` and return its native absolute path. Owned.
-    fn resolve(self: *const Directory, rel_path: []const u8) ![]u8 {
-        try workspace.validateRelPath(rel_path);
-        try workspace.ensureNoSymlinkEscapeReal(self.io, self.gpa, self.root, rel_path);
-        return workspace.nativeRelPath(self.gpa, self.root, rel_path);
-    }
-
-    fn makeFile(
-        self: *const Directory,
-        rel_path: []const u8,
-        handle: std.Io.File,
-        access: File.Access,
-        size: u64,
-    ) !File {
-        const owned = try self.gpa.dupe(u8, rel_path);
-        return .{
-            .io = self.io,
-            .gpa = self.gpa,
-            .rel_path = owned,
-            .handle = handle,
-            .access = access,
-            .size = size,
-        };
-    }
-
-    /// Recursively delete the root tree. Does not free `root`.
-    pub fn deleteTree(self: *const Directory) void {
-        std.Io.Dir.cwd().deleteTree(self.io, self.root) catch |err|
-            log.warn("Failed to remove workspace '{s}': {s}", .{
-                self.root,
-                @errorName(err),
-            });
-    }
-};
-
-pub const Lifetime = enum {
-    /// Removed after use.
-    ephemeral,
-    /// No deletion after use.
-    persistent,
-
-    pub inline fn fromWorkspaceMode(mode: protocol.WorkspaceMode) Lifetime {
-        return if (mode == .persistent) .persistent else .ephemeral;
-    }
-};
 
 pub const Workspace = struct {
     directory: Directory,
@@ -144,16 +58,116 @@ pub const Workspace = struct {
     }
 };
 
-/// One workspace-relative file open for reading or writing.
+/// A workspace root directory with validated, `/`-separated access.
+pub const Directory = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    /// Canonical real path of the root directory. Owned.
+    root: [:0]u8,
+
+    pub fn init(io: std.Io, gpa: std.mem.Allocator, root: []const u8) !Directory {
+        const real = try std.Io.Dir.cwd().realPathFileAlloc(io, root, gpa);
+        return .{ .io = io, .gpa = gpa, .root = real };
+    }
+
+    pub fn deinit(self: *Directory) void {
+        self.gpa.free(self.root);
+    }
+
+    /// Open a workspace-relative file for reading.
+    pub fn openRead(self: *const Directory, rel_path: []const u8) !File {
+        const full = try self.resolve(rel_path);
+        defer self.gpa.free(full);
+
+        const cwd = std.Io.Dir.cwd();
+        const handle = try cwd.openFile(self.io, full, .{ .mode = .read_only });
+        errdefer handle.close(self.io);
+        const stat = try handle.stat(self.io);
+
+        return self.makeFile(
+            rel_path,
+            handle,
+            .read,
+            stat.size,
+            wirePermissions(stat.permissions),
+        );
+    }
+
+    /// Create or reopen a workspace-relative file for writing.
+    ///
+    /// Creates parent directories and does not truncate.
+    pub fn openWrite(self: *const Directory, rel_path: []const u8) !File {
+        const full = try self.resolve(rel_path);
+        defer self.gpa.free(full);
+
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirname(full)) |dir| try cwd.createDirPath(self.io, dir);
+        const handle = try cwd.createFile(self.io, full, .{ .truncate = false });
+        errdefer handle.close(self.io);
+
+        return self.makeFile(rel_path, handle, .write, 0, 0);
+    }
+
+    /// Validate `rel_path` and return its native absolute path. Owned.
+    fn resolve(self: *const Directory, rel_path: []const u8) ![]u8 {
+        try workspace.validateRelPath(rel_path);
+        try workspace.ensureNoSymlinkEscapeReal(self.io, self.gpa, self.root, rel_path);
+        return workspace.nativeRelPath(self.gpa, self.root, rel_path);
+    }
+
+    fn makeFile(
+        self: *const Directory,
+        rel_path: []const u8,
+        handle: std.Io.File,
+        access: File.Access,
+        size: u64,
+        mode: u32,
+    ) !File {
+        const owned = try self.gpa.dupe(u8, rel_path);
+        return .{
+            .io = self.io,
+            .gpa = self.gpa,
+            .rel_path = owned,
+            .handle = handle,
+            .access = access,
+            .size = size,
+            .mode = mode,
+        };
+    }
+
+    /// Recursively delete the root tree. Does not free `root`.
+    pub fn deleteTree(self: *const Directory) void {
+        std.Io.Dir.cwd().deleteTree(self.io, self.root) catch |err|
+            log.warn("Failed to remove workspace '{s}': {s}", .{
+                self.root,
+                @errorName(err),
+            });
+    }
+};
+
+pub const Lifetime = enum {
+    /// Removed after use.
+    ephemeral,
+    /// No deletion after use.
+    persistent,
+
+    pub inline fn fromWorkspaceMode(mode: protocol.WorkspaceMode) Lifetime {
+        return if (mode == .persistent) .persistent else .ephemeral;
+    }
+};
+
+/// One directory-relative file open for reading or writing.
 pub const File = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
-    /// Owned workspace-relative path.
+    /// Owned directory-relative path.
     rel_path: []u8,
     handle: std.Io.File,
     access: Access,
     /// File size when opened for reading.
     size: u64 = 0,
+    /// POSIX mode bits when opened for reading.
+    mode: u32 = 0,
     /// Highest end offset written, used to trim stale tails on finish.
     written: u64 = 0,
     closed: bool = false,
@@ -209,14 +223,6 @@ pub const File = struct {
     }
 };
 
-/// Upper bound on a single received file.
-///
-/// The wire format carries no explicit file size, so this keeps a bogus
-/// offset from materializing an enormous sparse file (`finish` truncates
-/// to the highest written offset). Manager-side transfer quotas are a
-/// later milestone; this is the agent-side sanity bound.
-pub const MAX_FILE_SIZE: u64 = 1 << 40; // 1 TiB
-
 /// Apply permission bits to an open file.
 fn applyPermissions(file: std.Io.File, io: std.Io, permissions: u32) !void {
     const Permissions = std.Io.File.Permissions;
@@ -230,6 +236,17 @@ fn applyPermissions(file: std.Io.File, io: std.Io, permissions: u32) !void {
         try file.setPermissions(io, perms);
     }
 }
+
+/// Convert platform permissions to wire mode bits.
+fn wirePermissions(permissions: std.Io.File.Permissions) u32 {
+    if (comptime std.Io.File.Permissions.has_executable_bit) {
+        return @intFromEnum(permissions) & 0o777;
+    } else {
+        return 0o644;
+    }
+}
+
+// TODO: maybe move Receiver, Sender, File, Directory to different files under sync/
 
 /// Receives one push transfer into a destination root.
 pub const Receiver = struct {
@@ -409,6 +426,126 @@ pub const Receiver = struct {
     }
 };
 
+pub const Sender = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    /// The root directory to send files from.
+    directory: Directory,
+    /// Glob patterns of workspace-relative paths to skip.
+    exclude: []const []const u8,
+
+    walker: std.Io.Dir.Walker,
+    dir: std.Io.Dir,
+
+    /// File currently being read, if any.
+    open: ?File = null,
+    /// Read position within the open file.
+    pos: u64 = 0,
+    /// Owned path of the open file. Valid until the next event.
+    current_path: []u8 = &.{},
+    /// Set once the walk is exhausted.
+    finished: bool = false,
+
+    pub const Event = union(enum) {
+        /// Next slice of the current file.
+        chunk: struct {
+            path: []const u8,
+            offset: u64,
+            data: []const u8,
+        },
+        file_done: struct {
+            path: []const u8,
+            mode: u32,
+        },
+        end,
+    };
+
+    /// Open a sender over `root`.
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        root: []const u8,
+        exclude: []const []const u8,
+    ) !Sender {
+        var directory: Directory = try .init(io, gpa, root);
+        errdefer directory.deinit();
+        const dir = try std.Io.Dir.openDirAbsolute(io, directory.root, .{
+            .iterate = true,
+        });
+        errdefer dir.close(io);
+        var walker = try dir.walk(gpa);
+        errdefer walker.deinit();
+
+        return .{
+            .io = io,
+            .gpa = gpa,
+            .directory = directory,
+            .exclude = exclude,
+            .dir = dir,
+            .walker = walker,
+        };
+    }
+
+    pub fn deinit(self: *Sender) void {
+        if (self.open) |*f| f.deinit();
+        if (self.current_path.len > 0) self.gpa.free(self.current_path);
+        self.walker.deinit();
+        self.dir.close(self.io);
+        self.directory.deinit();
+    }
+
+    /// Produce the next event. `path` slices are valid until the next call.
+    pub fn next(self: *Sender, dest: []u8) !?Event {
+        if (self.finished) return null;
+        std.debug.assert(dest.len > 0 and dest.len <= protocol.SYNC_CHUNK_SIZE);
+
+        const file = while (self.open == null) {
+            const entry = try self.walker.next(self.io) orelse {
+                self.finished = true;
+                return .end;
+            };
+            if (entry.kind != .file) {
+                log.debug("sync send skipping non-file '{s}'", .{entry.path});
+                continue;
+            }
+            if (glob.matchAny(self.exclude, entry.path)) continue;
+            try self.openFile(entry.path);
+        } else &self.open.?;
+
+        const offset = self.pos;
+        const read = try file.readAt(offset, dest);
+        self.pos = offset + read;
+
+        if (read == 0) {
+            const event: Event = .{ .file_done = .{
+                .path = self.current_path,
+                .mode = file.mode,
+            } };
+            file.deinit();
+            self.open = null;
+            return event;
+        }
+        return .{ .chunk = .{
+            .path = self.current_path,
+            .offset = offset,
+            .data = dest[0..read],
+        } };
+    }
+
+    /// Open `entry_path` for reading.
+    fn openFile(self: *Sender, entry_path: []const u8) !void {
+        const rel = try workspace.toWireRelPath(self.gpa, entry_path);
+        errdefer self.gpa.free(rel);
+        var file = try self.directory.openRead(rel);
+        errdefer file.deinit();
+
+        if (self.current_path.len > 0) self.gpa.free(self.current_path);
+        self.current_path = rel;
+        self.pos = 0;
+        self.open = file;
+    }
+};
+
 /// Create a workspace for `mode`.
 pub fn createWorkspace(
     io: std.Io,
@@ -450,6 +587,14 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
         .direction = .push,
         .config_json = "{}",
     };
+}
+
+/// Create a test file with the given content written.
+fn createTestFile(dir: *Directory, path: []const u8, content: []const u8) !void {
+    var file = try dir.openWrite(path);
+    defer file.deinit();
+    try file.writeAt(0, content);
+    try file.finish(0o644);
 }
 
 test "workspace_lifetime" {
@@ -767,4 +912,143 @@ test "directory_root_is_canonical" {
     defer dir.deinit();
     try expect(std.mem.endsWith(u8, dir.root, "real/ws"));
     try expect(std.mem.indexOf(u8, dir.root, "/link/") == null);
+}
+
+/// Accumulates sender events per file.
+const SenderEventCollector = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct {
+        path: []u8,
+        body: std.ArrayList(u8) = .empty,
+        mode: u32 = 0,
+        done: bool = false,
+    };
+
+    fn get(self: *@This(), gpa: std.mem.Allocator, path: []const u8) !*Entry {
+        for (self.entries.items) |*e| {
+            if (std.mem.eql(u8, e.path, path)) return e;
+        }
+        try self.entries.append(gpa, .{ .path = try gpa.dupe(u8, path) });
+        return &self.entries.items[self.entries.items.len - 1];
+    }
+
+    fn chunk(self: *@This(), gpa: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+        const e = try self.get(gpa, path);
+        try expect(!e.done);
+        try e.body.appendSlice(gpa, data);
+    }
+
+    fn done(self: *@This(), gpa: std.mem.Allocator, path: []const u8, mode: u32) !void {
+        const e = try self.get(gpa, path);
+        try expect(!e.done);
+        e.mode = mode;
+        e.done = true;
+    }
+
+    fn find(self: *@This(), path: []const u8) ?*Entry {
+        for (self.entries.items) |*e| {
+            if (std.mem.eql(u8, e.path, path)) return e;
+        }
+        return null;
+    }
+
+    /// Drain `sender`. Returns whether `.end` was reported.
+    fn drain(self: *@This(), sender: *Sender, gpa: std.mem.Allocator, dest: []u8) !bool {
+        while (try sender.next(dest)) |event| switch (event) {
+            .chunk => |c| try self.chunk(gpa, c.path, c.data),
+            .file_done => |f| try self.done(gpa, f.path, f.mode),
+            .end => return true,
+        };
+        return false;
+    }
+
+    fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        for (self.entries.items) |*e| {
+            gpa.free(e.path);
+            e.body.deinit(gpa);
+        }
+        self.entries.deinit(gpa);
+    }
+};
+
+test "sender_transfers_files_as_events" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const root = try std.fs.path.join(gpa, &.{ env.path, "tmp" });
+    defer gpa.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var dir = try Directory.init(io, gpa, root);
+    defer dir.deinit();
+
+    try createTestFile(&dir, "a.txt", "Hello world!");
+    try createTestFile(&dir, "b.txt", "text");
+    try createTestFile(&dir, "empty.txt", "");
+    try createTestFile(&dir, "dir/c.txt", "test");
+
+    var sender: Sender = try .init(io, gpa, root, &.{});
+    defer sender.deinit();
+
+    var collector: SenderEventCollector = .{};
+    defer collector.deinit(gpa);
+
+    var buf: [5]u8 = undefined;
+    try expect(try collector.drain(&sender, gpa, &buf));
+    try expect((try sender.next(&buf)) == null);
+
+    try expect(collector.entries.items.len == 4);
+    try expectEqualStrings("Hello world!", collector.find("a.txt").?.body.items);
+    try expectEqualStrings("text", collector.find("b.txt").?.body.items);
+    try expectEqualStrings("test", collector.find("dir/c.txt").?.body.items);
+    try expectEqualStrings("", collector.find("empty.txt").?.body.items);
+
+    for (collector.entries.items) |*e| try expect(e.done);
+
+    if (comptime std.Io.File.Permissions.has_executable_bit) {
+        for (collector.entries.items) |*e| {
+            try expect(e.mode & 0o777 == 0o644);
+        }
+    }
+}
+
+test "sender_excludes_and_skips_non_files" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const root = try std.fs.path.join(gpa, &.{ env.path, "tmp" });
+    defer gpa.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var dir = try Directory.init(io, gpa, root);
+    defer dir.deinit();
+
+    try createTestFile(&dir, "keep.txt", "keep");
+    try createTestFile(&dir, "skipme.txt", "skip");
+    try createTestFile(&dir, "node_modules/dep.txt", "dep");
+
+    // Symlinked files are skipped
+    // TODO: allow symlinks inside the root?
+    const target = try std.fs.path.join(gpa, &.{ root, "keep.txt" });
+    defer gpa.free(target);
+    const link = try std.fs.path.join(gpa, &.{ root, "link.txt" });
+    defer gpa.free(link);
+    try std.Io.Dir.cwd().symLink(io, target, link, .{});
+
+    var sender: Sender = try .init(io, gpa, root, &.{
+        "skipme.txt",
+        "node_modules",
+    });
+    defer sender.deinit();
+
+    var collector: SenderEventCollector = .{};
+    defer collector.deinit(gpa);
+    var buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined;
+    try expect(try collector.drain(&sender, gpa, &buf));
+
+    try expect(collector.entries.items.len == 1);
+    try expectEqualStrings("keep", collector.find("keep.txt").?.body.items);
 }
