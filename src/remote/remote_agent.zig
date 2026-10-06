@@ -22,8 +22,8 @@ const HEARTBEAT_FREQ_S = 10;
 const JobEntry = struct {
     job: task.Job,
     node: JobNode,
-    /// Owned workspace directory the job runs in.
-    cwd: ?[]u8 = null,
+    /// Workspace the job runs in.
+    workspace: sync.Workspace,
     /// Set while the job waits for its workspace transfer to finish.
     awaiting_sync: bool = false,
     /// Set once the job was appended to the run queue.
@@ -125,8 +125,8 @@ pub const RemoteAgent = struct {
     }
 
     pub fn deinit(self: *RemoteAgent) void {
-        self.stopReader();
         self.stopWriter();
+        self.stopReader();
         self.running.store(false, .seq_cst);
         self.pool.cancelWaiter(self);
         var active = self.active_runners.iterator();
@@ -184,6 +184,7 @@ pub const RemoteAgent = struct {
         self.handleLogs() catch |err|
             log.err("Failed to handle remaining job log event: {s}", .{@errorName(err)});
         self.handleResults();
+        self.stopWriter();
         self.stopReader();
     }
 
@@ -204,8 +205,8 @@ pub const RemoteAgent = struct {
 
     /// Try to connect to the server at the address
     pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
-        self.stopReader();
         self.stopWriter();
+        self.stopReader();
         try self.connection.connect(addr);
         self.connection_writer = try self.connection.writer(self.gpa);
         self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
@@ -298,7 +299,7 @@ pub const RemoteAgent = struct {
         while (true) {
             const sent = writer.sendNext() catch |err| {
                 log.warn("Failed to send remote message: {s}", .{@errorName(err)});
-                self.connection.close();
+                self.connection.shutdown();
                 return;
             };
             if (!sent) break;
@@ -318,10 +319,23 @@ pub const RemoteAgent = struct {
         }
     }
 
-    /// Handle parsed message
+    /// Handle the parsed message.
     fn handleMessage(self: *RemoteAgent, msg: protocol.Msg) !void {
         switch (msg) {
-            .run_job => |m| try self.queueJob(m),
+            .run_job => |m| self.queueJob(m) catch |err| switch (err) {
+                error.JobRunning => log.warn(
+                    "Ignoring duplicate dispatch for job {x}",
+                    .{m.job_id},
+                ),
+                else => {
+                    log.warn("Rejected remote job {x}: {s}", .{
+                        m.job_id,
+                        @errorName(err),
+                    });
+                    self.destroySync(m.job_id);
+                    self.failDispatch(m.job_id, @errorName(err));
+                },
+            },
             .cancel_job => |m| self.cancelJob(m),
             .error_msg => |m| {
                 self.writeStatus(
@@ -380,6 +394,8 @@ pub const RemoteAgent = struct {
             self.sendSyncAck(msg.job_id, false, "out of memory");
             return;
         };
+        // A dispatch that arrived first already owns this workspace tree.
+        if (self.jobs.contains(msg.job_id)) recv.workspace.disown();
     }
 
     /// Accept the workspace manifest.
@@ -438,6 +454,23 @@ pub const RemoteAgent = struct {
         self.sendSyncAck(msg.job_id, true, null);
     }
 
+    /// Report a dispatch that could not be queued to the manager.
+    fn failDispatch(self: *RemoteAgent, job_id: u64, message: []const u8) void {
+        const msg: protocol.JobEndMsg = .{
+            .job_id = job_id,
+            .timestamp = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .success = false,
+            .message = message,
+        };
+        const payload = protocol.serialize(self.gpa, .{ .job_finish = msg }) catch |err| {
+            log.err("Failed to serialize dispatch failure for job {x}: {s}", .{
+                job_id, @errorName(err),
+            });
+            return;
+        };
+        self.sendMessageOwned(payload);
+    }
+
     /// Queue a sync acknowledgment for delivery.
     fn sendSyncAck(self: *RemoteAgent, job_id: u64, ok: bool, message: ?[]const u8) void {
         const msg: protocol.SyncAckMsg = .{ .job_id = job_id, .ok = ok, .message = message };
@@ -451,48 +484,77 @@ pub const RemoteAgent = struct {
         self.sendMessageOwned(payload);
     }
 
-    /// Load a dispatched job and either queue it or hold it for its sync.
+    /// Load a dispatched job, create its workspace, and either queue it or
+    /// hold it for its sync.
     fn queueJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
         if (self.jobs.contains(msg.job_id)) return error.JobRunning;
 
+        const recv = self.syncs.get(msg.job_id);
+        if (recv) |r| {
+            // An in-flight transfer must match the dispatch plan
+            if (msg.workspace == .none) return error.WorkspaceMismatch;
+            const planned: sync.Lifetime = .fromWorkspaceMode(msg.workspace);
+            if (r.workspace.lifetime != planned) return error.WorkspaceMismatch;
+        }
+
+        var ws = try self.openWorkspace(msg, recv);
+        errdefer ws.deinit();
+
         const entry = try self.gpa.create(JobEntry);
         errdefer self.gpa.destroy(entry);
-        const job_name = try std.fmt.allocPrint(self.gpa, "{x}", .{msg.job_id});
+        const job_name = try self.gpa.dupe(u8, msg.job_name);
         errdefer self.gpa.free(job_name);
         const steps = try msg.parseSteps(self.gpa);
         errdefer {
             for (steps) |step| step.deinit(self.gpa);
             self.gpa.free(steps);
         }
-        const cwd = if (self.syncs.get(msg.job_id)) |recv|
-            try self.gpa.dupe(u8, recv.rootDir())
-        else
-            null;
-        errdefer if (cwd) |path| self.gpa.free(path);
 
         entry.* = .{
             .job = .{ .name = job_name, .steps = steps },
             .node = .{ .ptr = undefined, .id = msg.job_id },
-            .cwd = cwd,
+            .workspace = ws,
         };
         entry.node.ptr = &entry.job;
         try self.jobs.put(self.gpa, msg.job_id, entry);
 
-        const recv = self.syncs.get(msg.job_id) orelse {
-            self.enqueueJob(entry);
-            return;
-        };
-        if (recv.failed) {
-            // The transfer already failed. The remote manager learns through
-            // the negative ack and must not expect this job to run.
-            self.removeJob(msg.job_id);
+        if (recv) |r| {
+            if (r.failed) {
+                self.removeJob(msg.job_id);
+                return;
+            }
+            if (r.committed) {
+                self.enqueueJob(entry);
+            } else {
+                entry.awaiting_sync = true;
+            }
             return;
         }
-        if (recv.committed) {
-            self.enqueueJob(entry);
-        } else {
+        if (msg.workspace != .none) {
+            // Transfer promised but not started: wait for its receiver.
             entry.awaiting_sync = true;
+            return;
         }
+        self.enqueueJob(entry);
+    }
+
+    /// Open the job's workspace. Adopt the receiver's destination when its
+    /// transfer already started, otherwise create the planned root.
+    fn openWorkspace(
+        self: *RemoteAgent,
+        msg: protocol.RunJobMsg,
+        recv: ?*sync.Receiver,
+    ) !sync.Workspace {
+        if (recv) |r| return sync.Workspace.adopt(self.io, self.gpa, &r.workspace);
+        return sync.createWorkspace(
+            self.io,
+            self.gpa,
+            &self.workspaces,
+            msg.workspace,
+            msg.task_id,
+            msg.job_name,
+            msg.job_id,
+        );
     }
 
     /// Append a job to the run queue once.
@@ -508,11 +570,11 @@ pub const RemoteAgent = struct {
         entry.queued = true;
     }
 
-    /// Free a dispatched job and its owned fields.
+    /// Free a dispatched job and its owned fields, including its workspace.
     fn destroyJobEntry(self: *RemoteAgent, entry: *JobEntry) void {
         entry.node.deinit(self.gpa);
         entry.job.deinit(self.gpa);
-        if (entry.cwd) |cwd| self.gpa.free(cwd);
+        entry.workspace.deinit();
         self.gpa.destroy(entry);
     }
 
@@ -707,20 +769,19 @@ pub const RemoteAgent = struct {
             self.pool.release(runner);
             return;
         };
+        const entry = self.jobs.get(node.id) orelse {
+            log.err("Dropping queued remote job {x} without a job entry", .{node.id});
+            self.pool.release(runner);
+            return;
+        };
         self.active_runners.putAssumeCapacity(node, runner);
-        // Synced jobs run inside their workspace
-        // TODO: resolve relative cwd from the root of the workspace?
-        const cwd: ?[]const u8 = if (self.jobs.get(node.id)) |entry|
-            entry.cwd
-        else
-            null;
         runner.runJobWithMode(
             self.gpa,
             node,
             &self.result_queue,
             &self.log_queue,
             .piped,
-            cwd,
+            entry.workspace.root(),
             null,
         );
     }

@@ -519,6 +519,7 @@ pub const RemoteManager = struct {
         job_name: []const u8,
         agent: RemoteRunSpec,
         steps: []const task.Step,
+        workspace: protocol.WorkspaceMode,
     ) error{ OutOfMemory, FailedSerialize, FrameTooLarge }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
 
@@ -527,6 +528,9 @@ pub const RemoteManager = struct {
             defer self.gpa.free(steps_json);
             break :blk try protocol.serialize(self.gpa, .{ .run_job = .{
                 .job_id = dispatch_id,
+                .task_id = task_id,
+                .job_name = job_name,
+                .workspace = workspace,
                 .steps = steps_json,
             } });
         };

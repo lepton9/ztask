@@ -161,8 +161,16 @@ pub const RegisterMsg = struct {
 };
 
 pub const RunJobMsg = struct {
+    /// Dispatch id of the job.
     job_id: u64,
-    steps: []const u8, // JSON
+    /// Id of the task the job belongs to.
+    task_id: []const u8,
+    /// Display name of the job.
+    job_name: []const u8,
+    /// The job's workspace plan.
+    workspace: WorkspaceMode,
+    /// The executed steps of this job in JSON format.
+    steps: []const u8,
 
     /// Serialize the step slice to a JSON string
     pub fn serializeSteps(
@@ -230,13 +238,6 @@ pub const JobLogMsg = struct {
     data: []const u8,
 };
 
-pub const SyncMode = enum(u8) {
-    /// Full transfer into a per-run staging dir.
-    static = 1,
-    /// Reused workspace root updated incrementally against a manifest.
-    incremental = 2,
-};
-
 pub const SyncDirection = enum(u8) {
     /// Manager sends the workspace to the agent before the job runs.
     push = 1,
@@ -244,6 +245,15 @@ pub const SyncDirection = enum(u8) {
     pull = 2,
     /// Bidirectional sync.
     both = 3,
+};
+
+pub const WorkspaceMode = enum(u8) {
+    /// No transfer (dispatch only).
+    none = 0,
+    /// A transfer into a per-run staging dir.
+    ephemeral = 1,
+    /// A transfer into a reused workspace.
+    persistent = 2,
 };
 
 /// Start a workspace transfer for a dispatched job.
@@ -254,10 +264,8 @@ pub const SyncBeginMsg = struct {
     task_id: []const u8,
     /// Job name the workspace belongs to.
     job_name: []const u8,
-    /// Workspace-relative directory the job runs in.
-    root: []const u8,
-    /// Workspace mode.
-    mode: SyncMode,
+    /// Workspace mode. `none` is rejected for transfers.
+    mode: WorkspaceMode,
     /// Which way data flows for this transfer.
     direction: SyncDirection,
     /// JSON-encoded sync config (exclude globs).
@@ -612,6 +620,9 @@ test "run_job" {
     };
     const msg: RunJobMsg = .{
         .job_id = 111,
+        .task_id = "task-111",
+        .job_name = "build",
+        .workspace = .persistent,
         .steps = try RunJobMsg.serializeSteps(alloc, &steps),
     };
     defer alloc.free(msg.steps);
@@ -627,6 +638,9 @@ test "run_job" {
     }
 
     try std.testing.expect(msg.job_id == parsed.job_id);
+    try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
+    try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
+    try std.testing.expectEqual(msg.workspace, parsed.workspace);
     try std.testing.expect(std.mem.eql(u8, msg.steps, parsed.steps));
     for (0..steps.len) |i| {
         try std.testing.expect(std.meta.activeTag(steps[i]) == std.meta.activeTag(parsed_steps[i]));
@@ -660,8 +674,7 @@ test "sync_begin" {
         .job_id = 42,
         .task_id = "task-id",
         .job_name = "build",
-        .root = "src",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{\"exclude\":[\".zig-cache\",\"node_modules\"]}",
     };
@@ -674,7 +687,6 @@ test "sync_begin" {
     try expectEqual(msg.direction, parsed.direction);
     try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
     try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
-    try std.testing.expectEqualStrings(msg.root, parsed.root);
     try std.testing.expectEqualStrings(msg.config_json, parsed.config_json);
 }
 

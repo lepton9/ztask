@@ -6,7 +6,7 @@ const log = std.log.scoped(.sync);
 
 /// The capabilities the agent currently supports.
 pub fn validate(msg: protocol.SyncBeginMsg) error{ UnsupportedMode, UnsupportedDirection }!void {
-    if (msg.mode != .static) return error.UnsupportedMode;
+    if (msg.mode != .ephemeral) return error.UnsupportedMode;
     if (msg.direction != .push) return error.UnsupportedDirection;
 }
 
@@ -86,6 +86,61 @@ pub const Directory = struct {
                 self.root,
                 @errorName(err),
             });
+    }
+};
+
+pub const Lifetime = enum {
+    /// Removed after use.
+    ephemeral,
+    /// No deletion after use.
+    persistent,
+
+    pub inline fn fromWorkspaceMode(mode: protocol.WorkspaceMode) Lifetime {
+        return if (mode == .persistent) .persistent else .ephemeral;
+    }
+};
+
+pub const Workspace = struct {
+    directory: Directory,
+    /// Whether the tree is removed after use.
+    lifetime: Lifetime = .ephemeral,
+    /// Whether this handle removes the tree on deinit.
+    owns_tree: bool = true,
+
+    /// Open the workspace root with a lifetime policy.
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        root_dir: []const u8,
+        lifetime: Lifetime,
+    ) !Workspace {
+        return .{
+            .directory = try Directory.init(io, gpa, root_dir),
+            .lifetime = lifetime,
+        };
+    }
+
+    /// Open a second handle to `other`'s root, taking over tree cleanup.
+    pub fn adopt(io: std.Io, gpa: std.mem.Allocator, other: *Workspace) !Workspace {
+        const self = try init(io, gpa, other.directory.root, other.lifetime);
+        other.disown();
+        return self;
+    }
+
+    /// The absolute root files are written into.
+    pub fn root(self: *const Workspace) []const u8 {
+        return self.directory.root;
+    }
+
+    /// Hand cleanup of the tree to another handle.
+    pub fn disown(self: *Workspace) void {
+        self.owns_tree = false;
+    }
+
+    /// Remove the tree unless persistent or disowned, then free the root.
+    pub fn deinit(self: *Workspace) void {
+        if (self.owns_tree and self.lifetime == .ephemeral) self.directory.deleteTree();
+        self.directory.deinit();
     }
 };
 
@@ -184,8 +239,8 @@ pub const Receiver = struct {
     task_id: []u8,
     /// Job name the workspace belongs to.
     job_name: []u8,
-    /// Destination root. Owned.
-    directory: Directory,
+    /// Destination root and its deletion policy.
+    workspace: Workspace,
 
     /// File currently being received, if any.
     open: ?File = null,
@@ -212,7 +267,6 @@ pub const Receiver = struct {
         try validate(msg);
         try workspace.validateComponent(msg.task_id);
         try workspace.validateComponent(msg.job_name);
-        try validateRoot(msg.root);
 
         const task_id = try gpa.dupe(u8, msg.task_id);
         errdefer gpa.free(task_id);
@@ -222,45 +276,40 @@ pub const Receiver = struct {
         const self = try gpa.create(Receiver);
         errdefer gpa.destroy(self);
 
-        // TODO: handle different modes
-        const dest_root = try store.createStagingDir(
+        const ws = try createWorkspace(
             io,
             gpa,
+            store,
+            msg.mode,
             msg.task_id,
             msg.job_name,
             msg.job_id,
         );
-        defer gpa.free(dest_root);
-        errdefer std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
-
-        const directory = try Directory.init(io, gpa, dest_root);
 
         self.* = .{
             .io = io,
             .gpa = gpa,
             .task_id = task_id,
             .job_name = job_name,
-            .directory = directory,
+            .workspace = ws,
         };
         log.debug(
             "Workspace sync {x} begin: task='{s}' job='{s}' dest='{s}'",
-            .{ msg.job_id, task_id, job_name, self.directory.root },
+            .{ msg.job_id, task_id, job_name, self.workspace.root() },
         );
         return self;
     }
 
     /// The absolute root files are written into.
     pub fn rootDir(self: *const Receiver) []const u8 {
-        return self.directory.root;
+        return self.workspace.root();
     }
 
-    /// Close open handles, reclaim the root and free the receiver.
+    /// Close open handles, reclaim the workspace and free the receiver.
     pub fn deinit(self: *Receiver) void {
         self.closeOpen();
         if (self.failure_msg) |msg| self.gpa.free(msg);
-        // TODO: dont delete in incremental mode
-        self.directory.deleteTree();
-        self.directory.deinit();
+        self.workspace.deinit();
         self.gpa.free(self.task_id);
         self.gpa.free(self.job_name);
     }
@@ -342,7 +391,7 @@ pub const Receiver = struct {
     }
 
     fn openFile(self: *Receiver, path: []const u8) !void {
-        self.open = try self.directory.openWrite(path);
+        self.open = try self.workspace.directory.openWrite(path);
     }
 
     fn closeOpen(self: *Receiver) void {
@@ -360,10 +409,29 @@ pub const Receiver = struct {
     }
 };
 
-/// The receiver's source root: the task cwd (`"."`) or a relative subpath.
-fn validateRoot(root: []const u8) workspace.PathError!void {
-    if (std.mem.eql(u8, root, ".")) return;
-    try workspace.validateRelPath(root);
+/// Create a workspace for `mode`.
+pub fn createWorkspace(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    store: *const workspace.Store,
+    mode: protocol.WorkspaceMode,
+    task_id: []const u8,
+    job_name: []const u8,
+    job_id: u64,
+) !Workspace {
+    switch (mode) {
+        .persistent => {
+            const path = try store.createWorkspaceRoot(io, gpa, task_id, job_name);
+            defer gpa.free(path);
+            return Workspace.init(io, gpa, path, .persistent);
+        },
+        .none, .ephemeral => {
+            const path = try store.createStagingDir(io, gpa, task_id, job_name, job_id);
+            defer gpa.free(path);
+            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            return Workspace.init(io, gpa, path, .ephemeral);
+        },
+    }
 }
 
 const testutil = @import("../testing/utils.zig");
@@ -378,11 +446,54 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
         .job_id = job_id,
         .task_id = "task1",
         .job_name = "build",
-        .root = ".",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{}",
     };
+}
+
+test "workspace_lifetime" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const root = try std.fs.path.join(gpa, &.{ env.path, "ws" });
+    defer gpa.free(root);
+    const exists = struct {
+        fn check(i: std.Io, r: []const u8) bool {
+            _ = std.Io.Dir.cwd().statFile(i, r, .{}) catch return false;
+            return true;
+        }
+    }.check;
+
+    // Ephemeral workspaces are removed on deinit.
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    {
+        var ws = try Workspace.init(io, gpa, root, .ephemeral);
+        ws.deinit();
+        try expect(!exists(io, root));
+    }
+
+    // Adopting transfers cleanup: exactly one handle removes the tree.
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    {
+        var owner = try Workspace.init(io, gpa, root, .ephemeral);
+        var taker = try Workspace.adopt(io, gpa, &owner);
+        owner.deinit();
+        try expect(exists(io, root));
+        taker.deinit();
+        try expect(!exists(io, root));
+    }
+
+    // Persistent workspaces survive deinit.
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    {
+        var ws = try Workspace.init(io, gpa, root, .persistent);
+        ws.deinit();
+        try expect(exists(io, root));
+    }
+    try std.Io.Dir.cwd().deleteTree(io, root);
 }
 
 test "receiver_writes_and_commits" {
@@ -554,7 +665,7 @@ test "receiver_rejects_unsupported_mode_and_direction" {
     defer store.deinit(gpa);
 
     var msg = testBegin(12);
-    msg.mode = .incremental;
+    msg.mode = .persistent;
     try expectErrorFn(error.UnsupportedMode, Receiver.init(io, gpa, &store, msg));
 
     var dir_msg = testBegin(13);

@@ -86,6 +86,21 @@ pub const Store = struct {
         return path;
     }
 
+    /// Create the reusable workspace root of a task job and return its path.
+    pub fn createWorkspaceRoot(
+        self: *const Store,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        task_id: []const u8,
+        job_name: []const u8,
+    ) ![]u8 {
+        const path = try self.workspaceRoot(gpa, task_id, job_name);
+        errdefer gpa.free(path);
+        var dir = try data.openDir(io, path, .{ .create = true });
+        dir.close(io);
+        return path;
+    }
+
     /// Return an allocated manifest file path.
     pub fn manifestPath(
         self: *const Store,
@@ -349,6 +364,12 @@ test "store_layout" {
     defer gpa.free(created);
     const staging_stat = try env.dir.statFile(io, "ztask-data/workspaces/task1/build/runs/7", .{});
     try expect(staging_stat.kind == .directory);
+
+    // Workspace roots are created on demand
+    const created_root = try store.createWorkspaceRoot(io, gpa, "task1", "build2");
+    defer gpa.free(created_root);
+    const root_stat = try env.dir.statFile(io, "ztask-data/workspaces/task1/build2", .{});
+    try expect(root_stat.kind == .directory);
 
     // Invalid components are rejected before any path is built
     try expectError(error.InvalidPath, store.workspaceRoot(gpa, "../x", "build"));

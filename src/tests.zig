@@ -515,8 +515,7 @@ test "remote_sync_agent_transfer" {
         .job_id = job_id,
         .task_id = "sync-agent",
         .job_name = "build",
-        .root = ".",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{}",
     } });
@@ -541,6 +540,9 @@ test "remote_sync_agent_transfer" {
     defer gpa.free(steps_json);
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
         .job_id = job_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .workspace = .ephemeral,
         .steps = steps_json,
     } });
 
@@ -566,14 +568,16 @@ test "remote_sync_agent_transfer" {
         .job_id = bad_id,
         .task_id = "sync-agent",
         .job_name = "build",
-        .root = ".",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{}",
     } });
     // The job arrives while the transfer is still in flight.
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
         .job_id = bad_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .workspace = .ephemeral,
         .steps = steps_json,
     } });
     try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
@@ -604,8 +608,7 @@ test "remote_sync_agent_transfer" {
         .job_id = drop_id,
         .task_id = "sync-agent",
         .job_name = "build",
-        .root = ".",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{}",
     } });
@@ -617,6 +620,9 @@ test "remote_sync_agent_transfer" {
     } });
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
         .job_id = drop_id,
+        .task_id = "sync-agent",
+        .job_name = "build",
+        .workspace = .ephemeral,
         .steps = steps_json,
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = drop_id } });
@@ -630,8 +636,7 @@ test "remote_sync_agent_transfer" {
         .job_id = probe_id,
         .task_id = "sync-agent",
         .job_name = "build",
-        .root = ".",
-        .mode = .static,
+        .mode = .ephemeral,
         .direction = .push,
         .config_json = "{}",
     } });
@@ -640,6 +645,94 @@ test "remote_sync_agent_transfer" {
     const probe_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
     try expect(probe_ack.job_id == probe_id);
     try expect(probe_ack.ok);
+}
+
+test "remote_job_uses_empty_workspace" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const bind = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(
+        io,
+        gpa,
+        "runner1",
+        2,
+        &output.writer,
+        env.data_dir,
+    );
+    defer agent.deinit();
+    try agent.connect(server.socket.address);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+    defer {
+        agent.stop();
+        agent_thread.join();
+    }
+
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var reader = try Connection.Reader.init(io, gpa, stream);
+    defer reader.deinit();
+    var writer = Connection.Writer.init(io, gpa, stream);
+    defer writer.deinit();
+
+    _ = try readMsg(&reader, .register);
+
+    const job_id: u64 = 5;
+    const steps = [_]task_types.Step{.{ .command = .{ .value = "pwd" } }};
+    const steps_json = try protocol.RunJobMsg.serializeSteps(gpa, &steps);
+    defer gpa.free(steps_json);
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = job_id,
+        .task_id = "empty-ws",
+        .job_name = "jobA",
+        .workspace = .none,
+        .steps = steps_json,
+    } });
+
+    const workspace = try std.fs.path.join(gpa, &.{
+        env.data_dir, "workspaces", "empty-ws", "jobA", "runs", "5",
+    });
+    defer gpa.free(workspace);
+
+    var got_output: std.ArrayListUnmanaged(u8) = .empty;
+    defer got_output.deinit(gpa);
+    var finish: protocol.JobEndMsg = undefined;
+    while (true) {
+        const frame = try reader.readNextFrame();
+        const msg = try protocol.parse(frame);
+        switch (msg) {
+            .job_log => |m| try got_output.appendSlice(gpa, m.data),
+            .job_finish => |m| {
+                finish = m;
+                break;
+            },
+            else => {},
+        }
+    }
+    try expect(finish.job_id == job_id);
+    try expect(finish.success);
+    try expect(std.mem.indexOf(u8, got_output.items, workspace) != null);
+
+    try waitRemoved(io, workspace);
+
+    // An invalid job name is failed
+    const bad_id: u64 = 6;
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = bad_id,
+        .task_id = "empty-ws",
+        .job_name = "bad/name",
+        .workspace = .none,
+        .steps = steps_json,
+    } });
+    const rejected = (try readMsg(&reader, .job_finish)).job_finish;
+    try expect(rejected.job_id == bad_id);
+    try expect(!rejected.success);
 }
 
 test "remote_dispatch_survives_task_unload" {
