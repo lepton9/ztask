@@ -2,15 +2,13 @@ const std = @import("std");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
 const sync = @import("sync.zig");
-const Connection = @import("Connection.zig");
 
 const task = @import("../types/task.zig");
+const Connection = @import("Connection.zig");
 const RemoteRunSpec = task.RemoteRunSpec;
 const Queue = @import("../types/queue.zig").Queue;
 const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const Notify = @import("../types/queue.zig").Notify;
-const ResultQueue = localrunner.ResultQueue;
-const LogQueue = localrunner.LogQueue;
 const ResultError = localrunner.ResultError;
 const ExecResult = localrunner.ExecResult;
 
@@ -1454,3 +1452,284 @@ pub const RemoteManager = struct {
         }
     }
 };
+
+const testutil = @import("../testing/utils.zig");
+const expect = std.testing.expect;
+const expectEqualStrings = std.testing.expectEqualStrings;
+
+test "sync_pump_retries_pending_frames_in_order" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Source workspace with one file spanning several chunks.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = try gpa.alloc(u8, 3 * protocol.SYNC_CHUNK_SIZE);
+    defer gpa.free(content);
+    for (content, 0..) |*byte, i| byte.* = @truncate(i);
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "big.bin", content);
+    defer gpa.free(source_root);
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+
+    var agent = try FakeAgent.init(io, gpa, protocol.MAX_FRAME_SIZE);
+    defer agent.deinit(gpa);
+
+    const st = try testTransfer(io, gpa, source_root, 1);
+    try manager.syncs.put(manager.gpa, 7, st);
+
+    var frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (frames.items) |frame| gpa.free(frame);
+        frames.deinit(gpa);
+    }
+    var pumps: usize = 0;
+    while (!st.ended) {
+        pumps += 1;
+        try expect(pumps < 20);
+        manager.pumpTransfer(7, st, &agent.handle);
+        // Every unfinished pump backpressured
+        if (!st.ended) try expect(st.paused);
+        while (agent.writer.outbox.send_queue.tryPop()) |frame|
+            try frames.append(gpa, frame);
+        st.paused = false;
+    }
+    while (agent.writer.outbox.send_queue.tryPop()) |frame|
+        try frames.append(gpa, frame);
+
+    try expect(st.pending == null);
+    // 3 chunk frames + file_done + sync_end.
+    try expect(frames.items.len == 5);
+
+    // The queued frames must reproduce the source in order.
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+    for (frames.items) |frame| {
+        const msg = try protocol.parse(frame);
+        switch (msg) {
+            .file_chunk => |c| {
+                try expect(c.offset == received.items.len);
+                try expectEqualStrings("big.bin", c.path);
+                try received.appendSlice(gpa, c.data);
+            },
+            .file_done => |f| {
+                try expect(std.mem.eql(u8, received.items, content));
+                try expectEqualStrings("big.bin", f.path);
+            },
+            .sync_end => |e| try expect(e.job_id == 7),
+            else => return error.Unexpected,
+        }
+    }
+    try expect(std.mem.eql(u8, received.items, content));
+}
+
+test "sync_pump_fails_transfer_on_closed_writer" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "f.bin", "data");
+    defer gpa.free(source_root);
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+
+    // A zero budget forces the first chunk to backpressure and stay pending
+    var agent = try FakeAgent.init(io, gpa, 0);
+    defer agent.deinit(gpa);
+
+    const st = try testTransfer(io, gpa, source_root, 1);
+    try manager.syncs.put(manager.gpa, 7, st);
+
+    // First pump backpressures, leaving one chunk pending
+    manager.pumpTransfer(7, st, &agent.handle);
+    try expect(st.paused);
+    try expect(st.pending != null);
+
+    // Once the queue is closed, the next pump must remove the transfer
+    agent.writer.outbox.closeQueue();
+    manager.pumpTransfer(7, st, &agent.handle);
+    try expect(manager.syncs.get(7) == null);
+    try expect(manager.syncs.count() == 0);
+}
+
+/// Create one in-flight push transfer over `source_root`.
+fn testTransfer(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    source_root: []const u8,
+    agent_fd: std.Io.net.Socket.Handle,
+) !*SyncTransfer {
+    var sender = try sync.Sender.init(io, gpa, source_root, &.{});
+    errdefer sender.deinit();
+    const st = try gpa.create(SyncTransfer);
+    errdefer gpa.destroy(st);
+    st.* = .{
+        .agent_fd = agent_fd,
+        .session = .{ .sender = sender },
+        .last_progress_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+    };
+    return st;
+}
+
+/// A fake agent with a bounded writer queue and no worker threads.
+const FakeAgent = struct {
+    handle: AgentHandle,
+    writer: *AgentWriter,
+
+    fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        budget_bytes: usize,
+    ) !FakeAgent {
+        const writer = try gpa.create(AgentWriter);
+        errdefer gpa.destroy(writer);
+        writer.* = .{
+            .outbox = .init(io, gpa, undefined),
+            .notify = undefined,
+            .thread = undefined,
+        };
+        writer.outbox.send_queue.budget_bytes = budget_bytes;
+        return .{ .handle = .{
+            .connection = try Connection.init(io),
+            .reader = undefined,
+            .writer = writer,
+            .last_heartbeat = 0,
+        }, .writer = writer };
+    }
+
+    fn deinit(self: *FakeAgent, gpa: std.mem.Allocator) void {
+        self.writer.outbox.deinit();
+        gpa.destroy(self.writer);
+        self.handle.connection.deinit();
+    }
+};
+
+/// Register a dispatched sync job with owned request fields.
+fn putTestDispatch(
+    manager: *RemoteManager,
+    job_id: u64,
+    source_root: []const u8,
+    agent_fd: std.Io.net.Socket.Handle,
+) !void {
+    try manager.dispatched_jobs.put(manager.gpa, job_id, .{
+        .dispatch_id = job_id,
+        .task_id = try manager.gpa.dupe(u8, "stall-task"),
+        .job_name = try manager.gpa.dupe(u8, "build"),
+        .agent = .{ .name = try manager.gpa.dupe(u8, "runner1") },
+        .sync = .{
+            .source_root = try manager.gpa.dupe(u8, source_root),
+            .mode = .ephemeral,
+            .direction = .push,
+        },
+        .agent_fd = agent_fd,
+    });
+}
+
+test "sync_stall_reaper_fails_and_disconnects" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Source workspace with one file.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "f.bin", "data");
+    defer gpa.free(source_root);
+
+    var sink = testutil.RemoteEventSink.init(io, gpa);
+    defer sink.deinit();
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+    manager.setEventSink(.{ .ptr = &sink, .emit = testutil.RemoteEventSink.emit });
+
+    const listen_addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try listen_addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var client = try Connection.init(io);
+    try client.connect(server.socket.address);
+    defer client.deinit();
+
+    const agent_stream = try server.accept(io);
+    const agent_fd = agent_stream.socket.handle;
+
+    const reader = try AgentReader.start(
+        io,
+        gpa,
+        &manager.incoming_frames,
+        .{ .ptr = manager, .callback = RemoteManager.notify },
+        agent_stream,
+    );
+    const writer = try AgentWriter.start(
+        io,
+        gpa,
+        .{ .ptr = manager, .callback = RemoteManager.notify },
+        agent_stream,
+    );
+    writer.outbox.send_queue.budget_bytes = 0;
+    try manager.agents.put(manager.gpa, agent_fd, .{
+        .connection = try Connection.initConn(io, .{
+            .stream = agent_stream,
+            .address = agent_stream.socket.address,
+        }),
+        .reader = reader,
+        .writer = writer,
+        .last_heartbeat = 0,
+    });
+
+    try putTestDispatch(manager, 7, source_root, agent_fd);
+
+    const stalled = try testTransfer(io, gpa, source_root, agent_fd);
+    try manager.syncs.put(manager.gpa, 7, stalled);
+    // Pump once so the transfer holds a pending frame
+    manager.pumpTransfer(7, stalled, manager.agents.getPtr(agent_fd).?);
+    try expect(stalled.pending != null);
+
+    const unacked = try testTransfer(io, gpa, source_root, 2);
+    unacked.ended = true;
+    try manager.syncs.put(manager.gpa, 8, unacked);
+    try putTestDispatch(manager, 8, source_root, 2);
+
+    const fresh = try testTransfer(io, gpa, source_root, 3);
+    try manager.syncs.put(manager.gpa, 9, fresh);
+
+    const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+    stalled.last_progress_ms = now_ms - SYNC_STALL_TIMEOUT_MS - 1;
+    unacked.last_progress_ms = now_ms - SYNC_STALL_TIMEOUT_MS - 1;
+
+    manager.reapStalledSyncs();
+
+    // Stalled and unacked transfers are gone, the progressing one
+    // survives, and the stalled agent is disconnected.
+    try expect(manager.syncs.get(7) == null);
+    try expect(manager.syncs.get(8) == null);
+    try expect(manager.syncs.get(9) != null);
+    try expect(manager.dispatched_jobs.count() == 0);
+    try expect(manager.agents.count() == 0);
+
+    // Two SyncFailed results and one agent_changed from the disconnect
+    var job_finished_count: usize = 0;
+    var agent_changed_count: usize = 0;
+    while (sink.queue.pop()) |event| {
+        defer event.deinit(gpa);
+        switch (event) {
+            .job_finished => |finished| {
+                job_finished_count += 1;
+                try expect(!finished.success);
+                try expect(finished.result.err != null);
+                try expect(finished.result.err.? == error.SyncFailed);
+                try expectEqualStrings(
+                    "workspace transfer stalled",
+                    finished.result.msg.?,
+                );
+            },
+            .agent_changed => agent_changed_count += 1,
+            .job_started, .job_output => {},
+        }
+    }
+    try expect(job_finished_count == 2);
+    try expect(agent_changed_count == 1);
+}

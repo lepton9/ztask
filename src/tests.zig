@@ -5,6 +5,7 @@ const data = @import("data.zig");
 const snap = @import("tui/snapshot.zig");
 const run = @import("run.zig");
 const remote_agent = @import("remote/remote_agent.zig");
+const remote_manager = @import("remote/remote_manager.zig");
 const task_types = @import("types/task.zig");
 const protocol = @import("remote/protocol.zig");
 const Connection = @import("remote/Connection.zig");
@@ -767,6 +768,80 @@ test "remote_dispatch_survives_task_unload" {
     task_manager.remote_manager.wake();
 
     try std.Io.sleep(io, .fromMilliseconds(50), .awake);
+}
+
+test "remote_job_with_sync" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // Source workspace with one file
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "hello.txt", "world");
+    defer gpa.free(source_root);
+
+    var events = testutil.RemoteEventSink.init(io, gpa);
+    defer events.deinit();
+
+    var remote = try remote_manager.RemoteManager.init(io, gpa);
+    defer remote.deinit();
+
+    remote.setEventSink(.{ .ptr = &events, .emit = testutil.RemoteEventSink.emit });
+
+    try remote.start(try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
+    defer agent.deinit();
+    try agent.connect(remote.getAddress().?);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    // Wait for the agent to register
+    var waited: usize = 0;
+    while (remote.agent_count.load(.seq_cst) == 0) {
+        try expect(waited < 200);
+        waited += 1;
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+
+    const steps = [_]task_types.Step{.{ .command = .{ .value = "test -f hello.txt" } }};
+    const agent_spec = task_types.RemoteRunSpec{ .name = "runner1" };
+
+    const dispatch_id = try remote.pushDispatch(
+        "sync-task",
+        "build",
+        agent_spec,
+        &steps,
+        .{ .source_root = source_root, .mode = .ephemeral, .direction = .push },
+    );
+
+    var finished = try events.waitJobFinished(io);
+    defer finished.deinit(gpa);
+    try expect(finished.job_finished.success);
+    try expect(finished.job_finished.result.err == null);
+    try expect(finished.job_finished.dispatch_id == dispatch_id);
+
+    // A missing source root fails before any transfer traffic
+    const missing = try std.fs.path.join(gpa, &.{ env.path, "missing" });
+    defer gpa.free(missing);
+    _ = try remote.pushDispatch(
+        "sync-task",
+        "build",
+        agent_spec,
+        &steps,
+        .{ .source_root = missing, .mode = .ephemeral, .direction = .push },
+    );
+    var failed = try events.waitJobFinished(io);
+    defer failed.deinit(gpa);
+    try expect(failed.job_finished.result.err != null);
+    try expect(failed.job_finished.result.err.? == error.SyncFailed);
+
+    agent.stop();
+    agent_thread.join();
+
+    try expect(agent.isIdle());
 }
 
 test "manager_run_history_prefetch" {
