@@ -237,6 +237,19 @@ pub const Writer = struct {
         try self.send_queue.enqueue(self.gpa, frame);
     }
 
+    /// Queue an already allocated frame when the bulk byte budget allows,
+    /// taking ownership on success.
+    ///
+    /// Returns `error.Backpressure` without queueing once the queued
+    /// bytes reach the budget.
+    pub fn tryEnqueueOwned(
+        self: *Writer,
+        frame: []u8,
+    ) error{ Closed, Backpressure, FrameTooLarge, OutOfMemory }!void {
+        if (frame.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+        return self.send_queue.tryEnqueue(self.gpa, frame);
+    }
+
     /// Set the callback fired when bulk production can resume.
     pub fn setNotify(self: *Writer, notify: ?Notify) void {
         self.send_queue.setNotify(notify);

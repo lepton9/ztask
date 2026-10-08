@@ -371,13 +371,14 @@ pub const Scheduler = struct {
         job_meta.status = .running;
         self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
-        // TODO: derive from the task/job `sync` config
+        // TODO: derive the sync spec from the task/job `sync` config
+        const sync: ?remote.SyncSpec = null;
         const dispatch_id = self.remote_manager.pushDispatch(
             self.task_meta.task_id,
             node.ptr.name,
             node.ptr.run_on.remote,
             node.ptr.steps,
-            .none,
+            sync,
         ) catch |err| {
             log.warn(
                 "Failed to queue remote dispatch of job '{s}': {s}",

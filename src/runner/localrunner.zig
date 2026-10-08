@@ -44,6 +44,7 @@ pub const ResultError = error{
     NoRunnerFound,
     RunnerNotConnected,
     MessageTooLarge,
+    SyncFailed,
 };
 
 pub const ExecResult = struct {

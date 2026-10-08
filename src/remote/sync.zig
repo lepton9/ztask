@@ -546,6 +546,18 @@ pub const Sender = struct {
     }
 };
 
+/// Sync session for bidirectional workspace transfer.
+pub const Session = struct {
+    receiver: ?Receiver = null,
+    sender: ?Sender = null,
+
+    pub fn deinit(self: *Session) void {
+        if (self.receiver) |*r| r.deinit();
+        if (self.sender) |*s| s.deinit();
+        self.* = .{};
+    }
+};
+
 /// Create a workspace for `mode`.
 pub fn createWorkspace(
     io: std.Io,

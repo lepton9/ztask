@@ -1,6 +1,7 @@
 const std = @import("std");
 const localrunner = @import("../runner/localrunner.zig");
 const protocol = @import("protocol.zig");
+const sync = @import("sync.zig");
 const Connection = @import("Connection.zig");
 
 const task = @import("../types/task.zig");
@@ -51,12 +52,12 @@ const DeadlineTimer = struct {
             .io = self.io,
             .deadline_ms = deadline,
         }}) catch |err| {
-            log.warn("Failed to arm dispatch deadline timer: {s}", .{@errorName(err)});
+            log.warn("Failed to arm deadline timer: {s}", .{@errorName(err)});
             return;
         };
         self.deadline_ms = deadline;
         self.thread = std.Thread.spawn(.{}, wait, .{self}) catch |err| {
-            log.warn("Failed to spawn dispatch deadline thread: {s}", .{@errorName(err)});
+            log.warn("Failed to spawn deadline timer thread: {s}", .{@errorName(err)});
             self.select.cancelDiscard();
             self.deadline_ms = null;
             return;
@@ -82,7 +83,10 @@ const DeadlineTimer = struct {
     fn wait(self: *DeadlineTimer) void {
         var events: [1]DeadlineEvent = undefined;
         const n = self.select.queue.get(self.io, &events, 1) catch return;
-        if (n == 1) self.notify.callback(self.notify.ptr);
+        if (n == 1) {
+            self.deadline_ms = null;
+            self.notify.callback(self.notify.ptr);
+        }
     }
 };
 
@@ -217,6 +221,25 @@ const AgentWriter = struct {
     }
 };
 
+pub const SyncSpec = struct {
+    /// Source root to transfer, absolute and resolved by the caller.
+    source_root: []const u8,
+    mode: protocol.WorkspaceMode,
+    direction: protocol.SyncDirection,
+
+    pub fn deinit(self: *SyncSpec, gpa: std.mem.Allocator) void {
+        gpa.free(self.source_root);
+    }
+
+    pub fn copy(self: *const SyncSpec, gpa: std.mem.Allocator) !SyncSpec {
+        return .{
+            .source_root = try gpa.dupe(u8, self.source_root),
+            .mode = self.mode,
+            .direction = self.direction,
+        };
+    }
+};
+
 /// A queued remote job dispatch.
 pub const DispatchRequest = struct {
     /// Globally unique dispatch id, used as the protocol job id.
@@ -229,8 +252,11 @@ pub const DispatchRequest = struct {
     agent: RemoteRunSpec,
     /// Serialized `run_job` message.
     run_job_payload: ?[]u8 = null,
+    /// Owned copy of the sync inputs.
+    sync: ?SyncSpec = null,
+    /// Socket handle of the connected remote agent.
     agent_fd: ?std.Io.net.Socket.Handle = null,
-    /// Absolute time after which an unavailable dispatch fails.
+    /// Absolute time after which a dispatch with no matching runner fails.
     deadline_ms: ?i64 = null,
 
     const RETRY_TIMEOUT_MS = 5 * std.time.ms_per_s;
@@ -241,6 +267,57 @@ pub const DispatchRequest = struct {
         gpa.free(self.agent.name);
         if (self.agent.addr) |addr| gpa.free(addr);
         if (self.run_job_payload) |payload| gpa.free(payload);
+        if (self.sync) |s| gpa.free(s.source_root);
+    }
+};
+
+/// Fail a workspace transfer once no frame was queued for this long.
+const SYNC_STALL_TIMEOUT_MS: i64 = 60 * std.time.ms_per_s;
+
+/// State of one in-flight workspace transfer.
+const SyncTransfer = struct {
+    /// Socket handle of the agent receiving the transfer.
+    agent_fd: std.Io.net.Socket.Handle,
+    /// Transfer session roles.
+    session: sync.Session,
+    /// Read buffer for one file chunk.
+    chunk_buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined,
+    /// Serialized frame waiting for queue space.
+    pending: ?[]u8 = null,
+    /// Set once the writer queue is full.
+    paused: bool = false,
+    /// Set once the transfer is completed.
+    ended: bool = false,
+    /// Last time a frame was successfully queued.
+    last_progress_ms: i64,
+
+    /// Create the transfer of `spec` to the agent at `agent_fd`.
+    fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        agent_fd: std.Io.net.Socket.Handle,
+        spec: SyncSpec,
+    ) !*SyncTransfer {
+        var session: sync.Session = switch (spec.direction) {
+            .push => .{ .sender = try sync.Sender.init(io, gpa, spec.source_root, &.{}) },
+            .pull, .both => return error.UnsupportedDirection,
+        };
+        errdefer session.deinit();
+
+        const st = try gpa.create(SyncTransfer);
+        errdefer gpa.destroy(st);
+        st.* = .{
+            .agent_fd = agent_fd,
+            .session = session,
+            .last_progress_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
+        };
+        return st;
+    }
+
+    fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
+        self.session.deinit();
+        if (self.pending) |frame| gpa.free(frame);
+        gpa.destroy(self);
     }
 };
 
@@ -332,7 +409,7 @@ pub const RemoteManager = struct {
     thread: ?std.Thread = null,
     /// Cancelable worker thread accepting incoming agent connections.
     accept_future: ?std.Io.Future(void) = null,
-    dispatch_timer: DeadlineTimer,
+    deadline_timer: DeadlineTimer,
 
     /// Connected remote agents.
     agents: std.AutoHashMapUnmanaged(std.Io.net.Socket.Handle, AgentHandle),
@@ -344,8 +421,12 @@ pub const RemoteManager = struct {
     /// Source of globally unique dispatch ids.
     next_dispatch_id: std.atomic.Value(u64) = .init(1),
 
-    dispatch_queue: Queue(DispatchRequest),
-    dispatched_jobs: std.AutoHashMapUnmanaged(u64, DispatchRequest),
+    /// Queue of requests ready to be dispatched.
+    dispatch_queue: Queue(DispatchRequest) = .{},
+    /// Currently dispatched job requests waiting to be finished.
+    dispatched_jobs: std.AutoHashMapUnmanaged(u64, DispatchRequest) = .empty,
+    /// In-flight workspace transfers, keyed by job dispatch id.
+    syncs: std.AutoHashMapUnmanaged(u64, *SyncTransfer) = .empty,
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator) !*RemoteManager {
         const manager = try gpa.create(RemoteManager);
@@ -355,13 +436,11 @@ pub const RemoteManager = struct {
             .agents = .{},
             .incoming_frames = .init(io),
             .commands = .init(io),
-            .dispatch_timer = undefined,
-            .dispatch_queue = .{},
-            .dispatched_jobs = .{},
+            .deadline_timer = undefined,
         };
         manager.incoming_frames.setNotify(.{ .ptr = manager, .callback = notify });
         manager.commands.setNotify(.{ .ptr = manager, .callback = notify });
-        manager.dispatch_timer.init(io, .{ .ptr = manager, .callback = notify });
+        manager.deadline_timer.init(io, .{ .ptr = manager, .callback = notify });
         return manager;
     }
 
@@ -372,6 +451,10 @@ pub const RemoteManager = struct {
         var dispatched_it = self.dispatched_jobs.valueIterator();
         while (dispatched_it.next()) |req| req.deinit(self.gpa);
         self.dispatched_jobs.deinit(self.gpa);
+
+        var sync_it = self.syncs.valueIterator();
+        while (sync_it.next()) |st| st.*.deinit(self.gpa);
+        self.syncs.deinit(self.gpa);
 
         var it = self.agents.valueIterator();
         while (it.next()) |a| a.deinit(self.gpa);
@@ -416,7 +499,7 @@ pub const RemoteManager = struct {
 
     /// Release the accept worker, listener and agent connections.
     fn teardown(self: *RemoteManager) void {
-        self.dispatch_timer.cancel();
+        self.deadline_timer.cancel();
         if (self.accept_future) |*future| {
             future.cancel(self.io);
             self.accept_future = null;
@@ -462,8 +545,11 @@ pub const RemoteManager = struct {
                 log.err("Failed to process remote agent messages: {s}", .{@errorName(err)});
             self.reapDeadAgents() catch |err|
                 log.err("Failed to remove dead remote agents: {s}", .{@errorName(err)});
+            self.reapStalledSyncs();
             self.dispatchJobs() catch |err|
                 log.err("Failed to dispatch remote jobs: {s}", .{@errorName(err)});
+            self.resumeSyncs();
+            self.refreshDeadlineTimer();
 
             self.mutex.lockUncancelable(self.io);
             while (self.running.load(.seq_cst) and !self.work_pending.swap(false, .seq_cst)) {
@@ -519,9 +605,10 @@ pub const RemoteManager = struct {
         job_name: []const u8,
         agent: RemoteRunSpec,
         steps: []const task.Step,
-        workspace: protocol.WorkspaceMode,
+        spec: ?SyncSpec,
     ) error{ OutOfMemory, FailedSerialize, FrameTooLarge }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
+        const workspace: protocol.WorkspaceMode = if (spec) |s| s.mode else .none;
 
         const run_job_payload = blk: {
             const steps_json = try protocol.RunJobMsg.serializeSteps(self.gpa, steps);
@@ -549,12 +636,16 @@ pub const RemoteManager = struct {
             null;
         errdefer if (agent_addr) |addr| self.gpa.free(addr);
 
+        var sync_spec: ?SyncSpec = if (spec) |*s| try s.copy(self.gpa) else null;
+        errdefer if (sync_spec) |*s| s.deinit(self.gpa);
+
         try self.commands.append(self.gpa, .{ .dispatch = .{
             .dispatch_id = dispatch_id,
             .task_id = task_id_copy,
             .job_name = job_name_copy,
             .agent = .{ .name = agent_name, .addr = agent_addr },
             .run_job_payload = run_job_payload,
+            .sync = sync_spec,
         } });
         return dispatch_id;
     }
@@ -723,14 +814,39 @@ pub const RemoteManager = struct {
                 );
                 try self.emitEvent(event);
             },
-            // TODO: implement handling
-            .sync_ack, .file_req, .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
-                log.debug("Ignoring manager-side sync message '{s}'", .{
+            .sync_ack => |m| self.handleSyncAck(agent, m),
+            .file_req, .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
+                log.debug("Ignoring sync message '{s}'", .{
                     @tagName(std.meta.activeTag(msg)),
                 });
             },
             else => {},
         }
+    }
+
+    /// Complete a workspace transfer. Send `run_job` after an
+    /// affirmative ack or fail the dispatch.
+    fn handleSyncAck(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.SyncAckMsg,
+    ) void {
+        const st = self.syncs.get(msg.job_id) orelse return;
+        const fd = agent.connection.conn.stream.socket.handle;
+        if (st.agent_fd != fd) {
+            log.warn("Ignoring sync ack for job {x} from a different agent", .{msg.job_id});
+            return;
+        }
+        _ = self.syncs.fetchRemove(msg.job_id);
+        st.deinit(self.gpa);
+
+        if (!msg.ok) {
+            return self.failSyncedDispatch(
+                msg.job_id,
+                msg.message orelse "workspace transfer rejected",
+            );
+        }
+        self.sendRunJob(agent, msg.job_id);
     }
 
     /// Find if a connected and registered agent exists with the name
@@ -749,16 +865,25 @@ pub const RemoteManager = struct {
         return false;
     }
 
-    /// Dispatch all jobs in the queue to agents
+    /// Process the dispatch requests currently in the queue.
     fn dispatchJobs(self: *RemoteManager) !void {
-        const count = self.dispatch_queue.len();
         const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
-        var earliest_deadline_ms: ?i64 = null;
 
-        for (0..count) |_| {
+        const queued_count = self.dispatch_queue.len();
+        for (0..queued_count) |_| {
             var req = self.dispatch_queue.pop() orelse unreachable;
-            if (self.findAgent(req.agent)) |agent| {
-                try self.dispatchJob(agent, req);
+            const agent = self.findAgent(req.agent);
+
+            if (agent) |a| {
+                // Check if in-flight workspace transfers for the agent
+                if (req.sync != null and self.agentBusySync(a)) {
+                    // Wait for the transfer to be completed before dispatching
+                    req.deadline_ms = null;
+                    self.dispatch_queue.append(self.gpa, req) catch |err| {
+                        req.deinit(self.gpa);
+                        return err;
+                    };
+                } else try self.dispatchJob(a, req);
                 continue;
             }
 
@@ -772,14 +897,10 @@ pub const RemoteManager = struct {
                     req.deinit(self.gpa);
                     return err;
                 };
-                earliest_deadline_ms = if (earliest_deadline_ms) |earliest|
-                    @min(earliest, deadline_ms)
-                else
-                    deadline_ms;
                 continue;
             }
 
-            // Failed to find matching agent
+            // Failed to dispatch in time
             defer req.deinit(self.gpa);
             log.warn("No remote runner for job '{s}' within timeout", .{req.job_name});
             const event = try self.makeJobFinishedEvent(
@@ -792,12 +913,36 @@ pub const RemoteManager = struct {
             );
             try self.emitEvent(event);
         }
-        self.dispatch_timer.setDeadline(earliest_deadline_ms);
     }
 
-    /// Dispatch a job to an agent.
-    ///
-    /// Takes ownership of `req` once it is registered as dispatched.
+    /// Arm the deadline timer for the earliest queue deadline or
+    /// transfer stall deadline.
+    fn refreshDeadlineTimer(self: *RemoteManager) void {
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        var earliest: ?i64 = null;
+        // Check dispatch requests
+        var it = self.dispatch_queue.iterator();
+        while (it.next()) |node| {
+            const deadline = node.value.deadline_ms orelse continue;
+            earliest = if (earliest) |e| @min(e, deadline) else deadline;
+        }
+        // Check in-flight transfers
+        var sync_it = self.syncs.iterator();
+        while (sync_it.next()) |entry| {
+            const stall_at = entry.value_ptr.*.last_progress_ms + SYNC_STALL_TIMEOUT_MS;
+            earliest = if (earliest) |e| @min(e, stall_at) else stall_at;
+        }
+        const deadline = earliest orelse {
+            self.deadline_timer.cancel();
+            return;
+        };
+        if (self.deadline_timer.deadline_ms) |armed| {
+            if (armed > now_ms and armed <= deadline) return;
+        }
+        self.deadline_timer.setDeadline(deadline);
+    }
+
+    /// Process a single dispatch request. Takes ownership of `req`.
     fn dispatchJob(
         self: *RemoteManager,
         agent: *AgentHandle,
@@ -809,31 +954,300 @@ pub const RemoteManager = struct {
             dispatched.deinit(self.gpa);
             return err;
         };
-        // Send the pre-serialized job message to the agent
-        const entry = self.dispatched_jobs.getPtr(dispatched.dispatch_id) orelse
+        // Sync the workspace before dispatching
+        if (dispatched.sync != null) {
+            self.startSync(agent, dispatched.dispatch_id);
             return;
+        }
+        self.sendRunJob(agent, dispatched.dispatch_id);
+    }
+
+    /// Send the queued `run_job` payload of a dispatched job.
+    fn sendRunJob(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
         const payload = entry.run_job_payload orelse return;
         entry.run_job_payload = null;
         self.sendMessageOwned(agent, payload) catch |err| {
             self.gpa.free(payload);
-            // Remove runner and send an error to scheduler
-            const kv = self.dispatched_jobs.fetchRemove(dispatched.dispatch_id) orelse return;
-            var failed = kv.value;
-            defer failed.deinit(self.gpa);
-            const frame_too_large = err == error.FrameTooLarge;
-            const event = self.makeJobFinishedEvent(
-                failed.task_id,
-                failed.dispatch_id,
-                false,
-                if (frame_too_large) error.MessageTooLarge else error.RunnerNotConnected,
-                if (frame_too_large)
-                    "Remote job message exceeds the frame limit"
-                else
-                    "Failed to send job to remote runner",
-                std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
-            ) catch return;
-            self.emitEvent(event) catch {};
+            self.failRunJobSend(job_id, err);
         };
+    }
+
+    /// Fail a dispatched job whose `run_job` message could not be sent.
+    fn failRunJobSend(self: *RemoteManager, job_id: u64, err: anyerror) void {
+        const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return;
+        var failed = kv.value;
+        defer failed.deinit(self.gpa);
+        const frame_too_large = err == error.FrameTooLarge;
+        const event = self.makeJobFinishedEvent(
+            failed.task_id,
+            failed.dispatch_id,
+            false,
+            if (frame_too_large) error.MessageTooLarge else error.RunnerNotConnected,
+            if (frame_too_large)
+                "Remote job message exceeds the frame limit"
+            else
+                "Failed to send job to remote runner",
+            std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+        ) catch return;
+        self.emitEvent(event) catch {};
+    }
+
+    /// Start the workspace transfer of a dispatched job.
+    fn startSync(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
+        const spec = entry.sync orelse return;
+
+        const st = SyncTransfer.start(
+            self.io,
+            self.gpa,
+            agent.connection.conn.stream.socket.handle,
+            spec,
+        ) catch |err| return self.failSyncedDispatchErr(
+            job_id,
+            "failed to start the workspace transfer",
+            err,
+        );
+        self.syncs.put(self.gpa, job_id, st) catch {
+            st.deinit(self.gpa);
+            return self.failSyncedDispatch(job_id, "out of memory");
+        };
+
+        log.debug("Workspace sync {x} begin: task='{s}' job='{s}' root='{s}' mode={s}", .{
+            job_id, entry.task_id, entry.job_name, spec.source_root, @tagName(spec.mode),
+        });
+
+        const begin = protocol.serialize(self.gpa, .{ .sync_begin = .{
+            .job_id = job_id,
+            .task_id = entry.task_id,
+            .job_name = entry.job_name,
+            .mode = spec.mode,
+            .direction = spec.direction,
+            .config_json = "{}",
+        } }) catch return self.failSyncedDispatch(job_id, "out of memory");
+        self.sendMessageOwned(agent, begin) catch |err| {
+            self.gpa.free(begin);
+            return self.failSyncedDispatchErr(
+                job_id,
+                "failed to send sync_begin",
+                err,
+            );
+        };
+        self.touchSync(st);
+
+        self.pumpTransfer(job_id, st, agent);
+    }
+
+    /// Record forward progress of a transfer.
+    fn touchSync(self: *RemoteManager, st: *SyncTransfer) void {
+        st.last_progress_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+    }
+
+    /// Queue transfer frames for one in-flight session until the agent
+    /// queue reaches its byte budget or the transfer is fully queued.
+    fn pumpTransfer(
+        self: *RemoteManager,
+        job_id: u64,
+        st: *SyncTransfer,
+        agent: *AgentHandle,
+    ) void {
+        const sender = &(st.session.sender orelse return);
+
+        while (!st.ended) {
+            // Retry a backpressured frame first
+            if (st.pending) |frame| {
+                agent.writer.outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
+                    error.Backpressure => {
+                        st.paused = true;
+                        return;
+                    },
+                    error.Closed => return self.failSyncedDispatch(
+                        job_id,
+                        "agent connection closed",
+                    ),
+                    else => return self.failSyncedDispatchErr(
+                        job_id,
+                        "failed to queue the workspace transfer",
+                        err,
+                    ),
+                };
+                st.pending = null;
+                self.touchSync(st);
+            }
+
+            const event = sender.next(&st.chunk_buf) catch |err| {
+                return self.failSyncedDispatchErr(
+                    job_id,
+                    "failed to read the workspace source",
+                    err,
+                );
+            } orelse return;
+
+            switch (event) {
+                .chunk => |c| {
+                    const frame = protocol.serialize(self.gpa, .{ .file_chunk = .{
+                        .job_id = job_id,
+                        .path = c.path,
+                        .offset = c.offset,
+                        .data = c.data,
+                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
+                    agent.writer.outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
+                        error.Backpressure => {
+                            st.pending = frame; // retried on the next pass
+                            st.paused = true;
+                            return;
+                        },
+                        error.Closed => {
+                            self.gpa.free(frame);
+                            return self.failSyncedDispatch(job_id, "agent connection closed");
+                        },
+                        else => {
+                            self.gpa.free(frame);
+                            return self.failSyncedDispatchErr(
+                                job_id,
+                                "failed to queue the workspace transfer",
+                                err,
+                            );
+                        },
+                    };
+                    self.touchSync(st);
+                },
+                .file_done => |f| {
+                    const frame = protocol.serialize(self.gpa, .{ .file_done = .{
+                        .job_id = job_id,
+                        .path = f.path,
+                        .permissions = f.mode,
+                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
+                    self.sendMessageOwned(agent, frame) catch |err| {
+                        self.gpa.free(frame);
+                        return self.failSyncedDispatchErr(
+                            job_id,
+                            "failed to send file_done",
+                            err,
+                        );
+                    };
+                    self.touchSync(st);
+                },
+                .end => {
+                    const frame = protocol.serialize(self.gpa, .{ .sync_end = .{
+                        .job_id = job_id,
+                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
+                    self.sendMessageOwned(agent, frame) catch |err| {
+                        self.gpa.free(frame);
+                        return self.failSyncedDispatchErr(
+                            job_id,
+                            "failed to send sync_end",
+                            err,
+                        );
+                    };
+                    st.ended = true;
+                    self.touchSync(st);
+                },
+            }
+        }
+    }
+
+    /// Pump every in-flight transfer that is not waiting for its ack.
+    fn resumeSyncs(self: *RemoteManager) void {
+        // Unpause all the transfers from last pass
+        var pause_it = self.syncs.iterator();
+        while (pause_it.next()) |entry| entry.value_ptr.*.paused = false;
+
+        while (true) {
+            const Target: type = struct { job_id: u64, st: *SyncTransfer, agent: *AgentHandle };
+            var it = self.syncs.iterator();
+            const next: ?Target = blk: while (it.next()) |entry| {
+                const st = entry.value_ptr.*;
+                if (st.ended or st.paused) continue;
+                const agent = self.agents.getPtr(st.agent_fd) orelse continue;
+                break :blk .{
+                    .job_id = entry.key_ptr.*,
+                    .st = st,
+                    .agent = agent,
+                };
+            } else null;
+            const target = next orelse return;
+            self.pumpTransfer(target.job_id, target.st, target.agent);
+        }
+    }
+
+    /// Whether the agent has an in-flight workspace transfer.
+    fn agentBusySync(self: *RemoteManager, agent: *const AgentHandle) bool {
+        const fd = agent.connection.conn.stream.socket.handle;
+        var it = self.syncs.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.*.agent_fd == fd) return true;
+        }
+        return false;
+    }
+
+    /// Destroy the transfer session of a job, if one exists.
+    fn destroySync(self: *RemoteManager, job_id: u64) void {
+        const kv = self.syncs.fetchRemove(job_id) orelse return;
+        kv.value.deinit(self.gpa);
+    }
+
+    /// Fail transfers that stopped making queue progress.
+    fn reapStalledSyncs(self: *RemoteManager) void {
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        while (true) {
+            const Stalled: type = struct { job_id: u64, agent_fd: std.Io.net.Socket.Handle };
+            var it = self.syncs.iterator();
+            const stalled: ?Stalled = blk: while (it.next()) |entry| {
+                const st = entry.value_ptr.*;
+                if (now_ms >= st.last_progress_ms + SYNC_STALL_TIMEOUT_MS) {
+                    break :blk .{ .job_id = entry.key_ptr.*, .agent_fd = st.agent_fd };
+                }
+            } else null;
+            const target = stalled orelse return;
+            self.failSyncedDispatch(target.job_id, "workspace transfer stalled");
+            self.removeAgentByFd(target.agent_fd);
+        }
+    }
+
+    /// Fail a dispatch whose workspace transfer did not complete.
+    fn failSyncedDispatch(self: *RemoteManager, job_id: u64, message: []const u8) void {
+        self.failSyncedDispatchErr(job_id, message, null);
+    }
+
+    /// Fail a dispatch whose workspace transfer did not complete,
+    /// logging the error behind the failure alongside `message`.
+    fn failSyncedDispatchErr(
+        self: *RemoteManager,
+        job_id: u64,
+        message: []const u8,
+        err: ?anyerror,
+    ) void {
+        self.destroySync(job_id);
+        const kv = self.dispatched_jobs.fetchRemove(job_id) orelse return;
+        var req = kv.value;
+        defer req.deinit(self.gpa);
+        if (err) |e| {
+            log.warn("Workspace sync failed for job '{s}' ({x}): {s} ({s})", .{
+                req.job_name,
+                job_id,
+                message,
+                @errorName(e),
+            });
+        } else {
+            log.warn("Workspace sync failed for job '{s}' ({x}): {s}", .{
+                req.job_name,
+                job_id,
+                message,
+            });
+        }
+        const event = self.makeJobFinishedEvent(
+            req.task_id,
+            req.dispatch_id,
+            false,
+            error.SyncFailed,
+            message,
+            std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+        ) catch {
+            log.warn("Failed to report remote job {x} as failed", .{job_id});
+            return;
+        };
+        self.emitEvent(event) catch {};
     }
 
     /// Push a command to cancel a job from running.
@@ -847,6 +1261,7 @@ pub const RemoteManager = struct {
         if (self.dispatched_jobs.fetchRemove(job_id)) |kv| {
             var req = kv.value;
             defer req.deinit(self.gpa);
+            self.destroySync(job_id);
             const agent = self.findAgent(req.agent) orelse return;
             const msg: protocol.CancelJobMsg = .{ .job_id = req.dispatch_id };
             const payload = try protocol.serialize(self.gpa, .{
@@ -877,10 +1292,10 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         message: []u8,
     ) !void {
-        const fd = agent.connection.conn.stream.socket.handle;
         agent.writer.outbox.enqueueOwned(message) catch |err| switch (err) {
             error.FrameTooLarge => return err,
             else => {
+                const fd = agent.connection.conn.stream.socket.handle;
                 self.removeAgentByFd(fd);
                 return error.NotConnected;
             },
@@ -986,18 +1401,25 @@ pub const RemoteManager = struct {
     }
 
     fn failJobsForAgent(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
+        // Fail jobs
         while (true) {
-            var job_id: ?u64 = null;
             var it = self.dispatched_jobs.iterator();
-            while (it.next()) |entry| {
+            const job_id = blk: while (it.next()) |entry| {
                 const job_fd = entry.value_ptr.agent_fd orelse continue;
                 if (job_fd != fd) continue;
-                job_id = entry.key_ptr.*;
-                break;
-            }
-            const id = job_id orelse break;
-            const req = self.dispatched_jobs.fetchRemove(id) orelse continue;
+                break :blk entry.key_ptr.*;
+            } else break;
+            const req = self.dispatched_jobs.fetchRemove(job_id) orelse continue;
             self.failDisconnectedJob(req.value);
+        }
+        // Clear syncs
+        while (true) {
+            var it = self.syncs.iterator();
+            const sync_id = blk: while (it.next()) |entry| {
+                if (entry.value_ptr.*.agent_fd != fd) continue;
+                break :blk entry.key_ptr.*;
+            } else break;
+            self.destroySync(sync_id);
         }
     }
 
