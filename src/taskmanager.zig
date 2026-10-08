@@ -635,7 +635,7 @@ pub const TaskManager = struct {
         const key = gop.key_ptr.*;
 
         self.watcher.addFileWatch(key, .{ .recursive = recursive }) catch |err| {
-            if (new_entry) if (self.watch_map.fetchRemove(key)) |kv| {
+            defer if (new_entry) if (self.watch_map.fetchRemove(key)) |kv| {
                 var entry = kv.value;
                 entry.direct.deinit(self.gpa);
                 entry.recursive.deinit(self.gpa);

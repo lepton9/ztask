@@ -1296,6 +1296,10 @@ test "manager_watch_registration_rollback" {
     try expect(diagnostics.err != null);
     try std.testing.expectEqual(error.WatchPathNotFound, diagnostics.err.?);
 
+    // The diagnostic message must contain the watch path
+    try expect(diagnostics.message != null);
+    try expect(std.mem.indexOf(u8, diagnostics.message.?, missing_path) != null);
+
     // All partial registrations were undone
     try std.testing.expectEqual(@as(usize, 0), task_manager.watch_map.count());
     try std.testing.expectEqual(
