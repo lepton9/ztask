@@ -2,6 +2,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const workspace = @import("workspace.zig");
 const glob = @import("glob.zig");
+const Connection = @import("Connection.zig");
 
 const log = std.log.scoped(.sync);
 
@@ -246,7 +247,7 @@ fn wirePermissions(permissions: std.Io.File.Permissions) u32 {
     }
 }
 
-// TODO: maybe move Receiver, Sender, File, Directory to different files under sync/
+// TODO: maybe move Receiver, Sender, Source, File, Directory to different files under sync/
 
 /// Receives one push transfer into a destination root.
 pub const Receiver = struct {
@@ -280,7 +281,7 @@ pub const Receiver = struct {
         gpa: std.mem.Allocator,
         store: *const workspace.Store,
         msg: protocol.SyncBeginMsg,
-    ) !*Receiver {
+    ) !Receiver {
         try validate(msg);
         try workspace.validateComponent(msg.task_id);
         try workspace.validateComponent(msg.job_name);
@@ -289,9 +290,6 @@ pub const Receiver = struct {
         errdefer gpa.free(task_id);
         const job_name = try gpa.dupe(u8, msg.job_name);
         errdefer gpa.free(job_name);
-
-        const self = try gpa.create(Receiver);
-        errdefer gpa.destroy(self);
 
         const ws = try createWorkspace(
             io,
@@ -303,18 +301,17 @@ pub const Receiver = struct {
             msg.job_id,
         );
 
-        self.* = .{
+        log.debug(
+            "Workspace sync {x} begin: task='{s}' job='{s}' dest='{s}'",
+            .{ msg.job_id, task_id, job_name, ws.root() },
+        );
+        return .{
             .io = io,
             .gpa = gpa,
             .task_id = task_id,
             .job_name = job_name,
             .workspace = ws,
         };
-        log.debug(
-            "Workspace sync {x} begin: task='{s}' job='{s}' dest='{s}'",
-            .{ msg.job_id, task_id, job_name, self.workspace.root() },
-        );
-        return self;
     }
 
     /// The absolute root files are written into.
@@ -322,7 +319,7 @@ pub const Receiver = struct {
         return self.workspace.root();
     }
 
-    /// Close open handles, reclaim the workspace and free the receiver.
+    /// Close open handles and reclaim the workspace.
     pub fn deinit(self: *Receiver) void {
         self.closeOpen();
         if (self.failure_msg) |msg| self.gpa.free(msg);
@@ -426,7 +423,8 @@ pub const Receiver = struct {
     }
 };
 
-pub const Sender = struct {
+/// Reads a source tree and yields transfer events.
+pub const Source = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
     /// The root directory to send files from.
@@ -460,13 +458,13 @@ pub const Sender = struct {
         end,
     };
 
-    /// Open a sender over `root`.
+    /// Open a source over `root`.
     pub fn init(
         io: std.Io,
         gpa: std.mem.Allocator,
         root: []const u8,
         exclude: []const []const u8,
-    ) !Sender {
+    ) !Source {
         var directory: Directory = try .init(io, gpa, root);
         errdefer directory.deinit();
         const dir = try std.Io.Dir.openDirAbsolute(io, directory.root, .{
@@ -486,7 +484,7 @@ pub const Sender = struct {
         };
     }
 
-    pub fn deinit(self: *Sender) void {
+    pub fn deinit(self: *Source) void {
         if (self.open) |*f| f.deinit();
         if (self.current_path.len > 0) self.gpa.free(self.current_path);
         self.walker.deinit();
@@ -495,7 +493,7 @@ pub const Sender = struct {
     }
 
     /// Produce the next event. `path` slices are valid until the next call.
-    pub fn next(self: *Sender, dest: []u8) !?Event {
+    pub fn next(self: *Source, dest: []u8) !?Event {
         if (self.finished) return null;
         std.debug.assert(dest.len > 0 and dest.len <= protocol.SYNC_CHUNK_SIZE);
 
@@ -533,7 +531,7 @@ pub const Sender = struct {
     }
 
     /// Open `entry_path` for reading.
-    fn openFile(self: *Sender, entry_path: []const u8) !void {
+    fn openFile(self: *Source, entry_path: []const u8) !void {
         const rel = try workspace.toWireRelPath(self.gpa, entry_path);
         errdefer self.gpa.free(rel);
         var file = try self.directory.openRead(rel);
@@ -548,13 +546,169 @@ pub const Sender = struct {
 
 /// Sync session for bidirectional workspace transfer.
 pub const Session = struct {
+    /// Receiving role. Writes inbound chunks into a destination root.
     receiver: ?Receiver = null,
+    /// Sending role. Reads a source root and queues transfer frames.
     sender: ?Sender = null,
 
     pub fn deinit(self: *Session) void {
         if (self.receiver) |*r| r.deinit();
-        if (self.sender) |*s| s.deinit();
+        if (self.sender) |*p| p.deinit();
         self.* = .{};
+    }
+};
+
+/// The sending role of a workspace transfer. Reads a `Source` and
+/// queues transfer frames with backpressure.
+pub const Sender = struct {
+    gpa: std.mem.Allocator,
+    source: Source,
+    /// Dispatch id stamped onto every frame.
+    job_id: u64,
+    /// Read buffer for one file chunk.
+    chunk_buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined,
+    /// Serialized frame rejected by the writer queue.
+    /// Must be retried before consuming new source events.
+    pending: ?[]u8 = null,
+
+    pub const Status = union(enum) {
+        /// Queued at least one frame, then hit the writer budget.
+        backpressured,
+        /// The budget was already full and nothing was queued.
+        blocked,
+        /// All frames queued, including `sync_end`.
+        ended,
+        /// Unrecoverable failure.
+        failed: struct {
+            message: []const u8,
+            err: anyerror,
+        },
+    };
+
+    /// Open a pump over `root`, stamping frames with `job_id`.
+    pub fn init(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        root: []const u8,
+        exclude: []const []const u8,
+        job_id: u64,
+    ) !Sender {
+        return .{
+            .gpa = gpa,
+            .source = try Source.init(io, gpa, root, exclude),
+            .job_id = job_id,
+        };
+    }
+
+    pub fn deinit(self: *Sender) void {
+        if (self.pending) |frame| self.gpa.free(frame);
+        self.source.deinit();
+    }
+
+    /// Queue frames until the writer budget is reached or the transfer
+    /// is fully queued.
+    pub fn pump(self: *Sender, outbox: *Connection.Writer) Status {
+        var queued_any = false;
+        while (true) {
+            // A backpressured frame is retried before producing new source events
+            if (self.pending) |frame| {
+                outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
+                    error.Backpressure => return if (queued_any)
+                        .backpressured
+                    else
+                        .blocked,
+                    error.Closed => return .{ .failed = .{
+                        .message = "connection closed",
+                        .err = err,
+                    } },
+                    else => return .{ .failed = .{
+                        .message = "failed to queue the workspace transfer",
+                        .err = err,
+                    } },
+                };
+                self.pending = null;
+                queued_any = true;
+            }
+
+            const event = self.source.next(&self.chunk_buf) catch |err| {
+                return .{ .failed = .{
+                    .message = "failed to read the workspace source",
+                    .err = err,
+                } };
+            } orelse return .ended;
+
+            switch (event) {
+                .chunk => |c| {
+                    const frame = protocol.serialize(self.gpa, .{ .file_chunk = .{
+                        .job_id = self.job_id,
+                        .path = c.path,
+                        .offset = c.offset,
+                        .data = c.data,
+                    } }) catch return .{ .failed = .{
+                        .message = "out of memory",
+                        .err = error.OutOfMemory,
+                    } };
+                    outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
+                        error.Backpressure => {
+                            self.pending = frame; // retried on the next pass
+                            return if (queued_any)
+                                .backpressured
+                            else
+                                .blocked;
+                        },
+                        error.Closed => {
+                            self.gpa.free(frame);
+                            return .{ .failed = .{
+                                .message = "connection closed",
+                                .err = err,
+                            } };
+                        },
+                        else => {
+                            self.gpa.free(frame);
+                            return .{ .failed = .{
+                                .message = "failed to queue the workspace transfer",
+                                .err = err,
+                            } };
+                        },
+                    };
+                    queued_any = true;
+                },
+                .file_done => |f| {
+                    const frame = protocol.serialize(self.gpa, .{ .file_done = .{
+                        .job_id = self.job_id,
+                        .path = f.path,
+                        .permissions = f.mode,
+                    } }) catch return .{ .failed = .{
+                        .message = "out of memory",
+                        .err = error.OutOfMemory,
+                    } };
+                    outbox.enqueueOwned(frame) catch |err| {
+                        self.gpa.free(frame);
+                        return .{ .failed = .{
+                            .message = "failed to queue the workspace transfer",
+                            .err = err,
+                        } };
+                    };
+                    queued_any = true;
+                },
+                .end => {
+                    const frame = protocol.serialize(self.gpa, .{ .sync_end = .{
+                        .job_id = self.job_id,
+                    } }) catch return .{ .failed = .{
+                        .message = "out of memory",
+                        .err = error.OutOfMemory,
+                    } };
+                    outbox.enqueueOwned(frame) catch |err| {
+                        self.gpa.free(frame);
+                        return .{ .failed = .{
+                            .message = "failed to queue the workspace transfer",
+                            .err = err,
+                        } };
+                    };
+                    return .ended;
+                },
+            }
+        }
     }
 };
 
@@ -662,11 +816,8 @@ test "receiver_writes_and_commits" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(7));
-    defer {
-        recv.deinit();
-        gpa.destroy(recv);
-    }
+    var recv = try Receiver.init(io, gpa, &store, testBegin(7));
+    defer recv.deinit();
 
     recv.receiveChunk("dir/file.txt", 0, "hello ");
     recv.receiveChunk("dir/file.txt", 6, "world");
@@ -697,11 +848,8 @@ test "receiver_empty_file" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(8));
-    defer {
-        recv.deinit();
-        gpa.destroy(recv);
-    }
+    var recv = try Receiver.init(io, gpa, &store, testBegin(8));
+    defer recv.deinit();
 
     // Zero chunks, only file_done
     recv.finishFile("empty.txt", 0o600);
@@ -723,11 +871,8 @@ test "receiver_rejects_traversal" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(9));
-    defer {
-        recv.deinit();
-        gpa.destroy(recv);
-    }
+    var recv = try Receiver.init(io, gpa, &store, testBegin(9));
+    defer recv.deinit();
 
     recv.receiveChunk("../escape.txt", 0, "x");
     try expect(recv.failed);
@@ -748,11 +893,8 @@ test "receiver_rejects_interleaved_files" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(10));
-    defer {
-        recv.deinit();
-        gpa.destroy(recv);
-    }
+    var recv = try Receiver.init(io, gpa, &store, testBegin(10));
+    defer recv.deinit();
 
     recv.receiveChunk("a.txt", 0, "a");
     recv.receiveChunk("b.txt", 0, "b");
@@ -770,21 +912,15 @@ test "receiver_rejects_impossible_offsets" {
 
     // `offset + len` overflows u64
     {
-        const recv = try Receiver.init(io, gpa, &store, testBegin(18));
-        defer {
-            recv.deinit();
-            gpa.destroy(recv);
-        }
+        var recv = try Receiver.init(io, gpa, &store, testBegin(18));
+        defer recv.deinit();
         recv.receiveChunk("f.bin", std.math.maxInt(u64) - 1, "ab");
         try expect(recv.failed);
     }
 
     {
-        const recv = try Receiver.init(io, gpa, &store, testBegin(19));
-        defer {
-            recv.deinit();
-            gpa.destroy(recv);
-        }
+        var recv = try Receiver.init(io, gpa, &store, testBegin(19));
+        defer recv.deinit();
         recv.receiveChunk("f.bin", MAX_FILE_SIZE + 1, "ab");
         try expect(recv.failed);
     }
@@ -799,11 +935,8 @@ test "receiver_rejects_oversized_chunk" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(11));
-    defer {
-        recv.deinit();
-        gpa.destroy(recv);
-    }
+    var recv = try Receiver.init(io, gpa, &store, testBegin(11));
+    defer recv.deinit();
 
     const big = try gpa.alloc(u8, protocol.SYNC_CHUNK_SIZE + 1);
     defer gpa.free(big);
@@ -839,14 +972,13 @@ test "receiver_abort_removes_staging" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    const recv = try Receiver.init(io, gpa, &store, testBegin(17));
+    var recv = try Receiver.init(io, gpa, &store, testBegin(17));
     const staging = try gpa.dupe(u8, recv.rootDir());
     defer gpa.free(staging);
 
     recv.receiveChunk("f.txt", 0, "data");
     recv.finishFile("f.txt", 0o644);
     recv.deinit();
-    gpa.destroy(recv);
 
     try expectErrorFn(error.FileNotFound, std.Io.Dir.cwd().statFile(io, staging, .{}));
 }
@@ -926,8 +1058,8 @@ test "directory_root_is_canonical" {
     try expect(std.mem.indexOf(u8, dir.root, "/link/") == null);
 }
 
-/// Accumulates sender events per file.
-const SenderEventCollector = struct {
+/// Accumulates source events per file.
+const SourceEventCollector = struct {
     entries: std.ArrayList(Entry) = .empty,
 
     const Entry = struct {
@@ -965,9 +1097,9 @@ const SenderEventCollector = struct {
         return null;
     }
 
-    /// Drain `sender`. Returns whether `.end` was reported.
-    fn drain(self: *@This(), sender: *Sender, gpa: std.mem.Allocator, dest: []u8) !bool {
-        while (try sender.next(dest)) |event| switch (event) {
+    /// Drain `source`. Returns whether `.end` was reported.
+    fn drain(self: *@This(), source: *Source, gpa: std.mem.Allocator, dest: []u8) !bool {
+        while (try source.next(dest)) |event| switch (event) {
             .chunk => |c| try self.chunk(gpa, c.path, c.data),
             .file_done => |f| try self.done(gpa, f.path, f.mode),
             .end => return true,
@@ -984,7 +1116,7 @@ const SenderEventCollector = struct {
     }
 };
 
-test "sender_transfers_files_as_events" {
+test "source_yields_file_events" {
     var env: TestEnv = try .init();
     defer env.deinit();
     const io = env.io;
@@ -1001,15 +1133,15 @@ test "sender_transfers_files_as_events" {
     try createTestFile(&dir, "empty.txt", "");
     try createTestFile(&dir, "dir/c.txt", "test");
 
-    var sender: Sender = try .init(io, gpa, root, &.{});
-    defer sender.deinit();
+    var source: Source = try .init(io, gpa, root, &.{});
+    defer source.deinit();
 
-    var collector: SenderEventCollector = .{};
+    var collector: SourceEventCollector = .{};
     defer collector.deinit(gpa);
 
     var buf: [5]u8 = undefined;
-    try expect(try collector.drain(&sender, gpa, &buf));
-    try expect((try sender.next(&buf)) == null);
+    try expect(try collector.drain(&source, gpa, &buf));
+    try expect((try source.next(&buf)) == null);
 
     try expect(collector.entries.items.len == 4);
     try expectEqualStrings("Hello world!", collector.find("a.txt").?.body.items);
@@ -1026,7 +1158,7 @@ test "sender_transfers_files_as_events" {
     }
 }
 
-test "sender_excludes_and_skips_non_files" {
+test "source_excludes_and_skips_non_files" {
     var env: TestEnv = try .init();
     defer env.deinit();
     const io = env.io;
@@ -1050,16 +1182,16 @@ test "sender_excludes_and_skips_non_files" {
     defer gpa.free(link);
     try std.Io.Dir.cwd().symLink(io, target, link, .{});
 
-    var sender: Sender = try .init(io, gpa, root, &.{
+    var source: Source = try .init(io, gpa, root, &.{
         "skipme.txt",
         "node_modules",
     });
-    defer sender.deinit();
+    defer source.deinit();
 
-    var collector: SenderEventCollector = .{};
+    var collector: SourceEventCollector = .{};
     defer collector.deinit(gpa);
     var buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined;
-    try expect(try collector.drain(&sender, gpa, &buf));
+    try expect(try collector.drain(&source, gpa, &buf));
 
     try expect(collector.entries.items.len == 1);
     try expectEqualStrings("keep", collector.find("keep.txt").?.body.items);

@@ -30,6 +30,42 @@ const JobEntry = struct {
     queued: bool = false,
 };
 
+/// One workspace transfer tracked by the agent.
+const SyncTransfer = struct {
+    session: sync.Session = .{},
+
+    /// Create the transfer requested by `msg`.
+    fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        store: *const workspace.Store,
+        msg: protocol.SyncBeginMsg,
+    ) !*SyncTransfer {
+        var session: sync.Session = switch (msg.direction) {
+            .push => .{
+                .receiver = try sync.Receiver.init(io, gpa, store, msg),
+            },
+            .pull, .both => return error.UnsupportedDirection,
+        };
+        errdefer session.deinit();
+
+        const st = try gpa.create(SyncTransfer);
+        errdefer gpa.destroy(st);
+        st.* = .{ .session = session };
+        return st;
+    }
+
+    /// The receiving role of the transfer, if it has one.
+    fn receiver(self: *SyncTransfer) ?*sync.Receiver {
+        return if (self.session.receiver) |*r| r else null;
+    }
+
+    fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
+        self.session.deinit();
+        gpa.destroy(self);
+    }
+};
+
 pub const RemoteAgent = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -49,8 +85,8 @@ pub const RemoteAgent = struct {
     queue: Queue(*JobNode),
     /// Jobs currently running.
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
-    /// In-flight workspace transfers, keyed by job dispatch id.
-    syncs: std.AutoHashMapUnmanaged(u64, *sync.Receiver),
+    /// Tracked workspace transfers, keyed by job dispatch id.
+    syncs: std.AutoHashMapUnmanaged(u64, *SyncTransfer),
 
     connection: Connection,
     /// Incoming frames from the server.
@@ -139,10 +175,7 @@ pub const RemoteAgent = struct {
         while (it.next()) |e| self.destroyJobEntry(e.value_ptr.*);
         self.jobs.deinit(self.gpa);
         var syncs_it = self.syncs.valueIterator();
-        while (syncs_it.next()) |recv| {
-            recv.*.deinit();
-            self.gpa.destroy(recv.*);
-        }
+        while (syncs_it.next()) |st| st.*.deinit(self.gpa);
         self.syncs.deinit(self.gpa);
         self.result_queue.close(self.io);
         while (true) {
@@ -371,12 +404,7 @@ pub const RemoteAgent = struct {
             log.warn("Ignoring duplicate sync_begin for job {x}", .{msg.job_id});
             return;
         }
-        const recv = sync.Receiver.init(
-            self.io,
-            self.gpa,
-            &self.workspaces,
-            msg,
-        ) catch |err| {
+        const st = SyncTransfer.start(self.io, self.gpa, &self.workspaces, msg) catch |err| {
             log.warn("Rejected workspace sync for job {x}: {s}", .{
                 msg.job_id,
                 @errorName(err),
@@ -384,18 +412,20 @@ pub const RemoteAgent = struct {
             self.sendSyncAck(msg.job_id, false, @errorName(err));
             return;
         };
-        self.syncs.put(self.gpa, msg.job_id, recv) catch |err| {
+        // A dispatch that arrived first already owns this workspace tree
+        if (self.jobs.contains(msg.job_id)) {
+            if (st.receiver()) |r| r.workspace.disown();
+        }
+
+        self.syncs.put(self.gpa, msg.job_id, st) catch |err| {
             log.err("Failed to track workspace sync for job {x}: {s}", .{
                 msg.job_id,
                 @errorName(err),
             });
-            recv.deinit();
-            self.gpa.destroy(recv);
             self.sendSyncAck(msg.job_id, false, "out of memory");
+            st.deinit(self.gpa);
             return;
         };
-        // A dispatch that arrived first already owns this workspace tree.
-        if (self.jobs.contains(msg.job_id)) recv.workspace.disown();
     }
 
     /// Accept the workspace manifest.
@@ -411,9 +441,15 @@ pub const RemoteAgent = struct {
         // TODO: handle manifest
     }
 
+    /// The receiving role of a tracked transfer, if it has one.
+    fn transferReceiver(self: *RemoteAgent, job_id: u64) ?*sync.Receiver {
+        const st = self.syncs.get(job_id) orelse return null;
+        return st.receiver();
+    }
+
     /// Write one file chunk of an in-flight transfer.
     fn handleSyncChunk(self: *RemoteAgent, msg: protocol.FileChunkMsg) void {
-        const recv = self.syncs.get(msg.job_id) orelse {
+        const recv = self.transferReceiver(msg.job_id) orelse {
             log.debug("Ignoring file chunk for unknown sync {x}", .{msg.job_id});
             return;
         };
@@ -422,7 +458,7 @@ pub const RemoteAgent = struct {
 
     /// Complete one file of an in-flight transfer.
     fn handleSyncFileDone(self: *RemoteAgent, msg: protocol.FileDoneMsg) void {
-        const recv = self.syncs.get(msg.job_id) orelse {
+        const recv = self.transferReceiver(msg.job_id) orelse {
             log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
             return;
         };
@@ -431,7 +467,12 @@ pub const RemoteAgent = struct {
 
     /// Validate and commit a finished transfer, then run any job waiting on it.
     fn handleSyncEnd(self: *RemoteAgent, msg: protocol.SyncEndMsg) void {
-        const recv = self.syncs.get(msg.job_id) orelse {
+        const st = self.syncs.get(msg.job_id) orelse {
+            self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
+            return;
+        };
+        const recv = st.receiver() orelse {
+            log.debug("Ignoring sync_end for transfer {x} without a receiver", .{msg.job_id});
             self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
             return;
         };
@@ -489,7 +530,7 @@ pub const RemoteAgent = struct {
     fn queueJob(self: *RemoteAgent, msg: protocol.RunJobMsg) !void {
         if (self.jobs.contains(msg.job_id)) return error.JobRunning;
 
-        const recv = self.syncs.get(msg.job_id);
+        const recv = self.transferReceiver(msg.job_id);
         if (recv) |r| {
             // An in-flight transfer must match the dispatch plan
             if (msg.workspace == .none) return error.WorkspaceMismatch;
@@ -591,12 +632,10 @@ pub const RemoteAgent = struct {
         self.removeJob(job_id);
     }
 
-    /// Delete a transfer's staging dir and free the receiver.
+    /// Delete a transfer's staging dir and free its tracked state.
     fn destroySync(self: *RemoteAgent, job_id: u64) void {
         const kv = self.syncs.fetchRemove(job_id) orelse return;
-        const recv = kv.value;
-        recv.deinit();
-        self.gpa.destroy(recv);
+        kv.value.deinit(self.gpa);
     }
 
     /// Queue a message for delivery by the writer thread.

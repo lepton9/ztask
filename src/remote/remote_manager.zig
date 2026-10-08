@@ -278,10 +278,6 @@ const SyncTransfer = struct {
     agent_fd: std.Io.net.Socket.Handle,
     /// Transfer session roles.
     session: sync.Session,
-    /// Read buffer for one file chunk.
-    chunk_buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined,
-    /// Serialized frame waiting for queue space.
-    pending: ?[]u8 = null,
     /// Set once the writer queue is full.
     paused: bool = false,
     /// Set once the transfer is completed.
@@ -294,10 +290,13 @@ const SyncTransfer = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         agent_fd: std.Io.net.Socket.Handle,
+        job_id: u64,
         spec: SyncSpec,
     ) !*SyncTransfer {
         var session: sync.Session = switch (spec.direction) {
-            .push => .{ .sender = try sync.Sender.init(io, gpa, spec.source_root, &.{}) },
+            .push => .{
+                .sender = try sync.Sender.init(io, gpa, spec.source_root, &.{}, job_id),
+            },
             .pull, .both => return error.UnsupportedDirection,
         };
         errdefer session.deinit();
@@ -314,7 +313,6 @@ const SyncTransfer = struct {
 
     fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
         self.session.deinit();
-        if (self.pending) |frame| gpa.free(frame);
         gpa.destroy(self);
     }
 };
@@ -1000,6 +998,7 @@ pub const RemoteManager = struct {
             self.io,
             self.gpa,
             agent.connection.conn.stream.socket.handle,
+            job_id,
             spec,
         ) catch |err| return self.failSyncedDispatchErr(
             job_id,
@@ -1041,8 +1040,8 @@ pub const RemoteManager = struct {
         st.last_progress_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
     }
 
-    /// Queue transfer frames for one in-flight session until the agent
-    /// queue reaches its byte budget or the transfer is fully queued.
+    /// Pump one in-flight session, mapping the sender's outcome onto
+    /// manager scheduling and failure policy.
     fn pumpTransfer(
         self: *RemoteManager,
         job_id: u64,
@@ -1050,98 +1049,18 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
     ) void {
         const sender = &(st.session.sender orelse return);
-
-        while (!st.ended) {
-            // Retry a backpressured frame first
-            if (st.pending) |frame| {
-                agent.writer.outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
-                    error.Backpressure => {
-                        st.paused = true;
-                        return;
-                    },
-                    error.Closed => return self.failSyncedDispatch(
-                        job_id,
-                        "agent connection closed",
-                    ),
-                    else => return self.failSyncedDispatchErr(
-                        job_id,
-                        "failed to queue the workspace transfer",
-                        err,
-                    ),
-                };
-                st.pending = null;
+        switch (sender.pump(&agent.writer.outbox)) {
+            .backpressured => {
+                st.paused = true;
                 self.touchSync(st);
-            }
-
-            const event = sender.next(&st.chunk_buf) catch |err| {
-                return self.failSyncedDispatchErr(
-                    job_id,
-                    "failed to read the workspace source",
-                    err,
-                );
-            } orelse return;
-
-            switch (event) {
-                .chunk => |c| {
-                    const frame = protocol.serialize(self.gpa, .{ .file_chunk = .{
-                        .job_id = job_id,
-                        .path = c.path,
-                        .offset = c.offset,
-                        .data = c.data,
-                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
-                    agent.writer.outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
-                        error.Backpressure => {
-                            st.pending = frame; // retried on the next pass
-                            st.paused = true;
-                            return;
-                        },
-                        error.Closed => {
-                            self.gpa.free(frame);
-                            return self.failSyncedDispatch(job_id, "agent connection closed");
-                        },
-                        else => {
-                            self.gpa.free(frame);
-                            return self.failSyncedDispatchErr(
-                                job_id,
-                                "failed to queue the workspace transfer",
-                                err,
-                            );
-                        },
-                    };
-                    self.touchSync(st);
-                },
-                .file_done => |f| {
-                    const frame = protocol.serialize(self.gpa, .{ .file_done = .{
-                        .job_id = job_id,
-                        .path = f.path,
-                        .permissions = f.mode,
-                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
-                    self.sendMessageOwned(agent, frame) catch |err| {
-                        self.gpa.free(frame);
-                        return self.failSyncedDispatchErr(
-                            job_id,
-                            "failed to send file_done",
-                            err,
-                        );
-                    };
-                    self.touchSync(st);
-                },
-                .end => {
-                    const frame = protocol.serialize(self.gpa, .{ .sync_end = .{
-                        .job_id = job_id,
-                    } }) catch return self.failSyncedDispatch(job_id, "out of memory");
-                    self.sendMessageOwned(agent, frame) catch |err| {
-                        self.gpa.free(frame);
-                        return self.failSyncedDispatchErr(
-                            job_id,
-                            "failed to send sync_end",
-                            err,
-                        );
-                    };
-                    st.ended = true;
-                    self.touchSync(st);
-                },
-            }
+            },
+            // No frame was queued, so no progress
+            .blocked => st.paused = true,
+            .ended => {
+                st.ended = true;
+                self.touchSync(st);
+            },
+            .failed => |f| self.failSyncedDispatchErr(job_id, f.message, f.err),
         }
     }
 
@@ -1476,7 +1395,7 @@ test "sync_pump_retries_pending_frames_in_order" {
     var agent = try FakeAgent.init(io, gpa, protocol.MAX_FRAME_SIZE);
     defer agent.deinit(gpa);
 
-    const st = try testTransfer(io, gpa, source_root, 1);
+    const st = try testTransfer(io, gpa, source_root, 7, 1);
     try manager.syncs.put(manager.gpa, 7, st);
 
     var frames: std.ArrayList([]u8) = .empty;
@@ -1498,7 +1417,7 @@ test "sync_pump_retries_pending_frames_in_order" {
     while (agent.writer.outbox.send_queue.tryPop()) |frame|
         try frames.append(gpa, frame);
 
-    try expect(st.pending == null);
+    try expect(st.session.sender.?.pending == null);
     // 3 chunk frames + file_done + sync_end.
     try expect(frames.items.len == 5);
 
@@ -1540,13 +1459,13 @@ test "sync_pump_fails_transfer_on_closed_writer" {
     var agent = try FakeAgent.init(io, gpa, 0);
     defer agent.deinit(gpa);
 
-    const st = try testTransfer(io, gpa, source_root, 1);
+    const st = try testTransfer(io, gpa, source_root, 7, 1);
     try manager.syncs.put(manager.gpa, 7, st);
 
     // First pump backpressures, leaving one chunk pending
     manager.pumpTransfer(7, st, &agent.handle);
     try expect(st.paused);
-    try expect(st.pending != null);
+    try expect(st.session.sender.?.pending != null);
 
     // Once the queue is closed, the next pump must remove the transfer
     agent.writer.outbox.closeQueue();
@@ -1560,15 +1479,14 @@ fn testTransfer(
     io: std.Io,
     gpa: std.mem.Allocator,
     source_root: []const u8,
+    job_id: u64,
     agent_fd: std.Io.net.Socket.Handle,
 ) !*SyncTransfer {
-    var sender = try sync.Sender.init(io, gpa, source_root, &.{});
-    errdefer sender.deinit();
     const st = try gpa.create(SyncTransfer);
     errdefer gpa.destroy(st);
     st.* = .{
         .agent_fd = agent_fd,
-        .session = .{ .sender = sender },
+        .session = .{ .sender = try sync.Sender.init(io, gpa, source_root, &.{}, job_id) },
         .last_progress_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds(),
     };
     return st;
@@ -1682,18 +1600,18 @@ test "sync_stall_reaper_fails_and_disconnects" {
 
     try putTestDispatch(manager, 7, source_root, agent_fd);
 
-    const stalled = try testTransfer(io, gpa, source_root, agent_fd);
+    const stalled = try testTransfer(io, gpa, source_root, 7, agent_fd);
     try manager.syncs.put(manager.gpa, 7, stalled);
     // Pump once so the transfer holds a pending frame
     manager.pumpTransfer(7, stalled, manager.agents.getPtr(agent_fd).?);
-    try expect(stalled.pending != null);
+    try expect(stalled.session.sender.?.pending != null);
 
-    const unacked = try testTransfer(io, gpa, source_root, 2);
+    const unacked = try testTransfer(io, gpa, source_root, 8, 2);
     unacked.ended = true;
     try manager.syncs.put(manager.gpa, 8, unacked);
     try putTestDispatch(manager, 8, source_root, 2);
 
-    const fresh = try testTransfer(io, gpa, source_root, 3);
+    const fresh = try testTransfer(io, gpa, source_root, 9, 3);
     try manager.syncs.put(manager.gpa, 9, fresh);
 
     const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
