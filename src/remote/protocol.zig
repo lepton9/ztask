@@ -127,6 +127,7 @@ fn initSerializeTable() [MsgUnionInfo.fields.len]SerializeFn {
 fn minSerializedLen(comptime T: type) usize {
     switch (@typeInfo(T)) {
         .@"struct" => |s| {
+            if (comptime asListView(T)) |_| return @sizeOf(u32); // count prefix only
             var total: usize = 0;
             inline for (s.fields) |field| total += minSerializedLen(field.type);
             return total;
@@ -145,14 +146,54 @@ fn minSerializedLen(comptime T: type) usize {
     }
 }
 
-/// Initializes a message prefixed with the given type
-fn initMsgPrefix(
-    gpa: std.mem.Allocator,
-    msg_type: Msg.Tag,
-) !std.ArrayList(u8) {
-    var buf = try std.ArrayList(u8).initCapacity(gpa, 1);
-    buf.appendAssumeCapacity(@intFromEnum(msg_type));
-    return buf;
+/// Maximum wire size of a serialized `T`, or `null` when unbounded.
+fn maxSerializedLen(comptime T: type) ?usize {
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime asListView(T)) |_| return null;
+            var total: usize = 0;
+            inline for (s.fields) |field| {
+                total += maxSerializedLen(field.type) orelse return null;
+            }
+            return total;
+        },
+        .optional => |o| return 1 + (maxSerializedLen(o.child) orelse return null),
+        .pointer => |p| {
+            if (p.size != .slice or p.child != u8)
+                @compileError("Only []const u8 slices supported");
+            return null;
+        },
+        .void => return 0,
+        else => return minSerializedLen(T),
+    }
+}
+
+/// Exact serialized size of `value` in bytes.
+fn serializedLen(comptime T: type, value: T) usize {
+    switch (comptime @typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime asListView(T)) |L| {
+                const list: ListView(L.ItemType) = value;
+                if (list.items.len == 0) return @sizeOf(u32) + list.buf.len;
+                var total: usize = @sizeOf(u32);
+                for (list.items) |elem| total += serializedLen(L.ItemType, elem);
+                return total;
+            }
+
+            var total: usize = 0;
+            inline for (s.fields) |field|
+                total += serializedLen(field.type, @field(value, field.name));
+            return total;
+        },
+        .optional => |o| return if (value) |v| 1 + serializedLen(o.child, v) else 1,
+        .pointer => |p| {
+            if (p.size != .slice or p.child != u8)
+                @compileError("Only []const u8 slices supported");
+            return @sizeOf(u32) + value.len;
+        },
+        .int, .@"enum", .bool, .void => return comptime minSerializedLen(T),
+        else => @compileError("Unsupported field type" ++ @typeInfo(T)),
+    }
 }
 
 pub const RegisterMsg = struct {
@@ -329,99 +370,85 @@ pub const SyncAckMsg = struct {
 };
 
 /// Serialize a struct to a payload with message type prefix
-pub fn serializePayload(
+fn serializePayload(
     comptime T: type,
     comptime M: Msg.Tag,
     gpa: std.mem.Allocator,
     value: T,
 ) error{OutOfMemory}![]u8 {
-    var msg = try initMsgPrefix(gpa, M);
-    const serialized = try serializeAlloc(T, gpa, value);
-    defer gpa.free(serialized);
-    try msg.appendSlice(gpa, serialized);
+    var msg = try std.ArrayList(u8).initCapacity(gpa, 1 + serializedLen(T, value));
+    errdefer msg.deinit(gpa);
+    msg.appendAssumeCapacity(@intFromEnum(M));
+    serializeField(T, value, &msg);
+    std.debug.assert(msg.items.len == msg.capacity);
     return msg.toOwnedSlice(gpa);
 }
 
-/// Serialize a type to a string
-pub fn serializeAlloc(
+/// Serialize a type into a string.
+fn serializeAlloc(
     comptime T: type,
     gpa: std.mem.Allocator,
     value: T,
 ) error{OutOfMemory}![]u8 {
-    const info = comptime @typeInfo(T);
-    var msg = try std.ArrayList(u8).initCapacity(gpa, 128);
-
-    switch (info) {
-        .@"struct" => inline for (info.@"struct".fields) |field| {
-            const field_val = @field(value, field.name);
-            try serializeField(gpa, field.type, field_val, &msg);
-        },
-        else => try serializeField(gpa, T, value, &msg),
-    }
+    var msg = try std.ArrayList(u8).initCapacity(gpa, serializedLen(T, value));
+    errdefer msg.deinit(gpa);
+    serializeField(T, value, &msg);
+    std.debug.assert(msg.items.len == msg.capacity);
     return msg.toOwnedSlice(gpa);
 }
 
-/// Deserialize a string to a type
-pub fn deserialize(
+/// Deserialize a string to a type.
+fn deserialize(
     comptime T: type,
     msg: []const u8,
 ) error{ InvalidMsg, InvalidEnumValue }!T {
-    var out: T = undefined;
     var pos: usize = 0;
-
-    const info = comptime @typeInfo(T);
-
-    switch (info) {
-        .@"struct" => inline for (info.@"struct".fields) |field| {
-            if (pos > msg.len) return error.InvalidMsg;
-            const FieldType = field.type;
-            @field(out, field.name) = try deserializeField(FieldType, msg, &pos);
-        },
-        else => return deserializeField(T, msg, &pos),
-    }
-    return out;
+    return deserializeField(T, msg, &pos);
 }
 
-/// Serialize a `field` of type `T` and append it to `msg`
+/// Append the serialized form of `value` to `msg`, which must have spare
+/// capacity for exactly `serializedLen(T, value)` bytes.
 fn serializeField(
-    gpa: std.mem.Allocator,
     comptime T: type,
-    field: T,
+    value: T,
     msg: *std.ArrayList(u8),
-) error{OutOfMemory}!void {
+) void {
     var buf: [64]u8 = undefined;
-    switch (@typeInfo(T)) {
+    switch (comptime @typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime asListView(T)) |L| return serializeList(L.ItemType, value, msg);
+            inline for (s.fields) |field| {
+                serializeField(field.type, @field(value, field.name), msg);
+            }
+        },
         .@"enum" => |e| {
             const Tag = e.tag_type;
-            const raw: Tag = @intFromEnum(field);
+            const raw: Tag = @intFromEnum(value);
             const bytes = @divExact(@typeInfo(Tag).int.bits, 8);
             std.mem.writeInt(Tag, buf[0..bytes], raw, .little);
-            try msg.appendSlice(gpa, buf[0..bytes]);
+            msg.appendSliceAssumeCapacity(buf[0..bytes]);
         },
         .int => |i| {
             const bytes = @divExact(i.bits, 8);
-            std.mem.writeInt(T, buf[0..bytes], field, .little);
-            try msg.appendSlice(gpa, buf[0..bytes]);
+            std.mem.writeInt(T, buf[0..bytes], value, .little);
+            msg.appendSliceAssumeCapacity(buf[0..bytes]);
         },
         .pointer => |p| {
             if (p.size != .slice or p.child != u8)
                 @compileError("Only []const u8 slices supported");
             const size = @sizeOf(u32);
-            const slice: []const u8 = @ptrCast(field);
+            const slice: []const u8 = @ptrCast(value);
             std.mem.writeInt(u32, buf[0..size], @intCast(slice.len), .little);
-            try msg.appendSlice(gpa, buf[0..size]); // length prefix
-            try msg.appendSlice(gpa, slice);
+            msg.appendSliceAssumeCapacity(buf[0..size]); // length prefix
+            msg.appendSliceAssumeCapacity(slice);
         },
-        .bool => {
-            std.mem.writeInt(u8, buf[0..1], @intFromBool(field), .little);
-            try msg.appendSlice(gpa, buf[0..1]);
-        },
+        .bool => msg.appendAssumeCapacity(@intFromBool(value)),
         .optional => |o| {
-            if (field) |val| {
-                try msg.append(gpa, 1);
-                try serializeField(gpa, o.child, val, msg);
+            if (value) |val| {
+                msg.appendAssumeCapacity(1);
+                serializeField(o.child, val, msg);
             } else {
-                try msg.append(gpa, 0);
+                msg.appendAssumeCapacity(0);
             }
         },
         .void => return,
@@ -438,7 +465,15 @@ fn deserializeField(
     buffer: []const u8,
     pos: *usize,
 ) error{ InvalidMsg, InvalidEnumValue }!T {
-    switch (@typeInfo(T)) {
+    switch (comptime @typeInfo(T)) {
+        .@"struct" => |s| {
+            if (comptime asListView(T)) |L| return deserializeList(L.ItemType, buffer, pos);
+            var value: T = undefined;
+            inline for (s.fields) |field| {
+                @field(value, field.name) = try deserializeField(field.type, buffer, pos);
+            }
+            return value;
+        },
         .@"enum" => |e| {
             const Tag = e.tag_type;
             const raw: Tag = try deserializeField(Tag, buffer, pos);
@@ -493,14 +528,144 @@ fn deserializeField(
     }
 }
 
+/// A zero-allocation view over a list of serialized elements, decoded on
+/// demand.
+pub fn ListView(comptime T: type) type {
+    return struct {
+        const Self = @This();
+
+        /// Type of the elements in the list.
+        pub const ItemType = T;
+
+        /// Materialized elements. When non-empty, `buf` and `count` are unused.
+        items: []const T = &.{},
+        /// Serialized elements. Empty when built from a materialized slice.
+        buf: []const u8 = &.{},
+        /// Element count in buffer mode. Ignored when `items` is non-empty.
+        count: usize = 0,
+
+        /// Wire size of one element, or `null` when elements vary in size.
+        const fixed_elem_size: ?usize = elemSize();
+
+        /// Calculate the element size when serialized, if it is fixed.
+        fn elemSize() ?usize {
+            const min = comptime minSerializedLen(T);
+            const max = comptime maxSerializedLen(T) orelse return null;
+            return if (max == min) min else null;
+        }
+
+        /// Validate `count` serialized elements in `buf` and return a view
+        /// over them, with `buf` trimmed to the bytes they occupy.
+        pub fn fromBuffer(buf: []const u8, count: usize) error{InvalidList}!Self {
+            const min = comptime minSerializedLen(T);
+            if (count > buf.len / @max(1, min)) return error.InvalidList;
+            if (fixed_elem_size) |size| {
+                return .{ .buf = buf[0 .. count * size], .count = count };
+            }
+            var pos: usize = 0;
+            for (0..count) |_| {
+                _ = deserializeField(T, buf, &pos) catch return error.InvalidList;
+            }
+            return .{ .buf = buf[0..pos], .count = count };
+        }
+
+        /// Wrap an already materialized element slice.
+        pub fn fromSlice(items: []const T) Self {
+            return .{ .items = items };
+        }
+
+        pub fn len(self: Self) usize {
+            return if (self.items.len != 0) self.items.len else self.count;
+        }
+
+        /// Decode element `i` on demand.
+        /// O(i) for variable-size elements, O(1) for fixed-size ones.
+        pub fn at(self: Self, i: usize) ?T {
+            if (i >= self.len()) return null;
+            if (self.items.len != 0) return self.items[i];
+            var pos: usize = 0;
+            if (fixed_elem_size) |size| {
+                pos = i * size;
+            } else for (0..i) |_| {
+                _ = deserializeField(T, self.buf, &pos) catch return null;
+            }
+            return deserializeField(T, self.buf, &pos) catch null;
+        }
+
+        pub const Iterator = struct {
+            view: Self,
+            idx: usize = 0,
+            pos: usize = 0,
+
+            pub fn next(self: *Iterator) ?T {
+                const i = self.idx;
+                if (i >= self.view.len()) return null;
+                self.idx = i + 1;
+                if (self.view.items.len != 0) return self.view.items[i];
+                return deserializeField(T, self.view.buf, &self.pos) catch null;
+            }
+        };
+
+        pub fn iterator(self: Self) Iterator {
+            return .{ .view = self };
+        }
+    };
+}
+
+/// The `ListView` instantiation `T` is, or `null` when `T` is anything else.
+fn asListView(comptime T: type) ?type {
+    switch (comptime @typeInfo(T)) {
+        .@"struct" => {
+            if (!@hasDecl(T, "ItemType")) return null;
+            const ListType = ListView(T.ItemType);
+            if (T != ListType) return null;
+            return ListType;
+        },
+        else => return null,
+    }
+}
+
+/// Serialize a list field. `u32` count prefix, then the serialized elements.
+fn serializeList(
+    comptime E: type,
+    list: ListView(E),
+    msg: *std.ArrayList(u8),
+) void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], @intCast(list.len()), .little);
+    msg.appendSliceAssumeCapacity(buf[0..4]);
+    if (list.items.len != 0) {
+        for (list.items) |elem| serializeField(E, elem, msg);
+    } else {
+        msg.appendSliceAssumeCapacity(list.buf);
+    }
+}
+
+/// Decode a list field from a `u32` count prefix followed by the
+/// serialized elements, advancing `pos` past the whole list.
+fn deserializeList(
+    comptime E: type,
+    buffer: []const u8,
+    pos: *usize,
+) error{InvalidMsg}!ListView(E) {
+    const size = @sizeOf(u32);
+    if (pos.* + size > buffer.len) return error.InvalidMsg;
+    const count = std.mem.readInt(u32, @ptrCast(buffer[pos.* .. pos.* + size]), .little);
+    pos.* += size;
+    const view = ListView(E).fromBuffer(buffer[pos.*..], count) catch
+        return error.InvalidMsg;
+    pos.* += view.buf.len;
+    return view;
+}
+
 test "integer" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: u64 = 123;
     const msg1: i16 = -10;
-    const serialized = try serializeAlloc(u64, alloc, msg);
-    const serialized1 = try serializeAlloc(i16, alloc, msg1);
-    defer alloc.free(serialized);
-    defer alloc.free(serialized1);
+    const serialized = try serializeAlloc(u64, gpa, msg);
+    const serialized1 = try serializeAlloc(i16, gpa, msg1);
+    defer gpa.free(serialized);
+    defer gpa.free(serialized1);
     const parsed_msg = try deserialize(u64, serialized);
     const parsed_msg1 = try deserialize(i16, serialized1);
     try std.testing.expect(msg == parsed_msg);
@@ -508,14 +673,14 @@ test "integer" {
 }
 
 test "boolean" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const T: type = struct { a: bool, b: bool };
     const s: T = .{ .a = false, .b = true };
     const b: bool = true;
-    const serialized_s = try serializeAlloc(T, alloc, s);
-    const serialized_b = try serializeAlloc(bool, alloc, b);
-    defer alloc.free(serialized_s);
-    defer alloc.free(serialized_b);
+    const serialized_s = try serializeAlloc(T, gpa, s);
+    const serialized_b = try serializeAlloc(bool, gpa, b);
+    defer gpa.free(serialized_s);
+    defer gpa.free(serialized_b);
     const parsed_s = try deserialize(T, serialized_s);
     const parsed_b = try deserialize(bool, serialized_b);
     try std.testing.expect(b == parsed_b);
@@ -524,11 +689,11 @@ test "boolean" {
 }
 
 test "struct_multiple_slices" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const T: type = struct { a: []const u8, b: []const u8, c: []const u8 };
     const s: T = .{ .a = "asd", .b = "", .c = "Some text" };
-    const serialized = try serializeAlloc(T, alloc, s);
-    defer alloc.free(serialized);
+    const serialized = try serializeAlloc(T, gpa, s);
+    defer gpa.free(serialized);
     const parsed: T = try deserialize(T, serialized);
     try std.testing.expect(std.mem.eql(u8, s.a, parsed.a));
     try std.testing.expect(std.mem.eql(u8, s.b, parsed.b));
@@ -536,11 +701,11 @@ test "struct_multiple_slices" {
 }
 
 test "struct_mix_fields" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const T: type = struct { a: []const u8, b: u32, c: []const u8, d: i64 };
     const s: T = .{ .a = "asd", .b = 67, .c = "\"Testing\"", .d = 987654321 };
-    const serialized = try serializeAlloc(T, alloc, s);
-    defer alloc.free(serialized);
+    const serialized = try serializeAlloc(T, gpa, s);
+    defer gpa.free(serialized);
     const parsed: T = try deserialize(T, serialized);
     try std.testing.expect(std.mem.eql(u8, s.a, parsed.a));
     try std.testing.expect(s.b == parsed.b);
@@ -549,20 +714,20 @@ test "struct_mix_fields" {
 }
 
 test "register" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: RegisterMsg = .{ .version = VERSION, .hostname = "test" };
-    const serialized = try serialize(alloc, .{ .register = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .register = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: RegisterMsg = parsed_msg.register;
     try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
 }
 
 test "job_start" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: JobStartMsg = .{ .job_id = 1, .timestamp = 0 };
-    const serialized = try serialize(alloc, .{ .job_start = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .job_start = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: JobStartMsg = parsed_msg.job_start;
     try std.testing.expect(msg.job_id == parsed.job_id);
@@ -570,10 +735,10 @@ test "job_start" {
 }
 
 test "job_log" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
-    const serialized = try serialize(alloc, .{ .job_log = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .job_log = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: JobLogMsg = parsed_msg.job_log;
     try std.testing.expect(msg.job_id == parsed.job_id);
@@ -583,14 +748,14 @@ test "job_log" {
 
 test "job_end" {
     const io = std.testing.io;
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: JobEndMsg = .{
         .job_id = 1337,
         .timestamp = std.Io.Timestamp.now(io, .real).toMilliseconds(),
         .success = true,
     };
-    const serialized = try serialize(alloc, .{ .job_finish = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .job_finish = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: JobEndMsg = parsed_msg.job_finish;
     try std.testing.expect(msg.job_id == parsed.job_id);
@@ -603,8 +768,8 @@ test "job_end" {
         .success = false,
         .message = "Command exited with an unexpected exit code",
     };
-    const null_serialized = try serialize(alloc, .{ .job_finish = null_msg });
-    defer alloc.free(null_serialized);
+    const null_serialized = try serialize(gpa, .{ .job_finish = null_msg });
+    defer gpa.free(null_serialized);
     const null_parsed_msg = try parse(null_serialized);
     const null_parsed: JobEndMsg = null_parsed_msg.job_finish;
     try std.testing.expect(null_msg.job_id == null_parsed.job_id);
@@ -613,7 +778,7 @@ test "job_end" {
 }
 
 test "run_job" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     var steps = [_]task.Step{
         .{ .command = .{ .value = "command" } },
         .{ .command = .{ .value = "" } },
@@ -623,18 +788,18 @@ test "run_job" {
         .task_id = "task-111",
         .job_name = "build",
         .workspace = .persistent,
-        .steps = try RunJobMsg.serializeSteps(alloc, &steps),
+        .steps = try RunJobMsg.serializeSteps(gpa, &steps),
     };
-    defer alloc.free(msg.steps);
+    defer gpa.free(msg.steps);
 
-    const serialized = try serialize(alloc, .{ .run_job = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .run_job = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
-    const parsed_steps = try parsed.parseSteps(alloc);
+    const parsed_steps = try parsed.parseSteps(gpa);
     defer {
-        for (parsed_steps) |step| step.deinit(alloc);
-        alloc.free(parsed_steps);
+        for (parsed_steps) |step| step.deinit(gpa);
+        gpa.free(parsed_steps);
     }
 
     try std.testing.expect(msg.job_id == parsed.job_id);
@@ -650,26 +815,26 @@ test "run_job" {
 }
 
 test "cancel_job" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: CancelJobMsg = .{ .job_id = 1 };
-    const serialized = try serialize(alloc, .{ .cancel_job = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .cancel_job = msg });
+    defer gpa.free(serialized);
     const parsed = try parse(serialized);
     try std.testing.expect(msg.job_id == parsed.cancel_job.job_id);
 }
 
 test "error_message" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: ErrorMsg = .{ .code = ErrorCode.NameTaken, .message = "taken" };
-    const serialized = try serialize(alloc, .{ .error_msg = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .error_msg = msg });
+    defer gpa.free(serialized);
     const parsed = try parse(serialized);
     try std.testing.expect(msg.code == parsed.error_msg.code);
     try std.testing.expect(std.mem.eql(u8, msg.message, parsed.error_msg.message));
 }
 
 test "sync_begin" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: SyncBeginMsg = .{
         .job_id = 42,
         .task_id = "task-id",
@@ -678,8 +843,8 @@ test "sync_begin" {
         .direction = .push,
         .config_json = "{\"exclude\":[\".zig-cache\",\"node_modules\"]}",
     };
-    const serialized = try serialize(alloc, .{ .sync_begin = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .sync_begin = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: SyncBeginMsg = parsed_msg.sync_begin;
     try expect(msg.job_id == parsed.job_id);
@@ -691,13 +856,13 @@ test "sync_begin" {
 }
 
 test "manifest" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: ManifestMsg = .{
         .job_id = 7,
         .manifest_json = "[{\"path\":\"src/main.zig\",\"size\":123}]",
     };
-    const serialized = try serialize(alloc, .{ .manifest = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .manifest = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: ManifestMsg = parsed_msg.manifest;
     try expect(msg.job_id == parsed.job_id);
@@ -705,10 +870,10 @@ test "manifest" {
 }
 
 test "file_req" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: FileReqMsg = .{ .job_id = 9, .path = "src/lib.zig", .offset = 4096 };
-    const serialized = try serialize(alloc, .{ .file_req = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .file_req = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: FileReqMsg = parsed_msg.file_req;
     try expect(msg.job_id == parsed.job_id);
@@ -717,9 +882,9 @@ test "file_req" {
 }
 
 test "file_chunk" {
-    const alloc = std.testing.allocator;
-    const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
-    defer alloc.free(data);
+    const gpa = std.testing.allocator;
+    const data = try gpa.alloc(u8, SYNC_CHUNK_SIZE);
+    defer gpa.free(data);
     for (data, 0..) |*byte, i| byte.* = @truncate(i);
     const msg: FileChunkMsg = .{
         .job_id = 11,
@@ -727,8 +892,8 @@ test "file_chunk" {
         .offset = 2048,
         .data = data,
     };
-    const serialized = try serialize(alloc, .{ .file_chunk = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .file_chunk = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: FileChunkMsg = parsed_msg.file_chunk;
     try expect(msg.job_id == parsed.job_id);
@@ -739,10 +904,10 @@ test "file_chunk" {
 }
 
 test "file_done" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: FileDoneMsg = .{ .job_id = 3, .path = "scripts/run.sh", .permissions = 0o755 };
-    const serialized = try serialize(alloc, .{ .file_done = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .file_done = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: FileDoneMsg = parsed_msg.file_done;
     try expect(msg.job_id == parsed.job_id);
@@ -751,20 +916,20 @@ test "file_done" {
 }
 
 test "sync_end" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: SyncEndMsg = .{ .job_id = 5 };
-    const serialized = try serialize(alloc, .{ .sync_end = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .sync_end = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: SyncEndMsg = parsed_msg.sync_end;
     try expect(msg.job_id == parsed.job_id);
 }
 
 test "sync_ack" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const msg: SyncAckMsg = .{ .job_id = 1337, .ok = true };
-    const serialized = try serialize(alloc, .{ .sync_ack = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .sync_ack = msg });
+    defer gpa.free(serialized);
     const parsed_msg = try parse(serialized);
     const parsed: SyncAckMsg = parsed_msg.sync_ack;
     try expect(msg.job_id == parsed.job_id);
@@ -776,8 +941,8 @@ test "sync_ack" {
         .ok = false,
         .message = "File chunk rejected: path escapes the workspace",
     };
-    const fail_serialized = try serialize(alloc, .{ .sync_ack = fail_msg });
-    defer alloc.free(fail_serialized);
+    const fail_serialized = try serialize(gpa, .{ .sync_ack = fail_msg });
+    defer gpa.free(fail_serialized);
     const fail_parsed_msg = try parse(fail_serialized);
     const fail_parsed: SyncAckMsg = fail_parsed_msg.sync_ack;
     try expect(fail_parsed.job_id == fail_msg.job_id);
@@ -786,14 +951,14 @@ test "sync_ack" {
 }
 
 test "sync_chunk_frame_budget" {
-    const alloc = std.testing.allocator;
+    const gpa = std.testing.allocator;
     const path = "a" ** SYNC_MAX_PATH_LEN;
-    const data = try alloc.alloc(u8, SYNC_CHUNK_SIZE);
-    defer alloc.free(data);
+    const data = try gpa.alloc(u8, SYNC_CHUNK_SIZE);
+    defer gpa.free(data);
     @memset(data, 0xab);
     const msg: FileChunkMsg = .{ .job_id = 1, .path = path, .offset = 0, .data = data };
-    const serialized = try serialize(alloc, .{ .file_chunk = msg });
-    defer alloc.free(serialized);
+    const serialized = try serialize(gpa, .{ .file_chunk = msg });
+    defer gpa.free(serialized);
     try expect(serialized.len == MAX_FRAME_SIZE);
 
     const parsed_msg = try parse(serialized);
@@ -803,18 +968,193 @@ test "sync_chunk_frame_budget" {
 }
 
 test "heartbeat" {
-    const alloc = std.testing.allocator;
-    var payload = try initMsgPrefix(alloc, .heartbeat);
-    defer payload.deinit(alloc);
-    const parsed = try parse(payload.items);
-    try std.testing.expect(payload.items.len == 1);
+    const gpa = std.testing.allocator;
+    const payload = try serialize(gpa, .heartbeat);
+    defer gpa.free(payload);
+    const parsed = try parse(payload);
+    try std.testing.expect(payload.len == 1);
     try std.testing.expect(parsed == .heartbeat);
 }
 
 test "invalid_message_type" {
-    const alloc = std.testing.allocator;
-    var payload = try std.ArrayList(u8).initCapacity(alloc, 1);
-    defer payload.deinit(alloc);
+    const gpa = std.testing.allocator;
+    var payload = try std.ArrayList(u8).initCapacity(gpa, 1);
+    defer payload.deinit(gpa);
     payload.appendAssumeCapacity(255);
     try std.testing.expect(parse(payload.items) == error.InvalidMsgType);
+}
+
+test "serialized_len_exact" {
+    const gpa = std.testing.allocator;
+    const s: JobLogMsg = .{ .job_id = 123, .step = 2, .data = "hello" };
+    try expect(serializedLen(JobLogMsg, s) == @sizeOf(u64) + 2 * @sizeOf(u32) + s.data.len);
+
+    const out = try serializeAlloc(JobLogMsg, gpa, s);
+    defer gpa.free(out);
+    try expect(out.len == serializedLen(JobLogMsg, s));
+
+    const msg = Msg{ .job_log = s };
+    const payload = try serialize(gpa, msg);
+    defer gpa.free(payload);
+    try expect(payload.len == 1 + serializedLen(JobLogMsg, s));
+}
+
+test "serialize_single_allocation" {
+    const gpa = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const data = try gpa.alloc(u8, SYNC_CHUNK_SIZE);
+    defer gpa.free(data);
+    @memset(data, 0xab);
+    const msg: FileChunkMsg = .{ .job_id = 1, .path = "a/b", .offset = 0, .data = data };
+
+    const out = try serializeAlloc(FileChunkMsg, failing.allocator(), msg);
+    defer gpa.free(out);
+    try expect(failing.allocations == 1);
+    try expect(failing.deallocations == 0);
+    try expect(out.len == serializedLen(FileChunkMsg, msg));
+}
+
+test "list_view_detection" {
+    try expect(asListView(ListView(u8)) != null);
+    try expect(asListView(ListView(struct { id: u32, name: []const u8 })) != null);
+    try expect(asListView(struct {
+        pub const ItemType = u8;
+        x: u32,
+    }) == null);
+    try expect(asListView(u32) == null);
+    try expect(asListView(?ListView(u8)) == null);
+}
+
+test "list_view_round_trip" {
+    const gpa = std.testing.allocator;
+    const Elem = struct { id: u32, name: []const u8 };
+    const items = [_]Elem{
+        .{ .id = 1, .name = "alpha" },
+        .{ .id = 2, .name = "" },
+        .{ .id = 3, .name = "third element" },
+    };
+    const slice_view = ListView(Elem).fromSlice(&items);
+    try expect(slice_view.len() == items.len);
+    try expectEqual(items[1], slice_view.at(1).?);
+
+    const serialized = try serializeAlloc(ListView(Elem), gpa, slice_view);
+    defer gpa.free(serialized);
+
+    const view = try deserialize(ListView(Elem), serialized);
+    try expect(view.len() == items.len);
+    var it = view.iterator();
+    var i: usize = 0;
+    while (it.next()) |got| : (i += 1) {
+        try expectEqual(items[i].id, got.id);
+        try std.testing.expectEqualStrings(items[i].name, got.name);
+    }
+    try expect(i == items.len);
+    try expect(view.at(items.len) == null);
+}
+
+test "list_view_fixed_size" {
+    const gpa = std.testing.allocator;
+    const Elem = struct { a: u32, b: u16 };
+    try expect(ListView(Elem).fixed_elem_size.? == 6);
+
+    const items = [_]Elem{ .{ .a = 1, .b = 2 }, .{ .a = 3, .b = 4 }, .{ .a = 5, .b = 6 } };
+    const serialized = try serializeAlloc(ListView(Elem), gpa, .fromSlice(&items));
+    defer gpa.free(serialized);
+    try expect(serialized.len == @sizeOf(u32) + items.len * 6);
+
+    const view = try deserialize(ListView(Elem), serialized);
+    try expectEqual(items[2], view.at(2).?);
+    try expectEqual(items[0], view.at(0).?);
+    var it = view.iterator();
+    for (items) |want| try expectEqual(want, it.next().?);
+    try expect(it.next() == null);
+}
+
+test "list_view_struct_field" {
+    const gpa = std.testing.allocator;
+    const T = struct { ids: ListView(u32), tag: u8 };
+    try expect(minSerializedLen(T) == @sizeOf(u32) + 1);
+    const ids = [_]u32{ 7, 8, 9 };
+    const value: T = .{ .ids = ListView(u32).fromSlice(&ids), .tag = 42 };
+    const serialized = try serializeAlloc(T, gpa, value);
+    defer gpa.free(serialized);
+
+    const parsed = try deserialize(T, serialized);
+    try expectEqual(value.tag, parsed.tag);
+    try expect(parsed.ids.len() == ids.len);
+    try expectEqual(@as(?u32, 8), parsed.ids.at(1));
+    var it = parsed.ids.iterator();
+    var sum: u32 = 0;
+    while (it.next()) |id| sum += id;
+    try expectEqual(@as(u32, 24), sum);
+}
+
+test "list_view_from_buffer" {
+    const gpa = std.testing.allocator;
+    const Elem = struct { name: []const u8 };
+    const items = [_]Elem{ .{ .name = "one" }, .{ .name = "two" } };
+    const serialized = try serializeAlloc(ListView(Elem), gpa, .fromSlice(&items));
+    defer gpa.free(serialized);
+
+    const elems = serialized[@sizeOf(u32)..];
+
+    const expectError = std.testing.expectError;
+    try expectError(error.InvalidList, ListView(Elem).fromBuffer(elems, 1000));
+    try expectError(error.InvalidList, ListView(Elem).fromBuffer(elems[0 .. elems.len - 1], 2));
+    try expectError(error.InvalidList, ListView(Elem).fromBuffer("", 1));
+
+    // Trailing bytes after the last element are trimmed
+    const padded = try gpa.alloc(u8, elems.len + 2);
+    defer gpa.free(padded);
+    @memcpy(padded[0..elems.len], elems);
+    padded[elems.len] = 0xaa;
+    padded[elems.len + 1] = 0xbb;
+    const view = try ListView(Elem).fromBuffer(padded, 2);
+    try expect(view.len() == 2);
+    const reserialized = try serializeAlloc(ListView(Elem), gpa, view);
+    defer gpa.free(reserialized);
+    try std.testing.expectEqualSlices(u8, serialized, reserialized);
+}
+
+test "list_view_nested" {
+    const alloc = std.testing.allocator;
+    const Elem = struct { id: u32, name: ListView(u8) };
+    const names = [_][]const u8{ "name", "", "third name" };
+    var elems: [names.len]Elem = undefined;
+    for (names, &elems, 0..) |name, *e, i| e.* = .{
+        .id = @intCast(i),
+        .name = ListView(u8).fromSlice(name),
+    };
+
+    const serialized = try serializeAlloc(ListView(Elem), alloc, ListView(Elem).fromSlice(&elems));
+    defer alloc.free(serialized);
+
+    const view = try deserialize(ListView(Elem), serialized);
+    var it = view.iterator();
+    var i: usize = 0;
+    while (it.next()) |got| : (i += 1) {
+        try expect(got.id == i);
+        try std.testing.expectEqualStrings(names[i], got.name.buf);
+    }
+    try expect(i == names.len);
+}
+
+test "list_view_empty" {
+    const gpa = std.testing.allocator;
+    const Elem = struct { a: u32 };
+    const view = ListView(Elem).fromSlice(&.{});
+    try expect(view.len() == 0);
+    try expect(view.at(0) == null);
+
+    const empty = try ListView(Elem).fromBuffer("", 0);
+    try expect(empty.len() == 0);
+
+    const serialized = try serializeAlloc(ListView(Elem), gpa, view);
+    defer gpa.free(serialized);
+    try expect(serialized.len == @sizeOf(u32));
+
+    const parsed = try deserialize(ListView(Elem), serialized);
+    try expect(parsed.len() == 0);
+    var it = parsed.iterator();
+    try expect(it.next() == null);
 }
