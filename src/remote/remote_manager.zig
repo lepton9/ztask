@@ -1369,12 +1369,8 @@ pub const RemoteManager = struct {
         self.failJobsForAgent(fd);
         var kv = self.agents.fetchRemove(fd);
         if (kv) |*e| {
-            const fd_val: usize = switch (@typeInfo(std.Io.net.Socket.Handle)) {
-                .pointer => @intFromPtr(fd),
-                else => @intCast(fd),
-            };
             log.info("Remote agent disconnected (fd={d}, name={s})", .{
-                fd_val,
+                fdNum(fd),
                 e.value.name orelse "unregistered",
             });
             e.value.deinit(self.gpa);
@@ -1395,6 +1391,23 @@ pub const RemoteManager = struct {
         }
     }
 };
+
+/// Numeric value of a socket handle.
+fn fdNum(fd: std.Io.net.Socket.Handle) usize {
+    return switch (@typeInfo(std.Io.net.Socket.Handle)) {
+        .pointer => @intFromPtr(fd),
+        else => @intCast(fd),
+    };
+}
+
+/// Coerce an integer into a socket handle. Test-only.
+fn fdHandle(v: anytype) std.Io.net.Socket.Handle {
+    const Handle = std.Io.net.Socket.Handle;
+    return switch (@typeInfo(Handle)) {
+        .pointer => @ptrFromInt(@as(usize, @intCast(v))),
+        else => v,
+    };
+}
 
 const testutil = @import("../testing/utils.zig");
 const expect = std.testing.expect;
@@ -1419,7 +1432,7 @@ test "sync_pump_retries_pending_frames_in_order" {
     var agent = try FakeAgent.init(io, gpa, protocol.MAX_FRAME_SIZE);
     defer agent.deinit(gpa);
 
-    const st = try testTransfer(io, gpa, source_root, 7, 1);
+    const st = try testTransfer(io, gpa, source_root, 7, fdHandle(1));
     try manager.syncs.put(manager.gpa, 7, st);
 
     var frames: std.ArrayList([]u8) = .empty;
@@ -1483,7 +1496,7 @@ test "sync_pump_fails_transfer_on_closed_writer" {
     var agent = try FakeAgent.init(io, gpa, 0);
     defer agent.deinit(gpa);
 
-    const st = try testTransfer(io, gpa, source_root, 7, 1);
+    const st = try testTransfer(io, gpa, source_root, 7, fdHandle(1));
     try manager.syncs.put(manager.gpa, 7, st);
 
     // First pump backpressures, leaving one chunk pending
@@ -1630,12 +1643,12 @@ test "sync_stall_reaper_fails_and_disconnects" {
     manager.pumpTransfer(7, stalled, manager.agents.getPtr(agent_fd).?);
     try expect(stalled.session.sender.?.pending != null);
 
-    const unacked = try testTransfer(io, gpa, source_root, 8, 2);
+    const unacked = try testTransfer(io, gpa, source_root, 8, fdHandle(2));
     unacked.ended = true;
     try manager.syncs.put(manager.gpa, 8, unacked);
-    try putTestDispatch(manager, 8, source_root, 2);
+    try putTestDispatch(manager, 8, source_root, fdHandle(2));
 
-    const fresh = try testTransfer(io, gpa, source_root, 9, 3);
+    const fresh = try testTransfer(io, gpa, source_root, 9, fdHandle(3));
     try manager.syncs.put(manager.gpa, 9, fresh);
 
     const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
