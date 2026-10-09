@@ -29,5 +29,5 @@ pub fn main(init: std.process.Init) !void {
 
     const cli: *zcli.Cli = try zcli.parseInit(init, cli_spec);
     defer cli.deinit(gpa);
-    try runCmd(io, gpa, init.environ_map, cli);
+    try runCmd(io, gpa, init.environ_map, init.minimal.args, cli);
 }

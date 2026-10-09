@@ -874,11 +874,25 @@ inline fn printHelp(ctx: *Ctx) !void {
     try w.interface.flush();
 }
 
+/// Log the raw command line at debug level.
+fn logArgs(gpa: std.mem.Allocator, args: std.process.Args) void {
+    if (comptime !std.log.logEnabled(.debug, std.log.default_log_scope)) return;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var it = args.iterateAllocator(gpa) catch return;
+    defer it.deinit();
+    while (it.next()) |arg| {
+        w.print(" {s}", .{arg}) catch break;
+    }
+    std.log.debug("Run argv:{s}", .{w.buffered()});
+}
+
 /// Handle parsed cli and call the command function.
 pub fn runCmd(
     io: std.Io,
     gpa: std.mem.Allocator,
     env: *std.process.Environ.Map,
+    args: std.process.Args,
     cli: *zcli.Cli,
 ) !void {
     var ctx: Ctx = .{
@@ -898,8 +912,9 @@ pub fn runCmd(
         logger.deinit();
     }
 
+    logArgs(gpa, args);
+
     const cmd = cli.cmd orelse return try printHelp(&ctx);
-    std.log.debug("Run command {s}", .{cmd.name});
 
     const cmdFn = cmd.exec orelse return;
     cmdFn(&ctx) catch |err| {
