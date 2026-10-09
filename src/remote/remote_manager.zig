@@ -19,7 +19,17 @@ pub const DEFAULT_PORT = 5555;
 
 const InboundFrame = union(enum) {
     accepted: Connection.ConnInfo,
-    frame: struct { socket_handle: std.Io.net.Socket.Handle, data: []u8 },
+    /// A parsed message from an agent socket.
+    frame: struct {
+        socket_handle: std.Io.net.Socket.Handle,
+        /// Owns the backing frame of the message.
+        parsed: protocol.OwnedMsg,
+    },
+    /// A frame failed to parse.
+    malformed: struct {
+        socket_handle: std.Io.net.Socket.Handle,
+        err: anyerror,
+    },
 };
 
 const DeadlineEvent = union(enum) { elapsed: u8 };
@@ -151,12 +161,23 @@ const AgentReader = struct {
                 log.err("Failed to buffer remote agent frame: {s}", .{@errorName(err)});
                 break;
             };
+            // The message takes ownership of the frame buffer
+            const parsed = protocol.parseOwned(self.gpa, owned) catch |err| {
+                self.incoming_frames.append(self.gpa, .{ .malformed = .{
+                    .socket_handle = self.stream.socket.handle,
+                    .err = err,
+                } }) catch |append_err| {
+                    log.err("Failed to queue remote agent frame: {s}", .{@errorName(append_err)});
+                    break;
+                };
+                continue;
+            };
             self.incoming_frames.append(self.gpa, .{ .frame = .{
                 .socket_handle = self.stream.socket.handle,
-                .data = owned,
+                .parsed = parsed,
             } }) catch |err| {
+                parsed.deinit();
                 log.err("Failed to queue remote agent frame: {s}", .{@errorName(err)});
-                self.gpa.free(owned);
                 break;
             };
         }
@@ -457,7 +478,8 @@ pub const RemoteManager = struct {
         self.agents.deinit(self.gpa);
         while (self.incoming_frames.pop()) |item| switch (item) {
             .accepted => |conn| conn.stream.close(self.io),
-            .frame => |frame| self.gpa.free(frame.data),
+            .frame => |frame| frame.parsed.deinit(),
+            .malformed => {},
         };
         self.incoming_frames.deinit(self.gpa);
         while (self.commands.pop()) |command| switch (command) {
@@ -671,22 +693,24 @@ pub const RemoteManager = struct {
         }
     }
 
-    /// Process frames read by the blocking per-agent reader workers.
+    /// Process messages parsed by the blocking per-agent reader workers.
     fn drainAgentInbox(self: *RemoteManager) !void {
         while (self.incoming_frames.pop()) |item| switch (item) {
             .accepted => |conn| try self.newAgent(conn),
             .frame => |frame| {
-                defer self.gpa.free(frame.data);
-                const agent = self.agents.getPtr(frame.socket_handle) orelse continue;
-                const parsed = protocol.parse(frame.data) catch |err| {
-                    log.warn(
-                        "Discarding remote agent with malformed message: {s}",
-                        .{@errorName(err)},
-                    );
-                    self.removeAgentByFd(frame.socket_handle);
+                defer frame.parsed.deinit();
+                const agent = self.agents.getPtr(frame.socket_handle) orelse {
                     continue;
                 };
-                self.handleMessage(agent, parsed) catch |err| return err;
+                self.handleMessage(agent, frame.parsed.msg) catch |err| return err;
+            },
+            .malformed => |frame| {
+                if (!self.agents.contains(frame.socket_handle)) continue;
+                log.warn(
+                    "Discarding remote agent with malformed message: {s}",
+                    .{@errorName(frame.err)},
+                );
+                self.removeAgentByFd(frame.socket_handle);
             },
         };
     }
@@ -1425,7 +1449,7 @@ test "sync_pump_retries_pending_frames_in_order" {
     var received: std.ArrayList(u8) = .empty;
     defer received.deinit(gpa);
     for (frames.items) |frame| {
-        const msg = try protocol.parse(frame);
+        const msg = try protocol.Msg.parse(frame);
         switch (msg) {
             .file_chunk => |c| {
                 try expect(c.offset == received.items.len);

@@ -89,8 +89,8 @@ pub const RemoteAgent = struct {
     syncs: std.AutoHashMapUnmanaged(u64, *SyncTransfer),
 
     connection: Connection,
-    /// Incoming frames from the server.
-    incoming_frames: MutexQueue([]u8),
+    /// Incoming parsed messages from the server.
+    incoming_frames: MutexQueue(protocol.OwnedMsg),
     /// Worker thread for reading incoming frames from the server.
     reader_thread: ?std.Thread = null,
     /// Queueing writer for outgoing frames. Drained by the writer thread.
@@ -191,7 +191,7 @@ pub const RemoteAgent = struct {
         self.pool.deinit();
         self.workspaces.deinit(self.gpa);
         self.connection.deinit();
-        while (self.incoming_frames.pop()) |frame| self.gpa.free(frame);
+        while (self.incoming_frames.pop()) |msg| msg.deinit();
         self.incoming_frames.deinit(self.gpa);
         self.gpa.free(self.hostname);
         self.gpa.destroy(self);
@@ -281,9 +281,8 @@ pub const RemoteAgent = struct {
     /// Listen for incoming messages
     fn listen(self: *RemoteAgent) !void {
         while (self.incoming_frames.pop()) |msg| {
-            defer self.gpa.free(msg);
-            const parsed = try protocol.parse(msg);
-            try self.handleMessage(parsed);
+            defer msg.deinit();
+            try self.handleMessage(msg.msg);
         }
     }
 
@@ -309,8 +308,12 @@ pub const RemoteAgent = struct {
                 log.err("Failed to allocate remote message frame: {s}", .{@errorName(err)});
                 break;
             };
-            self.incoming_frames.append(self.gpa, owned) catch |err| {
-                self.gpa.free(owned);
+            const parsed = protocol.parseOwned(self.gpa, owned) catch |err| {
+                log.warn("Discarding malformed remote message: {s}", .{@errorName(err)});
+                continue;
+            };
+            self.incoming_frames.append(self.gpa, parsed) catch |err| {
+                parsed.deinit();
                 log.err("Failed to queue remote message frame: {s}", .{@errorName(err)});
                 break;
             };

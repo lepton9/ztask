@@ -38,6 +38,32 @@ comptime {
         @compileError("SYNC_CHUNK_SIZE must fit the u32 data length prefix");
 }
 
+const MsgUnionInfo = @typeInfo(Msg).@"union";
+const ParseFn = *const fn ([]const u8) ParseError!Msg;
+const SerializeFn = *const fn (std.mem.Allocator, Msg) error{OutOfMemory}![]u8;
+
+const parse_table: [MsgUnionInfo.fields.len]ParseFn = initParseTable();
+const serialize_table: [MsgUnionInfo.fields.len]SerializeFn = initSerializeTable();
+
+pub const ParseError = error{
+    EmptyMessage,
+    InvalidMsgType,
+    InvalidMsg,
+    InvalidEnumValue,
+};
+
+/// Parse `frame` into an owned message, taking ownership of the buffer.
+pub fn parseOwned(gpa: std.mem.Allocator, frame: []u8) ParseError!OwnedMsg {
+    errdefer gpa.free(frame);
+    return .{ .gpa = gpa, .frame = frame, .msg = try .parse(frame) };
+}
+
+/// Serialize a message to an owned payload string.
+pub fn serialize(gpa: std.mem.Allocator, msg: Msg) error{OutOfMemory}![]u8 {
+    return msg.serialize(gpa);
+}
+
+/// A protocol message.
 pub const Msg = union(enum) {
     register: RegisterMsg,
     heartbeat: void,
@@ -56,36 +82,36 @@ pub const Msg = union(enum) {
     sync_ack: SyncAckMsg,
 
     const Tag = std.meta.Tag(Msg);
+
+    /// Parse a payload into a protocol message type.
+    /// The returned message borrows `payload`.
+    pub fn parse(payload: []const u8) !Msg {
+        if (payload.len == 0) return error.EmptyMessage;
+        const msg_type = std.enums.fromInt(Msg.Tag, payload[0]) orelse
+            return error.InvalidMsgType;
+        const msg = payload[1..];
+        return parse_table[@intFromEnum(msg_type)](msg);
+    }
+
+    /// Serialize a message to an owned payload string.
+    pub fn serialize(self: Msg, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+        const tag = std.meta.activeTag(self);
+        return serialize_table[@intFromEnum(tag)](gpa, self);
+    }
 };
 
-pub const ParseError = error{
-    EmptyMessage,
-    InvalidMsgType,
-    InvalidMsg,
-    InvalidEnumValue,
+/// A parsed message that owns the frame buffer backing its slices.
+pub const OwnedMsg = struct {
+    gpa: std.mem.Allocator,
+    /// Owned frame.
+    frame: []u8,
+    /// The parsed message borrowing `frame`.
+    msg: Msg,
+
+    pub fn deinit(self: OwnedMsg) void {
+        self.gpa.free(self.frame);
+    }
 };
-
-const MsgUnionInfo = @typeInfo(Msg).@"union";
-const ParseFn = *const fn ([]const u8) ParseError!Msg;
-const SerializeFn = *const fn (std.mem.Allocator, Msg) error{OutOfMemory}![]u8;
-
-const parse_table: [MsgUnionInfo.fields.len]ParseFn = initParseTable();
-const serialize_table: [MsgUnionInfo.fields.len]SerializeFn = initSerializeTable();
-
-/// Parse a payload into a protocol message type.
-pub fn parse(payload: []const u8) ParseError!Msg {
-    if (payload.len == 0) return error.EmptyMessage;
-    const msg_type = std.enums.fromInt(Msg.Tag, payload[0]) orelse
-        return error.InvalidMsgType;
-    const msg = payload[1..];
-    return parse_table[@intFromEnum(msg_type)](msg);
-}
-
-/// Serialize a message to an owned payload string.
-pub fn serialize(gpa: std.mem.Allocator, msg: Msg) error{OutOfMemory}![]u8 {
-    const tag = std.meta.activeTag(msg);
-    return serialize_table[@intFromEnum(tag)](gpa, msg);
-}
 
 /// Initialize function table for message parse functions
 fn initParseTable() [MsgUnionInfo.fields.len]ParseFn {
@@ -718,7 +744,7 @@ test "register" {
     const msg: RegisterMsg = .{ .version = VERSION, .hostname = "test" };
     const serialized = try serialize(gpa, .{ .register = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: RegisterMsg = parsed_msg.register;
     try std.testing.expect(std.mem.eql(u8, msg.hostname, parsed.hostname));
 }
@@ -728,7 +754,7 @@ test "job_start" {
     const msg: JobStartMsg = .{ .job_id = 1, .timestamp = 0 };
     const serialized = try serialize(gpa, .{ .job_start = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: JobStartMsg = parsed_msg.job_start;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -739,7 +765,7 @@ test "job_log" {
     const msg: JobLogMsg = .{ .job_id = 123, .step = 0, .data = "Log data" };
     const serialized = try serialize(gpa, .{ .job_log = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: JobLogMsg = parsed_msg.job_log;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.step == parsed.step);
@@ -756,7 +782,7 @@ test "job_end" {
     };
     const serialized = try serialize(gpa, .{ .job_finish = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: JobEndMsg = parsed_msg.job_finish;
     try std.testing.expect(msg.job_id == parsed.job_id);
     try std.testing.expect(msg.timestamp == parsed.timestamp);
@@ -770,7 +796,7 @@ test "job_end" {
     };
     const null_serialized = try serialize(gpa, .{ .job_finish = null_msg });
     defer gpa.free(null_serialized);
-    const null_parsed_msg = try parse(null_serialized);
+    const null_parsed_msg = try Msg.parse(null_serialized);
     const null_parsed: JobEndMsg = null_parsed_msg.job_finish;
     try std.testing.expect(null_msg.job_id == null_parsed.job_id);
     try std.testing.expect(!null_parsed.success);
@@ -794,7 +820,7 @@ test "run_job" {
 
     const serialized = try serialize(gpa, .{ .run_job = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
     const parsed_steps = try parsed.parseSteps(gpa);
     defer {
@@ -819,7 +845,7 @@ test "cancel_job" {
     const msg: CancelJobMsg = .{ .job_id = 1 };
     const serialized = try serialize(gpa, .{ .cancel_job = msg });
     defer gpa.free(serialized);
-    const parsed = try parse(serialized);
+    const parsed = try Msg.parse(serialized);
     try std.testing.expect(msg.job_id == parsed.cancel_job.job_id);
 }
 
@@ -828,7 +854,7 @@ test "error_message" {
     const msg: ErrorMsg = .{ .code = ErrorCode.NameTaken, .message = "taken" };
     const serialized = try serialize(gpa, .{ .error_msg = msg });
     defer gpa.free(serialized);
-    const parsed = try parse(serialized);
+    const parsed = try Msg.parse(serialized);
     try std.testing.expect(msg.code == parsed.error_msg.code);
     try std.testing.expect(std.mem.eql(u8, msg.message, parsed.error_msg.message));
 }
@@ -845,7 +871,7 @@ test "sync_begin" {
     };
     const serialized = try serialize(gpa, .{ .sync_begin = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: SyncBeginMsg = parsed_msg.sync_begin;
     try expect(msg.job_id == parsed.job_id);
     try expectEqual(msg.mode, parsed.mode);
@@ -863,7 +889,7 @@ test "manifest" {
     };
     const serialized = try serialize(gpa, .{ .manifest = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: ManifestMsg = parsed_msg.manifest;
     try expect(msg.job_id == parsed.job_id);
     try std.testing.expectEqualStrings(msg.manifest_json, parsed.manifest_json);
@@ -874,7 +900,7 @@ test "file_req" {
     const msg: FileReqMsg = .{ .job_id = 9, .path = "src/lib.zig", .offset = 4096 };
     const serialized = try serialize(gpa, .{ .file_req = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: FileReqMsg = parsed_msg.file_req;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.offset == parsed.offset);
@@ -894,7 +920,7 @@ test "file_chunk" {
     };
     const serialized = try serialize(gpa, .{ .file_chunk = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: FileChunkMsg = parsed_msg.file_chunk;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.offset == parsed.offset);
@@ -908,7 +934,7 @@ test "file_done" {
     const msg: FileDoneMsg = .{ .job_id = 3, .path = "scripts/run.sh", .permissions = 0o755 };
     const serialized = try serialize(gpa, .{ .file_done = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: FileDoneMsg = parsed_msg.file_done;
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.permissions == parsed.permissions);
@@ -920,7 +946,7 @@ test "sync_end" {
     const msg: SyncEndMsg = .{ .job_id = 5 };
     const serialized = try serialize(gpa, .{ .sync_end = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: SyncEndMsg = parsed_msg.sync_end;
     try expect(msg.job_id == parsed.job_id);
 }
@@ -930,7 +956,7 @@ test "sync_ack" {
     const msg: SyncAckMsg = .{ .job_id = 1337, .ok = true };
     const serialized = try serialize(gpa, .{ .sync_ack = msg });
     defer gpa.free(serialized);
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: SyncAckMsg = parsed_msg.sync_ack;
     try expect(msg.job_id == parsed.job_id);
     try expect(parsed.ok);
@@ -943,7 +969,7 @@ test "sync_ack" {
     };
     const fail_serialized = try serialize(gpa, .{ .sync_ack = fail_msg });
     defer gpa.free(fail_serialized);
-    const fail_parsed_msg = try parse(fail_serialized);
+    const fail_parsed_msg = try Msg.parse(fail_serialized);
     const fail_parsed: SyncAckMsg = fail_parsed_msg.sync_ack;
     try expect(fail_parsed.job_id == fail_msg.job_id);
     try expect(!fail_parsed.ok);
@@ -961,7 +987,7 @@ test "sync_chunk_frame_budget" {
     defer gpa.free(serialized);
     try expect(serialized.len == MAX_FRAME_SIZE);
 
-    const parsed_msg = try parse(serialized);
+    const parsed_msg = try Msg.parse(serialized);
     const parsed: FileChunkMsg = parsed_msg.file_chunk;
     try expect(parsed.path.len == SYNC_MAX_PATH_LEN);
     try expect(parsed.data.len == SYNC_CHUNK_SIZE);
@@ -971,9 +997,45 @@ test "heartbeat" {
     const gpa = std.testing.allocator;
     const payload = try serialize(gpa, .heartbeat);
     defer gpa.free(payload);
-    const parsed = try parse(payload);
+    const parsed = try Msg.parse(payload);
     try std.testing.expect(payload.len == 1);
     try std.testing.expect(parsed == .heartbeat);
+}
+
+test "owned_msg_owns_frame" {
+    const gpa = std.testing.allocator;
+    const frame = try serialize(gpa, .{ .job_log = .{
+        .job_id = 1,
+        .step = 2,
+        .data = "log line",
+    } });
+
+    const owned = try parseOwned(gpa, frame);
+    defer owned.deinit();
+    try expect(owned.msg.job_log.job_id == 1);
+    try expect(owned.msg.job_log.step == 2);
+    try std.testing.expectEqualStrings("log line", owned.msg.job_log.data);
+
+    // The parsed slices point into the owned frame
+    const data = owned.msg.job_log.data;
+    const begin = @intFromPtr(owned.frame.ptr);
+    const end = begin + owned.frame.len;
+    try expect(@intFromPtr(data.ptr) >= begin);
+    try expect(@intFromPtr(data.ptr) + data.len <= end);
+}
+
+test "owned_msg_frees_frame_on_parse_error" {
+    const gpa = std.testing.allocator;
+    const expectError = std.testing.expectError;
+    // Unknown tag. Freed by the errdefer.
+    const unknown_tag = try gpa.dupe(u8, &.{255});
+    try expectError(error.InvalidMsgType, parseOwned(gpa, unknown_tag));
+    // Truncated frame
+    const truncated = try gpa.dupe(u8, &.{ @intFromEnum(Msg.Tag.register), 0 });
+    try expectError(error.InvalidMsg, parseOwned(gpa, truncated));
+    // An empty frame
+    const empty = try gpa.dupe(u8, &.{});
+    try expectError(error.EmptyMessage, parseOwned(gpa, empty));
 }
 
 test "invalid_message_type" {
@@ -981,7 +1043,7 @@ test "invalid_message_type" {
     var payload = try std.ArrayList(u8).initCapacity(gpa, 1);
     defer payload.deinit(gpa);
     payload.appendAssumeCapacity(255);
-    try std.testing.expect(parse(payload.items) == error.InvalidMsgType);
+    try std.testing.expect(Msg.parse(payload.items) == error.InvalidMsgType);
 }
 
 test "serialized_len_exact" {
@@ -994,7 +1056,7 @@ test "serialized_len_exact" {
     try expect(out.len == serializedLen(JobLogMsg, s));
 
     const msg = Msg{ .job_log = s };
-    const payload = try serialize(gpa, msg);
+    const payload = try msg.serialize(gpa);
     defer gpa.free(payload);
     try expect(payload.len == 1 + serializedLen(JobLogMsg, s));
 }

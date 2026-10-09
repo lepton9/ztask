@@ -435,31 +435,40 @@ fn sendProtocolMsg(
     gpa: std.mem.Allocator,
     msg: protocol.Msg,
 ) !void {
-    const payload = try protocol.serialize(gpa, msg);
+    const payload = try msg.serialize(gpa);
     defer gpa.free(payload);
     try writer.sendFrame(payload);
 }
 
 /// Read frames until one with the given tag arrives, returning it.
 fn readMsg(
+    gpa: std.mem.Allocator,
     reader: *Connection.Reader,
     comptime tag: std.meta.Tag(protocol.Msg),
-) !protocol.Msg {
+) !protocol.OwnedMsg {
     while (true) {
         const frame = try reader.readNextFrame();
-        const msg = try protocol.parse(frame);
-        if (std.meta.activeTag(msg) == tag) return msg;
+        const owned = try gpa.dupe(u8, frame);
+        const msg = try protocol.parseOwned(gpa, owned);
+        if (std.meta.activeTag(msg.msg) == tag) return msg;
+        msg.deinit();
     }
 }
 
 /// Read exactly one frame and require it to carry `tag`.
+/// The returned message owns its backing frame; `deinit` it when done.
 fn expectNextMsg(
+    gpa: std.mem.Allocator,
     reader: *Connection.Reader,
     comptime tag: std.meta.Tag(protocol.Msg),
-) !protocol.Msg {
+) !protocol.OwnedMsg {
     const frame = try reader.readNextFrame();
-    const msg = try protocol.parse(frame);
-    if (std.meta.activeTag(msg) != tag) return error.UnexpectedMessage;
+    const owned = try gpa.dupe(u8, frame);
+    const msg = try protocol.parseOwned(gpa, owned);
+    if (std.meta.activeTag(msg.msg) != tag) {
+        msg.deinit();
+        return error.UnexpectedMessage;
+    }
     return msg;
 }
 
@@ -509,7 +518,8 @@ test "remote_sync_agent_transfer" {
     var writer = Connection.Writer.init(io, gpa, stream);
     defer writer.deinit();
 
-    _ = try readMsg(&reader, .register);
+    const register_msg = try readMsg(gpa, &reader, .register);
+    register_msg.deinit();
 
     const job_id: u64 = 1;
     try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
@@ -549,11 +559,15 @@ test "remote_sync_agent_transfer" {
 
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = job_id } });
 
-    const ack = (try readMsg(&reader, .sync_ack)).sync_ack;
+    const ack_owned = try readMsg(gpa, &reader, .sync_ack);
+    defer ack_owned.deinit();
+    const ack = ack_owned.msg.sync_ack;
     try expect(ack.job_id == job_id);
     try expect(ack.ok);
 
-    const finish = (try readMsg(&reader, .job_finish)).job_finish;
+    const finish_owned = try readMsg(gpa, &reader, .job_finish);
+    defer finish_owned.deinit();
+    const finish = finish_owned.msg.job_finish;
     try expect(finish.job_id == job_id);
     try expect(finish.success);
 
@@ -589,7 +603,9 @@ test "remote_sync_agent_transfer" {
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = bad_id } });
 
-    const bad_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    const bad_ack_owned = try expectNextMsg(gpa, &reader, .sync_ack);
+    defer bad_ack_owned.deinit();
+    const bad_ack = bad_ack_owned.msg.sync_ack;
     try expect(bad_ack.job_id == bad_id);
     try expect(!bad_ack.ok);
 
@@ -628,7 +644,9 @@ test "remote_sync_agent_transfer" {
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = drop_id } });
 
-    const drop_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    const drop_ack_owned = try expectNextMsg(gpa, &reader, .sync_ack);
+    defer drop_ack_owned.deinit();
+    const drop_ack = drop_ack_owned.msg.sync_ack;
     try expect(drop_ack.job_id == drop_id);
     try expect(!drop_ack.ok);
 
@@ -643,7 +661,9 @@ test "remote_sync_agent_transfer" {
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = probe_id } });
 
-    const probe_ack = (try expectNextMsg(&reader, .sync_ack)).sync_ack;
+    const probe_ack_owned = try expectNextMsg(gpa, &reader, .sync_ack);
+    defer probe_ack_owned.deinit();
+    const probe_ack = probe_ack_owned.msg.sync_ack;
     try expect(probe_ack.job_id == probe_id);
     try expect(probe_ack.ok);
 }
@@ -682,7 +702,8 @@ test "remote_job_uses_empty_workspace" {
     var writer = Connection.Writer.init(io, gpa, stream);
     defer writer.deinit();
 
-    _ = try readMsg(&reader, .register);
+    const register_msg = try readMsg(gpa, &reader, .register);
+    register_msg.deinit();
 
     const job_id: u64 = 5;
     const steps = [_]task_types.Step{.{ .command = .{ .value = "pwd" } }};
@@ -706,7 +727,7 @@ test "remote_job_uses_empty_workspace" {
     var finish: protocol.JobEndMsg = undefined;
     while (true) {
         const frame = try reader.readNextFrame();
-        const msg = try protocol.parse(frame);
+        const msg = try protocol.Msg.parse(frame);
         switch (msg) {
             .job_log => |m| try got_output.appendSlice(gpa, m.data),
             .job_finish => |m| {
@@ -731,7 +752,9 @@ test "remote_job_uses_empty_workspace" {
         .workspace = .none,
         .steps = steps_json,
     } });
-    const rejected = (try readMsg(&reader, .job_finish)).job_finish;
+    const rejected_owned = try readMsg(gpa, &reader, .job_finish);
+    defer rejected_owned.deinit();
+    const rejected = rejected_owned.msg.job_finish;
     try expect(rejected.job_id == bad_id);
     try expect(!rejected.success);
 }
