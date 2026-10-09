@@ -279,14 +279,22 @@ pub fn MutexQueue(comptime T: type) type {
             self.queue.deinit(gpa);
         }
 
-        /// Push item to back of queue.
+        /// Push item to back of queue. Signal and call the nofity callback.
         pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
-            {
-                self.mutex.lockUncancelable(self.io);
-                defer self.mutex.unlock(self.io);
-                try self.queue.append(gpa, item);
-            }
+            try self.appendInner(gpa, item);
             self.signal();
+        }
+
+        /// Push item to back of queue without invoking the notify callback.
+        pub fn appendNoNotify(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+            try self.appendInner(gpa, item);
+            self.cond.signal(self.io);
+        }
+
+        fn appendInner(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            try self.queue.append(gpa, item);
         }
 
         /// Push item to back of queue.
@@ -374,4 +382,50 @@ test "mutex_queue" {
     try std.testing.expect(q.popBlocking() == 7);
     try std.testing.expect(q.popBlocking() == 6);
     thread.join();
+}
+
+test "append_no_notify skips the callback but wakes waiters" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = MutexQueue(usize).init(io);
+    defer q.deinit(gpa);
+
+    var calls: usize = 0;
+    const Counter = struct {
+        fn onNotify(ptr: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+        }
+    };
+    q.setNotify(.{ .ptr = &calls, .callback = Counter.onNotify });
+
+    // No callback for the silent append.
+    try q.appendNoNotify(gpa, 1);
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try std.testing.expectEqual(@as(usize, 1), q.len());
+
+    // The regular append still calls the callback.
+    try q.append(gpa, 2);
+    try std.testing.expectEqual(@as(usize, 1), calls);
+
+    // Drain the queue so the blocked pop below has to wait.
+    try std.testing.expectEqual(@as(usize, 1), q.pop().?);
+    try std.testing.expectEqual(@as(usize, 2), q.pop().?);
+
+    // Consumers blocked on the queue are woken by the silent append.
+    const Popper = struct {
+        waiting: std.atomic.Value(bool) = .init(false),
+        popped: ?usize = null,
+
+        fn f(self: *@This(), qu: *MutexQueue(usize)) void {
+            self.waiting.store(true, .seq_cst);
+            self.popped = qu.popBlocking();
+        }
+    };
+    var popper = Popper{};
+    const handle = try std.Thread.spawn(.{}, Popper.f, .{ &popper, &q });
+    while (!popper.waiting.load(.seq_cst)) std.Thread.yield() catch {};
+    try q.appendNoNotify(gpa, 3);
+    handle.join();
+    try std.testing.expectEqual(@as(usize, 3), popper.popped.?);
 }

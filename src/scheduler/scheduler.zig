@@ -20,6 +20,11 @@ const ErrorDAG = dag.ErrorDAG;
 
 const log = std.log.scoped(.scheduler);
 
+/// Max time spent handling events per scheduler update pass.
+const DRAIN_BUDGET_NS = 2 * std.time.ns_per_ms;
+/// Max job results fetched from the result queue per `get` call.
+const RESULT_BATCH_SIZE = 32;
+
 test {
     _ = dag;
     _ = queue_zig;
@@ -451,8 +456,8 @@ pub const Scheduler = struct {
         self.active_runners.clearRetainingCapacity();
 
         self.skipRemainingJobs();
-        self.handleResults();
-        self.handleLogs();
+        _ = self.handleResults(true);
+        _ = self.handleLogs(true);
 
         // Log task metadata
         self.task_meta.status = .interrupted;
@@ -522,18 +527,29 @@ pub const Scheduler = struct {
         self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
     }
 
-    /// Update the scheduler and handle pending events
-    pub fn update(self: *Scheduler) void {
-        self.handleLogs();
-        self.handleResults();
+    /// Update the scheduler and handle pending events.
+    ///
+    /// Unless `full_drain` is set, only a bounded amount of time is spent
+    /// handling events per call. Returns true when events were left
+    /// unprocessed and another pass is needed.
+    pub fn update(self: *Scheduler, full_drain: bool) bool {
+        var pending = self.handleLogs(full_drain);
+        if (self.handleResults(full_drain)) pending = true;
+        return pending;
     }
 
-    /// Handle the completed job results
-    fn handleResults(self: *Scheduler) void {
-        var results: [4]Result = undefined;
+    /// Handle the completed job results. Returns true when there are more
+    /// results left to handle.
+    fn handleResults(self: *Scheduler, full_drain: bool) bool {
+        var results: [RESULT_BATCH_SIZE]Result = undefined;
+        const started = std.Io.Timestamp.now(self.io, .awake);
         while (true) {
-            const n = self.result_queue.get(self.io, &results, 0) catch return;
-            if (n == 0) return;
+            if (!full_drain and
+                started.untilNow(self.io, .awake).toNanoseconds() >= DRAIN_BUDGET_NS)
+                return true;
+
+            const n = self.result_queue.get(self.io, &results, 0) catch return false;
+            if (n == 0) return false;
 
             for (results[0..n]) |*res| {
                 defer res.result.deinit(self.gpa);
@@ -554,9 +570,16 @@ pub const Scheduler = struct {
         }
     }
 
-    /// Handle the job log events in the queue
-    fn handleLogs(self: *Scheduler) void {
-        while (self.log_queue.pop()) |event| {
+    /// Handle the job log events in the queue. Returns true when there are
+    /// more log events left to handle.
+    fn handleLogs(self: *Scheduler, full_drain: bool) bool {
+        const started = std.Io.Timestamp.now(self.io, .awake);
+        while (true) {
+            if (!full_drain and
+                started.untilNow(self.io, .awake).toNanoseconds() >= DRAIN_BUDGET_NS)
+                return !self.log_queue.empty();
+
+            const event = self.log_queue.pop() orelse return false;
             defer event.deinit(self.gpa);
             switch (event) {
                 .job_started => |e| {
@@ -584,7 +607,13 @@ pub const Scheduler = struct {
                         .job_name = job_meta.job_name,
                         .success = e.success,
                         .message = e.message,
-                        .duration_ms = if (job_meta.start_time_ms != null and e.timestamp_ms >= job_meta.start_time_ms.?) e.timestamp_ms - job_meta.start_time_ms.? else null,
+                        .duration_ms = blk: {
+                            const start_ms = job_meta.start_time_ms orelse break :blk null;
+                            break :blk if (e.timestamp_ms >= start_ms)
+                                e.timestamp_ms - job_meta.start_time_ms.?
+                            else
+                                null;
+                        },
                     } });
                 },
             }

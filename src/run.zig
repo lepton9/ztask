@@ -395,11 +395,32 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         wake,
     };
 
+    // State for waking the event loop. Only one `.wake` event is kept in flight.
+    const WakeState = struct {
+        const Self = @This();
+
+        input: *InputLoop(Event),
+        pending: std.atomic.Value(bool) = .init(false),
+
+        /// Post a wake unless one is already in flight.
+        fn post(self: *Self) void {
+            if (self.pending.swap(true, .acq_rel)) return;
+            self.input.postEvent(.wake) catch {
+                self.pending.store(false, .release);
+            };
+        }
+
+        /// Re-arm after a wake was consumed.
+        fn consume(self: *Self) void {
+            self.pending.store(false, .release);
+        }
+    };
+
     // Wake an event loop waiting for events.
     const wakeLoop = struct {
         fn f(ptr: *anyopaque) void {
-            const il: *InputLoop(Event) = @ptrCast(@alignCast(ptr));
-            il.postEvent(.wake) catch {};
+            const state: *WakeState = @ptrCast(@alignCast(ptr));
+            state.post();
         }
     }.f;
 
@@ -412,15 +433,18 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
         }
     }.f;
 
+    var wake_state: WakeState = .{ .input = undefined };
+
     // Initialize event loop to handle input
     const input_loop: ?*InputLoop(Event) = blk: {
         if (!stdinIsTty(io) or builtin.is_test) break :blk null;
         if (options.attach_job != null) break :blk null;
         const input_loop = try InputLoop(Event).init(io, gpa, ctx.env);
+        wake_state.input = input_loop;
         // Set a notification to drain the events
-        events.setNotify(.{ .ptr = input_loop, .callback = wakeLoop });
+        events.setNotify(.{ .ptr = &wake_state, .callback = wakeLoop });
         // Wake the blocked loop when an interrupt signal is received
-        tui_input.Sig.setNotify(.{ .ptr = input_loop, .callback = wakeLoop });
+        tui_input.Sig.setNotify(.{ .ptr = &wake_state, .callback = wakeLoop });
         break :blk input_loop;
     };
     if (input_loop == null) {
@@ -475,13 +499,16 @@ pub fn runTask(ctx: RunCtx, options: RunOptions) !void {
                     if (!key.matches('c', .{ .ctrl = true })) continue;
                     break;
                 },
-                .wake => try drainRunEvents(
-                    gpa,
-                    events,
-                    out,
-                    selected.items,
-                    options.verbose,
-                ),
+                .wake => {
+                    wake_state.consume();
+                    try drainRunEvents(
+                        gpa,
+                        events,
+                        out,
+                        selected.items,
+                        options.verbose,
+                    );
+                },
             }
         } else {
             // Block until the next event arrives, then drain the rest

@@ -10,6 +10,9 @@ pub fn EventHub(comptime T: type) type {
     return struct {
         const Hub = @This();
 
+        /// Max notify callbacks deferred past the publish lock.
+        const max_deferred_notifies = 8;
+
         io: std.Io,
         gpa: std.mem.Allocator,
         mutex: std.Io.Mutex = .init,
@@ -103,26 +106,55 @@ pub fn EventHub(comptime T: type) type {
 
         /// Publish an event to all subscribers.
         pub fn publish(self: *@This(), event: T) void {
+            var deferred: [max_deferred_notifies]Notify = undefined;
+            var deferred_len: usize = 0;
+
             self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
 
             if (self.stopped or self.subscribers.items.len == 0) {
+                self.mutex.unlock(self.io);
                 event.deinit(self.gpa);
                 return;
             }
+
             if (self.subscribers.items.len == 1) {
+                // The only subscriber takes the ownership of the event.
                 const subscriber = self.subscribers.items[0];
-                subscriber.queue.append(self.gpa, event) catch
+                subscriber.queue.appendNoNotify(self.gpa, event) catch {
+                    self.mutex.unlock(self.io);
                     event.deinit(self.gpa);
+                    return;
+                };
+                recordNotify(subscriber, &deferred, &deferred_len);
+            } else {
+                for (self.subscribers.items) |subscriber| {
+                    const copy = event.clone(self.gpa) catch continue;
+                    subscriber.queue.appendNoNotify(self.gpa, copy) catch {
+                        copy.deinit(self.gpa);
+                        continue;
+                    };
+                    recordNotify(subscriber, &deferred, &deferred_len);
+                }
+                event.deinit(self.gpa);
+            }
+            self.mutex.unlock(self.io);
+
+            for (deferred[0..deferred_len]) |notify| notify.callback(notify.ptr);
+        }
+
+        /// Record the notify callback of a subscriber.
+        fn recordNotify(
+            subscriber: *Subscriber,
+            deferred: []Notify,
+            deferred_len: *usize,
+        ) void {
+            const notify = subscriber.queue.notify orelse return;
+            if (deferred_len.* < deferred.len) {
+                deferred[deferred_len.*] = notify;
+                deferred_len.* += 1;
                 return;
             }
-            for (self.subscribers.items) |subscriber| {
-                const copy = event.clone(self.gpa) catch continue;
-                subscriber.queue.append(self.gpa, copy) catch {
-                    copy.deinit(self.gpa);
-                };
-            }
-            event.deinit(self.gpa);
+            notify.callback(notify.ptr);
         }
 
         fn destroySubscriber(self: *@This(), subscriber: *Subscriber) void {
@@ -161,6 +193,47 @@ test "support multiple subscribers and zero subscribers" {
     defer b.deinit(gpa);
     try std.testing.expectEqualStrings("kept", a.data);
     try std.testing.expectEqualStrings("kept", b.data);
+    first.deinit();
+    second.deinit();
+}
+
+test "multiple subscribers each get their own notify" {
+    const TestEvent = struct {
+        data: []u8,
+
+        pub fn clone(self: @This(), gpa: std.mem.Allocator) !@This() {
+            return .{ .data = try gpa.dupe(u8, self.data) };
+        }
+
+        pub fn deinit(self: @This(), gpa: std.mem.Allocator) void {
+            gpa.free(self.data);
+        }
+    };
+
+    const Counter = struct {
+        fn onNotify(ptr: *anyopaque) void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+        }
+    };
+
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var hub = EventHub(TestEvent).init(io, gpa);
+    defer hub.deinit();
+    var first_calls: usize = 0;
+    var second_calls: usize = 0;
+    const first = try hub.subscribe();
+    const second = try hub.subscribe();
+    first.setNotify(.{ .ptr = &first_calls, .callback = Counter.onNotify });
+    second.setNotify(.{ .ptr = &second_calls, .callback = Counter.onNotify });
+
+    hub.publish(.{ .data = try gpa.dupe(u8, "x") });
+    try std.testing.expectEqual(@as(usize, 1), first_calls);
+    try std.testing.expectEqual(@as(usize, 1), second_calls);
+
+    while (first.tryNext()) |ev| ev.deinit(gpa);
+    while (second.tryNext()) |ev| ev.deinit(gpa);
     first.deinit();
     second.deinit();
 }

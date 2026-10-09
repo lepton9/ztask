@@ -457,12 +457,19 @@ pub const TaskManager = struct {
             self.processControlEvents() catch |err| {
                 self.emitError(.task_manager, err);
             };
-            self.updateSchedulers() catch |err| {
+            const schedulers_pending = self.updateSchedulers() catch |err| blk: {
                 self.emitError(.scheduler, err);
+                break :blk false;
             };
             self.prefetchTaskRuns() catch |err| {
                 self.emitError(.task_manager, err);
             };
+
+            if (schedulers_pending) {
+                self.work_pending.store(true, .seq_cst);
+                // Yield the mutex before continuing work
+                self.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            }
 
             // Wait until there is work to do
             self.work_mutex.lockUncancelable(self.io);
@@ -536,7 +543,7 @@ pub const TaskManager = struct {
             .waiting, .completed => {
                 s.*.status = .inactive;
                 self.unregisterAll(s);
-                s.update();
+                _ = s.update(true);
                 self.tasks_changed.store(true, .seq_cst);
             },
             else => {},
@@ -857,26 +864,29 @@ pub const TaskManager = struct {
         }
     }
 
-    /// Advance the schedulers
-    fn updateSchedulers(self: *TaskManager) !void {
+    /// Advance the schedulers. Returns true when some schedulers still have
+    /// unprocessed events left.
+    fn updateSchedulers(self: *TaskManager) !bool {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
 
         // No tasks running or waiting
         if (self.schedulers.count() == 0) {
             self.idle_cond.broadcast(self.io);
-            return;
+            return false;
         }
 
         var needs_followup = false;
+        var pending_events = false;
         var it = self.schedulers.valueIterator();
         while (it.next()) |s| switch (s.*.status) {
             .running => {
-                s.*.update();
+                if (s.*.update(false)) pending_events = true;
                 if (s.*.status != .running) needs_followup = true;
             },
             .completed => {
-                s.*.update();
+                // Drain the remaining events fully before the task is unloaded
+                _ = s.*.update(true);
                 if (s.*.task.hasTriggers()) {
                     s.*.status = .waiting;
                 } else s.*.status = .inactive;
@@ -922,6 +932,7 @@ pub const TaskManager = struct {
         if (self.schedulers.count() == 0) {
             self.idle_cond.broadcast(self.io);
         } else if (needs_followup) self.signalWork();
+        return pending_events;
     }
 
     /// Unload a task and its scheduler from memory
