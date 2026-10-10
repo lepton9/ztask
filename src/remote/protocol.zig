@@ -158,6 +158,14 @@ fn minSerializedLen(comptime T: type) usize {
             inline for (s.fields) |field| total += minSerializedLen(field.type);
             return total;
         },
+        .@"union" => |u| {
+            var min: ?usize = null;
+            inline for (u.fields) |field| {
+                const n = minSerializedLen(field.type);
+                min = if (min) |m| @min(m, n) else n;
+            }
+            return 1 + (min orelse 0); // tag byte + smallest variant
+        },
         .int => |i| return @divExact(i.bits, 8),
         .@"enum" => |e| return @divExact(@typeInfo(e.tag_type).int.bits, 8),
         .bool => return 1,
@@ -182,6 +190,13 @@ fn maxSerializedLen(comptime T: type) ?usize {
                 total += maxSerializedLen(field.type) orelse return null;
             }
             return total;
+        },
+        .@"union" => |u| {
+            var max: usize = 0;
+            inline for (u.fields) |field| {
+                max += maxSerializedLen(field.type) orelse return null;
+            }
+            return max + 1; // tag byte + variants
         },
         .optional => |o| return 1 + (maxSerializedLen(o.child) orelse return null),
         .pointer => |p| {
@@ -209,6 +224,13 @@ fn serializedLen(comptime T: type, value: T) usize {
             var total: usize = 0;
             inline for (s.fields) |field|
                 total += serializedLen(field.type, @field(value, field.name));
+            return total;
+        },
+        .@"union" => {
+            var total: usize = 1; // tag byte
+            switch (value) {
+                inline else => |payload| total += serializedLen(@TypeOf(payload), payload),
+            }
             return total;
         },
         .optional => |o| return if (value) |v| 1 + serializedLen(o.child, v) else 1,
@@ -447,6 +469,13 @@ fn serializeField(
                 serializeField(field.type, @field(value, field.name), msg);
             }
         },
+        .@"union" => {
+            const tag = std.meta.activeTag(value);
+            msg.appendAssumeCapacity(@intCast(@intFromEnum(tag)));
+            switch (value) {
+                inline else => |payload| serializeField(@TypeOf(payload), payload, msg),
+            }
+        },
         .@"enum" => |e| {
             const Tag = e.tag_type;
             const raw: Tag = @intFromEnum(value);
@@ -499,6 +528,21 @@ fn deserializeField(
                 @field(value, field.name) = try deserializeField(field.type, buffer, pos);
             }
             return value;
+        },
+        .@"union" => |u| {
+            if (pos.* + 1 > buffer.len) return error.InvalidMsg;
+            const raw = buffer[pos.*];
+            pos.* += 1;
+            const Tag = u.tag_type orelse @compileError("Untagged unions not supported");
+            const tag = std.enums.fromInt(Tag, raw) orelse return error.InvalidEnumValue;
+            inline for (u.fields) |field| if (tag == @field(Tag, field.name)) {
+                return @unionInit(
+                    T,
+                    field.name,
+                    try deserializeField(field.type, buffer, pos),
+                );
+            };
+            return error.InvalidEnumValue;
         },
         .@"enum" => |e| {
             const Tag = e.tag_type;
@@ -737,6 +781,85 @@ test "struct_mix_fields" {
     try std.testing.expect(s.b == parsed.b);
     try std.testing.expect(std.mem.eql(u8, s.c, parsed.c));
     try std.testing.expect(s.d == parsed.d);
+}
+
+test "union_round_trip" {
+    const gpa = std.testing.allocator;
+    const expectError = std.testing.expectError;
+    const U = union(enum) {
+        none,
+        flag: bool,
+        count: u32,
+        name: []const u8,
+        pair: struct { a: u16, b: u16 },
+    };
+    const Tag = std.meta.Tag(U);
+
+    try expect(minSerializedLen(U) == 1);
+    // The string variant is unbounded
+    try expect(maxSerializedLen(U) == null);
+
+    const values = [_]U{
+        .none,
+        .{ .flag = true },
+        .{ .count = 123456 },
+        .{ .name = "hello" },
+        .{ .name = "" },
+        .{ .pair = .{ .a = 0x0102, .b = 0x0304 } },
+    };
+    for (values) |value| {
+        const serialized = try serializeAlloc(U, gpa, value);
+        defer gpa.free(serialized);
+        try expect(serialized.len == serializedLen(U, value));
+
+        const parsed: U = try deserialize(U, serialized);
+        try expect(std.meta.activeTag(parsed) == std.meta.activeTag(value));
+        switch (parsed) {
+            .none => {},
+            .flag => |f| try expectEqual(value.flag, f),
+            .count => |n| try expectEqual(value.count, n),
+            .name => |s| try std.testing.expectEqualStrings(value.name, s),
+            .pair => |p| try expectEqual(value.pair, p),
+        }
+    }
+
+    const serialized = try serializeAlloc(U, gpa, U{ .count = 1 });
+    defer gpa.free(serialized);
+    try expect(serialized.len == 1 + @sizeOf(u32));
+    try expect(serialized[0] == @intFromEnum(Tag.count));
+    try expect(std.mem.readInt(u32, serialized[1..5], .little) == 1);
+
+    // Unknown tag byte
+    try expectError(error.InvalidEnumValue, deserialize(U, &.{200}));
+
+    // A list of unions decodes on demand
+    const items = [_]U{
+        .{ .name = "items" },
+        .none,
+        .{ .count = 7 },
+        .{ .name = "" },
+    };
+    const list = try serializeAlloc(ListView(U), gpa, .fromSlice(&items));
+    defer gpa.free(list);
+    // u32 count + (1+4+5) + 1 + (1+4) + (1+4)
+    try expect(list.len == 25);
+
+    const view = try deserialize(ListView(U), list);
+    try expect(view.len() == items.len);
+    var it = view.iterator();
+    var i: usize = 0;
+    while (it.next()) |got| : (i += 1) {
+        try expect(std.meta.activeTag(items[i]) == std.meta.activeTag(got));
+        switch (got) {
+            .none => {},
+            .flag => |f| try expectEqual(items[i].flag, f),
+            .count => |n| try expectEqual(items[i].count, n),
+            .name => |s| try std.testing.expectEqualStrings(items[i].name, s),
+            .pair => |p| try expectEqual(items[i].pair, p),
+        }
+    }
+    try expect(i == items.len);
+    try expect(view.at(items.len) == null);
 }
 
 test "register" {
