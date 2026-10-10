@@ -848,6 +848,18 @@ pub const Model = struct {
     }
 };
 
+/// Set a ListView's item count and clamp its cursor and scroll state to the
+/// new count.
+fn setListCount(list: *vxfw.ListView, count: usize) void {
+    list.item_count = @intCast(count);
+    list.cursor = @min(list.cursor, list.item_count.? -| 1);
+    if (count == 0) {
+        list.scroll = .{};
+    } else {
+        list.ensureScroll();
+    }
+}
+
 const TaskSplit = struct {
     model: *Model,
     tasks_models: std.ArrayList(TaskListItem),
@@ -875,8 +887,8 @@ const TaskSplit = struct {
                 } } },
             },
         };
-        task_split.selected_task_view.task_runs_list_view.item_count = 0;
-        task_split.task_list_view.item_count = 0;
+        setListCount(&task_split.selected_task_view.task_runs_list_view, 0);
+        setListCount(&task_split.task_list_view, 0);
         return task_split;
     }
 
@@ -1020,12 +1032,7 @@ const TaskSplit = struct {
             .task = &tasks_snap[i],
             .model = self.model,
         });
-        self.task_list_view.item_count = @intCast(self.tasks_models.items.len);
-        self.task_list_view.cursor = @min(
-            self.task_list_view.cursor,
-            self.task_list_view.item_count.? -| 1,
-        );
-        self.task_list_view.ensureScroll();
+        setListCount(&self.task_list_view, self.tasks_models.items.len);
     }
 
     /// Update selected task.
@@ -1898,7 +1905,9 @@ const TaskView = struct {
         self.selected_run_id = null;
         self.auto_pinned = false;
         self.task_runs_list_view.cursor = 0;
+        self.task_runs_list_view.scroll = .{};
         self.job_list.cursor = 0;
+        self.job_list.scroll = .{};
     }
 
     /// Set the data for the selected task
@@ -1912,8 +1921,8 @@ const TaskView = struct {
             .details = task_details.?,
         } else null;
 
-        self.job_list.item_count = 0;
-        self.task_runs_list_view.item_count = 0;
+        var runs_n: usize = 0;
+        var jobs_n: usize = 0;
 
         if (self.task) |task| {
             // Drop the selected run when it is no longer displayed
@@ -1924,28 +1933,17 @@ const TaskView = struct {
                     self.log_view_state = .{};
                 }
             }
-            const runs_n = task.details.past_runs.len;
-            self.task_runs_list_view.item_count = @intCast(runs_n);
+            runs_n = task.details.past_runs.len;
             if (task.details.selected_run) |selected_run| {
-                const jobs = selected_run.jobs;
-                self.job_list.item_count = @intCast(jobs.len);
+                jobs_n = selected_run.jobs.len;
             } else if (task.details.active_run) |active| {
-                const jobs = active.jobs;
-                self.job_list.item_count = @intCast(jobs.len);
+                jobs_n = active.jobs.len;
             }
         }
 
-        // Set list cursors in bounds
-        self.task_runs_list_view.cursor = @min(
-            self.task_runs_list_view.cursor,
-            self.task_runs_list_view.item_count.? -| 1,
-        );
-        self.job_list.cursor = @min(
-            self.job_list.cursor,
-            self.job_list.item_count.? -| 1,
-        );
-        self.task_runs_list_view.ensureScroll();
-        self.job_list.ensureScroll();
+        // Set list counts and clamp the cursors in bounds
+        setListCount(&self.task_runs_list_view, runs_n);
+        setListCount(&self.job_list, jobs_n);
     }
 
     /// Set selected run to null and reset job list
@@ -1953,13 +1951,12 @@ const TaskView = struct {
         if (self.selected_run_id == null) return;
         self.selected_run_id = null;
         self.auto_pinned = false;
-        self.job_list.item_count = 0;
-        const task = self.task orelse return;
-        if (task.details.active_run) |a| {
-            self.job_list.item_count = @intCast(a.jobs.len);
-            self.job_list.cursor = 0;
+        var jobs_n: usize = 0;
+        if (self.task) |task| {
+            if (task.details.active_run) |a| jobs_n = a.jobs.len;
         }
-        self.job_list.ensureScroll();
+        self.job_list.cursor = 0;
+        setListCount(&self.job_list, jobs_n);
     }
 
     /// Stop showing the selected run run.
