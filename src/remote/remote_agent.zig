@@ -548,7 +548,7 @@ pub const RemoteAgent = struct {
         errdefer self.gpa.destroy(entry);
         const job_name = try self.gpa.dupe(u8, msg.job_name);
         errdefer self.gpa.free(job_name);
-        const steps = try msg.parseSteps(self.gpa);
+        const steps = try msg.copySteps(self.gpa);
         errdefer {
             for (steps) |step| step.deinit(self.gpa);
             self.gpa.free(steps);

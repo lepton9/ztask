@@ -547,14 +547,12 @@ test "remote_sync_agent_transfer" {
     const steps = [_]task_types.Step{.{ .command = .{
         .value = "grep -q hello marker.txt",
     } }};
-    const steps_json = try protocol.RunJobMsg.serializeSteps(gpa, &steps);
-    defer gpa.free(steps_json);
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
         .job_id = job_id,
         .task_id = "sync-agent",
         .job_name = "build",
         .workspace = .ephemeral,
-        .steps = steps_json,
+        .steps = .fromSlice(&steps),
     } });
 
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = job_id } });
@@ -593,7 +591,7 @@ test "remote_sync_agent_transfer" {
         .task_id = "sync-agent",
         .job_name = "build",
         .workspace = .ephemeral,
-        .steps = steps_json,
+        .steps = .fromSlice(&steps),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
         .job_id = bad_id,
@@ -640,7 +638,7 @@ test "remote_sync_agent_transfer" {
         .task_id = "sync-agent",
         .job_name = "build",
         .workspace = .ephemeral,
-        .steps = steps_json,
+        .steps = .fromSlice(&steps),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = drop_id } });
 
@@ -707,14 +705,12 @@ test "remote_job_uses_empty_workspace" {
 
     const job_id: u64 = 5;
     const steps = [_]task_types.Step{.{ .command = .{ .value = "pwd" } }};
-    const steps_json = try protocol.RunJobMsg.serializeSteps(gpa, &steps);
-    defer gpa.free(steps_json);
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
         .job_id = job_id,
         .task_id = "empty-ws",
         .job_name = "jobA",
         .workspace = .none,
-        .steps = steps_json,
+        .steps = .fromSlice(&steps),
     } });
 
     const workspace = try std.fs.path.join(gpa, &.{
@@ -750,7 +746,7 @@ test "remote_job_uses_empty_workspace" {
         .task_id = "empty-ws",
         .job_name = "bad/name",
         .workspace = .none,
-        .steps = steps_json,
+        .steps = .fromSlice(&steps),
     } });
     const rejected_owned = try readMsg(gpa, &reader, .job_finish);
     defer rejected_owned.deinit();

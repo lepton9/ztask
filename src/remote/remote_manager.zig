@@ -624,21 +624,17 @@ pub const RemoteManager = struct {
         agent: RemoteRunSpec,
         steps: []const task.Step,
         spec: ?SyncSpec,
-    ) error{ OutOfMemory, FailedSerialize, FrameTooLarge }!u64 {
+    ) error{ OutOfMemory, FrameTooLarge }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
         const workspace: protocol.WorkspaceMode = if (spec) |s| s.mode else .none;
 
-        const run_job_payload = blk: {
-            const steps_json = try protocol.RunJobMsg.serializeSteps(self.gpa, steps);
-            defer self.gpa.free(steps_json);
-            break :blk try protocol.serialize(self.gpa, .{ .run_job = .{
-                .job_id = dispatch_id,
-                .task_id = task_id,
-                .job_name = job_name,
-                .workspace = workspace,
-                .steps = steps_json,
-            } });
-        };
+        const run_job_payload = try protocol.serialize(self.gpa, .{ .run_job = .{
+            .job_id = dispatch_id,
+            .task_id = task_id,
+            .job_name = job_name,
+            .workspace = workspace,
+            .steps = .fromSlice(steps),
+        } });
         errdefer self.gpa.free(run_job_payload);
         if (run_job_payload.len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
 

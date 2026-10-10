@@ -258,37 +258,23 @@ pub const RunJobMsg = struct {
     job_name: []const u8,
     /// The job's workspace plan.
     workspace: WorkspaceMode,
-    /// The executed steps of this job in JSON format.
-    steps: []const u8,
+    /// The executed steps of this job.
+    steps: ListView(task.Step),
 
-    /// Serialize the step slice to a JSON string
-    pub fn serializeSteps(
-        gpa: std.mem.Allocator,
-        steps: []const task.Step,
-    ) error{ OutOfMemory, FailedSerialize }![]u8 {
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        std.json.Stringify.value(steps, .{}, &out.writer) catch
-            return error.FailedSerialize;
-        return try out.toOwnedSlice();
-    }
-
-    /// Parse `task.Step` list from a JSON string
-    pub fn parseSteps(self: RunJobMsg, gpa: std.mem.Allocator) ![]task.Step {
-        const Parsed = std.json.Parsed([]task.Step);
-        const json: Parsed = std.json.parseFromSlice([]task.Step, gpa, self.steps, .{}) catch
-            return error.InvalidStepsFormat;
-        defer json.deinit();
-        const steps = json.value;
-        const copied = try gpa.alloc(task.Step, steps.len);
+    /// Copy the step list into owned memory.
+    pub fn copySteps(self: RunJobMsg, gpa: std.mem.Allocator) ![]task.Step {
+        const copied = try gpa.alloc(task.Step, self.steps.len());
         var copied_len: usize = 0;
         errdefer {
             for (copied[0..copied_len]) |step| step.deinit(gpa);
             gpa.free(copied);
         }
-        for (steps, 0..) |step, i| {
-            copied[i] = try step.copy(gpa);
+        var it = self.steps.iterator();
+        while (it.next()) |step| {
+            copied[copied_len] = try step.copy(gpa);
             copied_len += 1;
         }
+        if (copied_len != copied.len) return error.InvalidStepsFormat;
         return copied;
     }
 };
@@ -928,7 +914,7 @@ test "job_end" {
 
 test "run_job" {
     const gpa = std.testing.allocator;
-    var steps = [_]task.Step{
+    const steps = [_]task.Step{
         .{ .command = .{ .value = "command" } },
         .{ .command = .{ .value = "" } },
     };
@@ -937,15 +923,14 @@ test "run_job" {
         .task_id = "task-111",
         .job_name = "build",
         .workspace = .persistent,
-        .steps = try RunJobMsg.serializeSteps(gpa, &steps),
+        .steps = .fromSlice(&steps),
     };
-    defer gpa.free(msg.steps);
 
     const serialized = try serialize(gpa, .{ .run_job = msg });
     defer gpa.free(serialized);
     const parsed_msg = try Msg.parse(serialized);
     const parsed: RunJobMsg = parsed_msg.run_job;
-    const parsed_steps = try parsed.parseSteps(gpa);
+    const parsed_steps = try parsed.copySteps(gpa);
     defer {
         for (parsed_steps) |step| step.deinit(gpa);
         gpa.free(parsed_steps);
@@ -955,10 +940,10 @@ test "run_job" {
     try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
     try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
     try std.testing.expectEqual(msg.workspace, parsed.workspace);
-    try std.testing.expect(std.mem.eql(u8, msg.steps, parsed.steps));
+    try expectEqual(steps.len, parsed.steps.len());
     for (0..steps.len) |i| {
         try std.testing.expect(std.meta.activeTag(steps[i]) == std.meta.activeTag(parsed_steps[i]));
-        try std.testing.expect(std.mem.eql(u8, steps[i].command.value, parsed_steps[i].command.value));
+        try std.testing.expectEqualStrings(steps[i].command.value, parsed_steps[i].command.value);
         try std.testing.expect(steps[i].command.exit_code == parsed_steps[i].command.exit_code);
     }
 }
