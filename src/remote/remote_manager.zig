@@ -1451,8 +1451,8 @@ test "sync_pump_retries_pending_frames_in_order" {
         try frames.append(gpa, frame);
 
     try expect(st.session.sender.?.pending == null);
-    // 3 chunk frames + file_done + sync_end.
-    try expect(frames.items.len == 5);
+    // 3 chunk frames + file_done + manifest page + sync_end
+    try expect(frames.items.len == 6);
 
     // The queued frames must reproduce the source in order.
     var received: std.ArrayList(u8) = .empty;
@@ -1468,6 +1468,19 @@ test "sync_pump_retries_pending_frames_in_order" {
             .file_done => |f| {
                 try expect(std.mem.eql(u8, received.items, content));
                 try expectEqualStrings("big.bin", f.path);
+                var digest: protocol.Digest = undefined;
+                protocol.Hash.hash(content, &digest, .{});
+                const hex = protocol.hexDigest(digest);
+                try expectEqualStrings(&hex, f.hash.?);
+            },
+            .manifest => |m| {
+                try expect(m.job_id == 7);
+                try expect(m.total_entries == 1);
+                try expect(m.entries.len() == 1);
+                const entry = m.entries.at(0).?;
+                try expectEqualStrings("big.bin", entry.path);
+                try expect(entry.size == content.len);
+                try expect(entry.mtime_ms != 0);
             },
             .sync_end => |e| try expect(e.job_id == 7),
             else => return error.Unexpected,

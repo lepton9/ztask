@@ -431,17 +431,13 @@ pub const RemoteAgent = struct {
         };
     }
 
-    /// Accept the workspace manifest.
+    /// Accept one page of the workspace manifest.
     fn handleManifest(self: *RemoteAgent, msg: protocol.ManifestMsg) void {
-        if (!self.syncs.contains(msg.job_id)) {
+        const recv = self.transferReceiver(msg.job_id) orelse {
             log.debug("Ignoring manifest for unknown sync {x}", .{msg.job_id});
             return;
-        }
-        log.debug("Received manifest for sync {x} ({d} bytes)", .{
-            msg.job_id,
-            msg.manifest_json.len,
-        });
-        // TODO: handle manifest
+        };
+        recv.receiveManifest(msg);
     }
 
     /// The receiving role of a tracked transfer, if it has one.
@@ -465,7 +461,7 @@ pub const RemoteAgent = struct {
             log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
             return;
         };
-        recv.finishFile(msg.path, msg.permissions);
+        recv.finishFile(msg.path, msg.permissions, msg.hash);
     }
 
     /// Validate and commit a finished transfer, then run any job waiting on it.

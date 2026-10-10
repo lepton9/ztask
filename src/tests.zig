@@ -536,10 +536,14 @@ test "remote_sync_agent_transfer" {
         .offset = 0,
         .data = "hello\n",
     } });
+    var digest: protocol.Digest = undefined;
+    protocol.Hash.hash("hello\n", &digest, .{});
+    const hex = protocol.hexDigest(digest);
     try sendProtocolMsg(&writer, gpa, .{ .file_done = .{
         .job_id = job_id,
         .path = "marker.txt",
         .permissions = 0o644,
+        .hash = &hex,
     } });
 
     // The job arrives before the transfer is committed: the agent must hold
@@ -555,6 +559,13 @@ test "remote_sync_agent_transfer" {
         .steps = .fromSlice(&steps),
     } });
 
+    try sendProtocolMsg(&writer, gpa, .{ .manifest = .{
+        .job_id = job_id,
+        .total_entries = 1,
+        .entries = .fromSlice(&.{
+            .{ .path = "marker.txt", .size = 6, .mtime_ms = 0 },
+        }),
+    } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = job_id } });
 
     const ack_owned = try readMsg(gpa, &reader, .sync_ack);
@@ -656,6 +667,11 @@ test "remote_sync_agent_transfer" {
         .mode = .ephemeral,
         .direction = .push,
         .exclude = .fromSlice(&.{}),
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .manifest = .{
+        .job_id = probe_id,
+        .total_entries = 0,
+        .entries = .fromSlice(&.{}),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = probe_id } });
 

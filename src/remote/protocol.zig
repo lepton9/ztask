@@ -31,8 +31,32 @@ pub const MANIFEST_ENTRY_FIXED_SIZE: usize = minSerializedLen(ManifestEntry);
 const MANIFEST_MSG_FIXED_SIZE: usize = 1 + minSerializedLen(ManifestMsg);
 /// Payload budget for one `manifest` page.
 pub const MANIFEST_PAGE_BUDGET: usize = MAX_FRAME_SIZE / 2;
-/// Length of the content hash on the wire. Lowercase hex SHA-256.
-pub const FILE_HASH_HEX_LEN: usize = 2 * std.crypto.hash.sha2.Sha256.digest_length;
+
+/// The wire content hash.
+pub const Hash = std.crypto.hash.sha2.Sha256;
+/// Raw digest of the content hash.
+pub const Digest = [Hash.digest_length]u8;
+/// Length of the lowercase hex encoding of `Digest` on the wire.
+pub const HASH_HEX_LEN: usize = 2 * Hash.digest_length;
+
+pub const ParseDigestError = error{
+    InvalidLength,
+    NoSpaceLeft,
+    InvalidCharacter,
+};
+
+/// Encode a digest as the lowercase hex string the wire carries.
+pub inline fn hexDigest(digest: Digest) [HASH_HEX_LEN]u8 {
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Decode a hash into a digest.
+pub inline fn parseHexDigest(hex: []const u8) ParseDigestError!Digest {
+    if (hex.len != HASH_HEX_LEN) return error.InvalidLength;
+    var digest: Digest = undefined;
+    _ = try std.fmt.hexToBytes(&digest, hex);
+    return digest;
+}
 
 comptime {
     if (MAX_FRAME_SIZE == 0)
