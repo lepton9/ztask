@@ -528,7 +528,7 @@ test "remote_sync_agent_transfer" {
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{}",
+        .exclude = .fromSlice(&.{}),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
         .job_id = job_id,
@@ -583,7 +583,7 @@ test "remote_sync_agent_transfer" {
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{}",
+        .exclude = .fromSlice(&.{}),
     } });
     // The job arrives while the transfer is still in flight.
     try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
@@ -625,7 +625,7 @@ test "remote_sync_agent_transfer" {
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{}",
+        .exclude = .fromSlice(&.{}),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
         .job_id = drop_id,
@@ -655,7 +655,7 @@ test "remote_sync_agent_transfer" {
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{}",
+        .exclude = .fromSlice(&.{}),
     } });
     try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{ .job_id = probe_id } });
 

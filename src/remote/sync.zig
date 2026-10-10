@@ -751,7 +751,7 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{}",
+        .exclude = .fromSlice(&.{}),
     };
 }
 

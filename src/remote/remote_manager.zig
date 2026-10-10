@@ -1040,7 +1040,7 @@ pub const RemoteManager = struct {
             .job_name = entry.job_name,
             .mode = spec.mode,
             .direction = spec.direction,
-            .config_json = "{}",
+            .exclude = .fromSlice(&.{}),
         } }) catch return self.failSyncedDispatch(job_id, "out of memory");
         self.sendMessageOwned(agent, begin) catch |err| {
             self.gpa.free(begin);

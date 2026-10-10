@@ -25,6 +25,15 @@ pub const SYNC_CHUNK_SIZE: usize = (MAX_FRAME_SIZE - FILE_CHUNK_FIXED_SIZE) / 2;
 pub const SYNC_MAX_PATH_LEN: usize =
     MAX_FRAME_SIZE - FILE_CHUNK_FIXED_SIZE - SYNC_CHUNK_SIZE;
 
+/// Wire size of one `manifest` entry excluding its path.
+pub const MANIFEST_ENTRY_FIXED_SIZE: usize = minSerializedLen(ManifestEntry);
+/// Wire size of a `manifest` page excluding its entries.
+const MANIFEST_MSG_FIXED_SIZE: usize = 1 + minSerializedLen(ManifestMsg);
+/// Payload budget for one `manifest` page.
+pub const MANIFEST_PAGE_BUDGET: usize = MAX_FRAME_SIZE / 2;
+/// Length of the content hash on the wire. Lowercase hex SHA-256.
+pub const FILE_HASH_HEX_LEN: usize = 2 * std.crypto.hash.sha2.Sha256.digest_length;
+
 comptime {
     if (MAX_FRAME_SIZE == 0)
         @compileError("MAX_FRAME_SIZE must be positive");
@@ -32,6 +41,8 @@ comptime {
         @compileError("MAX_FRAME_SIZE must fit the u32 frame length header");
     if (FILE_CHUNK_FIXED_SIZE + SYNC_CHUNK_SIZE + SYNC_MAX_PATH_LEN > MAX_FRAME_SIZE)
         @compileError("`file_chunk` frame budget exceeds MAX_FRAME_SIZE");
+    if (MANIFEST_MSG_FIXED_SIZE + MANIFEST_ENTRY_FIXED_SIZE + SYNC_MAX_PATH_LEN > MAX_FRAME_SIZE)
+        @compileError("`manifest` frame budget exceeds MAX_FRAME_SIZE");
     if (SYNC_CHUNK_SIZE == 0)
         @compileError("SYNC_CHUNK_SIZE must be positive");
     if (SYNC_CHUNK_SIZE > std.math.maxInt(u32))
@@ -343,16 +354,28 @@ pub const SyncBeginMsg = struct {
     mode: WorkspaceMode,
     /// Which way data flows for this transfer.
     direction: SyncDirection,
-    /// JSON-encoded sync config (exclude globs).
-    config_json: []const u8,
+    /// Exclude globs.
+    exclude: ListView([]const u8),
 };
 
-/// Manifest of the workspace being transferred.
+/// One file entry of the workspace manifest.
+pub const ManifestEntry = struct {
+    /// Workspace-relative path, `/`-separated.
+    path: []const u8,
+    /// Size of the file at send time.
+    size: u64,
+    /// Source mtime in milliseconds since the epoch at send time.
+    mtime_ms: i64,
+};
+
+/// One page of the workspace manifest.
 pub const ManifestMsg = struct {
     /// Globally unique dispatch id the transfer belongs to.
     job_id: u64,
-    /// JSON-encoded manifest entries for the workspace.
-    manifest_json: []const u8,
+    /// Entry count across all pages of this manifest.
+    total_entries: u32,
+    /// This page's entries.
+    entries: ListView(ManifestEntry),
 };
 
 /// Request file data starting at an offset.
@@ -385,6 +408,9 @@ pub const FileDoneMsg = struct {
     path: []const u8,
     /// POSIX permission bits for the file.
     permissions: u32,
+    /// Lowercase hex SHA-256 of the file content. The receiver verifies
+    /// the bytes it accepted against it. Absent skips verification.
+    hash: ?[]const u8 = null,
 };
 
 /// The transfer is complete; validate and commit.
@@ -714,6 +740,23 @@ fn deserializeList(
     return view;
 }
 
+/// Check the two lists for equality. Expect them to be the same length
+/// and compare all the elements in the list using the `cmp` function.
+fn expectEqualListView(
+    comptime T: type,
+    expected: ListView(T),
+    actual: ListView(T),
+    cmp: *const fn (a: T, b: T) anyerror!void,
+) !void {
+    try std.testing.expect(expected.len() == actual.len());
+    var it_expected = expected.iterator();
+    var it_actual = actual.iterator();
+    while (it_actual.next()) |a| {
+        const e = it_expected.next() orelse unreachable;
+        try cmp(a, e);
+    }
+}
+
 test "integer" {
     const gpa = std.testing.allocator;
     const msg: u64 = 123;
@@ -969,13 +1012,14 @@ test "error_message" {
 
 test "sync_begin" {
     const gpa = std.testing.allocator;
+    const exclude: []const []const u8 = &.{ ".zig-cache", "node_modules" };
     const msg: SyncBeginMsg = .{
         .job_id = 42,
         .task_id = "task-id",
         .job_name = "build",
         .mode = .ephemeral,
         .direction = .push,
-        .config_json = "{\"exclude\":[\".zig-cache\",\"node_modules\"]}",
+        .exclude = .fromSlice(exclude),
     };
     const serialized = try serialize(gpa, .{ .sync_begin = msg });
     defer gpa.free(serialized);
@@ -986,21 +1030,60 @@ test "sync_begin" {
     try expectEqual(msg.direction, parsed.direction);
     try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
     try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
-    try std.testing.expectEqualStrings(msg.config_json, parsed.config_json);
+    try expectEqualListView(
+        []const u8,
+        .fromSlice(exclude),
+        parsed.exclude,
+        std.testing.expectEqualStrings,
+    );
 }
 
 test "manifest" {
     const gpa = std.testing.allocator;
+    const entries = [_]ManifestEntry{
+        .{ .path = "src/main.zig", .size = 123, .mtime_ms = 1728576000000 },
+        .{ .path = "dir/nested file.txt", .size = 0, .mtime_ms = 1 },
+        .{ .path = "b", .size = 7, .mtime_ms = -1 },
+    };
     const msg: ManifestMsg = .{
         .job_id = 7,
-        .manifest_json = "[{\"path\":\"src/main.zig\",\"size\":123}]",
+        .total_entries = entries.len,
+        .entries = .fromSlice(&entries),
     };
     const serialized = try serialize(gpa, .{ .manifest = msg });
     defer gpa.free(serialized);
     const parsed_msg = try Msg.parse(serialized);
     const parsed: ManifestMsg = parsed_msg.manifest;
     try expect(msg.job_id == parsed.job_id);
-    try std.testing.expectEqualStrings(msg.manifest_json, parsed.manifest_json);
+    try expect(msg.total_entries == parsed.total_entries);
+    try expect(parsed.entries.len() == entries.len);
+    var it = parsed.entries.iterator();
+    for (entries) |want| {
+        const got = it.next().?;
+        try std.testing.expectEqualStrings(want.path, got.path);
+        try expectEqual(want.size, got.size);
+        try expectEqual(want.mtime_ms, got.mtime_ms);
+    }
+    try expect(it.next() == null);
+}
+
+test "manifest_max_path_entry_fits_frame" {
+    const gpa = std.testing.allocator;
+    const path = "a" ** SYNC_MAX_PATH_LEN;
+    const msg: ManifestMsg = .{
+        .job_id = 1,
+        .total_entries = 1,
+        .entries = .fromSlice(&.{.{ .path = path, .size = 0, .mtime_ms = 0 }}),
+    };
+    const serialized = try serialize(gpa, .{ .manifest = msg });
+    defer gpa.free(serialized);
+    try expect(serialized.len == MANIFEST_MSG_FIXED_SIZE +
+        MANIFEST_ENTRY_FIXED_SIZE + SYNC_MAX_PATH_LEN);
+    try expect(serialized.len <= MAX_FRAME_SIZE);
+
+    const parsed_msg = try Msg.parse(serialized);
+    const parsed: ManifestMsg = parsed_msg.manifest;
+    try std.testing.expectEqualStrings(path, parsed.entries.at(0).?.path);
 }
 
 test "file_req" {
@@ -1039,7 +1122,14 @@ test "file_chunk" {
 
 test "file_done" {
     const gpa = std.testing.allocator;
-    const msg: FileDoneMsg = .{ .job_id = 3, .path = "scripts/run.sh", .permissions = 0o755 };
+    const hash = "e3b0c44298fc1c149afbf4c8996fb924" ++
+        "27ae41e4649b934ca495991b7852b855";
+    const msg: FileDoneMsg = .{
+        .job_id = 3,
+        .path = "scripts/run.sh",
+        .permissions = 0o755,
+        .hash = hash,
+    };
     const serialized = try serialize(gpa, .{ .file_done = msg });
     defer gpa.free(serialized);
     const parsed_msg = try Msg.parse(serialized);
@@ -1047,6 +1137,14 @@ test "file_done" {
     try expect(msg.job_id == parsed.job_id);
     try expect(msg.permissions == parsed.permissions);
     try std.testing.expectEqualStrings(msg.path, parsed.path);
+    try std.testing.expectEqualStrings(hash, parsed.hash.?);
+
+    const bare_msg: FileDoneMsg = .{ .job_id = 4, .path = "a", .permissions = 0o644 };
+    const bare_serialized = try serialize(gpa, .{ .file_done = bare_msg });
+    defer gpa.free(bare_serialized);
+    const bare_parsed_msg = try Msg.parse(bare_serialized);
+    const bare_parsed: FileDoneMsg = bare_parsed_msg.file_done;
+    try expect(bare_parsed.hash == null);
 }
 
 test "sync_end" {
