@@ -1429,7 +1429,7 @@ const TaskView = struct {
                 const task_h: u16 = @divFloor(max.height, 4);
                 if (self.display_job_log and selected_job != null) break :blk .{
                     .task = .{ .height = task_h },
-                    .job_log = .{ .height = max.height -| task_h -| 2, .selected = true },
+                    .job_log = .{ .height = max.height -| task_h, .selected = true },
                 };
                 break :blk .{ .task = .{ .height = max.height, .selected = true } };
             },
@@ -1487,8 +1487,9 @@ const TaskView = struct {
         // Display job log
         if (areas.job_log.selected) {
             const job = selected_job orelse unreachable;
-            const inner_w: u16 = max.width;
-            const inner_h: u16 = areas.job_log.height;
+            // The border takes 2 columns and 2 rows from the area
+            const inner_w: u16 = max.width -| 2;
+            const inner_h: u16 = areas.job_log.height -| 2;
 
             // Fetch logs
             const log_text = self.getJobLog(ctx.arena, job, .{
