@@ -2,8 +2,6 @@ const std = @import("std");
 const task = @import("types/task.zig");
 const date = @import("types/date.zig");
 const yaml = @import("yaml");
-const expectEqual = std.testing.expectEqual;
-const expectError = std.testing.expectError;
 
 const Task = task.Task;
 
@@ -37,10 +35,14 @@ pub const ParseError = error{
     InvalidRunnerType,
     InvalidRunnerName,
     InvalidExitCode,
+    InvalidSyncRoot,
+    InvalidSyncMode,
+    InvalidSyncDirection,
+    InvalidSyncExclude,
 };
 
 const VALID_TASK_FIELDS = makeVoidSet(
-    &[_][]const u8{ "name", "id", "on", "jobs", "cwd" },
+    &[_][]const u8{ "name", "id", "on", "jobs", "cwd", "sync" },
 );
 const VALID_TRIGGER_FIELDS = makeVoidSet(
     &[_][]const u8{ "watch", "time", "interval" },
@@ -49,10 +51,13 @@ const VALID_WATCH_FIELDS = makeVoidSet(
     &[_][]const u8{ "path", "recursive" },
 );
 const VALID_JOB_FIELDS = makeVoidSet(
-    &[_][]const u8{ "steps", "deps", "run_on" },
+    &[_][]const u8{ "steps", "deps", "run_on", "sync" },
 );
 const VALID_RUN_LOC_FIELDS = makeVoidSet(
     &[_][]const u8{ "type", "name", "addr" },
+);
+const VALID_SYNC_FIELDS = makeVoidSet(
+    &[_][]const u8{ "root", "mode", "direction", "exclude" },
 );
 const VALID_STEP_FIELDS = makeVoidSet(
     &[_][]const u8{ "run", "exit_code" },
@@ -161,6 +166,7 @@ const ParseCtx = struct {
 
     /// Add a path part to the context.
     fn at(self: ParseCtx, part: []const u8) ParseCtx {
+        std.debug.assert(self.parts_len < self.parts.len);
         var out = self;
         if (out.parts_len < out.parts.len) {
             out.parts[out.parts_len] = part;
@@ -363,6 +369,13 @@ fn parseTask(
 
     const cwd_maybe: ?[]const u8 = try parseTaskCwd(cx, map);
 
+    // Task-level sync spec
+    const task_sync: ?task.SyncSpec = blk: {
+        const sync_val = map.get("sync") orelse break :blk null;
+        break :blk try parseSyncSpec(cx.at("sync"), sync_val);
+    };
+    errdefer if (task_sync) |s| s.deinit(cx.gpa);
+
     // Triggers
     var triggers: std.ArrayList(task.Trigger) = .empty;
     errdefer {
@@ -394,6 +407,7 @@ fn parseTask(
         );
     };
     t.cwd = if (cwd_maybe) |cwd| try cx.gpa.dupe(u8, cwd) else null;
+    t.sync = task_sync;
     t.triggers = triggers;
     t.jobs = jobs;
     return t;
@@ -562,6 +576,99 @@ fn parseTaskCwd(cx: ParseCtx, map: yaml.Yaml.Map) !?[]const u8 {
         return cx_cwd.failf(ParseError.CwdNotDirectory, null, fmt, .{path});
     }
     return path;
+}
+
+/// Parse a `sync` configuration block.
+fn parseSyncSpec(
+    cx: ParseCtx,
+    value: yaml.Yaml.Value,
+) (ParseError || error{OutOfMemory})!task.SyncSpec {
+    const map = value.asMap() orelse return cx.fail(
+        ParseError.InvalidFieldType,
+        null,
+        "Field 'sync' must be a map",
+    );
+    try rejectUnknown(cx, map, VALID_SYNC_FIELDS, ParseError.InvalidFieldName);
+
+    var mode: task.SyncMode = .ephemeral;
+    var direction: task.SyncDirection = .push;
+    var exclude: []const []const u8 = &.{};
+
+    const root = blk: {
+        const root_val = map.get("root") orelse
+            break :blk try cx.gpa.dupe(u8, ".");
+        const root_cx = cx.at("root");
+        const raw = try requireScalar(root_cx, root_val);
+        const root = parseStringField(raw) catch return root_cx.failf(
+            ParseError.InvalidSyncRoot,
+            null,
+            "Invalid sync root '{s}'",
+            .{raw},
+        );
+        break :blk try cx.gpa.dupe(u8, root);
+    };
+    errdefer cx.gpa.free(root);
+
+    if (map.get("mode")) |mode_val| {
+        const mode_cx = cx.at("mode");
+        const raw = try requireScalar(mode_cx, mode_val);
+        mode = blk: {
+            const trimmed = try parseStringField(raw);
+            break :blk std.meta.stringToEnum(task.SyncMode, trimmed) orelse
+                error.InvalidSyncMode;
+        } catch return mode_cx.failf(
+            ParseError.InvalidSyncMode,
+            null,
+            "Invalid sync mode '{s}'",
+            .{raw},
+        );
+    }
+
+    if (map.get("direction")) |direction_val| {
+        const direction_cx = cx.at("direction");
+        const raw = try requireScalar(direction_cx, direction_val);
+        direction = blk: {
+            const trimmed = try parseStringField(raw);
+            break :blk std.meta.stringToEnum(task.SyncDirection, trimmed) orelse
+                error.InvalidSyncDirection;
+        } catch return direction_cx.failf(
+            ParseError.InvalidSyncDirection,
+            null,
+            "Invalid sync direction '{s}'",
+            .{raw},
+        );
+    }
+
+    if (map.get("exclude")) |exclude_val| {
+        const exclude_cx = cx.at("exclude");
+        const items = try requireList(exclude_cx, exclude_val);
+        var patterns = try cx.gpa.alloc([]const u8, items.len);
+        var n: usize = 0;
+        errdefer {
+            for (0..n) |i| cx.gpa.free(patterns[i]);
+            cx.gpa.free(patterns);
+        }
+        for (items) |item| {
+            const raw = try requireScalarMsg(
+                exclude_cx,
+                item,
+                "Exclude pattern must be a string",
+            );
+            const pattern = parseStringField(raw) catch {
+                return exclude_cx.failf(
+                    ParseError.InvalidSyncExclude,
+                    null,
+                    "Invalid exclude pattern '{s}'",
+                    .{raw},
+                );
+            };
+            patterns[n] = try cx.gpa.dupe(u8, pattern);
+            n += 1;
+        }
+        exclude = patterns;
+    }
+
+    return .{ .root = root, .mode = mode, .direction = direction, .exclude = exclude };
 }
 
 /// Parse a time from a string.
@@ -798,11 +905,20 @@ fn parseJob(
         for (d) |dep| cx.gpa.free(dep);
         cx.gpa.free(d);
     };
+
+    // Job-level sync spec
+    const job_sync: ?task.SyncSpec = blk: {
+        const sync_val = map.get("sync") orelse break :blk null;
+        break :blk try parseSyncSpec(cx.at("sync"), sync_val);
+    };
+    errdefer if (job_sync) |s| s.deinit(cx.gpa);
+
     return .{
         .name = try cx.gpa.dupe(u8, name),
         .steps = try steps.toOwnedSlice(cx.gpa),
         .run_on = try run_on.dupe(cx.gpa),
         .deps = deps,
+        .sync = job_sync,
     };
 }
 
@@ -975,6 +1091,11 @@ pub fn isTaskFile(file: []const u8) bool {
     return std.mem.eql(u8, suffix, ".yaml") or
         std.mem.eql(u8, suffix, ".yml");
 }
+
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+const expectError = std.testing.expectError;
 
 test "parse_empty" {
     try std.testing.expect(
@@ -1418,4 +1539,197 @@ test "time_error_ms" {
     try expectEqual(parseTime("00:00:00.1000"), ParseError.InvalidTriggerMs);
     try expectEqual(parseTime("00:00:00.zig"), ParseError.InvalidTriggerMs);
     try expectEqual(parseTime("00:00:00."), ParseError.InvalidTriggerMs);
+}
+
+test "parse_sync" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ sync:
+        \\   root: "src"
+        \\   mode: persistent
+        \\   direction: push
+        \\   exclude:
+        \\     - ".zig-cache"
+        \\     - "node_modules"
+        \\ jobs:
+        \\   remote:
+        \\     steps: []
+        \\     run_on: remote:runner1
+        \\     sync:
+        \\       root: "out"
+        \\       direction: pull
+        \\       exclude: ["*.o"]
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+
+    const task_sync = t.sync.?;
+    try expectEqualStrings("src", task_sync.root);
+    try expectEqual(task.SyncMode.persistent, task_sync.mode);
+    try expectEqual(task.SyncDirection.push, task_sync.direction);
+    try expect(task_sync.exclude.len == 2);
+    try expectEqualStrings(".zig-cache", task_sync.exclude[0]);
+    try expectEqualStrings("node_modules", task_sync.exclude[1]);
+
+    // A job-level sync overrides the task-level one
+    const job_sync = t.jobs.get("remote").?.sync.?;
+    try expectEqualStrings("out", job_sync.root);
+    try expectEqual(task.SyncMode.ephemeral, job_sync.mode);
+    try expectEqual(task.SyncDirection.pull, job_sync.direction);
+    try expect(job_sync.exclude.len == 1);
+    try expectEqualStrings("*.o", job_sync.exclude[0]);
+}
+
+test "parse_sync_defaults" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ sync:
+        \\   mode: ephemeral
+        \\ jobs:
+        \\   build:
+        \\     steps: []
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+    const task_sync = t.sync.?;
+    try expectEqualStrings(".", task_sync.root);
+    try expectEqual(task.SyncMode.ephemeral, task_sync.mode);
+    try expectEqual(task.SyncDirection.push, task_sync.direction);
+    try expect(task_sync.exclude.len == 0);
+    // Jobs without a `sync` field inherit the task-level config
+    try expect(t.jobs.get("build").?.sync == null);
+}
+
+test "parse_sync_none_disables" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ sync:
+        \\   root: "src"
+        \\ jobs:
+        \\   build:
+        \\     steps: []
+        \\     sync:
+        \\       mode: none
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+    try expectEqual(task.SyncMode.ephemeral, t.sync.?.mode);
+    // The job-level `mode: none` opts out of the task-level sync.
+    try expectEqual(task.SyncMode.none, t.jobs.get("build").?.sync.?.mode);
+}
+
+test "parse_sync_round_trip" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ sync:
+        \\   root: "src"
+        \\   mode: persistent
+        \\   direction: both
+        \\   exclude: [".zig-cache", "node_modules"]
+        \\ jobs:
+        \\   build:
+        \\     steps:
+        \\       - command: "ls"
+        \\     sync:
+        \\       root: "out"
+    ;
+    const t = try parseTaskBuffer(io, gpa, source);
+    defer t.deinit(gpa);
+    const yaml_text = try t.toYaml(gpa);
+    defer gpa.free(yaml_text);
+    const t2 = try parseTaskBuffer(io, gpa, yaml_text);
+    defer t2.deinit(gpa);
+
+    try expectEqualStrings(t.sync.?.root, t2.sync.?.root);
+    try expectEqual(t.sync.?.mode, t2.sync.?.mode);
+    try expectEqual(t.sync.?.direction, t2.sync.?.direction);
+    try expect(t2.sync.?.exclude.len == 2);
+    try expectEqualStrings(".zig-cache", t2.sync.?.exclude[0]);
+    try expectEqualStrings("node_modules", t2.sync.?.exclude[1]);
+    try expectEqualStrings("out", t2.jobs.get("build").?.sync.?.root);
+}
+
+test "parse_sync_invalid" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const bad_mode =
+        \\ name: test
+        \\ sync:
+        \\   mode: bogus
+    ;
+    try expectError(ParseError.InvalidSyncMode, parseTaskBuffer(io, gpa, bad_mode));
+
+    const bad_direction =
+        \\ name: test
+        \\ sync:
+        \\   direction: sideways
+    ;
+    try expectError(ParseError.InvalidSyncDirection, parseTaskBuffer(io, gpa, bad_direction));
+
+    const unknown_field =
+        \\ name: test
+        \\ sync:
+        \\   roots: "src"
+    ;
+    try expectError(ParseError.InvalidFieldName, parseTaskBuffer(io, gpa, unknown_field));
+
+    const not_a_map =
+        \\ name: test
+        \\ sync: "src"
+    ;
+    try expectError(ParseError.InvalidFieldType, parseTaskBuffer(io, gpa, not_a_map));
+
+    const exclude_not_list =
+        \\ name: test
+        \\ sync:
+        \\   exclude: ".zig-cache"
+    ;
+    try expectError(ParseError.InvalidFieldType, parseTaskBuffer(io, gpa, exclude_not_list));
+
+    const exclude_not_string =
+        \\ name: test
+        \\ sync:
+        \\   exclude:
+        \\     - root: x
+    ;
+    try expectError(ParseError.InvalidFieldType, parseTaskBuffer(io, gpa, exclude_not_string));
+
+    const empty_root =
+        \\ name: test
+        \\ sync:
+        \\   root: " "
+    ;
+    try expectError(ParseError.InvalidSyncRoot, parseTaskBuffer(io, gpa, empty_root));
+
+    const empty_pattern =
+        \\ name: test
+        \\ sync:
+        \\   exclude: ["  "]
+    ;
+    try expectError(ParseError.InvalidSyncExclude, parseTaskBuffer(io, gpa, empty_pattern));
+}
+
+test "parse_sync_diagnostics" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const source =
+        \\ name: test
+        \\ sync:
+        \\   mode: bogus
+    ;
+    var diag: ParseDiag = .{};
+    defer diag.deinit(gpa);
+    try expectError(
+        ParseError.InvalidSyncMode,
+        parseTaskBufferDiag(io, gpa, source, &diag),
+    );
+    try std.testing.expectEqualStrings("sync.mode", diag.field.?);
 }

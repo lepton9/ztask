@@ -4,8 +4,9 @@ const protocol = @import("protocol.zig");
 const sync = @import("sync.zig");
 
 const task = @import("../types/task.zig");
-const Connection = @import("Connection.zig");
 const RemoteRunSpec = task.RemoteRunSpec;
+const SyncSpec = task.SyncSpec;
+const Connection = @import("Connection.zig");
 const Queue = @import("../types/queue.zig").Queue;
 const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const Notify = @import("../types/queue.zig").Notify;
@@ -240,25 +241,6 @@ const AgentWriter = struct {
     }
 };
 
-pub const SyncSpec = struct {
-    /// Source root to transfer, absolute and resolved by the caller.
-    source_root: []const u8,
-    mode: protocol.WorkspaceMode,
-    direction: protocol.SyncDirection,
-
-    pub fn deinit(self: *SyncSpec, gpa: std.mem.Allocator) void {
-        gpa.free(self.source_root);
-    }
-
-    pub fn copy(self: *const SyncSpec, gpa: std.mem.Allocator) !SyncSpec {
-        return .{
-            .source_root = try gpa.dupe(u8, self.source_root),
-            .mode = self.mode,
-            .direction = self.direction,
-        };
-    }
-};
-
 /// A queued remote job dispatch.
 pub const DispatchRequest = struct {
     /// Globally unique dispatch id, used as the protocol job id.
@@ -286,7 +268,7 @@ pub const DispatchRequest = struct {
         gpa.free(self.agent.name);
         if (self.agent.addr) |addr| gpa.free(addr);
         if (self.run_job_payload) |payload| gpa.free(payload);
-        if (self.sync) |s| gpa.free(s.source_root);
+        if (self.sync) |s| s.deinit(gpa);
     }
 };
 
@@ -316,7 +298,13 @@ const SyncTransfer = struct {
     ) !*SyncTransfer {
         var session: sync.Session = switch (spec.direction) {
             .push => .{
-                .sender = try sync.Sender.init(io, gpa, spec.source_root, &.{}, job_id),
+                .sender = try .init(
+                    io,
+                    gpa,
+                    spec.root,
+                    spec.exclude,
+                    job_id,
+                ),
             },
             .pull, .both => return error.UnsupportedDirection,
         };
@@ -650,7 +638,7 @@ pub const RemoteManager = struct {
             null;
         errdefer if (agent_addr) |addr| self.gpa.free(addr);
 
-        var sync_spec: ?SyncSpec = if (spec) |*s| try s.copy(self.gpa) else null;
+        var sync_spec: ?SyncSpec = if (spec) |s| try s.dupe(self.gpa) else null;
         errdefer if (sync_spec) |*s| s.deinit(self.gpa);
 
         try self.commands.append(self.gpa, .{ .dispatch = .{
@@ -1030,9 +1018,10 @@ pub const RemoteManager = struct {
             return self.failSyncedDispatch(job_id, "out of memory");
         };
 
-        log.debug("Workspace sync {x} begin: task='{s}' job='{s}' root='{s}' mode={s}", .{
-            job_id, entry.task_id, entry.job_name, spec.source_root, @tagName(spec.mode),
-        });
+        log.debug(
+            "Workspace sync {x} begin: task='{s}' job='{s}' root='{s}' mode={s} direction={s}",
+            .{ job_id, entry.task_id, entry.job_name, spec.root, @tagName(spec.mode), @tagName(spec.direction) },
+        );
 
         const begin = protocol.serialize(self.gpa, .{ .sync_begin = .{
             .job_id = job_id,
@@ -1584,7 +1573,7 @@ fn putTestDispatch(
         .job_name = try manager.gpa.dupe(u8, "build"),
         .agent = .{ .name = try manager.gpa.dupe(u8, "runner1") },
         .sync = .{
-            .source_root = try manager.gpa.dupe(u8, source_root),
+            .root = try manager.gpa.dupe(u8, source_root),
             .mode = .ephemeral,
             .direction = .push,
         },

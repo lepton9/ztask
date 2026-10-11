@@ -849,7 +849,7 @@ test "remote_job_with_sync" {
         "build",
         agent_spec,
         &steps,
-        .{ .source_root = source_root, .mode = .ephemeral, .direction = .push },
+        .{ .root = source_root, .mode = .ephemeral, .direction = .push },
     );
 
     var finished = try events.waitJobFinished(io);
@@ -866,7 +866,7 @@ test "remote_job_with_sync" {
         "build",
         agent_spec,
         &steps,
-        .{ .source_root = missing, .mode = .ephemeral, .direction = .push },
+        .{ .root = missing, .mode = .ephemeral, .direction = .push },
     );
     var failed = try events.waitJobFinished(io);
     defer failed.deinit(gpa);

@@ -376,14 +376,33 @@ pub const Scheduler = struct {
         job_meta.status = .running;
         self.run_logger.logJobMetadata(self.gpa, job_meta) catch {};
 
-        // TODO: derive the sync spec from the task/job `sync` config
-        const sync: ?remote.SyncSpec = null;
+        // A job-level sync spec overrides the task-level one
+        var sync_spec: ?task_zig.SyncSpec = null;
+        defer if (sync_spec) |*s| s.deinit(self.gpa);
+        sync_spec = resolveSyncSpec(
+            self.io,
+            self.gpa,
+            self.task.cwd,
+            node.ptr.sync orelse self.task.sync,
+        ) catch |err| {
+            log.warn(
+                "Failed to prepare workspace sync for job '{s}': {s}",
+                .{ node.ptr.name, @errorName(err) },
+            );
+            self.onJobCompleted(node, .{
+                .success = false,
+                .runner = .remote,
+                .err = localrunner.ResultError.SyncFailed,
+            });
+            return;
+        };
+
         const dispatch_id = self.remote_manager.pushDispatch(
             self.task_meta.task_id,
             node.ptr.name,
             node.ptr.run_on.remote,
             node.ptr.steps,
-            sync,
+            sync_spec,
         ) catch |err| {
             log.warn(
                 "Failed to queue remote dispatch of job '{s}': {s}",
@@ -745,3 +764,71 @@ pub const Scheduler = struct {
         return status;
     }
 };
+
+/// Resolve the effective sync spec of a remote job dispatch.
+fn resolveSyncSpec(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    base_dir: ?[]const u8,
+    config: ?task_zig.SyncSpec,
+) error{ OutOfMemory, CwdUnavailable }!?task_zig.SyncSpec {
+    var spec: task_zig.SyncSpec = blk: {
+        const spec = config orelse return null;
+        if (spec.mode == .none) return null;
+        break :blk try spec.dupe(gpa);
+    };
+    errdefer spec.deinit(gpa);
+
+    // Resolve the path based on the task cwd
+    const absolute = try task_zig.normalizePath(io, gpa, spec.root, .{
+        .base = base_dir,
+    });
+    gpa.free(spec.root);
+    spec.root = absolute;
+    return spec;
+}
+
+test "resolves_root_and_dupes_exclude" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(base);
+
+    const spec = try resolveSyncSpec(io, gpa, base, .{
+        .root = "src",
+        .mode = .persistent,
+        .exclude = &.{ ".zig-cache", "**/*.o" },
+    });
+    try std.testing.expect(spec != null);
+    defer spec.?.deinit(gpa);
+
+    const expected_root = try std.fs.path.join(gpa, &.{ base, "src" });
+    defer gpa.free(expected_root);
+    try std.testing.expectEqualStrings(expected_root, spec.?.root);
+    try std.testing.expectEqual(task_zig.SyncMode.persistent, spec.?.mode);
+    try std.testing.expectEqual(task_zig.SyncDirection.push, spec.?.direction);
+    try std.testing.expectEqualStrings(".zig-cache", spec.?.exclude[0]);
+    try std.testing.expectEqualStrings("**/*.o", spec.?.exclude[1]);
+}
+
+test "none_and_null_disable_sync" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    try std.testing.expect((try resolveSyncSpec(io, gpa, null, null)) == null);
+    try std.testing.expect((try resolveSyncSpec(io, gpa, null, .{ .mode = .none })) == null);
+}
+
+test "sync_spec_resolve_defaults" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    const spec = try resolveSyncSpec(io, gpa, null, .{});
+    try std.testing.expect(spec != null);
+    defer spec.?.deinit(gpa);
+    try std.testing.expect(std.fs.path.isAbsolute(spec.?.root));
+    try std.testing.expectEqual(task_zig.SyncMode.ephemeral, spec.?.mode);
+    try std.testing.expectEqual(task_zig.SyncDirection.push, spec.?.direction);
+    try std.testing.expect(spec.?.exclude.len == 0);
+}

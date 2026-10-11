@@ -348,23 +348,11 @@ pub const JobLogMsg = struct {
     data: []const u8,
 };
 
-pub const SyncDirection = enum(u8) {
-    /// Manager sends the workspace to the agent before the job runs.
-    push = 1,
-    /// Agent sends workspace results back to the manager.
-    pull = 2,
-    /// Bidirectional sync.
-    both = 3,
-};
+/// Direction of a workspace sync.
+pub const SyncDirection = task.SyncDirection;
 
-pub const WorkspaceMode = enum(u8) {
-    /// No transfer (dispatch only).
-    none = 0,
-    /// A transfer into a per-run staging dir.
-    ephemeral = 1,
-    /// A transfer into a reused workspace.
-    persistent = 2,
-};
+/// Workspace mode of a dispatched job.
+pub const WorkspaceMode = task.SyncMode;
 
 /// Start a workspace transfer for a dispatched job.
 pub const SyncBeginMsg = struct {

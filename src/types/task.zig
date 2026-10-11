@@ -10,6 +10,8 @@ pub const Task = struct {
     name: []const u8,
     /// Current working directory for the task run.
     cwd: ?[]const u8 = null,
+    /// Task-level workspace sync spec for remote jobs.
+    sync: ?SyncSpec = null,
     /// Path of the task file for this task.
     file_path: ?[]const u8 = null,
     /// All task triggers. Any trigger firing runs the task.
@@ -34,6 +36,7 @@ pub const Task = struct {
 
         if (self.cwd) |path| gpa.free(path);
         if (self.file_path) |path| gpa.free(path);
+        if (self.sync) |s| s.deinit(gpa);
         for (self.triggers.items) |trigger| trigger.deinit(gpa);
         self.triggers.deinit(gpa);
         gpa.free(self.name);
@@ -86,6 +89,7 @@ pub const Task = struct {
         try appendYamlField(writer, 0, "name", task.name);
         if (task.id.str) |id_str| try appendYamlField(writer, 0, "id", id_str);
         if (task.cwd) |cwd| try appendYamlField(writer, 0, "cwd", cwd);
+        if (task.sync) |s| try appendYamlSyncBlock(writer, 0, s);
 
         if (task.triggers.items.len > 0) {
             try writer.writeAll("on:\n");
@@ -172,6 +176,8 @@ pub const Task = struct {
                     },
                 }
 
+                if (job.sync) |s| try appendYamlSyncBlock(writer, 2, s);
+
                 if (job.deps) |deps| {
                     try writer.writeAll("    deps: [");
                     for (deps, 0..) |dep, i| {
@@ -246,6 +252,33 @@ pub const Task = struct {
     fn appendYamlQuotedLine(writer: *std.Io.Writer, value: []const u8) !void {
         try appendYamlQuotedString(writer, value);
         try writer.writeByte('\n');
+    }
+
+    /// Write a `sync` configuration block under its key.
+    fn appendYamlSyncBlock(
+        writer: *std.Io.Writer,
+        indent_level: usize,
+        config: SyncSpec,
+    ) !void {
+        try appendYamlKey(writer, indent_level, "sync");
+        try appendYamlField(writer, indent_level + 1, "root", config.root);
+        try writer.splatByteAll(' ', yaml_indent_spaces * (indent_level + 1));
+        try writer.writeAll("mode: ");
+        try writer.writeAll(@tagName(config.mode));
+        try writer.writeByte('\n');
+        try writer.splatByteAll(' ', yaml_indent_spaces * (indent_level + 1));
+        try writer.writeAll("direction: ");
+        try writer.writeAll(@tagName(config.direction));
+        try writer.writeByte('\n');
+        if (config.exclude.len > 0) {
+            try writer.splatByteAll(' ', yaml_indent_spaces * (indent_level + 1));
+            try writer.writeAll("exclude: [");
+            for (config.exclude, 0..) |pattern, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try appendYamlQuotedString(writer, pattern);
+            }
+            try writer.writeAll("]\n");
+        }
     }
 
     fn appendYamlQuotedString(writer: *std.Io.Writer, value: []const u8) !void {
@@ -357,6 +390,69 @@ fn countKind(triggers: []const Trigger, kind: Trigger.Kind) usize {
     return count;
 }
 
+/// Workspace sync mode of remote jobs.
+pub const SyncMode = enum(u8) {
+    /// No transfer (dispatch only).
+    none = 0,
+    /// A transfer into a per-run staging dir. Deleted after the run.
+    ephemeral = 1,
+    /// A transfer into a reused workspace. Only changes are sent.
+    persistent = 2,
+};
+
+/// Direction of a workspace sync.
+pub const SyncDirection = enum(u8) {
+    /// Manager sends the workspace to the agent before the job runs.
+    push = 1,
+    /// Agent sends workspace results back to the manager.
+    pull = 2,
+    /// Bidirectional sync.
+    both = 3,
+};
+
+/// Workspace sync specification of remote jobs.
+pub const SyncSpec = struct {
+    /// Source root to transfer, relative to the task cwd.
+    root: []const u8 = ".",
+    /// Workspace lifetime on the agent.
+    mode: SyncMode = .ephemeral,
+    /// Which way data flows for this transfer.
+    direction: SyncDirection = .push,
+    /// Glob patterns (`/`-separated, workspace-relative) excluded
+    /// from the transfer.
+    exclude: []const []const u8 = &.{},
+
+    /// Allocate a copy of the spec.
+    pub fn dupe(self: SyncSpec, gpa: std.mem.Allocator) !SyncSpec {
+        const root = try gpa.dupe(u8, self.root);
+        errdefer gpa.free(root);
+        var exclude: []const []const u8 = &.{};
+        if (self.exclude.len > 0) {
+            const patterns = try gpa.alloc([]const u8, self.exclude.len);
+            errdefer gpa.free(patterns);
+            var owned: usize = 0;
+            errdefer for (patterns[0..owned]) |pattern| gpa.free(pattern);
+            for (self.exclude, 0..) |pattern, i| {
+                patterns[i] = try gpa.dupe(u8, pattern);
+                owned = i + 1;
+            }
+            exclude = patterns;
+        }
+        return .{
+            .root = root,
+            .mode = self.mode,
+            .direction = self.direction,
+            .exclude = exclude,
+        };
+    }
+
+    pub fn deinit(self: SyncSpec, gpa: std.mem.Allocator) void {
+        gpa.free(self.root);
+        for (self.exclude) |pattern| gpa.free(pattern);
+        if (self.exclude.len > 0) gpa.free(self.exclude);
+    }
+};
+
 pub const RemoteRunSpec = struct {
     /// Registered agent name.
     name: []const u8,
@@ -395,10 +491,13 @@ pub const Job = struct {
     steps: []Step = undefined,
     deps: ?[]const []const u8 = null,
     run_on: RunLocation = .local,
+    /// Job-level sync spec. Overrides the task-level `sync`.
+    sync: ?SyncSpec = null,
 
     pub fn deinit(self: Job, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
         self.run_on.deinit(gpa);
+        if (self.sync) |s| s.deinit(gpa);
         if (self.deps) |deps| {
             for (deps) |dep| gpa.free(dep);
             gpa.free(deps);
@@ -645,6 +744,56 @@ test "task_to_yaml_multiple_triggers" {
     const text = try t.toYaml(gpa);
     defer gpa.free(text);
     try std.testing.expectEqualStrings(expected, text);
+}
+
+test "task_to_yaml_sync" {
+    const gpa = std.testing.allocator;
+    var t = try Task.init(gpa, "sync-task");
+    defer t.deinit(gpa);
+    t.sync = .{
+        .root = try gpa.dupe(u8, "src"),
+        .mode = .persistent,
+        .exclude = try ownedExclude(gpa, &.{ ".zig-cache", "node_modules" }),
+    };
+
+    var steps = try gpa.alloc(Step, 1);
+    steps[0] = .{ .command = .{ .value = try gpa.dupe(u8, "ls") } };
+    try t.addJob(gpa, .{
+        .name = try gpa.dupe(u8, "job1"),
+        .steps = steps,
+        .sync = .{ .root = try gpa.dupe(u8, ".") },
+    });
+
+    const expected =
+        \\name: "sync-task"
+        \\sync:
+        \\  root: "src"
+        \\  mode: persistent
+        \\  direction: push
+        \\  exclude: [".zig-cache", "node_modules"]
+        \\
+        \\jobs:
+        \\  job1:
+        \\    steps:
+        \\      - command: "ls"
+        \\    run_on: local
+        \\    sync:
+        \\      root: "."
+        \\      mode: ephemeral
+        \\      direction: push
+        \\
+    ;
+
+    const text = try t.toYaml(gpa);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(expected, text);
+}
+
+/// Allocate owned copies of the given glob patterns.
+fn ownedExclude(gpa: std.mem.Allocator, patterns: []const []const u8) ![]const []const u8 {
+    const out = try gpa.alloc([]const u8, patterns.len);
+    for (patterns, 0..) |pattern, i| out[i] = try gpa.dupe(u8, pattern);
+    return out;
 }
 
 test "task_to_yaml_exit_code" {

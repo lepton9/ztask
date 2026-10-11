@@ -652,7 +652,7 @@ pub const Source = struct {
                 return .end;
             };
             if (entry.kind != .file) {
-                log.debug("sync send skipping non-file '{s}'", .{entry.path});
+                // TODO: handle sym_link?
                 continue;
             }
             if (glob.matchAny(self.exclude, entry.path)) continue;
