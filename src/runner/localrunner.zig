@@ -327,7 +327,7 @@ pub const LocalRunner = struct {
         else
             .inherit;
 
-        log.debug("Spawn command for job '{s}', step={d}: {s}", .{
+        log.debug("Spawn command for job '{s}', step={d}: '{s}'", .{
             job.ptr.name,
             step_index,
             step.command.value,

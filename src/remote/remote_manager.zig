@@ -563,6 +563,12 @@ pub const RemoteManager = struct {
             }
             self.mutex.unlock(self.io);
         }
+
+        // One final pass so commands queued are still processed and delivered
+        self.drainCommands() catch |err|
+            log.err("Failed to process remote commands: {s}", .{@errorName(err)});
+        self.drainAgentInbox() catch |err|
+            log.err("Failed to process remote agent messages: {s}", .{@errorName(err)});
     }
 
     /// Main loop for the accept worker.
@@ -1161,6 +1167,15 @@ pub const RemoteManager = struct {
                 job_id,
                 message,
             });
+        }
+        // Tell the agent to tear the job as well
+        if (self.findAgent(req.agent)) |agent| {
+            const payload = protocol.serialize(self.gpa, .{
+                .cancel_job = .{ .job_id = job_id },
+            }) catch null;
+            if (payload) |frame| self.sendMessageOwned(agent, frame) catch {
+                self.gpa.free(frame);
+            };
         }
         const event = self.makeJobFinishedEvent(
             req.task_id,

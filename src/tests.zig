@@ -474,11 +474,11 @@ fn expectNextMsg(
 
 /// Poll until the path no longer exists.
 fn waitRemoved(io: std.Io, path: []const u8) !void {
+    const timeout_ms = std.Io.Duration.fromMilliseconds(100).toMilliseconds();
     var waited_ts = std.Io.Timestamp.now(io, .awake);
     while (true) {
         _ = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
-        expect(waited_ts.untilNow(io, .awake).toMilliseconds() <
-            std.Io.Duration.fromMilliseconds(100).toMilliseconds()) catch
+        expect(waited_ts.untilNow(io, .awake).toMilliseconds() < timeout_ms) catch
             return error.WaitedTooLong;
         try std.Io.sleep(io, .fromMilliseconds(10), .awake);
     }

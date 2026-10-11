@@ -241,6 +241,7 @@ pub const RemoteAgent = struct {
         self.stopWriter();
         self.stopReader();
         try self.connection.connect(addr);
+        self.resetJobState();
         self.connection_writer = try self.connection.writer(self.gpa);
         self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
         self.writer_thread = std.Thread.spawn(.{}, writeLoop, .{self}) catch |err| {
@@ -635,6 +636,48 @@ pub const RemoteAgent = struct {
     fn destroySync(self: *RemoteAgent, job_id: u64) void {
         const kv = self.syncs.fetchRemove(job_id) orelse return;
         kv.value.deinit(self.gpa);
+    }
+
+    /// Drop every job and transfer tracked for the previous connection.
+    fn resetJobState(self: *RemoteAgent) void {
+        self.pool.cancelWaiter(self);
+        self.queue.clear();
+
+        // Force stop any currently running jobs
+        var active_it = self.active_runners.iterator();
+        while (active_it.next()) |kv| {
+            log.info(
+                "Cancelling job {x} of the dropped connection",
+                .{kv.key_ptr.*.id},
+            );
+            kv.value_ptr.*.forceStop();
+            self.pool.release(kv.value_ptr.*);
+        }
+        self.active_runners.clearRetainingCapacity();
+
+        var jobs_it = self.jobs.iterator();
+        while (jobs_it.next()) |e| self.destroyJobEntry(e.value_ptr.*);
+        self.jobs.clearAndFree(self.gpa);
+
+        var syncs_it = self.syncs.iterator();
+        while (syncs_it.next()) |entry| {
+            log.info(
+                "Aborted workspace transfer {x} of the dropped connection",
+                .{entry.key_ptr.*},
+            );
+            entry.value_ptr.*.deinit(self.gpa);
+        }
+        self.syncs.clearAndFree(self.gpa);
+
+        // Drop queued events, results and frames
+        while (self.log_queue.pop()) |event| event.deinit(self.gpa);
+        while (true) {
+            var pending: [4]Result = undefined;
+            const n = self.result_queue.get(self.io, &pending, 0) catch break;
+            if (n == 0) break;
+            for (pending[0..n]) |*res| res.result.deinit(self.gpa);
+        }
+        while (self.incoming_frames.pop()) |msg| msg.deinit();
     }
 
     /// Queue a message for delivery by the writer thread.
