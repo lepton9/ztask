@@ -170,7 +170,7 @@ pub const LocalRunner = struct {
                 err_msg = gpa.dupe(u8, "Interrupted") catch null;
                 break;
             }
-            log.debug("{s}: step {s}", .{ job.ptr.name, step.command.value });
+            log.debug("{s}: step '{s}'", .{ job.ptr.name, step.command.value });
 
             const step_result = switch (step.*) {
                 .command => self.runCommandStep(gpa, step, logs, mode) catch |err| blk: {

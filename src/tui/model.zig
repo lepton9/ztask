@@ -2,6 +2,8 @@ const std = @import("std");
 const tm = @import("../taskmanager.zig");
 const data = @import("../data.zig");
 const date = @import("../types/date.zig");
+const task_types = @import("../types/task.zig");
+const human = @import("../types/human.zig");
 const snap = @import("snapshot.zig");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
@@ -29,6 +31,16 @@ const COLOR_CYAN: vaxis.Color = .{ .rgb = .{ 0, 255, 255 } };
 const StatusText = struct {
     text: []const u8 = "",
     color: vaxis.Color = .default,
+};
+
+/// Display state of one in-flight workspace transfer.
+const SyncTransferState = struct {
+    task_id: u64,
+    direction: task_types.SyncDirection,
+    files_done: usize,
+    bytes_done: u64,
+    files_total: ?usize,
+    bytes_total: ?u64,
 };
 
 /// Main TUI state
@@ -68,6 +80,8 @@ pub const Model = struct {
     /// A finished run whose id differs from the stored one is treated as
     /// unchecked.
     acked_runs: std.StringHashMapUnmanaged(u64) = .empty,
+    /// In-flight workspace transfers, keyed by dispatch id.
+    sync_progress: std.AutoHashMapUnmanaged(u64, SyncTransferState) = .empty,
     /// The run launched that the selected task view follows.
     follow_run: ?struct { task_id: []u8 } = null,
 
@@ -123,6 +137,7 @@ pub const Model = struct {
         var it = self.acked_runs.iterator();
         while (it.next()) |e| self.gpa.free(e.key_ptr.*);
         self.acked_runs.deinit(self.gpa);
+        self.sync_progress.deinit(self.gpa);
         self.arena_task.deinit();
         self.arena_task_next.deinit();
         self.arena_list.deinit();
@@ -352,6 +367,45 @@ pub const Model = struct {
                     @tagName(e.scope),
                     e.msg orelse @errorName(e.err),
                 });
+            },
+            // TODO: display for the task
+            .sync_progress => |e| switch (e.phase) {
+                .finished => {
+                    _ = self.sync_progress.remove(e.dispatch_id);
+                    var byte_buf: [32]u8 = undefined;
+                    var dur_buf: [16]u8 = undefined;
+                    try self.setInfo(
+                        "Sync finished: task {x}: {d} files, {s} ({s})",
+                        .{
+                            e.task_id,
+                            e.files_done,
+                            human.bytes(&byte_buf, e.bytes_done),
+                            human.duration(&dur_buf, e.duration_ms),
+                        },
+                    );
+                },
+                .failed => {
+                    _ = self.sync_progress.remove(e.dispatch_id);
+                    var dur_buf: [16]u8 = undefined;
+                    try self.setInfo(
+                        "Sync failed: task {x} ({s})",
+                        .{ e.task_id, human.duration(&dur_buf, e.duration_ms) },
+                    );
+                },
+                .started, .progress => {
+                    self.sync_progress.put(self.gpa, e.dispatch_id, .{
+                        .task_id = e.task_id,
+                        .direction = e.direction,
+                        .files_done = e.files_done,
+                        .bytes_done = e.bytes_done,
+                        .files_total = e.files_total,
+                        .bytes_total = e.bytes_total,
+                    }) catch {};
+                    if (e.phase == .started) try self.setInfo(
+                        "Sync started: task {x} ({s})",
+                        .{ e.task_id, @tagName(e.direction) },
+                    );
+                },
             },
             .wake => {},
         };

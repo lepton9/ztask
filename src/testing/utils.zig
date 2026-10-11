@@ -154,17 +154,31 @@ pub const RemoteEventSink = struct {
         self.queue.deinit(self.gpa);
     }
 
-    /// Wait for the next `job_finished` event, skipping other kinds.
-    pub fn waitJobFinished(self: *RemoteEventSink, io: std.Io) !remote_manager.RemoteEvent {
+    /// Wait for the next event of the given kind, skipping others.
+    pub fn waitEvent(
+        self: *RemoteEventSink,
+        io: std.Io,
+        comptime tag: std.meta.Tag(remote_manager.RemoteEvent),
+    ) !remote_manager.RemoteEvent {
         var waited: usize = 0;
         while (true) {
             while (self.queue.pop()) |event| {
-                if (std.meta.activeTag(event) == .job_finished) return event;
+                if (std.meta.activeTag(event) == tag) return event;
                 event.deinit(self.gpa);
             }
             try std.testing.expect(waited < 300);
             waited += 1;
             try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
         }
+    }
+
+    /// Wait for the next `job_finished` event, skipping other kinds.
+    pub fn waitJobFinished(self: *RemoteEventSink, io: std.Io) !remote_manager.RemoteEvent {
+        return self.waitEvent(io, .job_finished);
+    }
+
+    /// Wait for the next sync progress event, skipping other kinds.
+    pub fn waitSyncProgress(self: *RemoteEventSink, io: std.Io) !remote_manager.RemoteEvent {
+        return self.waitEvent(io, .sync_progress);
     }
 };

@@ -128,6 +128,26 @@ pub const TaskManager = struct {
             err: anyerror,
             msg: ?[]const u8 = null,
         },
+        /// Workspace transfer progress of a remote job dispatch.
+        sync_progress: struct {
+            task_id: u64,
+            dispatch_id: u64,
+            /// Workspace mode of the transfer.
+            mode: task_zig.SyncMode,
+            /// Direction of the transfer.
+            direction: task_zig.SyncDirection,
+            /// Lifecycle stage of the transfer.
+            phase: remotemanager.SyncPhase,
+            /// Files transferred so far.
+            files_done: usize,
+            /// File payload bytes transferred so far.
+            bytes_done: u64,
+            /// Totals of the planned transfer if known.
+            files_total: ?usize = null,
+            bytes_total: ?u64 = null,
+            /// Elapsed time since the transfer started.
+            duration_ms: i64,
+        },
         wake,
 
         pub const ErrorScope = enum {
@@ -149,6 +169,7 @@ pub const TaskManager = struct {
                     .err = e.err,
                     .msg = if (e.msg) |msg| try gpa.dupe(u8, msg) else null,
                 } },
+                .sync_progress => |e| .{ .sync_progress = e },
                 .wake => .wake,
             };
         }
@@ -158,6 +179,7 @@ pub const TaskManager = struct {
                 .run_finished => {},
                 .info => |e| gpa.free(e.msg),
                 .err => |e| if (e.msg) |msg| gpa.free(msg),
+                .sync_progress => {},
                 .wake => {},
             }
         }
@@ -848,6 +870,21 @@ pub const TaskManager = struct {
                 );
                 self.gpa.free(e.task_id);
                 owned = false;
+            },
+            .sync_progress => |e| {
+                const sched = self.getScheduler(e.task_id) orelse return;
+                self.publishEvent(.{ .sync_progress = .{
+                    .task_id = sched.task.id.value,
+                    .dispatch_id = e.dispatch_id,
+                    .mode = e.mode,
+                    .direction = e.direction,
+                    .phase = e.phase,
+                    .files_done = e.files_done,
+                    .bytes_done = e.bytes_done,
+                    .files_total = e.files_total,
+                    .bytes_total = e.bytes_total,
+                    .duration_ms = e.duration_ms,
+                } });
             },
         }
     }

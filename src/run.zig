@@ -20,6 +20,7 @@ const InputLoop = tui_input.InputLoop;
 const RemoteAgent = remote_agent.RemoteAgent;
 const TaskManager = manager.TaskManager;
 const GenericDiagnostics = @import("diagnostics.zig").GenericDiagnostics;
+const human = @import("types/human.zig");
 const editor = @import("editor.zig");
 
 const EditResult = editor.EditResult;
@@ -630,6 +631,26 @@ fn handleRunEvent(
                 @tagName(e.scope),
                 e.msg orelse @errorName(e.err),
             });
+        },
+        .sync_progress => |e| {
+            if (!verbose) return;
+            const sel = findSelectedTask(selected, e.task_id) orelse return;
+            var byte_buf: [32]u8 = undefined;
+            var dur_buf: [16]u8 = undefined;
+            try out.print(
+                "{s:<12} task={s} dispatch={x} {s}/{s} {s}: {d} files, {s}, {s}\n",
+                .{
+                    "sync",
+                    sel.id(),
+                    e.dispatch_id,
+                    @tagName(e.direction),
+                    @tagName(e.mode),
+                    @tagName(e.phase),
+                    e.files_done,
+                    human.bytes(&byte_buf, e.bytes_done),
+                    human.duration(&dur_buf, e.duration_ms),
+                },
+            );
         },
         .wake => {},
     }

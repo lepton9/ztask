@@ -733,6 +733,13 @@ pub const Sender = struct {
     /// Serialized frame rejected by the writer queue.
     /// Must be retried before consuming new source events.
     pending: ?[]u8 = null,
+    /// Byte length of the pending chunk frame.
+    pending_bytes: usize = 0,
+
+    /// Files fully queued to the writer.
+    files: usize = 0,
+    /// Total file bytes queued to the writer.
+    bytes: u64 = 0,
 
     pub const Status = union(enum) {
         /// Queued at least one frame, then hit the writer budget.
@@ -768,10 +775,12 @@ pub const Sender = struct {
         self.source.deinit();
     }
 
-    /// Queue frames until the writer budget is reached or the transfer
-    /// is fully queued.
-    pub fn pump(self: *Sender, outbox: *Connection.Writer) Status {
+    /// Queue frames until the writer budget, the `max_bytes` quota of
+    /// chunk payload for this pass, or the end of the transfer is
+    /// reached.
+    pub fn pump(self: *Sender, outbox: *Connection.Writer, max_bytes: usize) Status {
         var queued_any = false;
+        var pass_bytes: usize = 0;
         while (true) {
             // A backpressured frame is retried before producing new source events
             if (self.pending) |frame| {
@@ -790,8 +799,16 @@ pub const Sender = struct {
                     } },
                 };
                 self.pending = null;
+                self.bytes += self.pending_bytes;
+                self.pending_bytes = 0;
                 queued_any = true;
             }
+
+            // The quota stops producing new chunks for this pass
+            if (pass_bytes >= max_bytes) return if (queued_any)
+                .backpressured
+            else
+                .blocked;
 
             const event = self.source.next(&self.chunk_buf) catch |err| {
                 return .{ .failed = .{
@@ -814,6 +831,7 @@ pub const Sender = struct {
                     outbox.tryEnqueueOwned(frame) catch |err| switch (err) {
                         error.Backpressure => {
                             self.pending = frame; // retried on the next pass
+                            self.pending_bytes = c.data.len;
                             return if (queued_any)
                                 .backpressured
                             else
@@ -834,6 +852,8 @@ pub const Sender = struct {
                             } };
                         },
                     };
+                    self.bytes += c.data.len;
+                    pass_bytes += c.data.len;
                     queued_any = true;
                 },
                 .file_done => |f| {
@@ -854,6 +874,7 @@ pub const Sender = struct {
                             .err = err,
                         } };
                     };
+                    self.files += 1;
                     queued_any = true;
                 },
                 .end => {
