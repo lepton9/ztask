@@ -300,12 +300,12 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const custom_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        log.err("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
         self.publishEvent(.{ .err = .{
             .scope = scope,
             .msg = custom_msg,
             .err = err,
         } });
-        log.err("{any}: error: {any} - '{s}'", .{ scope, err, custom_msg });
     }
 
     /// Handle error and push it to the event queue.
@@ -314,11 +314,11 @@ pub const TaskManager = struct {
         scope: Event.ErrorScope,
         err: anyerror,
     ) void {
+        log.err("{any}: error: {any}", .{ scope, err });
         self.publishEvent(.{ .err = .{
             .scope = scope,
             .err = err,
         } });
-        log.err("{any}: error: {any}", .{ scope, err });
     }
 
     /// Add an info event to the event queue.
@@ -329,10 +329,10 @@ pub const TaskManager = struct {
         args: anytype,
     ) void {
         const msg = std.fmt.allocPrint(self.gpa, fmt, args) catch return;
+        log.info("task={d} {s}", .{ task_id, msg });
         self.publishEvent(.{
             .info = .{ .task_id = task_id, .msg = msg },
         });
-        log.info("task={d} {s}", .{ task_id, msg });
     }
 
     /// Callback for the scheduler for adding info events.
