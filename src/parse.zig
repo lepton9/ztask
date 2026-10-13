@@ -1041,12 +1041,23 @@ pub fn parseTaskBufferDiag(
             null,
             "Duplicate key in the map",
         ),
-        else => cx.failf(
-            ParseError.InvalidFileFormat,
-            null,
-            "Invalid YAML format: {any}",
-            .{err},
-        ),
+        else => blk: {
+            if (yamlParseErrorDetail(gpa, &yaml_parser)) |detail| {
+                defer gpa.free(detail);
+                break :blk cx.failf(
+                    ParseError.InvalidFileFormat,
+                    null,
+                    "Invalid YAML format: {s}",
+                    .{detail},
+                );
+            }
+            break :blk cx.failf(
+                ParseError.InvalidFileFormat,
+                null,
+                "Invalid YAML format: {s}",
+                .{@errorName(err)},
+            );
+        },
     };
 
     const values = yaml_parser.docs.items;
@@ -1059,6 +1070,24 @@ pub fn parseTaskBufferDiag(
 
 pub fn parseTaskBuffer(io: std.Io, gpa: std.mem.Allocator, buf: []const u8) !*Task {
     return parseTaskBufferDiag(io, gpa, buf, null);
+}
+
+/// Extract the first recorded yaml parse error, if any.
+fn yamlParseErrorDetail(gpa: std.mem.Allocator, parser: *yaml.Yaml) ?[]u8 {
+    const bundle = parser.parse_errors;
+    if (bundle.errorMessageCount() == 0) return null;
+
+    const messages = bundle.getMessages();
+    const em = bundle.getErrorMessage(messages[0]);
+    const msg = bundle.nullTerminatedString(em.msg);
+    if (em.src_loc == .none) return gpa.dupe(u8, msg) catch null;
+
+    const loc = bundle.getSourceLocation(em.src_loc);
+    return std.fmt.allocPrint(
+        gpa,
+        "{s} (line {d}, column {d})",
+        .{ msg, loc.line + 1, loc.column + 1 },
+    ) catch null;
 }
 
 /// Parse a task file into a `Task`.

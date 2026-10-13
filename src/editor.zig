@@ -67,8 +67,11 @@ pub fn editTaskFile(
             const msg = diag.message orelse @errorName(err);
             const field = diag.field orelse "";
 
-            const err_msg = try std.fmt.bufPrint(&buf, "{s}: '{s}'", .{ msg, field });
-            const ans = try promptYesNo(io, "{s}. Re-edit? [Y/n] ", .{err_msg});
+            const err_msg: []const u8 = if (field.len > 0)
+                std.fmt.bufPrint(&buf, "{s}: '{s}'", .{ msg, field }) catch msg
+            else
+                msg;
+            const ans = try promptYesNo(io, "{s}.\nRe-edit? [Y/n] ", .{err_msg});
             if (ans) continue;
 
             if (original_hash != after_hash) {
@@ -222,17 +225,25 @@ fn promptYesNo(io: std.Io, comptime fmt: []const u8, args: anytype) !bool {
     try write(io, fmt, args);
 
     const stdin = std.Io.File.stdin();
-    var buf: [1]u8 = undefined;
-    var reader = stdin.reader(io, &buf);
+    var read_buf: [1]u8 = undefined;
+    var reader = stdin.reader(io, &read_buf);
+    var ch: [1]u8 = undefined;
     var first: ?u8 = null;
+    var eof = false;
+
     while (true) {
-        const n = try reader.interface.readSliceShort(&buf);
-        if (n == 0) break;
-        const b = buf[0];
+        const n = try reader.interface.readSliceShort(&ch);
+        if (n == 0) {
+            eof = true;
+            break;
+        }
+        const b = ch[0];
         if (b == '\n') break;
         if (b == '\r') continue;
         if (first == null and b != ' ' and b != '\t') first = b;
     }
+
+    if (eof and first == null) return false;
 
     const c = first orelse '\n';
     return switch (c) {
