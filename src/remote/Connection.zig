@@ -241,7 +241,7 @@ pub const Writer = struct {
     /// taking ownership on success.
     ///
     /// Returns `error.Backpressure` without queueing once the queued
-    /// bytes reach the budget.
+    /// bytes would reach the budget.
     pub fn tryEnqueueOwned(
         self: *Writer,
         frame: []u8,
@@ -284,6 +284,172 @@ pub const Writer = struct {
         try w.interface.writeAll(&header);
         try w.interface.writeAll(msg);
         try w.interface.flush();
+    }
+};
+
+/// Destination of the parsed incoming frames of a connection.
+pub const FrameSink = struct {
+    ptr: *anyopaque,
+    /// Store one parsed frame.
+    push: *const fn (
+        ptr: *anyopaque,
+        fd: std.Io.net.Socket.Handle,
+        frame: protocol.OwnedMsg,
+    ) error{OutOfMemory}!void,
+    /// Observe one frame that failed to parse.
+    malformed: *const fn (
+        ptr: *anyopaque,
+        fd: std.Io.net.Socket.Handle,
+        err: anyerror,
+    ) error{OutOfMemory}!void,
+};
+
+pub const WorkerKind = enum { reader, writer };
+
+/// Exit hook of the connection workers.
+pub const WorkerExit = struct {
+    ptr: *anyopaque,
+    callback: *const fn (ptr: *anyopaque, kind: WorkerKind) void,
+};
+
+/// Workers of one connection.
+///
+/// A reader parses incoming frames into a `FrameSink`.
+/// A writer drains the shared `outbox` queue to the socket.
+pub const Workers = struct {
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    /// The connected stream.
+    stream: std.Io.net.Stream,
+    /// Queueing writer drained by the writer thread.
+    outbox: Writer,
+    sink: FrameSink,
+    /// Called on the writer thread after each frame it sent.
+    on_sent: ?Notify = null,
+    /// Called on each worker exit, after its closed flag is set.
+    on_exit: ?WorkerExit = null,
+    /// Set once the reader exited.
+    reader_closed: std.atomic.Value(bool) = .init(false),
+    /// Set once the writer exited.
+    writer_closed: std.atomic.Value(bool) = .init(false),
+    reader_thread: ?std.Thread = null,
+    writer_thread: ?std.Thread = null,
+
+    /// Spawn the reader and writer workers of `connection`.
+    pub fn start(
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        connection: *Connection,
+        sink: FrameSink,
+        on_exit: ?WorkerExit,
+        on_sent: ?Notify,
+    ) !*Workers {
+        if (connection.isClosed()) return error.NotConnected;
+        const self = try gpa.create(Workers);
+        errdefer {
+            self.outbox.deinit();
+            gpa.destroy(self);
+        }
+        self.* = .{
+            .io = io,
+            .gpa = gpa,
+            .stream = connection.conn.stream,
+            .outbox = .init(io, gpa, connection.conn.stream),
+            .sink = sink,
+            .on_exit = on_exit,
+            .on_sent = on_sent,
+        };
+        errdefer {
+            self.stop(connection);
+            connection.close();
+        }
+        self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
+        self.writer_thread = try std.Thread.spawn(.{}, writeLoop, .{self});
+        return self;
+    }
+
+    /// Stop both workers, interrupt blocking IO, drop queued frames
+    /// and join the threads.
+    pub fn stop(self: *Workers, connection: *Connection) void {
+        connection.shutdown();
+        self.outbox.closeQueue();
+        if (self.reader_thread) |thread| {
+            thread.join();
+            self.reader_thread = null;
+        }
+        if (self.writer_thread) |thread| {
+            thread.join();
+            self.writer_thread = null;
+        }
+    }
+
+    /// Free the worker memory. `stop` must have been called before.
+    pub fn deinit(self: *Workers, gpa: std.mem.Allocator) void {
+        std.debug.assert(self.reader_thread == null);
+        std.debug.assert(self.writer_thread == null);
+        self.outbox.deinit();
+        gpa.destroy(self);
+    }
+
+    /// Whether either worker exited.
+    pub fn isDead(self: *Workers) bool {
+        return self.reader_closed.load(.acquire) or
+            self.writer_closed.load(.acquire);
+    }
+
+    fn exitWorker(self: *Workers, kind: WorkerKind) void {
+        switch (kind) {
+            .reader => self.reader_closed.store(true, .release),
+            .writer => self.writer_closed.store(true, .release),
+        }
+        if (self.on_exit) |notify| notify.callback(notify.ptr, kind);
+    }
+
+    /// Read incoming frames until the socket breaks or the sink fails.
+    fn readLoop(self: *Workers) void {
+        var frames = Reader.init(self.io, self.gpa, self.stream) catch |err| {
+            log.debug("Failed to initialize connection reader: {s}", .{@errorName(err)});
+            self.exitWorker(.reader);
+            return;
+        };
+        defer frames.deinit();
+        const fd = self.stream.socket.handle;
+        while (true) {
+            const frame = frames.readNextFrame() catch |err| {
+                if (err != error.EndOfStream)
+                    log.debug("Connection reader stopped: {s}", .{@errorName(err)});
+                break;
+            };
+            const owned = self.gpa.dupe(u8, frame) catch |err| {
+                log.err("Failed to buffer connection frame: {s}", .{@errorName(err)});
+                break;
+            };
+            const parsed = protocol.parseOwned(self.gpa, owned) catch |err| {
+                self.sink.malformed(self.sink.ptr, fd, err) catch |sink_err| {
+                    log.err("Failed to queue connection frame: {s}", .{@errorName(sink_err)});
+                    break;
+                };
+                continue;
+            };
+            self.sink.push(self.sink.ptr, fd, parsed) catch |err| {
+                log.err("Failed to queue connection frame: {s}", .{@errorName(err)});
+                break;
+            };
+        }
+        self.exitWorker(.reader);
+    }
+
+    /// Drain the outbound queue to the socket until it closes.
+    fn writeLoop(self: *Workers) void {
+        while (true) {
+            const sent = self.outbox.sendNext() catch |err| {
+                log.debug("Connection writer stopped: {s}", .{@errorName(err)});
+                break;
+            };
+            if (!sent) break;
+            if (self.on_sent) |notify| notify.callback(notify.ptr);
+        }
+        self.exitWorker(.writer);
     }
 };
 

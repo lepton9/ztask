@@ -102,147 +102,41 @@ const DeadlineTimer = struct {
     }
 };
 
-const AgentReader = struct {
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    stream: std.Io.net.Stream,
-    incoming_frames: *MutexQueue(InboundFrame),
-    /// Set once the reader exited.
-    closed: std.atomic.Value(bool) = .init(false),
-    /// Wakes the manager loop when the reader exited.
-    notify: Notify,
-    thread: std.Thread,
+/// Incoming-frame sink of the agent workers: stamp frames with the
+/// agent socket and queue them for the manager loop.
+fn pushIncoming(
+    opq: *anyopaque,
+    fd: std.Io.net.Socket.Handle,
+    parsed: protocol.OwnedMsg,
+) error{OutOfMemory}!void {
+    const self: *RemoteManager = @ptrCast(@alignCast(opq));
+    self.incoming_frames.append(self.gpa, .{ .frame = .{
+        .socket_handle = fd,
+        .parsed = parsed,
+    } }) catch |err| {
+        parsed.deinit();
+        return err;
+    };
+}
 
-    fn start(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        incoming_frames: *MutexQueue(InboundFrame),
-        notify: Notify,
-        stream: std.Io.net.Stream,
-    ) !*AgentReader {
-        const reader = try gpa.create(AgentReader);
-        errdefer gpa.destroy(reader);
-        reader.* = .{
-            .io = io,
-            .gpa = gpa,
-            .stream = stream,
-            .incoming_frames = incoming_frames,
-            .notify = notify,
-            .thread = undefined,
-        };
-        reader.thread = try std.Thread.spawn(.{}, run, .{reader});
-        return reader;
-    }
+/// Queue a malformed-frame notice for the manager loop.
+fn noteMalformedIncoming(
+    opq: *anyopaque,
+    fd: std.Io.net.Socket.Handle,
+    err: anyerror,
+) error{OutOfMemory}!void {
+    const self: *RemoteManager = @ptrCast(@alignCast(opq));
+    return self.incoming_frames.append(self.gpa, .{ .malformed = .{
+        .socket_handle = fd,
+        .err = err,
+    } });
+}
 
-    /// Stop and join the reader thread.
-    fn deinit(self: *AgentReader) void {
-        self.thread.join();
-        self.gpa.destroy(self);
-    }
-
-    /// Whether the reader worker exited.
-    pub fn isClosed(self: *AgentReader) bool {
-        return self.closed.load(.acquire);
-    }
-
-    fn run(self: *AgentReader) void {
-        var reader = Connection.Reader.init(
-            self.io,
-            self.gpa,
-            self.stream,
-        ) catch |err| {
-            log.warn("Failed to initialize remote agent reader: {s}", .{@errorName(err)});
-            return;
-        };
-        defer reader.deinit();
-        while (true) {
-            const frame = reader.readNextFrame() catch |err| {
-                if (err != error.EndOfStream)
-                    log.debug("Remote agent reader stopped: {s}", .{@errorName(err)});
-                break;
-            };
-            const owned = self.gpa.dupe(u8, frame) catch |err| {
-                log.err("Failed to buffer remote agent frame: {s}", .{@errorName(err)});
-                break;
-            };
-            // The message takes ownership of the frame buffer
-            const parsed = protocol.parseOwned(self.gpa, owned) catch |err| {
-                self.incoming_frames.append(self.gpa, .{ .malformed = .{
-                    .socket_handle = self.stream.socket.handle,
-                    .err = err,
-                } }) catch |append_err| {
-                    log.err("Failed to queue remote agent frame: {s}", .{@errorName(append_err)});
-                    break;
-                };
-                continue;
-            };
-            self.incoming_frames.append(self.gpa, .{ .frame = .{
-                .socket_handle = self.stream.socket.handle,
-                .parsed = parsed,
-            } }) catch |err| {
-                parsed.deinit();
-                log.err("Failed to queue remote agent frame: {s}", .{@errorName(err)});
-                break;
-            };
-        }
-        self.closed.store(true, .release);
-        self.notify.callback(self.notify.ptr);
-    }
-};
-
-/// Worker thread draining the connection writer's outbound queue to the socket.
-const AgentWriter = struct {
-    /// Queueing writer. The manager loop enqueues through `outbox`.
-    outbox: Connection.Writer,
-    /// Set once the writer exited.
-    closed: std.atomic.Value(bool) = .init(false),
-    /// Wakes the manager loop when the writer exited.
-    notify: Notify,
-    thread: std.Thread,
-
-    fn start(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        notify: Notify,
-        stream: std.Io.net.Stream,
-    ) !*AgentWriter {
-        const writer = try gpa.create(AgentWriter);
-        errdefer gpa.destroy(writer);
-        writer.* = .{
-            .outbox = .init(io, gpa, stream),
-            .notify = notify,
-            .thread = undefined,
-        };
-        writer.thread = try std.Thread.spawn(.{}, run, .{writer});
-        return writer;
-    }
-
-    /// Stop the writer and join its thread, dropping queued frames.
-    /// The caller must have shut down the socket first.
-    fn deinit(self: *AgentWriter, gpa: std.mem.Allocator) void {
-        self.outbox.closeQueue();
-        self.thread.join();
-        self.outbox.deinit();
-        gpa.destroy(self);
-    }
-
-    /// Whether the writer worker exited.
-    pub fn isClosed(self: *AgentWriter) bool {
-        return self.closed.load(.acquire);
-    }
-
-    fn run(self: *AgentWriter) void {
-        while (true) {
-            const sent = self.outbox.sendNext() catch |err| {
-                log.debug("Remote agent writer stopped: {s}", .{@errorName(err)});
-                break;
-            };
-            if (!sent) break;
-        }
-        self.closed.store(true, .release);
-        self.notify.callback(self.notify.ptr);
-    }
-};
+/// Wake the manager loop when a connection worker exited.
+fn workerExited(opq: *anyopaque, kind: Connection.WorkerKind) void {
+    _ = kind;
+    RemoteManager.notify(opq);
+}
 
 /// A queued remote job dispatch.
 pub const DispatchRequest = struct {
@@ -429,8 +323,10 @@ pub const RemoteEvent = union(enum) {
 pub const AgentHandle = struct {
     name: ?[]const u8 = null,
     connection: Connection,
-    reader: *AgentReader,
-    writer: *AgentWriter,
+    /// The two worker threads pumping the connection. Their `outbox`
+    /// is the shared queue of every producer of the connection,
+    /// including in-flight workspace transfer producers.
+    workers: *Connection.Workers,
     last_heartbeat: i64,
 
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
@@ -439,9 +335,8 @@ pub const AgentHandle = struct {
     }
 
     fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
-        self.connection.shutdown();
-        self.reader.deinit();
-        self.writer.deinit(gpa);
+        self.workers.stop(&self.connection);
+        self.workers.deinit(gpa);
         self.connection.close();
         if (self.name) |name| gpa.free(name);
         self.connection.deinit();
@@ -720,8 +615,7 @@ pub const RemoteManager = struct {
             var dead_fd: ?std.Io.net.Socket.Handle = null;
             var it = self.agents.iterator();
             dead_fd = blk: while (it.next()) |entry| {
-                if (entry.value_ptr.reader.isClosed() or
-                    entry.value_ptr.writer.isClosed())
+                if (entry.value_ptr.workers.isDead())
                     break :blk entry.key_ptr.*;
             } else null;
             const fd = dead_fd orelse return;
@@ -767,7 +661,7 @@ pub const RemoteManager = struct {
             agent.connection.close();
             return;
         };
-        agent.writer.outbox.enqueueOwned(payload) catch |err| {
+        agent.workers.outbox.enqueueOwned(payload) catch |err| {
             self.gpa.free(payload);
             log.debug(
                 "Failed to queue agent rejection message: {s}",
@@ -776,7 +670,7 @@ pub const RemoteManager = struct {
             agent.connection.close();
             return;
         };
-        agent.writer.outbox.finish();
+        agent.workers.outbox.finish();
     }
 
     /// Allocate a `job_finished` remote event.
@@ -1114,7 +1008,7 @@ pub const RemoteManager = struct {
         };
         self.touchSync(st);
 
-        self.pumpTransfer(job_id, st, agent);
+        self.pumpTransfer(job_id, st, &agent.workers.outbox);
     }
 
     /// Record forward progress of a transfer.
@@ -1128,11 +1022,11 @@ pub const RemoteManager = struct {
         self: *RemoteManager,
         job_id: u64,
         st: *SyncTransfer,
-        agent: *AgentHandle,
+        outbox: *Connection.Writer,
     ) void {
         const sender = &(st.session.sender orelse return);
         st.last_pump_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
-        switch (sender.pump(&agent.writer.outbox, SYNC_PUMP_QUOTA_BYTES)) {
+        switch (sender.pump(outbox, SYNC_PUMP_QUOTA_BYTES)) {
             .backpressured => {
                 st.paused = true;
                 self.touchSync(st);
@@ -1239,7 +1133,7 @@ pub const RemoteManager = struct {
                 };
             } else null;
             const target = next orelse return;
-            self.pumpTransfer(target.job_id, target.st, target.agent);
+            self.pumpTransfer(target.job_id, target.st, &target.agent.workers.outbox);
         }
     }
 
@@ -1375,7 +1269,7 @@ pub const RemoteManager = struct {
         agent: *AgentHandle,
         message: []u8,
     ) !void {
-        agent.writer.outbox.enqueueOwned(message) catch |err| switch (err) {
+        agent.workers.outbox.enqueueOwned(message) catch |err| switch (err) {
             error.FrameTooLarge => return err,
             else => {
                 const fd = agent.connection.conn.stream.socket.handle;
@@ -1428,32 +1322,22 @@ pub const RemoteManager = struct {
         var connection: Connection = try .initConn(self.io, conn);
         errdefer connection.deinit();
 
-        const reader = try AgentReader.start(
+        const workers = try Connection.Workers.start(
             self.io,
             self.gpa,
-            &self.incoming_frames,
-            .{ .ptr = self, .callback = notify },
-            conn.stream,
+            &connection,
+            .{ .ptr = self, .push = pushIncoming, .malformed = noteMalformedIncoming },
+            .{ .ptr = self, .callback = workerExited },
+            null,
         );
         errdefer {
-            connection.shutdown();
-            reader.deinit();
+            workers.stop(&connection);
+            workers.deinit(self.gpa);
         }
 
-        const writer = try AgentWriter.start(
-            self.io,
-            self.gpa,
-            .{ .ptr = self, .callback = notify },
-            conn.stream,
-        );
-        errdefer {
-            connection.shutdown();
-            writer.deinit(self.gpa);
-        }
         res.value_ptr.* = .{
             .connection = connection,
-            .reader = reader,
-            .writer = writer,
+            .workers = workers,
             .last_heartbeat = std.Io.Timestamp.now(self.io, .real).toSeconds(),
         };
         self.agent_count.store(self.agents.count(), .seq_cst);
@@ -1589,14 +1473,14 @@ test "sync_pump_retries_pending_frames_in_order" {
     while (!st.ended) {
         pumps += 1;
         try expect(pumps < 20);
-        manager.pumpTransfer(7, st, &agent.handle);
+        manager.pumpTransfer(7, st, agent.writer);
         // Every unfinished pump backpressured
         if (!st.ended) try expect(st.paused);
-        while (agent.writer.outbox.send_queue.tryPop()) |frame|
+        while (agent.writer.send_queue.tryPop()) |frame|
             try frames.append(gpa, frame);
         st.paused = false;
     }
-    while (agent.writer.outbox.send_queue.tryPop()) |frame|
+    while (agent.writer.send_queue.tryPop()) |frame|
         try frames.append(gpa, frame);
 
     try expect(st.session.sender.?.pending == null);
@@ -1662,13 +1546,13 @@ test "sync_pump_fails_transfer_on_closed_writer" {
     try manager.syncs.put(manager.gpa, 7, st);
 
     // First pump backpressures, leaving one chunk pending
-    manager.pumpTransfer(7, st, &agent.handle);
+    manager.pumpTransfer(7, st, agent.writer);
     try expect(st.paused);
     try expect(st.session.sender.?.pending != null);
 
     // Once the queue is closed, the next pump must remove the transfer
-    agent.writer.outbox.closeQueue();
-    manager.pumpTransfer(7, st, &agent.handle);
+    agent.writer.closeQueue();
+    manager.pumpTransfer(7, st, agent.writer);
     try expect(manager.syncs.get(7) == null);
     try expect(manager.syncs.count() == 0);
 }
@@ -1696,34 +1580,23 @@ fn testTransfer(
 
 /// A fake agent with a bounded writer queue and no worker threads.
 const FakeAgent = struct {
-    handle: AgentHandle,
-    writer: *AgentWriter,
+    writer: *Connection.Writer,
 
     fn init(
         io: std.Io,
         gpa: std.mem.Allocator,
         budget_bytes: usize,
     ) !FakeAgent {
-        const writer = try gpa.create(AgentWriter);
+        const writer = try gpa.create(Connection.Writer);
         errdefer gpa.destroy(writer);
-        writer.* = .{
-            .outbox = .init(io, gpa, undefined),
-            .notify = undefined,
-            .thread = undefined,
-        };
-        writer.outbox.send_queue.budget_bytes = budget_bytes;
-        return .{ .handle = .{
-            .connection = try Connection.init(io),
-            .reader = undefined,
-            .writer = writer,
-            .last_heartbeat = 0,
-        }, .writer = writer };
+        writer.* = .init(io, gpa, undefined);
+        writer.send_queue.budget_bytes = budget_bytes;
+        return .{ .writer = writer };
     }
 
     fn deinit(self: *FakeAgent, gpa: std.mem.Allocator) void {
-        self.writer.outbox.deinit();
+        self.writer.deinit();
         gpa.destroy(self.writer);
-        self.handle.connection.deinit();
     }
 };
 
@@ -1776,26 +1649,21 @@ test "sync_stall_reaper_fails_and_disconnects" {
     const agent_stream = try server.accept(io);
     const agent_fd = agent_stream.socket.handle;
 
-    const reader = try AgentReader.start(
+    var agent_connection = try Connection.initConn(io, .{
+        .stream = agent_stream,
+        .address = agent_stream.socket.address,
+    });
+    const workers = try Connection.Workers.start(
         io,
         gpa,
-        &manager.incoming_frames,
-        .{ .ptr = manager, .callback = RemoteManager.notify },
-        agent_stream,
-    );
-    const writer = try AgentWriter.start(
-        io,
-        gpa,
-        .{ .ptr = manager, .callback = RemoteManager.notify },
-        agent_stream,
+        &agent_connection,
+        .{ .ptr = manager, .push = pushIncoming, .malformed = noteMalformedIncoming },
+        .{ .ptr = manager, .callback = workerExited },
+        null,
     );
     try manager.agents.put(manager.gpa, agent_fd, .{
-        .connection = try Connection.initConn(io, .{
-            .stream = agent_stream,
-            .address = agent_stream.socket.address,
-        }),
-        .reader = reader,
-        .writer = writer,
+        .connection = agent_connection,
+        .workers = workers,
         .last_heartbeat = 0,
     });
 

@@ -91,12 +91,8 @@ pub const RemoteAgent = struct {
     connection: Connection,
     /// Incoming parsed messages from the server.
     incoming_frames: MutexQueue(protocol.OwnedMsg),
-    /// Worker thread for reading incoming frames from the server.
-    reader_thread: ?std.Thread = null,
-    /// Queueing writer for outgoing frames. Drained by the writer thread.
-    connection_writer: ?Connection.Writer = null,
-    /// Worker thread for writing outgoing frames to the server.
-    writer_thread: ?std.Thread = null,
+    /// Worker threads pumping the connection.
+    workers: ?*Connection.Workers = null,
     /// Filesystem layout for sync workspaces.
     workspaces: workspace.Store,
 
@@ -161,8 +157,7 @@ pub const RemoteAgent = struct {
     }
 
     pub fn deinit(self: *RemoteAgent) void {
-        self.stopWriter();
-        self.stopReader();
+        self.stopWorkers();
         self.running.store(false, .seq_cst);
         self.pool.cancelWaiter(self);
         var active = self.active_runners.iterator();
@@ -217,8 +212,7 @@ pub const RemoteAgent = struct {
         self.handleLogs() catch |err|
             log.err("Failed to handle remaining job log event: {s}", .{@errorName(err)});
         self.handleResults();
-        self.stopWriter();
-        self.stopReader();
+        self.stopWorkers();
     }
 
     /// Stop the agent
@@ -238,16 +232,17 @@ pub const RemoteAgent = struct {
 
     /// Try to connect to the server at the address
     pub fn connect(self: *RemoteAgent, addr: std.Io.net.IpAddress) !void {
-        self.stopWriter();
-        self.stopReader();
+        self.stopWorkers();
         try self.connection.connect(addr);
         self.resetJobState();
-        self.connection_writer = try self.connection.writer(self.gpa);
-        self.reader_thread = try std.Thread.spawn(.{}, readLoop, .{self});
-        self.writer_thread = std.Thread.spawn(.{}, writeLoop, .{self}) catch |err| {
-            self.stopReader();
-            return err;
-        };
+        self.workers = try Connection.Workers.start(
+            self.io,
+            self.gpa,
+            &self.connection,
+            .{ .ptr = self, .push = pushFrame, .malformed = noteMalformed },
+            .{ .ptr = self, .callback = workerExited },
+            .{ .ptr = self, .callback = frameSent },
+        );
         try self.register();
     }
 
@@ -287,72 +282,12 @@ pub const RemoteAgent = struct {
         }
     }
 
-    /// Loop for reading incoming frames from the server.
-    fn readLoop(self: *RemoteAgent) void {
-        var reader = Connection.Reader.init(
-            self.io,
-            self.gpa,
-            self.connection.conn.stream,
-        ) catch |err| {
-            log.warn("Failed to initialize remote connection reader: {s}", .{@errorName(err)});
-            return;
-        };
-        defer reader.deinit();
-
-        while (true) {
-            const frame = reader.readNextFrame() catch |err| {
-                if (self.running.load(.seq_cst))
-                    log.warn("Remote connection reader stopped: {s}", .{@errorName(err)});
-                break;
-            };
-            const owned = self.gpa.dupe(u8, frame) catch |err| {
-                log.err("Failed to allocate remote message frame: {s}", .{@errorName(err)});
-                break;
-            };
-            const parsed = protocol.parseOwned(self.gpa, owned) catch |err| {
-                log.warn("Discarding malformed remote message: {s}", .{@errorName(err)});
-                continue;
-            };
-            self.incoming_frames.append(self.gpa, parsed) catch |err| {
-                parsed.deinit();
-                log.err("Failed to queue remote message frame: {s}", .{@errorName(err)});
-                break;
-            };
-        }
-        self.connection.close();
-    }
-
-    /// Stop the read worker thread.
-    fn stopReader(self: *RemoteAgent) void {
-        self.connection.shutdown();
-        if (self.reader_thread) |thread| thread.join();
-        self.reader_thread = null;
-        self.connection.close();
-    }
-
-    /// Loop for writing outgoing frames to the server.
-    fn writeLoop(self: *RemoteAgent) void {
-        const writer = if (self.connection_writer) |*w| w else return;
-        while (true) {
-            const sent = writer.sendNext() catch |err| {
-                log.warn("Failed to send remote message: {s}", .{@errorName(err)});
-                self.connection.shutdown();
-                return;
-            };
-            if (!sent) break;
-            self.connection.setLastAccessed();
-        }
-    }
-
-    /// Stop the write worker thread and release the connection writer.
-    fn stopWriter(self: *RemoteAgent) void {
-        if (self.connection_writer) |*w| w.closeQueue();
-        self.connection.shutdown();
-        if (self.writer_thread) |thread| thread.join();
-        self.writer_thread = null;
-        if (self.connection_writer) |*w| {
-            w.deinit();
-            self.connection_writer = null;
+    /// Stop and free the connection workers, if any.
+    fn stopWorkers(self: *RemoteAgent) void {
+        if (self.workers) |workers| {
+            workers.stop(&self.connection);
+            workers.deinit(self.gpa);
+            self.workers = null;
         }
     }
 
@@ -693,13 +628,13 @@ pub const RemoteAgent = struct {
     ///
     /// Takes ownership of `message`.
     fn sendMessageOwned(self: *RemoteAgent, message: []u8) void {
-        const writer = if (self.connection_writer) |*w| w else {
+        const workers = self.workers orelse {
             self.gpa.free(message);
             log.warn("Failed to queue remote message: connection closed", .{});
             if (self.running.load(.seq_cst)) self.tryReconnect();
             return;
         };
-        writer.enqueueOwned(message) catch |err| {
+        workers.outbox.enqueueOwned(message) catch |err| {
             self.gpa.free(message);
             log.warn("Failed to queue remote message: {s}", .{@errorName(err)});
             if (err == error.Closed and self.running.load(.seq_cst))
@@ -884,3 +819,42 @@ pub const RemoteAgent = struct {
         if (self.running.load(.seq_cst) and !self.queue.empty()) self.requestRunner();
     }
 };
+
+/// Store one parsed server message for the main loop.
+fn pushFrame(
+    opq: *anyopaque,
+    fd: std.Io.net.Socket.Handle,
+    frame: protocol.OwnedMsg,
+) error{OutOfMemory}!void {
+    _ = fd;
+    const self: *RemoteAgent = @ptrCast(@alignCast(opq));
+    return self.incoming_frames.append(self.gpa, frame);
+}
+
+/// Log one frame that failed to parse.
+fn noteMalformed(
+    opq: *anyopaque,
+    fd: std.Io.net.Socket.Handle,
+    err: anyerror,
+) error{OutOfMemory}!void {
+    _ = opq;
+    _ = fd;
+    log.warn("Discarding malformed remote message: {s}", .{@errorName(err)});
+}
+
+/// React to a connection worker exit. A dead reader closes the
+/// connection so the main loop reconnects, a dead writer interrupts
+/// the reader which may outlive it.
+fn workerExited(opq: *anyopaque, kind: Connection.WorkerKind) void {
+    const self: *RemoteAgent = @ptrCast(@alignCast(opq));
+    switch (kind) {
+        .reader => self.connection.close(),
+        .writer => self.connection.shutdown(),
+    }
+}
+
+/// Record activity after each sent frame.
+fn frameSent(opq: *anyopaque) void {
+    const self: *RemoteAgent = @ptrCast(@alignCast(opq));
+    self.connection.setLastAccessed();
+}
