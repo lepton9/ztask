@@ -1,9 +1,7 @@
 //! Bounded FIFO of owned frames between producers and a consumer.
 const std = @import("std");
 const queue = @import("../types/queue.zig");
-
 const Queue = queue.Queue;
-const Notify = queue.Notify;
 
 const OutboundFrameQueue = @This();
 
@@ -15,19 +13,11 @@ frames: Queue([]u8) = .{},
 queued_bytes: usize = 0,
 /// Max queued bytes before bulk producers must pause.
 budget_bytes: usize = BUDGET_THRESHOLD_BYTES,
-/// Bulk production resumes at or below this many queued bytes.
-resume_threshold_bytes: usize = RESUME_THRESHOLD_BYTES,
-/// Set once a bulk producer was rejected.
-bulk_retry_pending: bool = false,
 /// No new frames are accepted.
 closed: bool = false,
-/// Fired by the producer when bulk production can resume.
-notify: ?Notify = null,
 
 /// Pause bulk production at this many queued bytes.
-pub const BUDGET_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
-/// Resume bulk production at or below this many queued bytes.
-pub const RESUME_THRESHOLD_BYTES: usize = 512 * 1024;
+pub const BUDGET_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn init(io: std.Io) OutboundFrameQueue {
     return .{ .io = io };
@@ -41,10 +31,6 @@ pub fn deinit(self: *OutboundFrameQueue, gpa: std.mem.Allocator) void {
     self.frames.deinit(gpa);
 }
 
-pub fn setNotify(self: *OutboundFrameQueue, notify: ?Notify) void {
-    self.notify = notify;
-}
-
 /// Stop accepting new frames.
 pub fn finish(self: *OutboundFrameQueue) void {
     {
@@ -52,7 +38,7 @@ pub fn finish(self: *OutboundFrameQueue) void {
         defer self.mutex.unlock(self.io);
         self.closed = true;
     }
-    self.cond.signal(self.io);
+    self.cond.broadcast(self.io);
 }
 
 /// Stop accepting new frames and drop the queued ones.
@@ -63,9 +49,15 @@ pub fn close(self: *OutboundFrameQueue, gpa: std.mem.Allocator) void {
         self.closed = true;
         while (self.frames.pop()) |frame| gpa.free(frame);
         self.queued_bytes = 0;
-        self.bulk_retry_pending = false;
     }
-    self.cond.signal(self.io);
+    self.cond.broadcast(self.io);
+}
+
+/// Wake threads blocked in `pop` or `waitWritable`.
+pub fn wake(self: *OutboundFrameQueue) void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    self.cond.broadcast(self.io);
 }
 
 /// Queue a frame, taking ownership of `frame` on success.
@@ -84,10 +76,11 @@ pub fn enqueue(
     self.cond.signal(self.io);
 }
 
-/// Queue a frame, taking ownership of `frame` on success.
+/// Queue a frame when the bulk byte budget allows, taking ownership
+/// of `frame` on success.
 ///
 /// Returns `error.Backpressure` without queueing once the queued
-/// bytes reach `budget_bytes`.
+/// bytes would reach `budget_bytes`.
 pub fn tryEnqueue(
     self: *OutboundFrameQueue,
     gpa: std.mem.Allocator,
@@ -97,49 +90,60 @@ pub fn tryEnqueue(
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closed) return error.Closed;
-        if (self.queued_bytes + frame.len > self.budget_bytes) {
-            self.bulk_retry_pending = true;
+        if (self.queued_bytes > 0 and
+            self.queued_bytes + frame.len > self.budget_bytes)
             return error.Backpressure;
-        }
         try self.frames.append(gpa, frame);
         self.queued_bytes += frame.len;
     }
     self.cond.signal(self.io);
 }
 
+/// Block until a bulk frame of `need_bytes` fits the byte budget.
+pub fn waitWritable(
+    self: *OutboundFrameQueue,
+    need_bytes: usize,
+    abort: ?*const std.atomic.Value(bool),
+) error{Closed}!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    while (self.queued_bytes > 0 and
+        self.queued_bytes + need_bytes > self.budget_bytes)
+    {
+        if (self.closed) return error.Closed;
+        if (abort) |flag| if (flag.load(.acquire)) return error.Closed;
+        self.cond.wait(self.io, &self.mutex) catch return error.Closed;
+    }
+    if (self.closed) return error.Closed;
+}
+
 /// Return the next frame, blocking while the queue is empty.
 pub fn pop(self: *OutboundFrameQueue) ?[]u8 {
     self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    while (true) {
-        if (self.frames.pop()) |frame| {
-            self.queued_bytes -|= frame.len;
-            return frame;
+    const frame: ?[]u8 = blk: while (true) {
+        if (self.frames.pop()) |popped| {
+            self.queued_bytes -|= popped.len;
+            break :blk popped;
         }
-        if (self.closed) return null;
-        self.cond.wait(self.io, &self.mutex) catch return null;
-    }
+        if (self.closed) break :blk null;
+        self.cond.wait(self.io, &self.mutex) catch break :blk null;
+    };
+    self.mutex.unlock(self.io);
+    if (frame != null) self.cond.broadcast(self.io);
+    return frame;
 }
 
 /// Pop the first frame if there is one, without blocking.
 pub fn tryPop(self: *OutboundFrameQueue) ?[]u8 {
     self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    const frame = self.frames.pop() orelse return null;
+    const frame = self.frames.pop() orelse {
+        self.mutex.unlock(self.io);
+        return null;
+    };
     self.queued_bytes -|= frame.len;
+    self.mutex.unlock(self.io);
+    self.cond.broadcast(self.io);
     return frame;
-}
-
-/// Called by the consumer after popping a frame.
-/// Notifies when bulk production can resume.
-pub fn resumeIfDrained(self: *OutboundFrameQueue) void {
-    {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (!self.bulk_retry_pending or self.queued_bytes > self.resume_threshold_bytes) return;
-        self.bulk_retry_pending = false;
-    }
-    if (self.notify) |notify| notify.callback(notify.ptr);
 }
 
 const expect = std.testing.expect;
@@ -217,15 +221,7 @@ test "backpressure" {
     const gpa = std.testing.allocator;
     var q = OutboundFrameQueue.init(io);
     q.budget_bytes = 10;
-    q.resume_threshold_bytes = 5;
     defer q.deinit(gpa);
-
-    var fired = false;
-    q.setNotify(.{ .ptr = &fired, .callback = struct {
-        fn f(ptr: *anyopaque) void {
-            @as(*bool, @ptrCast(@alignCast(ptr))).* = true;
-        }
-    }.f });
 
     // 8 queued bytes leave 2 under the budget
     const frame = try gpa.dupe(u8, "12345678");
@@ -236,24 +232,58 @@ test "backpressure" {
     defer gpa.free(over);
     try expectError(error.Backpressure, q.tryEnqueue(gpa, over));
 
-    // Draining to the resume threshold resumes production
+    // Draining to empty makes room even for an oversized frame
     const popped = q.pop().?;
     defer gpa.free(popped);
     try expect(q.queued_bytes == 0);
-    q.resumeIfDrained();
-    try expect(fired);
-
-    const refill = try gpa.dupe(u8, "1234567890");
-    try q.tryEnqueue(gpa, refill);
+    const huge = try gpa.dupe(u8, "0123456789abcdef");
+    try q.tryEnqueue(gpa, huge);
     try expectError(error.Backpressure, q.tryEnqueue(gpa, over));
-    const ctrl = try gpa.dupe(u8, "ctrl");
-    try q.enqueue(gpa, ctrl);
 
-    const popped1 = q.pop().?;
-    defer gpa.free(popped1);
-    const popped2 = q.pop().?;
-    defer gpa.free(popped2);
-    q.resumeIfDrained();
+    const huge_popped = q.pop().?;
+    defer gpa.free(huge_popped);
+    try expect(@intFromPtr(huge_popped.ptr) == @intFromPtr(huge.ptr));
+}
+
+test "wait_writable_blocks_until_room" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var q = OutboundFrameQueue.init(io);
+    q.budget_bytes = 10;
+    defer q.deinit(gpa);
+
+    const frame = try gpa.dupe(u8, "12345678");
+    try q.tryEnqueue(gpa, frame);
+
+    const Waiter = struct {
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(sq: *OutboundFrameQueue, self: *@This()) void {
+            if (sq.waitWritable(3, null)) |_| {
+                self.err = null;
+            } else |err| self.err = err;
+            self.done.store(true, .release);
+        }
+    };
+    var waiter: Waiter = .{};
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &q, &waiter });
+    errdefer thread.join();
+
+    // 8 queued bytes leave no room for 3 more, so the waiter blocks
+    var waited: usize = 0;
+    while (waited < 50) : (waited += 1) {
+        try expect(!waiter.done.load(.acquire));
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+
+    // Popping the frame makes room and releases the waiter
+    const popped = q.pop().?;
+    defer gpa.free(popped);
+    while (!waiter.done.load(.acquire)) std.Thread.yield() catch {};
+    thread.join();
+    try expect(waiter.err == null);
+    try expect(q.queued_bytes == 0);
 }
 
 test "pop_wakes_on_close" {

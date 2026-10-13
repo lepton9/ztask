@@ -1450,8 +1450,6 @@ pub const RemoteManager = struct {
             connection.shutdown();
             writer.deinit(self.gpa);
         }
-        writer.outbox.setNotify(.{ .ptr = self, .callback = notify });
-
         res.value_ptr.* = .{
             .connection = connection,
             .reader = reader,
@@ -1644,16 +1642,20 @@ test "sync_pump_fails_transfer_on_closed_writer" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
+    // Source workspace with one file spanning several chunks.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "f.bin", "data");
+    const content = try gpa.alloc(u8, 3 * protocol.SYNC_CHUNK_SIZE);
+    defer gpa.free(content);
+    for (content, 0..) |*byte, i| byte.* = @truncate(i);
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "big.bin", content);
     defer gpa.free(source_root);
 
     const manager = try RemoteManager.init(io, gpa);
     defer manager.deinit();
 
-    // A zero budget forces the first chunk to backpressure and stay pending
-    var agent = try FakeAgent.init(io, gpa, 0);
+    // A one-frame budget parks the producer with a pending frame
+    var agent = try FakeAgent.init(io, gpa, protocol.SYNC_CHUNK_SIZE + 512);
     defer agent.deinit(gpa);
 
     const st = try testTransfer(io, gpa, source_root, 7, fdHandle(1));
@@ -1787,7 +1789,6 @@ test "sync_stall_reaper_fails_and_disconnects" {
         .{ .ptr = manager, .callback = RemoteManager.notify },
         agent_stream,
     );
-    writer.outbox.send_queue.budget_bytes = 0;
     try manager.agents.put(manager.gpa, agent_fd, .{
         .connection = try Connection.initConn(io, .{
             .stream = agent_stream,
@@ -1802,9 +1803,6 @@ test "sync_stall_reaper_fails_and_disconnects" {
 
     const stalled = try testTransfer(io, gpa, source_root, 7, agent_fd);
     try manager.syncs.put(manager.gpa, 7, stalled);
-    // Pump once so the transfer holds a pending frame
-    manager.pumpTransfer(7, stalled, manager.agents.getPtr(agent_fd).?);
-    try expect(stalled.session.sender.?.pending != null);
 
     const unacked = try testTransfer(io, gpa, source_root, 8, fdHandle(2));
     unacked.ended = true;

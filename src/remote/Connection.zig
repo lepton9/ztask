@@ -250,11 +250,6 @@ pub const Writer = struct {
         return self.send_queue.tryEnqueue(self.gpa, frame);
     }
 
-    /// Set the callback fired when bulk production can resume.
-    pub fn setNotify(self: *Writer, notify: ?Notify) void {
-        self.send_queue.setNotify(notify);
-    }
-
     /// Stop accepting new frames. Queued frames are still delivered.
     pub fn finish(self: *Writer) void {
         self.send_queue.finish();
@@ -272,7 +267,6 @@ pub const Writer = struct {
         const frame = self.send_queue.pop() orelse return false;
         defer self.gpa.free(frame);
         try self.sendFrame(frame);
-        self.send_queue.resumeIfDrained();
         return true;
     }
 
