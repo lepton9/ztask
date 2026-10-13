@@ -724,6 +724,7 @@ pub const Session = struct {
 /// The sending role of a workspace transfer. Reads a `Source` and
 /// queues transfer frames with backpressure.
 pub const Sender = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     source: Source,
     /// Dispatch id stamped onto every frame.
@@ -764,6 +765,7 @@ pub const Sender = struct {
         job_id: u64,
     ) !Sender {
         return .{
+            .io = io,
             .gpa = gpa,
             .source = try Source.init(io, gpa, root, exclude),
             .job_id = job_id,
@@ -948,6 +950,110 @@ pub const Sender = struct {
             self.gpa.free(frame);
             return err;
         };
+    }
+
+    pub const RunHooks = struct {
+        ptr: *anyopaque,
+        /// Called once per pump pass that queued at least one frame.
+        activity: *const fn (ptr: *anyopaque) void,
+        /// Called with the throttled transfer progress.
+        progress: *const fn (
+            ptr: *anyopaque,
+            files: usize,
+            bytes: u64,
+            elapsed_ms: i64,
+        ) void,
+    };
+
+    pub const RunOptions = struct {
+        /// Queueing writer receiving the transfer frames.
+        outbox: *Connection.Writer,
+        /// Chunk payload quota of one pump pass.
+        quota_bytes: usize,
+        /// Cooperative stop flag, checked between pump passes.
+        stop: ?*const std.atomic.Value(bool) = null,
+        /// Transfer start time.
+        start_ms: i64 = 0,
+        /// Min interval between progress emissions.
+        progress_interval_ms: i64,
+        hooks: ?RunHooks = null,
+    };
+
+    /// Terminal outcome of a sender run.
+    pub const RunOutcome = union(enum) {
+        /// All frames queued, including `sync_end`.
+        ended,
+        /// Stopped before finishing.
+        stopped,
+        /// Unrecoverable failure.
+        failed: struct {
+            message: []const u8,
+            err: anyerror,
+        },
+    };
+
+    /// Run the transfer loop. Queue frames until the source is
+    /// exhausted, the stop flag is set or the writer queue closes,
+    /// blocking on the writer byte budget between passes.
+    pub fn run(self: *Sender, opts: RunOptions) RunOutcome {
+        var last_emit_ms: i64 = 0;
+        var emitted_files: usize = 0;
+        var emitted_bytes: u64 = 0;
+        while (true) {
+            if (opts.stop) |stop| {
+                if (stop.load(.acquire)) return .stopped;
+            }
+            switch (self.pump(opts.outbox, opts.quota_bytes)) {
+                .backpressured => {
+                    // Queued at least one frame, so progress was made.
+                    if (opts.hooks) |hooks| hooks.activity(hooks.ptr);
+                    self.emitRunProgress(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+                },
+                // No frame was queued, so no progress
+                .blocked => {},
+                .ended => {
+                    if (opts.hooks) |hooks| hooks.activity(hooks.ptr);
+                    self.emitRunProgress(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+                    return .ended;
+                },
+                .failed => |f| return .{ .failed = .{
+                    .message = f.message,
+                    .err = f.err,
+                } },
+            }
+            // The writer queue budget is full, wait for the consumer to drain it
+            const need: usize = if (self.pending) |frame|
+                frame.len
+            else
+                protocol.MAX_FRAME_SIZE;
+            opts.outbox.send_queue.waitWritable(need, opts.stop) catch {
+                if (opts.stop) |stop| {
+                    if (stop.load(.acquire)) return .stopped;
+                }
+                return .{ .failed = .{
+                    .message = "connection closed",
+                    .err = error.Closed,
+                } };
+            };
+        }
+    }
+
+    /// Emit throttled progress of the run through the host hooks.
+    fn emitRunProgress(
+        self: *Sender,
+        opts: RunOptions,
+        last_emit_ms: *i64,
+        emitted_files: *usize,
+        emitted_bytes: *u64,
+    ) void {
+        const hooks = opts.hooks orelse return;
+        if (self.files == emitted_files.* and self.bytes == emitted_bytes.*) return;
+        const now_ms = std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
+        if (now_ms - last_emit_ms.* < opts.progress_interval_ms) return;
+        last_emit_ms.* = now_ms;
+        emitted_files.* = self.files;
+        emitted_bytes.* = self.bytes;
+        hooks.progress(hooks.ptr, self.files, self.bytes, now_ms - opts.start_ms);
     }
 };
 
