@@ -12,7 +12,7 @@ pub const MAX_FILE_SIZE: u64 = 1 << 40; // 1 TiB
 
 /// The capabilities currently supported.
 pub fn validate(msg: protocol.SyncBeginMsg) error{ UnsupportedMode, UnsupportedDirection }!void {
-    if (msg.mode != .ephemeral) return error.UnsupportedMode;
+    if (msg.mode == .none) return error.UnsupportedMode;
     if (msg.direction != .push) return error.UnsupportedDirection;
 }
 
@@ -86,15 +86,16 @@ pub const Directory = struct {
         errdefer handle.close(self.io);
         const stat = try handle.stat(self.io);
 
-        var file = try self.makeFile(
+        return self.makeFile(
             rel_path,
             handle,
             .read,
-            stat.size,
-            wirePermissions(stat.permissions),
+            .{
+                .size = stat.size,
+                .mtime_ms = stat.mtime.toMilliseconds(),
+                .permissions = wirePermissions(stat.permissions),
+            },
         );
-        file.mtime_ms = stat.mtime.toMilliseconds();
-        return file;
     }
 
     /// Create or reopen a workspace-relative file for writing.
@@ -109,7 +110,56 @@ pub const Directory = struct {
         const handle = try cwd.createFile(self.io, full, .{ .truncate = false });
         errdefer handle.close(self.io);
 
-        return self.makeFile(rel_path, handle, .write, 0, 0);
+        return self.makeFile(rel_path, handle, .write, .{});
+    }
+
+    /// Create a workspace-relative file for writing through a temp file.
+    pub fn openWriteAtomic(self: *const Directory, rel_path: []const u8) !File {
+        const full = try self.resolve(rel_path);
+        defer self.gpa.free(full);
+
+        const cwd = std.Io.Dir.cwd();
+        if (std.fs.path.dirname(full)) |dir| try cwd.createDirPath(self.io, dir);
+        const temp_full = try atomicTempPath(self.gpa, full);
+        errdefer self.gpa.free(temp_full);
+        const handle = try cwd.createFile(self.io, temp_full, .{ .truncate = true });
+        errdefer handle.close(self.io);
+
+        var file = try self.makeFile(rel_path, handle, .write, .{});
+        file.temp = true;
+        file.temp_path = temp_full;
+        return file;
+    }
+
+    /// Rename the temp file of `file` over its target. No-op when the
+    /// file was not opened atomically.
+    pub fn publishTemp(self: *const Directory, file: *File) !void {
+        const temp_full = file.temp_path orelse return;
+        const target = try self.resolve(file.rel_path);
+        defer self.gpa.free(target);
+        try std.Io.Dir.renameAbsolute(temp_full, target, self.io);
+        self.gpa.free(temp_full);
+        file.temp_path = null;
+    }
+
+    /// Returns `std.Io.File.Stat` of the file at the relative path.
+    pub fn statFile(self: *const Directory, rel_path: []const u8) !std.Io.File.Stat {
+        const full = try self.resolve(rel_path);
+        defer self.gpa.free(full);
+        const cwd = std.Io.Dir.cwd();
+        const handle = try cwd.openFile(self.io, full, .{ .mode = .read_only });
+        defer handle.close(self.io);
+        return try handle.stat(self.io);
+    }
+
+    /// Set the modify timestamp of a workspace-relative file.
+    pub fn setMtime(self: *const Directory, rel_path: []const u8, mtime_ms: i64) !void {
+        const full = try self.resolve(rel_path);
+        defer self.gpa.free(full);
+        const ns: i96 = @as(i96, mtime_ms) * std.time.ns_per_ms;
+        try std.Io.Dir.cwd().setTimestamps(self.io, full, .{
+            .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(ns) },
+        });
     }
 
     /// Validate `rel_path` and return its native absolute path. Owned.
@@ -124,8 +174,7 @@ pub const Directory = struct {
         rel_path: []const u8,
         handle: std.Io.File,
         access: File.Access,
-        size: u64,
-        mode: u32,
+        stat: File.Stat,
     ) !File {
         const owned = try self.gpa.dupe(u8, rel_path);
         return .{
@@ -134,8 +183,7 @@ pub const Directory = struct {
             .rel_path = owned,
             .handle = handle,
             .access = access,
-            .size = size,
-            .mode = mode,
+            .stat = stat,
         };
     }
 
@@ -168,17 +216,28 @@ pub const File = struct {
     rel_path: []u8,
     handle: std.Io.File,
     access: Access,
-    /// File size when opened for reading.
-    size: u64 = 0,
-    /// POSIX mode bits when opened for reading.
-    mode: u32 = 0,
-    /// Source mtime in ms since the epoch when opened for reading.
-    mtime_ms: i64 = 0,
+    /// Stat of the file when opened.
+    stat: Stat = .{},
     /// Highest end offset written, used to trim stale tails on finish.
     written: u64 = 0,
     closed: bool = false,
+    /// Whether the handle writes a pending temp file.
+    temp: bool = false,
+    /// Owned absolute path of the pending temp file.
+    temp_path: ?[]u8 = null,
 
     pub const Access = enum { read, write };
+
+    pub const Stat = struct {
+        /// Size of the file.
+        size: u64 = 0,
+        /// Modify time of the file.
+        mtime_ms: i64 = 0,
+        /// Wire permission bits (0o777) observed at open time.
+        permissions: u32 = 0,
+        /// Hash of the file content.
+        hash: protocol.Digest = undefined,
+    };
 
     /// Read up to `dest.len` bytes starting at `offset`. Returns the number
     /// of bytes read.
@@ -219,11 +278,21 @@ pub const File = struct {
         try self.handle.setLength(self.io, self.written);
     }
 
-    /// Close the handle if still open and free the owned path.
+    /// Close the handle if still open.
+    pub fn close(self: *File) void {
+        if (self.closed) return;
+        self.closed = true;
+        self.handle.close(self.io);
+    }
+
+    /// Close the handle if still open, remove a pending temp file, and
+    /// free the owned paths.
     pub fn deinit(self: *File) void {
-        if (!self.closed) {
-            self.closed = true;
-            self.handle.close(self.io);
+        self.close();
+        if (self.temp_path) |tp| {
+            std.Io.Dir.deleteFileAbsolute(self.io, tp) catch {};
+            self.gpa.free(tp);
+            self.temp_path = null;
         }
         self.gpa.free(self.rel_path);
     }
@@ -251,6 +320,18 @@ fn wirePermissions(permissions: std.Io.File.Permissions) u32 {
         // TODO: maybe extract a constant
         return 0o644;
     }
+}
+
+/// Absolute path of the atomic-write temp file beside `full`.
+fn atomicTempPath(gpa: std.mem.Allocator, full: []const u8) ![]u8 {
+    const name = try std.fmt.allocPrint(
+        gpa,
+        ".ztask-partial-{s}.tmp",
+        .{std.fs.path.basename(full)},
+    );
+    defer gpa.free(name);
+    const dirname = std.fs.path.dirname(full) orelse ".";
+    return std.fs.path.join(gpa, &.{ dirname, name });
 }
 
 // TODO: maybe move Receiver, Sender, Source, File, Directory to different files under sync/
@@ -302,9 +383,9 @@ pub const Receiver = struct {
         declared: bool = false,
         /// The transfer received this file.
         received: bool = false,
-        /// Declared stat, from the manifest.
-        size: u64 = 0,
-        mtime_ms: i64 = 0,
+        /// Declared attributes of the file: the manifest stat plus the
+        /// content hash of the transfer.
+        stat: File.Stat = .{},
     };
 
     /// Open a receiver and resolve its destination root.
@@ -403,9 +484,9 @@ pub const Receiver = struct {
         self.bytes += bytes.len;
     }
 
-    /// Finish `path`, applying its permission bits and verifying the
-    /// sender's content hash when present. Records a failure instead
-    /// of erroring.
+    /// Finish `path`, verifying the sender's content hash when present,
+    /// then publishing an atomic write at the target. Records a failure
+    /// instead of erroring.
     pub fn finishFile(self: *Receiver, path: []const u8, permissions: u32, hash: ?[]const u8) void {
         if (self.failed) return;
         if (self.open) |*file| {
@@ -426,8 +507,6 @@ pub const Receiver = struct {
                     .{ path, @errorName(err) },
                 );
             };
-            file.deinit();
-            self.open = null;
         }
 
         var digest: protocol.Digest = undefined;
@@ -441,6 +520,19 @@ pub const Receiver = struct {
             }
         }
 
+        if (self.open) |*file| {
+            // Close before publishing so the rename is portable.
+            file.close();
+            self.workspace.directory.publishTemp(file) catch |err| {
+                return self.markFailed(
+                    "cannot publish '{s}': {s}",
+                    .{ path, @errorName(err) },
+                );
+            };
+            file.deinit();
+            self.open = null;
+        }
+
         const gop = self.tracked.getOrPut(self.gpa, path) catch {
             return self.markFailed("out of memory", .{});
         };
@@ -452,6 +544,7 @@ pub const Receiver = struct {
         } else if (gop.value_ptr.received) {
             return self.markFailed("file '{s}' was completed twice", .{path});
         }
+        gop.value_ptr.stat.hash = digest;
         gop.value_ptr.received = true;
         self.files += 1;
     }
@@ -487,8 +580,9 @@ pub const Receiver = struct {
                 return self.markFailed("manifest declares '{s}' twice", .{entry.path});
             }
             gop.value_ptr.declared = true;
-            gop.value_ptr.size = entry.size;
-            gop.value_ptr.mtime_ms = entry.mtime_ms;
+            gop.value_ptr.stat.size = entry.size;
+            gop.value_ptr.stat.mtime_ms = entry.mtime_ms;
+            gop.value_ptr.stat.permissions = entry.permissions;
         }
         self.manifest_len += msg.entries.len();
         if (self.manifest_len > self.manifest_total.?) {
@@ -535,6 +629,15 @@ pub const Receiver = struct {
                 return false;
             }
         }
+        // Apply the declared source mtimes to the received files
+        var mtime_it = self.tracked.iterator();
+        while (mtime_it.next()) |kv| {
+            if (!kv.value_ptr.received) continue;
+            const path = kv.key_ptr.*;
+            self.workspace.directory.setMtime(path, kv.value_ptr.stat.mtime_ms) catch |err| {
+                log.warn("Failed to set mtime of '{s}': {s}", .{ path, @errorName(err) });
+            };
+        }
         self.committed = true;
         log.debug(
             "Workspace sync committed: task='{s}' job='{s}' files={d} bytes={d}",
@@ -544,7 +647,11 @@ pub const Receiver = struct {
     }
 
     fn openFile(self: *Receiver, path: []const u8) !void {
-        self.open = try self.workspace.directory.openWrite(path);
+        const directory = &self.workspace.directory;
+        self.open = if (self.workspace.lifetime == .persistent)
+            try directory.openWriteAtomic(path)
+        else
+            try directory.openWrite(path);
         self.hasher = .init(.{});
         self.next_offset = 0;
     }
@@ -586,6 +693,9 @@ pub const Source = struct {
     hasher: Hash = .init(.{}),
     /// Manifest entries collected during the pass, in walk order.
     entries: std.ArrayList(protocol.ManifestEntry) = .empty,
+    /// Set once `collectManifest` recorded all entries, so the chunk
+    /// pass does not record them again.
+    manifest_collected: bool = false,
     /// Set once the walk is exhausted.
     finished: bool = false,
 
@@ -598,7 +708,7 @@ pub const Source = struct {
         },
         file_done: struct {
             path: []const u8,
-            mode: u32,
+            permissions: u32,
             /// Hash of the file content as read.
             hash: protocol.Digest,
         },
@@ -641,23 +751,57 @@ pub const Source = struct {
         self.directory.deinit();
     }
 
-    /// Produce the next event. `path` slices are valid until the next call.
-    pub fn next(self: *Source, dest: []u8) !?Event {
-        if (self.finished) return null;
-        std.debug.assert(dest.len > 0 and dest.len <= protocol.SYNC_CHUNK_SIZE);
+    /// Reset the state and start the walk from the beginning.
+    fn reset(self: *Source) !void {
+        if (self.open) |*f| {
+            f.deinit();
+            self.open = null;
+        }
+        if (self.current_path.len > 0) {
+            self.gpa.free(self.current_path);
+            self.current_path = &.{};
+        }
+        self.pos = 0;
+        // Pre-collected manifest entries survive resets, so the serving
+        // pass can start a fresh walk without losing the manifest.
+        if (!self.manifest_collected) {
+            for (self.entries.items) |*entry| self.gpa.free(entry.path);
+            self.entries.clearRetainingCapacity();
+        }
+        self.walker.deinit();
+        var walker = try self.dir.walk(self.gpa);
+        errdefer walker.deinit();
+        self.walker = walker;
+        self.finished = false;
+    }
 
-        const file = while (self.open == null) {
+    /// Get the next entry from the walker.
+    fn nextEntry(self: *Source) !?std.Io.Dir.Walker.Entry {
+        while (true) {
             const entry = try self.walker.next(self.io) orelse {
                 self.finished = true;
-                return .end;
+                return null;
             };
             if (entry.kind != .file) {
                 // TODO: handle sym_link?
                 continue;
             }
             if (glob.matchAny(self.exclude, entry.path)) continue;
+            return entry;
+        }
+    }
+
+    /// Produce the next event. `path` slices are valid until the next call.
+    pub fn next(self: *Source, dest: []u8) !?Event {
+        if (self.finished) return null;
+        std.debug.assert(dest.len > 0 and dest.len <= protocol.SYNC_CHUNK_SIZE);
+
+        const file = blk: {
+            if (self.open) |*f| break :blk f;
+            const entry = try self.nextEntry() orelse return .end;
             try self.openFile(entry.path);
-        } else &self.open.?;
+            break :blk &self.open.?;
+        };
 
         const offset = self.pos;
         const read = try file.readAt(offset, dest);
@@ -670,7 +814,7 @@ pub const Source = struct {
             self.hasher.final(&digest);
             const event: Event = .{ .file_done = .{
                 .path = self.current_path,
-                .mode = file.mode,
+                .permissions = file.stat.permissions,
                 .hash = digest,
             } };
             file.deinit();
@@ -684,20 +828,51 @@ pub const Source = struct {
         } };
     }
 
+    /// Collect all the manifest entries.
+    pub fn collectManifest(self: *Source) !void {
+        try self.reset();
+        while (true) {
+            const entry = try self.nextManifestEntry() orelse break;
+            try self.entries.append(self.gpa, entry);
+        }
+        self.manifest_collected = true;
+    }
+
+    /// Get the next manifest entry.
+    fn nextManifestEntry(self: *Source) !?protocol.ManifestEntry {
+        const entry = try self.nextEntry() orelse return null;
+
+        const rel = try workspace.toWireRelPath(self.gpa, entry.path);
+        errdefer self.gpa.free(rel);
+        const stat = try self.directory.statFile(rel);
+
+        return .{
+            .path = rel,
+            .size = stat.size,
+            .mtime_ms = stat.mtime.toMilliseconds(),
+            .permissions = wirePermissions(stat.permissions),
+        };
+    }
+
     /// Open `entry_path` for reading and record its manifest entry.
     fn openFile(self: *Source, entry_path: []const u8) !void {
+        std.debug.assert(self.open == null);
         const rel = try workspace.toWireRelPath(self.gpa, entry_path);
         errdefer self.gpa.free(rel);
         var file = try self.directory.openRead(rel);
         errdefer file.deinit();
 
-        const entry_rel = try self.gpa.dupe(u8, rel);
-        errdefer self.gpa.free(entry_rel);
-        try self.entries.append(self.gpa, .{
-            .path = entry_rel,
-            .size = file.size,
-            .mtime_ms = file.mtime_ms,
-        });
+        // Entries were already recorded by `collectManifest`.
+        if (!self.manifest_collected) {
+            const entry_rel = try self.gpa.dupe(u8, rel);
+            errdefer self.gpa.free(entry_rel);
+            try self.entries.append(self.gpa, .{
+                .path = entry_rel,
+                .size = file.stat.size,
+                .mtime_ms = file.stat.mtime_ms,
+                .permissions = file.stat.permissions,
+            });
+        }
 
         if (self.current_path.len > 0) self.gpa.free(self.current_path);
         self.current_path = rel;
@@ -863,7 +1038,7 @@ pub const Sender = struct {
                     const frame = protocol.serialize(self.gpa, .{ .file_done = .{
                         .job_id = self.job_id,
                         .path = f.path,
-                        .permissions = f.mode,
+                        .permissions = f.permissions,
                         .hash = &hex,
                     } }) catch return .{ .failed = .{
                         .message = "out of memory",
@@ -1100,6 +1275,12 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
     };
 }
 
+fn testBeginMode(job_id: u64, mode: protocol.WorkspaceMode) protocol.SyncBeginMsg {
+    var msg = testBegin(job_id);
+    msg.mode = mode;
+    return msg;
+}
+
 /// Create a test file with the given content written.
 fn createTestFile(dir: *Directory, path: []const u8, content: []const u8) !void {
     var file = try dir.openWrite(path);
@@ -1315,7 +1496,7 @@ test "receiver_rejects_oversized_chunk" {
     try expect(recv.failed);
 }
 
-test "receiver_rejects_unsupported_mode_and_direction" {
+test "receiver_rejects_none_mode_and_pull_direction" {
     var env: TestEnv = try .init();
     defer env.deinit();
     const io = env.io;
@@ -1324,8 +1505,7 @@ test "receiver_rejects_unsupported_mode_and_direction" {
     var store = try workspace.Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    var msg = testBegin(12);
-    msg.mode = .persistent;
+    const msg = testBeginMode(12, .none);
     try expectErrorFn(error.UnsupportedMode, Receiver.init(io, gpa, &store, msg));
 
     var dir_msg = testBegin(13);
@@ -1567,7 +1747,7 @@ test "directory_read_write_roundtrip" {
     {
         var opened = try dir.openRead("a/b.txt");
         defer opened.deinit();
-        try expect(opened.size == 11);
+        try expect(opened.stat.size == 11);
 
         const all = try opened.readAll();
         defer gpa.free(all);
@@ -1625,7 +1805,7 @@ const SourceEventCollector = struct {
     const Entry = struct {
         path: []u8,
         body: std.ArrayList(u8) = .empty,
-        mode: u32 = 0,
+        permissions: u32 = 0,
         hash: protocol.Digest = undefined,
         done: bool = false,
     };
@@ -1648,12 +1828,12 @@ const SourceEventCollector = struct {
         self: *@This(),
         gpa: std.mem.Allocator,
         path: []const u8,
-        mode: u32,
+        permissions: u32,
         hash: protocol.Digest,
     ) !void {
         const e = try self.get(gpa, path);
         try expect(!e.done);
-        e.mode = mode;
+        e.permissions = permissions;
         e.hash = hash;
         e.done = true;
     }
@@ -1669,7 +1849,7 @@ const SourceEventCollector = struct {
     fn drain(self: *@This(), source: *Source, gpa: std.mem.Allocator, dest: []u8) !bool {
         while (try source.next(dest)) |event| switch (event) {
             .chunk => |c| try self.chunk(gpa, c.path, c.data),
-            .file_done => |f| try self.done(gpa, f.path, f.mode, f.hash),
+            .file_done => |f| try self.done(gpa, f.path, f.permissions, f.hash),
             .end => return true,
         };
         return false;
@@ -1728,7 +1908,7 @@ test "source_yields_file_events" {
 
     if (comptime std.Io.File.Permissions.has_executable_bit) {
         for (collector.entries.items) |*e| {
-            try expect(e.mode & 0o777 == 0o644);
+            try expect(e.permissions & 0o777 == 0o644);
         }
     }
 }

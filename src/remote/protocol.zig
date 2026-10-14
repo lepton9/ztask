@@ -378,6 +378,8 @@ pub const ManifestEntry = struct {
     size: u64,
     /// Source mtime in milliseconds since the epoch at send time.
     mtime_ms: i64,
+    /// POSIX permission bits of the file at send time.
+    permissions: u32 = 0o644,
 };
 
 /// One page of the workspace manifest.
@@ -1053,8 +1055,8 @@ test "sync_begin" {
 test "manifest" {
     const gpa = std.testing.allocator;
     const entries = [_]ManifestEntry{
-        .{ .path = "src/main.zig", .size = 123, .mtime_ms = 1728576000000 },
-        .{ .path = "dir/nested file.txt", .size = 0, .mtime_ms = 1 },
+        .{ .path = "src/main.zig", .size = 123, .mtime_ms = 1728576000000, .permissions = 0o755 },
+        .{ .path = "dir/nested file.txt", .size = 0, .mtime_ms = 1, .permissions = 0o600 },
         .{ .path = "b", .size = 7, .mtime_ms = -1 },
     };
     const msg: ManifestMsg = .{
@@ -1075,6 +1077,7 @@ test "manifest" {
         try std.testing.expectEqualStrings(want.path, got.path);
         try expectEqual(want.size, got.size);
         try expectEqual(want.mtime_ms, got.mtime_ms);
+        try expectEqual(want.permissions, got.permissions);
     }
     try expect(it.next() == null);
 }
