@@ -1,4 +1,5 @@
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 pub const Notify = struct {
     ptr: *anyopaque,
@@ -19,7 +20,7 @@ pub fn Queue(comptime T: type) type {
         count: usize = 0,
 
         /// Initialize with capacity to hold `n` elements.
-        pub fn initCapacity(gpa: std.mem.Allocator, n: usize) !@This() {
+        pub fn initCapacity(gpa: Allocator, n: usize) Allocator.Error!@This() {
             var queue: @This() = .{};
             for (0..n) |_| {
                 const node = try gpa.create(QueueNode);
@@ -30,13 +31,13 @@ pub fn Queue(comptime T: type) type {
         }
 
         /// Clear all allocated memory for the nodes.
-        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), gpa: Allocator) void {
             while (self.list.pop()) |item| gpa.destroy(getNode(item));
             while (self.free.pop()) |item| gpa.destroy(getNode(item));
         }
 
         /// Append an item to the back of the queue.
-        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+        pub fn append(self: *@This(), gpa: Allocator, item: T) Allocator.Error!void {
             const node: *QueueNode = if (self.free.pop()) |n|
                 getNode(n)
             else
@@ -255,9 +256,13 @@ pub fn MutexQueue(comptime T: type) type {
         mutex: std.Io.Mutex = .init,
         cond: std.Io.Condition = .init,
         queue: Queue(T) = .{},
+        /// Set by `close`. No further items are accepted.
+        closed: bool = false,
         /// Optional callback to invoke when an item gets pushed
         /// to the queue.
         notify: ?Notify = null,
+
+        pub const AppendError = error{ Closed, OutOfMemory };
 
         pub fn init(io: std.Io) @This() {
             return .{ .io = io };
@@ -268,41 +273,44 @@ pub fn MutexQueue(comptime T: type) type {
         }
 
         /// Initialize with capacity to hold `n` elements.
-        pub fn initCapacity(io: std.Io, gpa: std.mem.Allocator, n: usize) !@This() {
+        pub fn initCapacity(io: std.Io, gpa: Allocator, n: usize) Allocator.Error!@This() {
             return .{ .io = io, .queue = try .initCapacity(gpa, n) };
         }
 
-        /// Clear all allocated memory for the nodes.
-        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+        /// Clear all allocated memory for the nodes. Does not free the
+        /// queued items.
+        pub fn deinit(self: *@This(), gpa: Allocator) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.queue.deinit(gpa);
         }
 
         /// Push item to back of queue. Signal and call the nofity callback.
-        pub fn append(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+        pub fn append(self: *@This(), gpa: Allocator, item: T) AppendError!void {
             try self.appendInner(gpa, item);
             self.signal();
         }
 
         /// Push item to back of queue without invoking the notify callback.
-        pub fn appendNoNotify(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+        pub fn appendNoNotify(self: *@This(), gpa: Allocator, item: T) AppendError!void {
             try self.appendInner(gpa, item);
             self.cond.signal(self.io);
         }
 
-        fn appendInner(self: *@This(), gpa: std.mem.Allocator, item: T) !void {
+        fn appendInner(self: *@This(), gpa: Allocator, item: T) AppendError!void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
+            if (self.closed) return error.Closed;
             try self.queue.append(gpa, item);
         }
 
-        /// Push item to back of queue.
-        /// Assumes that there is capacity for the element.
+        /// Push item to back of queue. Assumes that there is capacity
+        /// for the element. The item is dropped if the queue is closed.
         pub fn appendAssumeCapacity(self: *@This(), item: T) void {
             {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
+                if (self.closed) return;
                 self.queue.appendAssumeCapacity(item);
             }
             self.signal();
@@ -315,15 +323,23 @@ pub fn MutexQueue(comptime T: type) type {
             return self.queue.pop();
         }
 
-        /// Pop the first item from the queue.
-        /// Block the caller thread until an item gets pushed.
+        /// Pop the first item from the queue. Block the caller thread
+        /// until an item gets pushed or the queue closes.
         pub fn popBlocking(self: *@This()) ?T {
             self.mutex.lockUncancelable(self.io);
-            while (self.queue.empty()) {
+            defer self.mutex.unlock(self.io);
+            while (self.queue.empty() and !self.closed) {
                 self.cond.wait(self.io, &self.mutex) catch return null;
             }
-            self.mutex.unlock(self.io);
-            return self.pop();
+            return self.queue.pop();
+        }
+
+        /// Stop accepting new items and wake blocked consumers.
+        pub fn close(self: *@This()) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.closed = true;
+            self.cond.broadcast(self.io);
         }
 
         /// Check if the queue is empty.
@@ -368,7 +384,7 @@ test "mutex_queue" {
     try std.testing.expect(q.pop() == 3);
 
     const push_items = struct {
-        fn f(qu: *MutexQueue(usize), a: std.mem.Allocator) !void {
+        fn f(qu: *MutexQueue(usize), a: Allocator) !void {
             try qu.append(a, 9);
             try qu.append(a, 8);
             try qu.append(a, 7);
@@ -428,4 +444,47 @@ test "append_no_notify skips the callback but wakes waiters" {
     try q.appendNoNotify(gpa, 3);
     handle.join();
     try std.testing.expectEqual(@as(usize, 3), popper.popped.?);
+}
+
+test "mutex_queue_close_wakes_blocked_popper" {
+    const io = std.testing.io;
+    var q = MutexQueue(usize).init(io);
+    defer q.deinit(std.testing.allocator);
+
+    const Popper = struct {
+        waiting: std.atomic.Value(bool) = .init(false),
+        popped: ?usize = null,
+
+        fn f(self: *@This(), qu: *MutexQueue(usize)) void {
+            self.waiting.store(true, .seq_cst);
+            self.popped = qu.popBlocking();
+        }
+    };
+    var popper = Popper{};
+    const handle = try std.Thread.spawn(.{}, Popper.f, .{ &popper, &q });
+    while (!popper.waiting.load(.seq_cst)) std.Thread.yield() catch {};
+
+    // The close wakes the blocked consumer without an item.
+    q.close();
+    handle.join();
+    try std.testing.expect(popper.popped == null);
+}
+
+test "mutex_queue_drains_after_close" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var q = MutexQueue(usize).init(io);
+    defer q.deinit(gpa);
+
+    try q.append(gpa, 1);
+    q.close();
+
+    // Items queued before the close are still returned.
+    try std.testing.expect(q.popBlocking() == 1);
+    try std.testing.expect(q.popBlocking() == null);
+
+    // Closed queues reject new items.
+    try std.testing.expectError(error.Closed, q.append(gpa, 2));
+    try std.testing.expectError(error.Closed, q.appendNoNotify(gpa, 3));
+    try std.testing.expect(q.len() == 0);
 }
