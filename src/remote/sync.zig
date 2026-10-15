@@ -3,6 +3,7 @@ const protocol = @import("protocol.zig");
 const workspace = @import("workspace.zig");
 const glob = @import("glob.zig");
 const Connection = @import("Connection.zig");
+const queue = @import("../types/queue.zig");
 const Hash = protocol.Hash;
 
 const log = std.log.scoped(.sync);
@@ -160,6 +161,39 @@ pub const Directory = struct {
         try std.Io.Dir.cwd().setTimestamps(self.io, full, .{
             .modify_timestamp = .{ .new = std.Io.Timestamp.fromNanoseconds(ns) },
         });
+    }
+
+    /// Clear local entries that would block creating a file at `rel_path`.
+    pub fn reconcileWritePath(self: *const Directory, rel_path: []const u8) !void {
+        try workspace.validateRelPath(rel_path);
+        var prefix: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, rel_path, prefix, '/')) |i| : (prefix = i + 1) {
+            try self.removeConflictingEntry(rel_path[0..i], .directory);
+        }
+        try self.removeConflictingEntry(rel_path, .file);
+    }
+
+    /// Delete the entry at `rel_path` unless it already has the kind `want`.
+    fn removeConflictingEntry(
+        self: *const Directory,
+        rel_path: []const u8,
+        want: std.Io.File.Kind,
+    ) !void {
+        const full = try workspace.nativeRelPath(self.gpa, self.root, rel_path);
+        defer self.gpa.free(full);
+        const stat = std.Io.Dir.cwd().statFile(self.io, full, .{}) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        if (stat.kind == want) return;
+        std.Io.Dir.cwd().deleteTree(self.io, full) catch |err| {
+            log.warn(
+                "Failed to remove conflicting workspace entry '{s}': {s}",
+                .{ full, @errorName(err) },
+            );
+            return err;
+        };
+        log.debug("Removed conflicting workspace entry '{s}'", .{full});
     }
 
     /// Validate `rel_path` and return its native absolute path. Owned.
@@ -334,6 +368,30 @@ fn atomicTempPath(gpa: std.mem.Allocator, full: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ dirname, name });
 }
 
+/// Own copies of the exclude globs.
+fn dupeExclude(
+    gpa: std.mem.Allocator,
+    view: protocol.ListView([]const u8),
+) error{OutOfMemory}![][]u8 {
+    var out: std.ArrayList([]u8) = try .initCapacity(gpa, view.len());
+    errdefer {
+        for (out.items) |pattern| gpa.free(pattern);
+        out.deinit(gpa);
+    }
+    var it = view.iterator();
+    while (it.next()) |pattern| {
+        const copy = try gpa.dupe(u8, pattern);
+        out.appendAssumeCapacity(copy);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Free a slice produced by `dupeExclude`.
+fn freeExclude(gpa: std.mem.Allocator, exclude: [][]u8) void {
+    for (exclude) |pattern| gpa.free(pattern);
+    if (exclude.len > 0) gpa.free(exclude);
+}
+
 // TODO: maybe move Receiver, Sender, Source, File, Directory to different files under sync/
 
 /// Receives one push transfer into a destination root. Validates the
@@ -348,6 +406,12 @@ pub const Receiver = struct {
     job_name: []u8,
     /// Destination root and its deletion policy.
     workspace: Workspace,
+
+    // TODO: use enum?
+    /// Whether the transfer reuses a persistent workspace.
+    persistent: bool,
+    /// Owned copies of the exclude globs, applied by the delete pass.
+    exclude: [][]u8 = &.{},
 
     /// File currently being received, if any.
     open: ?File = null,
@@ -364,6 +428,11 @@ pub const Receiver = struct {
     manifest_len: usize = 0,
     /// Total entries the manifest promises.
     manifest_total: ?u32 = null,
+
+    /// Wanted paths recorded while diffing manifest pages.
+    requests: std.ArrayList([]u8) = .empty,
+    /// Number of requested files not received yet.
+    outstanding: usize = 0,
 
     /// Number of files completed with an explicit `file_done`.
     files: usize = 0,
@@ -383,6 +452,10 @@ pub const Receiver = struct {
         declared: bool = false,
         /// The transfer received this file.
         received: bool = false,
+        /// The live local copy stat-matched the declaration (persistent mode).
+        matched: bool = false,
+        /// The content was requested from the manager (persistent mode).
+        requested: bool = false,
         /// Declared attributes of the file: the manifest stat plus the
         /// content hash of the transfer.
         stat: File.Stat = .{},
@@ -403,6 +476,8 @@ pub const Receiver = struct {
         errdefer gpa.free(task_id);
         const job_name = try gpa.dupe(u8, msg.job_name);
         errdefer gpa.free(job_name);
+        const exclude = try dupeExclude(gpa, msg.exclude);
+        errdefer freeExclude(gpa, exclude);
 
         const ws = try createWorkspace(
             io,
@@ -413,6 +488,7 @@ pub const Receiver = struct {
             msg.job_name,
             msg.job_id,
         );
+        errdefer ws.deinit();
 
         log.debug(
             "Workspace sync {x} begin: task='{s}' job='{s}' dest='{s}'",
@@ -423,6 +499,8 @@ pub const Receiver = struct {
             .gpa = gpa,
             .task_id = task_id,
             .job_name = job_name,
+            .persistent = msg.mode == .persistent,
+            .exclude = exclude,
             .workspace = ws,
         };
     }
@@ -439,6 +517,9 @@ pub const Receiver = struct {
         var it = self.tracked.keyIterator();
         while (it.next()) |key| self.gpa.free(key.*);
         self.tracked.deinit(self.gpa);
+        for (self.requests.items) |path| self.gpa.free(path);
+        self.requests.deinit(self.gpa);
+        freeExclude(self.gpa, self.exclude);
         self.workspace.deinit();
         self.gpa.free(self.task_id);
         self.gpa.free(self.job_name);
@@ -544,6 +625,9 @@ pub const Receiver = struct {
         } else if (gop.value_ptr.received) {
             return self.markFailed("file '{s}' was completed twice", .{path});
         }
+        if (gop.value_ptr.requested and !gop.value_ptr.received) {
+            self.outstanding -= 1;
+        }
         gop.value_ptr.stat.hash = digest;
         gop.value_ptr.received = true;
         self.files += 1;
@@ -583,6 +667,21 @@ pub const Receiver = struct {
             gop.value_ptr.stat.size = entry.size;
             gop.value_ptr.stat.mtime_ms = entry.mtime_ms;
             gop.value_ptr.stat.permissions = entry.permissions;
+            if (self.persistent) {
+                if (self.wantsContent(entry.path, entry.size, entry.mtime_ms, entry.permissions)) {
+                    const copy = self.gpa.dupe(u8, entry.path) catch {
+                        return self.markFailed("out of memory", .{});
+                    };
+                    self.requests.append(self.gpa, copy) catch {
+                        self.gpa.free(copy);
+                        return self.markFailed("out of memory", .{});
+                    };
+                    gop.value_ptr.requested = true;
+                    self.outstanding += 1;
+                } else {
+                    gop.value_ptr.matched = true;
+                }
+            }
         }
         self.manifest_len += msg.entries.len();
         if (self.manifest_len > self.manifest_total.?) {
@@ -592,6 +691,31 @@ pub const Receiver = struct {
             "Workspace sync manifest: {d}/{d} entries",
             .{ self.manifest_len, self.manifest_total.? },
         );
+    }
+
+    /// Whether the live local copy of a declared file differs from the
+    /// declared stat so its content must be requested.
+    fn wantsContent(
+        self: *Receiver,
+        path: []const u8,
+        size: u64,
+        mtime_ms: i64,
+        permissions: u32,
+    ) bool {
+        const stat = self.workspace.directory.statFile(path) catch return true;
+        if (stat.kind != .file) return true;
+        if (stat.size != size) return true;
+        if (stat.mtime.toMilliseconds() != mtime_ms) return true;
+        if (wirePermissions(stat.permissions) != permissions) return true;
+        return false;
+    }
+
+    /// Drain the file requests recorded while diffing manifest pages.
+    pub fn takeRequests(self: *Receiver) ?[][]u8 {
+        return self.requests.toOwnedSlice(self.gpa) catch {
+            self.markFailed("out of memory", .{});
+            return null;
+        };
     }
 
     /// Whether every manifest page has arrived.
@@ -615,6 +739,8 @@ pub const Receiver = struct {
         while (it.next()) |kv| {
             const file = kv.value_ptr;
             if (!file.received) {
+                // A persistent transfer may skip files that stat-matched
+                if (self.persistent and file.matched) continue;
                 self.markFailed(
                     "manifest declares '{s}' but it was not received",
                     .{kv.key_ptr.*},
@@ -629,6 +755,8 @@ pub const Receiver = struct {
                 return false;
             }
         }
+        // Delete all not declared files, protecting the excluded globs
+        if (self.persistent) self.deleteUndeclared();
         // Apply the declared source mtimes to the received files
         var mtime_it = self.tracked.iterator();
         while (mtime_it.next()) |kv| {
@@ -646,12 +774,53 @@ pub const Receiver = struct {
         return true;
     }
 
+    /// Delete workspace files the manifest does not declare,
+    /// ignoring the exclude globs.
+    fn deleteUndeclared(self: *Receiver) void {
+        const root = self.workspace.root();
+        var dir = std.Io.Dir.openDirAbsolute(self.io, root, .{
+            .iterate = true,
+        }) catch |err| {
+            log.warn("Failed to open workspace '{s}' for the delete pass: {s}", .{
+                root, @errorName(err),
+            });
+            return;
+        };
+        defer dir.close(self.io);
+        var walker = dir.walk(self.gpa) catch return;
+        defer walker.deinit();
+
+        while (true) {
+            const entry = walker.next(self.io) catch |err| {
+                log.warn("Failed to walk workspace '{s}' for the delete pass: {s}", .{
+                    root, @errorName(err),
+                });
+                return;
+            } orelse return;
+            if (entry.kind != .file) continue;
+            const wire = workspace.toWireRelPath(self.gpa, entry.path) catch continue;
+            defer self.gpa.free(wire);
+            if (glob.matchAny(self.exclude, wire)) continue;
+            if (self.tracked.contains(wire)) continue;
+            dir.deleteFile(self.io, entry.path) catch |err| {
+                log.warn(
+                    "Failed to delete undeclared workspace file '{s}': {s}",
+                    .{ entry.path, @errorName(err) },
+                );
+                continue;
+            };
+            log.debug("Deleted undeclared workspace file '{s}'", .{entry.path});
+        }
+    }
+
     fn openFile(self: *Receiver, path: []const u8) !void {
         const directory = &self.workspace.directory;
-        self.open = if (self.workspace.lifetime == .persistent)
-            try directory.openWriteAtomic(path)
-        else
-            try directory.openWrite(path);
+        if (self.workspace.lifetime == .persistent) {
+            try directory.reconcileWritePath(path);
+            self.open = try directory.openWriteAtomic(path);
+        } else {
+            self.open = try directory.openWrite(path);
+        }
         self.hasher = .init(.{});
         self.next_offset = 0;
     }
@@ -662,7 +831,7 @@ pub const Receiver = struct {
         self.open = null;
     }
 
-    fn markFailed(self: *Receiver, comptime fmt: []const u8, args: anytype) void {
+    pub fn markFailed(self: *Receiver, comptime fmt: []const u8, args: anytype) void {
         if (self.failed) return;
         self.failed = true;
         self.failure_msg = std.fmt.allocPrint(self.gpa, fmt, args) catch null;
@@ -680,7 +849,8 @@ pub const Source = struct {
     /// Glob patterns of workspace-relative paths to skip.
     exclude: []const []const u8,
 
-    walker: std.Io.Dir.Walker,
+    /// Tree walker of the current full pass. Created lazily.
+    walker: ?std.Io.Dir.Walker = null,
     dir: std.Io.Dir,
 
     /// File currently being read, if any.
@@ -698,6 +868,8 @@ pub const Source = struct {
     manifest_collected: bool = false,
     /// Set once the walk is exhausted.
     finished: bool = false,
+    /// If true, only the file opened by `openSingle` is yielded.
+    single: bool = false,
 
     pub const Event = union(enum) {
         /// Next slice of the current file.
@@ -728,8 +900,6 @@ pub const Source = struct {
             .iterate = true,
         });
         errdefer dir.close(io);
-        var walker = try dir.walk(gpa);
-        errdefer walker.deinit();
 
         return .{
             .io = io,
@@ -737,7 +907,6 @@ pub const Source = struct {
             .directory = directory,
             .exclude = exclude,
             .dir = dir,
-            .walker = walker,
         };
     }
 
@@ -746,13 +915,13 @@ pub const Source = struct {
         if (self.current_path.len > 0) self.gpa.free(self.current_path);
         for (self.entries.items) |*entry| self.gpa.free(entry.path);
         self.entries.deinit(self.gpa);
-        self.walker.deinit();
+        if (self.walker) |*w| w.deinit();
         self.dir.close(self.io);
         self.directory.deinit();
     }
 
-    /// Reset the state and start the walk from the beginning.
-    fn reset(self: *Source) !void {
+    /// Reset the state.
+    fn reset(self: *Source) void {
         if (self.open) |*f| {
             f.deinit();
             self.open = null;
@@ -768,17 +937,43 @@ pub const Source = struct {
             for (self.entries.items) |*entry| self.gpa.free(entry.path);
             self.entries.clearRetainingCapacity();
         }
-        self.walker.deinit();
-        var walker = try self.dir.walk(self.gpa);
-        errdefer walker.deinit();
-        self.walker = walker;
+        if (self.walker) |*w| {
+            w.deinit();
+            self.walker = null;
+        }
         self.finished = false;
+        self.single = false;
+    }
+
+    /// Reset the state and serve only the file at `wire_path` next.
+    pub fn openSingle(self: *Source, wire_path: []const u8) !void {
+        self.reset();
+        std.debug.assert(self.open == null);
+        var file = try self.directory.openRead(wire_path);
+        errdefer file.deinit();
+        if (self.current_path.len > 0) self.gpa.free(self.current_path);
+        self.current_path = try self.gpa.dupe(u8, wire_path);
+        self.pos = 0;
+        self.open = file;
+        self.hasher = .init(.{});
+        self.single = true;
     }
 
     /// Get the next entry from the walker.
     fn nextEntry(self: *Source) !?std.Io.Dir.Walker.Entry {
+        if (self.single) {
+            // The requested file was consumed
+            self.finished = true;
+            return null;
+        }
+        // Create the walker lazily
+        const walker = blk: {
+            if (self.walker) |*w| break :blk w;
+            self.walker = try self.dir.walk(self.gpa);
+            break :blk &self.walker.?;
+        };
         while (true) {
-            const entry = try self.walker.next(self.io) orelse {
+            const entry = try walker.next(self.io) orelse {
                 self.finished = true;
                 return null;
             };
@@ -830,7 +1025,7 @@ pub const Source = struct {
 
     /// Collect all the manifest entries.
     pub fn collectManifest(self: *Source) !void {
-        try self.reset();
+        self.reset();
         while (true) {
             const entry = try self.nextManifestEntry() orelse break;
             try self.entries.append(self.gpa, entry);
@@ -916,6 +1111,13 @@ pub const Sender = struct {
     files: usize = 0,
     /// Total file bytes queued to the writer.
     bytes: u64 = 0,
+    /// Whether the end of the source closes the transfer with the
+    /// manifest pages and `sync_end`.
+    send_end: bool = true,
+    /// Planned file total of the transfer, when known ahead of serving.
+    files_total: ?usize = null,
+    /// Planned payload byte total, when known (sum of requested sizes).
+    bytes_total: ?u64 = null,
 
     pub const Status = union(enum) {
         /// Queued at least one frame, then hit the writer budget.
@@ -925,10 +1127,22 @@ pub const Sender = struct {
         /// All frames queued, including `sync_end`.
         ended,
         /// Unrecoverable failure.
-        failed: struct {
-            message: []const u8,
-            err: anyerror,
-        },
+        failed: Failed,
+    };
+
+    /// Terminal outcome of a sender run.
+    pub const RunOutcome = union(enum) {
+        /// All frames queued successfully.
+        ended,
+        /// Stopped before finishing.
+        stopped,
+        /// Unrecoverable failure.
+        failed: Failed,
+    };
+
+    pub const Failed = struct {
+        message: []const u8,
+        err: anyerror,
     };
 
     /// Open a pump over `root`, stamping frames with `job_id`.
@@ -1055,7 +1269,8 @@ pub const Sender = struct {
                     queued_any = true;
                 },
                 .end => {
-                    // Close the transfer with the manifest, then the end marker.
+                    if (!self.send_end) return .ended;
+                    // Close the transfer with the manifest, then the end marker
                     self.queueManifest(outbox) catch |err| switch (err) {
                         error.OutOfMemory => return .{ .failed = .{
                             .message = "out of memory",
@@ -1090,7 +1305,7 @@ pub const Sender = struct {
     }
 
     /// Queue the collected manifest entries as pages.
-    fn queueManifest(self: *Sender, outbox: *Connection.Writer) !void {
+    pub fn queueManifest(self: *Sender, outbox: *Connection.Writer) !void {
         const entries = self.source.entries.items;
         var start: usize = 0;
         var page_len: usize = 0;
@@ -1136,6 +1351,8 @@ pub const Sender = struct {
             ptr: *anyopaque,
             files: usize,
             bytes: u64,
+            files_total: ?usize,
+            bytes_total: ?u64,
             elapsed_ms: i64,
         ) void,
     };
@@ -1145,7 +1362,7 @@ pub const Sender = struct {
         outbox: *Connection.Writer,
         /// Chunk payload quota of one pump pass.
         quota_bytes: usize,
-        /// Cooperative stop flag, checked between pump passes.
+        /// Stop flag, checked between pump passes.
         stop: ?*const std.atomic.Value(bool) = null,
         /// Transfer start time.
         start_ms: i64 = 0,
@@ -1154,47 +1371,82 @@ pub const Sender = struct {
         hooks: ?RunHooks = null,
     };
 
-    /// Terminal outcome of a sender run.
-    pub const RunOutcome = union(enum) {
-        /// All frames queued, including `sync_end`.
-        ended,
-        /// Stopped before finishing.
-        stopped,
-        /// Unrecoverable failure.
-        failed: struct {
-            message: []const u8,
-            err: anyerror,
-        },
-    };
-
-    /// Run the transfer loop. Queue frames until the source is
+    /// Stream the whole source tree. Queue frames until the source is
     /// exhausted, the stop flag is set or the writer queue closes,
     /// blocking on the writer byte budget between passes.
-    pub fn run(self: *Sender, opts: RunOptions) RunOutcome {
+    pub fn streamAll(self: *Sender, opts: RunOptions) RunOutcome {
+        var last_emit_ms: i64 = 0;
+        var emitted_files: usize = 0;
+        var emitted_bytes: u64 = 0;
+        return self.runPasses(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+    }
+
+    /// Persistent producer loop. Collects the manifest and queues its
+    /// pages so the receiver can diff and request, then serves the
+    /// requested files until the inbox closes or the transfer stops.
+    pub fn serveRequests(
+        self: *Sender,
+        inbox: *queue.MutexQueue([]u8),
+        opts: RunOptions,
+    ) RunOutcome {
+        self.source.collectManifest() catch |err| return .{ .failed = .{
+            .message = "failed to read the workspace source",
+            .err = err,
+        } };
+        self.files_total = self.source.entries.items.len;
+        self.bytes_total = 0;
+        self.queueManifest(opts.outbox) catch |err| return .{ .failed = .{
+            .message = "failed to queue the workspace manifest",
+            .err = err,
+        } };
+
         var last_emit_ms: i64 = 0;
         var emitted_files: usize = 0;
         var emitted_bytes: u64 = 0;
         while (true) {
-            if (opts.stop) |stop| {
-                if (stop.load(.acquire)) return .stopped;
+            if (opts.stop) |stop| if (stop.load(.acquire)) return .stopped;
+            const path = inbox.popBlocking() orelse return .stopped;
+            defer self.gpa.free(path);
+
+            // Serve the one file
+            self.source.openSingle(path) catch |err| return .{ .failed = .{
+                .message = "failed to read a requested file",
+                .err = err,
+            } };
+            if (self.bytes_total) |*total| total.* += self.source.open.?.stat.size;
+            const outcome = self.runPasses(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+            switch (outcome) {
+                .ended => {},
+                else => |o| return o,
             }
+        }
+    }
+
+    /// Drive pump passes until the source reports the end of its
+    /// current pass, the stop flag is set or the writer queue closes.
+    fn runPasses(
+        self: *Sender,
+        opts: RunOptions,
+        last_emit_ms: *i64,
+        emitted_files: *usize,
+        emitted_bytes: *u64,
+    ) RunOutcome {
+        while (true) {
+            if (opts.stop) |stop| if (stop.load(.acquire)) return .stopped;
             switch (self.pump(opts.outbox, opts.quota_bytes)) {
                 .backpressured => {
                     // Queued at least one frame, so progress was made.
                     if (opts.hooks) |hooks| hooks.activity(hooks.ptr);
-                    self.emitRunProgress(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+                    self.emitRunProgress(opts, last_emit_ms, emitted_files, emitted_bytes);
                 },
                 // No frame was queued, so no progress
                 .blocked => {},
                 .ended => {
                     if (opts.hooks) |hooks| hooks.activity(hooks.ptr);
-                    self.emitRunProgress(opts, &last_emit_ms, &emitted_files, &emitted_bytes);
+                    self.emitRunProgress(opts, last_emit_ms, emitted_files, emitted_bytes);
                     return .ended;
                 },
-                .failed => |f| return .{ .failed = .{
-                    .message = f.message,
-                    .err = f.err,
-                } },
+                .failed => |f| return .{ .failed = f },
             }
             // The writer queue budget is full, wait for the consumer to drain it
             const need: usize = if (self.pending) |frame|
@@ -1228,7 +1480,14 @@ pub const Sender = struct {
         last_emit_ms.* = now_ms;
         emitted_files.* = self.files;
         emitted_bytes.* = self.bytes;
-        hooks.progress(hooks.ptr, self.files, self.bytes, now_ms - opts.start_ms);
+        hooks.progress(
+            hooks.ptr,
+            self.files,
+            self.bytes,
+            self.files_total,
+            self.bytes_total,
+            now_ms - opts.start_ms,
+        );
     }
 };
 
@@ -1278,6 +1537,16 @@ fn testBegin(job_id: u64) protocol.SyncBeginMsg {
 fn testBeginMode(job_id: u64, mode: protocol.WorkspaceMode) protocol.SyncBeginMsg {
     var msg = testBegin(job_id);
     msg.mode = mode;
+    return msg;
+}
+
+fn testBeginExclude(
+    job_id: u64,
+    mode: protocol.WorkspaceMode,
+    patterns: []const []const u8,
+) protocol.SyncBeginMsg {
+    var msg = testBeginMode(job_id, mode);
+    msg.exclude = .fromSlice(patterns);
     return msg;
 }
 
@@ -1723,6 +1992,133 @@ test "receiver_commits_empty_workspace" {
     try expect(recv.commit());
 }
 
+test "receiver_persistent_diffs_and_requests" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    var store = try workspace.Store.init(io, gpa, env.data_dir);
+    defer store.deinit(gpa);
+
+    var recv = try Receiver.init(io, gpa, &store, testBeginMode(34, .persistent));
+    defer recv.deinit();
+    const dir = &recv.workspace.directory;
+
+    // A local file that matches the declaration exactly.
+    try createTestFile(dir, "same.txt", "same");
+    const mtime_ms: i64 = 1_700_000_000_000;
+    try dir.setMtime("same.txt", mtime_ms);
+
+    // A file whose content changed since the last sync.
+    try createTestFile(dir, "changed.txt", "changed");
+
+    recv.receiveManifest(.{
+        .job_id = 34,
+        .total_entries = 3,
+        .entries = .fromSlice(&.{
+            .{ .path = "same.txt", .size = 4, .mtime_ms = mtime_ms, .permissions = 0o644 },
+            .{ .path = "changed.txt", .size = 99, .mtime_ms = mtime_ms, .permissions = 0o644 },
+        }),
+    });
+    try expect(!recv.failed);
+    try expect(recv.outstanding == 1);
+
+    // The requests of one page are drained per page, before the rest
+    // of the manifest arrives.
+    const reqs = recv.takeRequests().?;
+    defer {
+        for (reqs) |path| gpa.free(path);
+        gpa.free(reqs);
+    }
+    try expect(reqs.len == 1);
+    try expectEqualStrings("changed.txt", reqs[0]);
+
+    // A file missing on disk is requested like any changed one.
+    recv.receiveManifest(.{
+        .job_id = 34,
+        .total_entries = 3,
+        .entries = .fromSlice(&.{
+            .{ .path = "missing.txt", .size = 0, .mtime_ms = 0, .permissions = 0o644 },
+        }),
+    });
+    try expect(!recv.failed);
+    try expect(recv.outstanding == 2);
+    const reqs2 = recv.takeRequests().?;
+    defer {
+        for (reqs2) |path| gpa.free(path);
+        gpa.free(reqs2);
+    }
+    try expect(reqs2.len == 1);
+    try expectEqualStrings("missing.txt", reqs2[0]);
+    try expect(recv.manifestComplete());
+}
+
+test "receiver_persistent_delete_pass" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    var store = try workspace.Store.init(io, gpa, env.data_dir);
+    defer store.deinit(gpa);
+
+    var recv = try Receiver.init(
+        io,
+        gpa,
+        &store,
+        testBeginExclude(35, .persistent, &.{"node_modules"}),
+    );
+    defer recv.deinit();
+    const dir = &recv.workspace.directory;
+
+    // The declared file, a stale undeclared file and an excluded tree
+    // that the manager does not declare but the job still needs.
+    try createTestFile(dir, "keep.txt", "keep");
+    try createTestFile(dir, "extra.txt", "extra");
+    try createTestFile(dir, "sub/extra.txt", "extra");
+    try createTestFile(dir, "node_modules/dep.txt", "dep");
+    const mtime_ms: i64 = 1_700_000_000_000;
+    try dir.setMtime("keep.txt", mtime_ms);
+
+    recv.receiveManifest(.{
+        .job_id = 35,
+        .total_entries = 1,
+        .entries = .fromSlice(&.{
+            .{ .path = "keep.txt", .size = 4, .mtime_ms = mtime_ms, .permissions = 0o644 },
+        }),
+    });
+    try expect(recv.manifestComplete());
+    try expect(recv.outstanding == 0);
+    try expect(recv.commit());
+
+    const exists = struct {
+        fn check(i: std.Io, path: []const u8) bool {
+            _ = std.Io.Dir.cwd().statFile(i, path, .{}) catch return false;
+            return true;
+        }
+    }.check;
+    const wsPath = struct {
+        fn get(g: std.mem.Allocator, root: []const u8, rel: []const u8) ![]u8 {
+            return workspace.nativeRelPath(g, root, rel);
+        }
+    }.get;
+
+    // Undeclared files were deleted; the excluded tree survived.
+    const keep = try wsPath(gpa, recv.rootDir(), "keep.txt");
+    defer gpa.free(keep);
+    const extra = try wsPath(gpa, recv.rootDir(), "extra.txt");
+    defer gpa.free(extra);
+    const sub_extra = try wsPath(gpa, recv.rootDir(), "sub/extra.txt");
+    defer gpa.free(sub_extra);
+    const dep = try wsPath(gpa, recv.rootDir(), "node_modules/dep.txt");
+    defer gpa.free(dep);
+    try expect(exists(io, keep));
+    try expect(!exists(io, extra));
+    try expect(!exists(io, sub_extra));
+    try expect(exists(io, dep));
+}
+
 test "directory_read_write_roundtrip" {
     var env: TestEnv = try .init();
     defer env.deinit();
@@ -1911,6 +2307,40 @@ test "source_yields_file_events" {
             try expect(e.permissions & 0o777 == 0o644);
         }
     }
+}
+
+test "source_collect_manifest_then_chunk_pass" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const root = try std.fs.path.join(gpa, &.{ env.path, "tmp" });
+    defer gpa.free(root);
+    try std.Io.Dir.cwd().createDirPath(io, root);
+    var dir = try Directory.init(io, gpa, root);
+    defer dir.deinit();
+
+    try createTestFile(&dir, "a.txt", "alpha");
+    try createTestFile(&dir, "b/c.txt", "beta");
+
+    var source: Source = try .init(io, gpa, root, &.{});
+    defer source.deinit();
+
+    try source.collectManifest();
+    try expect(source.entries.items.len == 2);
+
+    // The serving pass starts a fresh walk and re-reads the same files
+    // without recording the manifest entries again, so pages cannot
+    // declare a file twice.
+    source.reset();
+    var collector: SourceEventCollector = .{};
+    defer collector.deinit(gpa);
+    var buf: [protocol.SYNC_CHUNK_SIZE]u8 = undefined;
+    try expect(try collector.drain(&source, gpa, &buf));
+    try expect(source.entries.items.len == 2);
+    try expectEqualStrings("alpha", collector.find("a.txt").?.body.items);
+    try expectEqualStrings("beta", collector.find("b/c.txt").?.body.items);
 }
 
 test "source_excludes_and_skips_non_files" {

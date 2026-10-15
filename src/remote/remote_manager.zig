@@ -116,7 +116,8 @@ fn pushIncoming(
         .parsed = parsed,
     } }) catch |err| {
         parsed.deinit();
-        return err;
+        if (err == error.Closed) return;
+        return error.OutOfMemory;
     };
 }
 
@@ -127,10 +128,13 @@ fn noteMalformedIncoming(
     err: anyerror,
 ) error{OutOfMemory}!void {
     const self: *RemoteManager = @ptrCast(@alignCast(opq));
-    return self.incoming_frames.append(self.gpa, .{ .malformed = .{
+    self.incoming_frames.append(self.gpa, .{ .malformed = .{
         .socket_handle = fd,
         .err = err,
-    } });
+    } }) catch |append_err| {
+        if (append_err == error.Closed) return;
+        return error.OutOfMemory;
+    };
 }
 
 /// Wake the manager loop when a connection worker exited.
@@ -198,6 +202,8 @@ const SyncTransfer = struct {
     writer: *Connection.Writer,
     /// Transfer session roles.
     session: sync.Session,
+    /// Requested file paths queued for the transfer's producer.
+    inbox: MutexQueue([]u8),
     /// Producer thread, spawned once the transfer is tracked.
     thread: ?std.Thread = null,
     /// Set by the manager to stop the producer.
@@ -236,6 +242,8 @@ const SyncTransfer = struct {
             .pull, .both => return error.UnsupportedDirection,
         };
         errdefer session.deinit();
+        // Persistent transfers complete agent-side
+        if (session.sender) |*sender| sender.send_end = spec.mode != .persistent;
 
         const task_id_copy = try gpa.dupe(u8, task_id);
         errdefer gpa.free(task_id_copy);
@@ -252,6 +260,7 @@ const SyncTransfer = struct {
             .direction = spec.direction,
             .writer = writer,
             .session = session,
+            .inbox = MutexQueue([]u8).init(io),
             .start_ms = now_ms,
             .last_progress_ms = .init(now_ms),
         };
@@ -262,6 +271,10 @@ const SyncTransfer = struct {
     fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
         std.debug.assert(self.thread == null);
         gpa.free(self.task_id);
+        // Requests queued but never served; the queue does not free
+        // its items.
+        while (self.inbox.pop()) |path| gpa.free(path);
+        self.inbox.deinit(gpa);
         self.session.deinit();
         gpa.destroy(self);
     }
@@ -269,6 +282,7 @@ const SyncTransfer = struct {
     /// Ask the producer to stop and unblock it.
     fn requestStop(self: *SyncTransfer) void {
         self.stop.store(true, .release);
+        self.inbox.close();
         self.writer.send_queue.wake();
     }
 
@@ -288,23 +302,29 @@ const SyncTransfer = struct {
         );
     }
 
-    /// Producer loop. Queues transfer frames until the source is
-    /// exhausted, the transfer is stopped or the writer queue closes.
-    fn run(self: *SyncTransfer, manager: *RemoteManager) void {
+    /// Producer thread body. Dispatches to the transfer model the mode
+    /// selected (`streamAll` for ephemeral, `serveRequests` for persistent).
+    fn produce(self: *SyncTransfer, manager: *RemoteManager) void {
         const sender = &(self.session.sender orelse return);
         var ctx: SyncRunContext = .{ .st = self, .manager = manager };
-        switch (sender.run(.{
+        const hooks: sync.Sender.RunHooks = .{
+            .ptr = &ctx,
+            .activity = SyncRunContext.activity,
+            .progress = SyncRunContext.progress,
+        };
+        const options: sync.Sender.RunOptions = .{
             .outbox = self.writer,
             .quota_bytes = SYNC_PUMP_QUOTA_BYTES,
             .stop = &self.stop,
             .start_ms = self.start_ms,
             .progress_interval_ms = SYNC_PROGRESS_INTERVAL_MS,
-            .hooks = .{
-                .ptr = &ctx,
-                .activity = SyncRunContext.activity,
-                .progress = SyncRunContext.progress,
-            },
-        })) {
+            .hooks = hooks,
+        };
+        const outcome = if (self.mode == .persistent)
+            sender.serveRequests(&self.inbox, options)
+        else
+            sender.streamAll(options);
+        switch (outcome) {
             .ended => {
                 self.status.store(.ended, .release);
                 manager.wake();
@@ -330,7 +350,14 @@ const SyncRunContext = struct {
         self.st.touch();
     }
 
-    fn progress(opq: *anyopaque, files: usize, bytes: u64, elapsed_ms: i64) void {
+    fn progress(
+        opq: *anyopaque,
+        files: usize,
+        bytes: u64,
+        files_total: ?usize,
+        bytes_total: ?u64,
+        elapsed_ms: i64,
+    ) void {
         const self: *SyncRunContext = @ptrCast(@alignCast(opq));
         self.manager.emitSyncEvent(
             self.st.task_id,
@@ -340,6 +367,8 @@ const SyncRunContext = struct {
             .progress,
             files,
             bytes,
+            files_total,
+            bytes_total,
             elapsed_ms,
         );
     }
@@ -660,6 +689,9 @@ pub const RemoteManager = struct {
     ///
     /// Returns the unique dispatch id to route agent replies
     /// back to the scheduler.
+    ///
+    /// `error.Closed` means the manager is stopping; the dispatch was
+    /// dropped and the id will never produce job events.
     pub fn pushDispatch(
         self: *RemoteManager,
         task_id: []const u8,
@@ -667,7 +699,7 @@ pub const RemoteManager = struct {
         agent: RemoteRunSpec,
         steps: []const task.Step,
         spec: ?SyncSpec,
-    ) error{ OutOfMemory, FrameTooLarge }!u64 {
+    ) error{ OutOfMemory, FrameTooLarge, Closed }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
         const workspace: protocol.WorkspaceMode = if (spec) |s| s.mode else .none;
 
@@ -696,6 +728,8 @@ pub const RemoteManager = struct {
         var sync_spec: ?SyncSpec = if (spec) |s| try s.dupe(self.gpa) else null;
         errdefer if (sync_spec) |*s| s.deinit(self.gpa);
 
+        // `error.Closed` means the manager is stopping; the scheduler's
+        // dispatch handler fails the job on any error, so it propagates.
         try self.commands.append(self.gpa, .{ .dispatch = .{
             .dispatch_id = dispatch_id,
             .task_id = task_id_copy,
@@ -873,7 +907,8 @@ pub const RemoteManager = struct {
                 try self.emitEvent(event);
             },
             .sync_ack => |m| self.handleSyncAck(agent, m),
-            .file_req, .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
+            .file_req => |m| self.handleFileReq(agent, m),
+            .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
                 log.debug("Ignoring sync message '{s}'", .{
                     @tagName(std.meta.activeTag(msg)),
                 });
@@ -905,6 +940,39 @@ pub const RemoteManager = struct {
         defer taken.deinit(self.gpa);
         self.emitSyncTerminal(msg.job_id, taken, .finished);
         self.sendRunJob(agent, msg.job_id);
+    }
+
+    /// Queue an agent file request for its transfer's producer.
+    fn handleFileReq(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.FileReqMsg,
+    ) void {
+        const st = self.syncs.get(msg.job_id) orelse return;
+        const fd = agent.connection.conn.stream.socket.handle;
+        if (st.agent_fd != fd) return;
+        // An agent-driven transfer only moves when requests arrive, so
+        // each one keeps the stall reaper off an idle-waiting producer.
+        st.touch();
+        // The producer owns the queued path once it pops it.
+        const copy = self.gpa.dupe(u8, msg.path) catch {
+            return self.failSyncedDispatchErr(
+                msg.job_id,
+                "failed to queue the file request",
+                error.OutOfMemory,
+            );
+        };
+        st.inbox.append(self.gpa, copy) catch |err| switch (err) {
+            error.Closed => self.gpa.free(copy), // the transfer is being torn down
+            error.OutOfMemory => {
+                self.gpa.free(copy);
+                self.failSyncedDispatchErr(
+                    msg.job_id,
+                    "failed to queue the file request",
+                    error.OutOfMemory,
+                );
+            },
+        };
     }
 
     /// Find if a connected and registered agent exists with the name
@@ -1088,6 +1156,8 @@ pub const RemoteManager = struct {
             .started,
             0,
             0,
+            null,
+            null,
             0,
         );
 
@@ -1102,7 +1172,7 @@ pub const RemoteManager = struct {
             .job_name = entry.job_name,
             .mode = spec.mode,
             .direction = spec.direction,
-            .exclude = .fromSlice(&.{}),
+            .exclude = .fromSlice(spec.exclude),
         } }) catch return self.failSyncedDispatch(job_id, "out of memory");
         self.sendMessageOwned(agent, begin) catch |err| {
             self.gpa.free(begin);
@@ -1113,14 +1183,18 @@ pub const RemoteManager = struct {
             );
         };
 
-        // The producer thread owns the transfer
-        st.thread = std.Thread.spawn(.{}, SyncTransfer.run, .{ st, self }) catch |err| {
-            return self.failSyncedDispatchErr(
-                job_id,
-                "failed to start the workspace transfer worker",
-                err,
-            );
-        };
+        // The producer thread owns the transfer's sending role;
+        // receiver-only transfers (pull) are driven by the manager loop
+        // instead and spawn no thread.
+        if (st.session.sender != null) {
+            st.thread = std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, self }) catch |err| {
+                return self.failSyncedDispatchErr(
+                    job_id,
+                    "failed to start the workspace transfer worker",
+                    err,
+                );
+            };
+        }
     }
 
     /// Emit one sync progress event.
@@ -1133,6 +1207,8 @@ pub const RemoteManager = struct {
         phase: SyncPhase,
         files_done: usize,
         bytes_done: u64,
+        files_total: ?usize,
+        bytes_total: ?u64,
         duration_ms: i64,
     ) void {
         const event = RemoteEvent{ .sync_progress = .{
@@ -1143,6 +1219,8 @@ pub const RemoteManager = struct {
             .phase = phase,
             .files_done = files_done,
             .bytes_done = bytes_done,
+            .files_total = files_total,
+            .bytes_total = bytes_total,
             .duration_ms = duration_ms,
         } };
         self.emitEvent(event) catch {};
@@ -1166,6 +1244,8 @@ pub const RemoteManager = struct {
             phase,
             sender.files,
             sender.bytes,
+            sender.files_total,
+            sender.bytes_total,
             std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - st.start_ms,
         );
     }
@@ -1288,7 +1368,10 @@ pub const RemoteManager = struct {
 
     /// Push a command to cancel a job from running.
     pub fn cancelJob(self: *RemoteManager, job_id: u64) !void {
-        try self.commands.append(self.gpa, .{ .cancel = .{ .job_id = job_id } });
+        self.commands.append(self.gpa, .{ .cancel = .{ .job_id = job_id } }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.Closed => {}, // the manager is stopping; nothing to cancel
+        };
     }
 
     /// Cancel a job from running. Send a cancel request to the
@@ -1552,7 +1635,7 @@ test "sync_transfer_thread_queues_frames_in_order" {
 
     const st = try testTransfer(io, gpa, agent.writer, source_root, 7, fdHandle(1));
     try manager.syncs.put(manager.gpa, 7, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.run, .{ st, manager });
+    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
 
     // Drain frames while the producer runs
     var frames: std.ArrayList([]u8) = .empty;
@@ -1611,6 +1694,125 @@ test "sync_transfer_thread_queues_frames_in_order" {
     try expect(std.mem.eql(u8, received.items, content));
 }
 
+test "sync_transfer_persistent_serves_requests" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // Source workspace with a small file and one spanning several chunks.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const content = try gpa.alloc(u8, 3 * protocol.SYNC_CHUNK_SIZE);
+    defer gpa.free(content);
+    for (content, 0..) |*byte, i| byte.* = @truncate(i);
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "big.bin", content);
+    defer gpa.free(source_root);
+    {
+        // A second, small file served first.
+        const small = try tmp.dir.createFile(io, "small.txt", .{});
+        defer small.close(io);
+        var wbuf: [64]u8 = undefined;
+        var w = small.writer(io, &wbuf);
+        try w.interface.writeAll("tiny");
+        try w.interface.flush();
+    }
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+
+    // A large budget queues the manifest and both files without
+    // backpressure so the test only has to wait for frames.
+    var agent = try FakeAgent.init(io, gpa, 4 * 1024 * 1024);
+    defer agent.deinit(gpa);
+
+    const st = try SyncTransfer.start(
+        io,
+        gpa,
+        agent.writer,
+        fdHandle(2),
+        8,
+        "persist-task",
+        .{ .root = source_root, .mode = .persistent, .direction = .push },
+    );
+    try manager.syncs.put(manager.gpa, 8, st);
+    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+
+    // Drain frames until the manifest page arrived; the producer then
+    // idle-waits for requests.
+    var frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (frames.items) |frame| gpa.free(frame);
+        frames.deinit(gpa);
+    }
+    var manifest_seen = false;
+    var waited: usize = 0;
+    while (!manifest_seen) {
+        try expect(waited < 5000);
+        waited += 1;
+        while (agent.writer.send_queue.tryPop()) |frame| {
+            const msg = try protocol.Msg.parse(frame);
+            manifest_seen = manifest_seen or msg == .manifest;
+            try frames.append(gpa, frame);
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+
+    // Ask for both files, the multi-chunk one last so its `file_done`
+    // marks the end of the served batch.
+    try st.inbox.append(gpa, try gpa.dupe(u8, "small.txt"));
+    try st.inbox.append(gpa, try gpa.dupe(u8, "big.bin"));
+
+    waited = 0;
+    while (st.session.sender.?.files < 2) {
+        try expect(waited < 5000);
+        waited += 1;
+        while (agent.writer.send_queue.tryPop()) |frame|
+            try frames.append(gpa, frame);
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    while (agent.writer.send_queue.tryPop()) |frame|
+        try frames.append(gpa, frame);
+
+    // The producer never completes on its own; stop it for teardown.
+    st.requestStop();
+    st.join();
+    try expect(st.status.load(.acquire) == .running);
+    try expect(manager.syncs.count() == 1);
+
+    // Persistent mode queues the manifest pages first, then only the
+    // requested files. No `sync_end` is ever sent.
+    var seen_small = false;
+    var seen_big = false;
+    var received: std.ArrayList(u8) = .empty;
+    defer received.deinit(gpa);
+    for (frames.items) |frame| {
+        const msg = try protocol.Msg.parse(frame);
+        switch (msg) {
+            .manifest => |m| {
+                try expect(m.total_entries == 2);
+            },
+            .file_chunk => |c| {
+                if (!std.mem.eql(u8, c.path, "big.bin")) continue;
+                try expect(c.offset == received.items.len);
+                try received.appendSlice(gpa, c.data);
+            },
+            .file_done => |f| {
+                if (std.mem.eql(u8, f.path, "small.txt")) {
+                    seen_small = true;
+                    continue;
+                }
+                try expectEqualStrings("big.bin", f.path);
+                try expect(std.mem.eql(u8, received.items, content));
+                seen_big = true;
+            },
+            .sync_end => return error.Unexpected,
+            else => {},
+        }
+    }
+    try expect(seen_small and seen_big);
+    try expect(st.session.sender.?.files_total.? == 2);
+    try expect(st.session.sender.?.bytes_total.? == 4 + content.len);
+}
+
 test "sync_transfer_fails_on_closed_queue" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -1639,7 +1841,7 @@ test "sync_transfer_fails_on_closed_queue" {
 
     const st = try testTransfer(io, gpa, agent.writer, source_root, 7, fdHandle(1));
     try manager.syncs.put(manager.gpa, 7, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.run, .{ st, manager });
+    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
 
     var waited: usize = 0;
     while (st.session.sender.?.pending == null) {

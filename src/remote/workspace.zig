@@ -1,6 +1,8 @@
 const std = @import("std");
 const data = @import("../data.zig");
 
+const log = std.log.scoped(.workspace);
+
 pub const WORKSPACES_DIR: []const u8 = "workspaces";
 pub const RUNS_DIR: []const u8 = "runs";
 pub const MANIFEST_SUFFIX: []const u8 = ".manifest.json";
@@ -113,6 +115,53 @@ pub const Store = struct {
         const file = try std.fmt.allocPrint(gpa, "{s}{s}", .{ job_name, MANIFEST_SUFFIX });
         defer gpa.free(file);
         return std.fs.path.join(gpa, &.{ self.root_dir, WORKSPACES_DIR, task_id, file });
+    }
+
+    /// Reclaim leftover per-run staging dirs of every workspace.
+    pub fn gc(self: *const Store, io: std.Io, gpa: std.mem.Allocator) void {
+        const workspaces = workspacesPath(gpa, self.root_dir) catch return;
+        defer gpa.free(workspaces);
+        var dir = std.Io.Dir.openDirAbsolute(io, workspaces, .{
+            .iterate = true,
+        }) catch return;
+        defer dir.close(io);
+        var walker = dir.walk(gpa) catch return;
+        defer walker.deinit();
+
+        // Collect the stale trees first
+        var stale: std.ArrayList([]u8) = .empty;
+        defer {
+            for (stale.items) |path| gpa.free(path);
+            stale.deinit(gpa);
+        }
+        while (true) {
+            const maybe = walker.next(io) catch return;
+            const entry = maybe orelse break;
+            if (entry.kind != .directory) continue;
+            // Only `<task_id>/<job_name>/runs` is reclaimable.
+            var it = std.mem.splitScalar(u8, entry.path, std.fs.path.sep);
+            _ = it.next() orelse continue;
+            _ = it.next() orelse continue;
+            const runs = it.next() orelse continue;
+            if (it.next() != null) continue;
+            if (!std.mem.eql(u8, runs, RUNS_DIR)) continue;
+            const path = std.fs.path.join(gpa, &.{ workspaces, entry.path }) catch continue;
+            stale.append(gpa, path) catch {
+                gpa.free(path);
+                continue;
+            };
+        }
+
+        for (stale.items) |path| {
+            std.Io.Dir.cwd().deleteTree(io, path) catch |err| {
+                log.warn("Failed to reclaim stale staging dir '{s}': {s}", .{
+                    path,
+                    @errorName(err),
+                });
+                continue;
+            };
+            log.debug("Reclaimed stale staging dir '{s}'", .{path});
+        }
     }
 };
 

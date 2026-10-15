@@ -18,6 +18,7 @@ const TaskManager = manager.TaskManager;
 
 const expect = std.testing.expect;
 const expectError = std.testing.expectError;
+const expectEqualStrings = std.testing.expectEqualStrings;
 
 test {
     _ = manager;
@@ -682,6 +683,226 @@ test "remote_sync_agent_transfer" {
     const probe_ack = probe_ack_owned.msg.sync_ack;
     try expect(probe_ack.job_id == probe_id);
     try expect(probe_ack.ok);
+}
+
+test "remote_sync_persistent_agent_transfer" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const bind = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(
+        io,
+        gpa,
+        "runner1",
+        2,
+        &output.writer,
+        env.data_dir,
+    );
+    defer agent.deinit();
+    try agent.connect(server.socket.address);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+    defer {
+        agent.stop();
+        agent_thread.join();
+    }
+
+    const stream = try server.accept(io);
+    defer stream.close(io);
+    var reader = try Connection.Reader.init(io, gpa, stream);
+    defer reader.deinit();
+    var writer = Connection.Writer.init(io, gpa, stream);
+    defer writer.deinit();
+
+    const register_msg = try readMsg(gpa, &reader, .register);
+    register_msg.deinit();
+
+    const task_id = "persist-agent";
+    const job_name = "build";
+    const declared_mtime: i64 = 1_700_000_000_000;
+
+    // First transfer: a full resend into the empty workspace
+    const job_id: u64 = 100;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = job_id,
+        .task_id = task_id,
+        .job_name = job_name,
+        .mode = .persistent,
+        .direction = .push,
+        .exclude = .fromSlice(&.{"node_modules"}),
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .manifest = .{
+        .job_id = job_id,
+        .total_entries = 2,
+        .entries = .fromSlice(&.{
+            .{ .path = "a.txt", .size = 2, .mtime_ms = declared_mtime, .permissions = 0o644 },
+            .{ .path = "b.txt", .size = 3, .mtime_ms = declared_mtime, .permissions = 0o644 },
+        }),
+    } });
+
+    // Both files are missing locally, so both are requested.
+    const req_a = try expectNextMsg(gpa, &reader, .file_req);
+    defer req_a.deinit();
+    try expect(req_a.msg.file_req.job_id == job_id);
+    try expectEqualStrings("a.txt", req_a.msg.file_req.path);
+    try expect(req_a.msg.file_req.offset == 0);
+    const req_b = try expectNextMsg(gpa, &reader, .file_req);
+    defer req_b.deinit();
+    try expectEqualStrings("b.txt", req_b.msg.file_req.path);
+
+    // Serve the requests, then wait for the agent ack
+    var digest: protocol.Digest = undefined;
+    protocol.Hash.hash("hi", &digest, .{});
+    const hex_a = protocol.hexDigest(digest);
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = job_id,
+        .path = "a.txt",
+        .offset = 0,
+        .data = "hi",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_done = .{
+        .job_id = job_id,
+        .path = "a.txt",
+        .permissions = 0o644,
+        .hash = &hex_a,
+    } });
+
+    var digest_b: protocol.Digest = undefined;
+    protocol.Hash.hash("abc", &digest_b, .{});
+    const hex_b = protocol.hexDigest(digest_b);
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = job_id,
+        .path = "b.txt",
+        .offset = 0,
+        .data = "abc",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_done = .{
+        .job_id = job_id,
+        .path = "b.txt",
+        .permissions = 0o644,
+        .hash = &hex_b,
+    } });
+
+    const ack_owned = try expectNextMsg(gpa, &reader, .sync_ack);
+    defer ack_owned.deinit();
+    const ack = ack_owned.msg.sync_ack;
+    try expect(ack.job_id == job_id);
+    try expect(ack.ok);
+
+    // The held job is released by the completion and runs in the
+    // persistent workspace root.
+    const steps = [_]task_types.Step{.{ .command = .{
+        .value = "cat a.txt b.txt",
+    } }};
+    try sendProtocolMsg(&writer, gpa, .{ .run_job = .{
+        .job_id = job_id,
+        .task_id = task_id,
+        .job_name = job_name,
+        .workspace = .persistent,
+        .steps = .fromSlice(&steps),
+    } });
+    const finish_owned = try readMsg(gpa, &reader, .job_finish);
+    defer finish_owned.deinit();
+    try expect(finish_owned.msg.job_finish.job_id == job_id);
+    try expect(finish_owned.msg.job_finish.success);
+
+    // The workspace root is reused
+    const ws_root = try std.fs.path.join(gpa, &.{
+        env.data_dir, "workspaces", task_id, job_name,
+    });
+    defer gpa.free(ws_root);
+    const a_path = try std.fs.path.join(gpa, &.{ ws_root, "a.txt" });
+    defer gpa.free(a_path);
+    const a_content = try std.Io.Dir.cwd().readFileAlloc(io, a_path, gpa, .unlimited);
+    defer gpa.free(a_content);
+    try expectEqualStrings("hi", a_content);
+    const a_stat = try std.Io.Dir.cwd().statFile(io, a_path, .{});
+    try expect(a_stat.mtime.toMilliseconds() == declared_mtime);
+    const runs_dir = try std.fs.path.join(gpa, &.{ ws_root, "runs" });
+    defer gpa.free(runs_dir);
+    try expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, runs_dir, .{}));
+
+    // Job-created files that the manager does not declare. `stale.txt`
+    // must be deleted by the second transfer's commit.
+    const stale_path = try std.fs.path.join(gpa, &.{ ws_root, "stale.txt" });
+    defer gpa.free(stale_path);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, stale_path, .{});
+        defer f.close(io);
+    }
+    // The excluded tree must survive the delete pass.
+    const dep_path = try std.fs.path.join(gpa, &.{ ws_root, "node_modules", "dep.txt" });
+    defer gpa.free(dep_path);
+    try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(dep_path).?);
+    {
+        const f = try std.Io.Dir.cwd().createFile(io, dep_path, .{});
+        defer f.close(io);
+    }
+
+    // Second transfer: a.txt stat-matches and is skipped. Only the new
+    // file is requested.
+    const job_id2: u64 = 101;
+    try sendProtocolMsg(&writer, gpa, .{ .sync_begin = .{
+        .job_id = job_id2,
+        .task_id = task_id,
+        .job_name = job_name,
+        .mode = .persistent,
+        .direction = .push,
+        .exclude = .fromSlice(&.{"node_modules"}),
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .manifest = .{
+        .job_id = job_id2,
+        .total_entries = 2,
+        .entries = .fromSlice(&.{
+            .{ .path = "a.txt", .size = 2, .mtime_ms = declared_mtime, .permissions = 0o644 },
+            .{ .path = "new.txt", .size = 4, .mtime_ms = declared_mtime + 1, .permissions = 0o644 },
+        }),
+    } });
+
+    const req_new = try expectNextMsg(gpa, &reader, .file_req);
+    defer req_new.deinit();
+    try expect(req_new.msg.file_req.job_id == job_id2);
+    try expectEqualStrings("new.txt", req_new.msg.file_req.path);
+
+    var digest_n: protocol.Digest = undefined;
+    protocol.Hash.hash("data", &digest_n, .{});
+    const hex_n = protocol.hexDigest(digest_n);
+    try sendProtocolMsg(&writer, gpa, .{ .file_chunk = .{
+        .job_id = job_id2,
+        .path = "new.txt",
+        .offset = 0,
+        .data = "data",
+    } });
+    try sendProtocolMsg(&writer, gpa, .{ .file_done = .{
+        .job_id = job_id2,
+        .path = "new.txt",
+        .permissions = 0o644,
+        .hash = &hex_n,
+    } });
+
+    const ack2_owned = try expectNextMsg(gpa, &reader, .sync_ack);
+    defer ack2_owned.deinit();
+    try expect(ack2_owned.msg.sync_ack.job_id == job_id2);
+    try expect(ack2_owned.msg.sync_ack.ok);
+
+    // a.txt was not re-transferred, the undeclared file was deleted and
+    // the excluded tree survived.
+    const a_content2 = try std.Io.Dir.cwd().readFileAlloc(io, a_path, gpa, .unlimited);
+    defer gpa.free(a_content2);
+    try expectEqualStrings("hi", a_content2);
+    try expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, stale_path, .{}));
+    const dep_content = try std.Io.Dir.cwd().readFileAlloc(io, dep_path, gpa, .unlimited);
+    defer gpa.free(dep_content);
+    try expectEqualStrings("", dep_content);
+    const new_path = try std.fs.path.join(gpa, &.{ ws_root, "new.txt" });
+    defer gpa.free(new_path);
+    const new_stat = try std.Io.Dir.cwd().statFile(io, new_path, .{});
+    try expect(new_stat.mtime.toMilliseconds() == declared_mtime + 1);
 }
 
 test "remote_job_uses_empty_workspace" {

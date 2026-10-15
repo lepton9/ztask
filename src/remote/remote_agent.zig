@@ -33,6 +33,8 @@ const JobEntry = struct {
 /// One workspace transfer tracked by the agent.
 const SyncTransfer = struct {
     session: sync.Session = .{},
+    /// Set once the transfer was settled with an ack.
+    settled: bool = false,
 
     /// Create the transfer requested by `msg`.
     fn start(
@@ -123,6 +125,8 @@ pub const RemoteAgent = struct {
 
         var workspaces = try workspace.Store.init(io, gpa, agent_data_dir);
         errdefer workspaces.deinit(gpa);
+        // Delete stale staging directories
+        workspaces.gc(io, gpa);
 
         const agent = try gpa.create(RemoteAgent);
         errdefer gpa.destroy(agent);
@@ -367,13 +371,14 @@ pub const RemoteAgent = struct {
         };
     }
 
-    /// Accept one page of the workspace manifest.
+    /// Accept one page of the workspace manifest, then pump the transfer.
     fn handleManifest(self: *RemoteAgent, msg: protocol.ManifestMsg) void {
         const recv = self.transferReceiver(msg.job_id) orelse {
             log.debug("Ignoring manifest for unknown sync {x}", .{msg.job_id});
             return;
         };
         recv.receiveManifest(msg);
+        self.pumpSync(msg.job_id);
     }
 
     /// The receiving role of a tracked transfer, if it has one.
@@ -391,13 +396,52 @@ pub const RemoteAgent = struct {
         recv.receiveChunk(msg.path, msg.offset, msg.data);
     }
 
-    /// Complete one file of an in-flight transfer.
+    /// Complete one file of an in-flight transfer, then pump the transfer.
     fn handleSyncFileDone(self: *RemoteAgent, msg: protocol.FileDoneMsg) void {
         const recv = self.transferReceiver(msg.job_id) orelse {
             log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
             return;
         };
         recv.finishFile(msg.path, msg.permissions, msg.hash);
+        self.pumpSync(msg.job_id);
+    }
+
+    /// Pump a persistent transfer. Ask the remote manager for the files the
+    /// last manifest page marked as wanted, and complete the transfer
+    /// once the manifest is complete and every requested file arrived.
+    fn pumpSync(self: *RemoteAgent, job_id: u64) void {
+        const recv = self.transferReceiver(job_id) orelse return;
+        if (!recv.persistent) return;
+        if (recv.failed) return self.settleSync(job_id);
+        const reqs = recv.takeRequests() orelse return self.settleSync(job_id);
+        defer self.gpa.free(reqs);
+        for (reqs) |path| {
+            defer self.gpa.free(path);
+            if (!self.sendFileReq(job_id, path)) {
+                recv.markFailed("failed to request '{s}' from the manager", .{path});
+                return self.settleSync(job_id);
+            }
+        }
+        if (recv.manifestComplete() and recv.outstanding == 0)
+            return self.settleSync(job_id);
+    }
+
+    /// Request the content of one workspace file from the manager.
+    /// Returns whether the request was queued.
+    fn sendFileReq(self: *RemoteAgent, job_id: u64, path: []const u8) bool {
+        const msg: protocol.FileReqMsg = .{
+            .job_id = job_id,
+            .path = path,
+            .offset = 0,
+        };
+        const payload = protocol.serialize(self.gpa, .{ .file_req = msg }) catch |err| {
+            log.err("Failed to serialize file request for job {x}: {s}", .{
+                job_id, @errorName(err),
+            });
+            return false;
+        };
+        self.sendMessageOwned(payload);
+        return true;
     }
 
     /// Validate and commit a finished transfer, then run any job waiting on it.
@@ -406,28 +450,38 @@ pub const RemoteAgent = struct {
             self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
             return;
         };
-        const recv = st.receiver() orelse {
+        if (st.receiver() == null) {
             log.debug("Ignoring sync_end for transfer {x} without a receiver", .{msg.job_id});
             self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
             return;
-        };
+        }
+        self.settleSync(msg.job_id);
+    }
 
-        if (!recv.commit()) {
-            const message = recv.failureMessage();
-            self.sendSyncAck(msg.job_id, false, message);
-            self.abortPendingJob(msg.job_id);
-            self.destroySync(msg.job_id);
+    /// Settle a transfer. Commit the receiver, release a waiting job
+    /// on success and ack the manager with the outcome.
+    fn settleSync(self: *RemoteAgent, job_id: u64) void {
+        const st = self.syncs.get(job_id) orelse return;
+        if (st.settled) return;
+        st.settled = true;
+        const recv = st.receiver() orelse return;
+
+        if (!recv.failed and recv.commit()) {
+            // A job that arrived before the transfer finished is released
+            if (self.jobs.get(job_id)) |entry| {
+                if (entry.awaiting_sync) {
+                    entry.awaiting_sync = false;
+                    self.enqueueJob(entry);
+                }
+            }
+            self.sendSyncAck(job_id, true, null);
             return;
         }
 
-        // A job that arrived before the transfer finished is released now.
-        if (self.jobs.get(msg.job_id)) |entry| {
-            if (entry.awaiting_sync) {
-                entry.awaiting_sync = false;
-                self.enqueueJob(entry);
-            }
-        }
-        self.sendSyncAck(msg.job_id, true, null);
+        const message = recv.failureMessage();
+        self.sendSyncAck(job_id, false, message);
+        self.abortPendingJob(job_id);
+        self.destroySync(job_id);
     }
 
     /// Report a dispatch that could not be queued to the manager.
@@ -828,7 +882,10 @@ fn pushFrame(
 ) error{OutOfMemory}!void {
     _ = fd;
     const self: *RemoteAgent = @ptrCast(@alignCast(opq));
-    return self.incoming_frames.append(self.gpa, frame);
+    self.incoming_frames.append(self.gpa, frame) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Closed => return, // the queue is never closed; workers stop first
+    };
 }
 
 /// Log one frame that failed to parse.

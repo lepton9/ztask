@@ -9,6 +9,7 @@ const task_zig = @import("types/task.zig");
 const MutexQueue = @import("types/queue.zig").MutexQueue;
 const event_hub = @import("types/event_hub.zig");
 const Task = task_zig.Task;
+const localrunner = @import("runner/localrunner.zig");
 const RunnerPool = @import("runner/runnerpool.zig").RunnerPool;
 const Scheduler = scheduler.Scheduler;
 const TriggerRegistration = scheduler.TriggerRegistration;
@@ -811,6 +812,18 @@ pub const TaskManager = struct {
         }
     }
 
+    /// Queue one log event of a remote job.
+    fn queueSchedulerLog(
+        self: *TaskManager,
+        sched: *Scheduler,
+        event: localrunner.LogEvent,
+    ) error{OutOfMemory}!void {
+        sched.log_queue.append(self.gpa, event) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Closed => {},
+        };
+    }
+
     /// Handle a remote manager event.
     ///
     /// Events for tasks or dispatches that no longer exist are dropped.
@@ -825,7 +838,7 @@ pub const TaskManager = struct {
             .job_started => |e| {
                 const sched = self.getScheduler(e.task_id) orelse return;
                 const node = sched.remoteJobNode(e.dispatch_id) orelse return;
-                try sched.log_queue.append(self.gpa, .{
+                try queueSchedulerLog(self, sched, .{
                     .job_started = .{
                         .job_id = node.id,
                         .name = null,
@@ -836,7 +849,7 @@ pub const TaskManager = struct {
             .job_output => |e| {
                 const sched = self.getScheduler(e.task_id) orelse return;
                 const node = sched.remoteJobNode(e.dispatch_id) orelse return;
-                try sched.log_queue.append(self.gpa, .{
+                try queueSchedulerLog(self, sched, .{
                     .job_output = .{
                         .job_id = node.id,
                         .step = e.step,
@@ -849,7 +862,7 @@ pub const TaskManager = struct {
             .job_finished => |e| {
                 const sched = self.getScheduler(e.task_id) orelse return;
                 const node = sched.remoteJobNode(e.dispatch_id) orelse return;
-                try sched.log_queue.append(self.gpa, .{
+                try queueSchedulerLog(self, sched, .{
                     .job_finished = .{
                         .job_id = node.id,
                         .name = null,
