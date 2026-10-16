@@ -23,7 +23,7 @@ const JobEntry = struct {
     job: task.Job,
     node: JobNode,
     /// Workspace the job runs in.
-    workspace: sync.Workspace,
+    workspace: sync.fs.Workspace,
     /// Set while the job waits for its workspace transfer to finish.
     awaiting_sync: bool = false,
     /// Set once the job was appended to the run queue.
@@ -523,7 +523,7 @@ pub const RemoteAgent = struct {
         if (recv) |r| {
             // An in-flight transfer must match the dispatch plan
             if (msg.workspace == .none) return error.WorkspaceMismatch;
-            const planned: sync.Lifetime = .fromWorkspaceMode(msg.workspace);
+            const planned: sync.fs.Lifetime = .fromWorkspaceMode(msg.workspace);
             if (r.workspace.lifetime != planned) return error.WorkspaceMismatch;
         }
 
@@ -574,8 +574,8 @@ pub const RemoteAgent = struct {
         self: *RemoteAgent,
         msg: protocol.RunJobMsg,
         recv: ?*sync.Receiver,
-    ) !sync.Workspace {
-        if (recv) |r| return sync.Workspace.adopt(self.io, self.gpa, &r.workspace);
+    ) !sync.fs.Workspace {
+        if (recv) |r| return sync.fs.Workspace.adopt(self.io, self.gpa, &r.workspace);
         return sync.createWorkspace(
             self.io,
             self.gpa,
