@@ -271,8 +271,6 @@ const SyncTransfer = struct {
     fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
         std.debug.assert(self.thread == null);
         gpa.free(self.task_id);
-        // Requests queued but never served; the queue does not free
-        // its items.
         while (self.inbox.pop()) |path| gpa.free(path);
         self.inbox.deinit(gpa);
         self.session.deinit();
@@ -462,6 +460,11 @@ pub const AgentHandle = struct {
     fn setName(self: *AgentHandle, gpa: std.mem.Allocator, name: []const u8) !void {
         if (self.name) |n| gpa.free(n);
         self.name = try gpa.dupe(u8, name);
+    }
+
+    /// The socket handle of the agent connection.
+    fn fd(self: *AgentHandle) std.Io.net.Socket.Handle {
+        return self.connection.conn.stream.socket.handle;
     }
 
     fn deinit(self: *AgentHandle, gpa: std.mem.Allocator) void {
@@ -800,7 +803,7 @@ pub const RemoteManager = struct {
                 "Failed to serialize agent rejection message: {s}",
                 .{@errorName(err)},
             );
-            agent.connection.close();
+            self.removeAgentByFd(agent.fd());
             return;
         };
         agent.workers.outbox.enqueueOwned(payload) catch |err| {
@@ -809,7 +812,7 @@ pub const RemoteManager = struct {
                 "Failed to queue agent rejection message: {s}",
                 .{@errorName(err)},
             );
-            agent.connection.close();
+            self.removeAgentByFd(agent.fd());
             return;
         };
         agent.workers.outbox.finish();
@@ -1370,7 +1373,7 @@ pub const RemoteManager = struct {
     pub fn cancelJob(self: *RemoteManager, job_id: u64) !void {
         self.commands.append(self.gpa, .{ .cancel = .{ .job_id = job_id } }) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            error.Closed => {}, // the manager is stopping; nothing to cancel
+            error.Closed => {},
         };
     }
 
@@ -1719,8 +1722,6 @@ test "sync_transfer_persistent_serves_requests" {
     const manager = try RemoteManager.init(io, gpa);
     defer manager.deinit();
 
-    // A large budget queues the manifest and both files without
-    // backpressure so the test only has to wait for frames.
     var agent = try FakeAgent.init(io, gpa, 4 * 1024 * 1024);
     defer agent.deinit(gpa);
 
@@ -1736,8 +1737,7 @@ test "sync_transfer_persistent_serves_requests" {
     try manager.syncs.put(manager.gpa, 8, st);
     st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
 
-    // Drain frames until the manifest page arrived; the producer then
-    // idle-waits for requests.
+    // Drain frames until the manifest page arrived
     var frames: std.ArrayList([]u8) = .empty;
     defer {
         for (frames.items) |frame| gpa.free(frame);
@@ -1756,8 +1756,7 @@ test "sync_transfer_persistent_serves_requests" {
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
 
-    // Ask for both files, the multi-chunk one last so its `file_done`
-    // marks the end of the served batch.
+    // Ask for both files
     try st.inbox.append(gpa, try gpa.dupe(u8, "small.txt"));
     try st.inbox.append(gpa, try gpa.dupe(u8, "big.bin"));
 
@@ -1772,14 +1771,13 @@ test "sync_transfer_persistent_serves_requests" {
     while (agent.writer.send_queue.tryPop()) |frame|
         try frames.append(gpa, frame);
 
-    // The producer never completes on its own; stop it for teardown.
     st.requestStop();
     st.join();
     try expect(st.status.load(.acquire) == .running);
     try expect(manager.syncs.count() == 1);
 
     // Persistent mode queues the manifest pages first, then only the
-    // requested files. No `sync_end` is ever sent.
+    // requested files.
     var seen_small = false;
     var seen_big = false;
     var received: std.ArrayList(u8) = .empty;

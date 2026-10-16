@@ -43,9 +43,27 @@ const SyncTransfer = struct {
         store: *const workspace.Store,
         msg: protocol.SyncBeginMsg,
     ) !*SyncTransfer {
+        // Capability gate before any layout is touched
+        try sync.validate(msg);
         var session: sync.Session = switch (msg.direction) {
-            .push => .{
-                .receiver = try sync.Receiver.init(io, gpa, store, msg),
+            .push => blk: {
+                var ws = try sync.createWorkspace(
+                    io,
+                    gpa,
+                    store,
+                    msg.mode,
+                    msg.task_id,
+                    msg.job_name,
+                    msg.job_id,
+                );
+                errdefer ws.deinit();
+                break :blk .{
+                    .receiver = try sync.Receiver.init(io, gpa, ws, .{
+                        .task_id = msg.task_id,
+                        .job_name = msg.job_name,
+                        .exclude = msg.exclude,
+                    }),
+                };
             },
             .pull, .both => return error.UnsupportedDirection,
         };
@@ -200,6 +218,7 @@ pub const RemoteAgent = struct {
     pub fn run(self: *RemoteAgent) void {
         self.running.store(true, .seq_cst);
         while (self.running.load(.seq_cst)) {
+            self.reapDeadWorkers();
             if (self.connection.isClosed()) {
                 self.tryReconnect();
             }
@@ -239,14 +258,17 @@ pub const RemoteAgent = struct {
         self.stopWorkers();
         try self.connection.connect(addr);
         self.resetJobState();
-        self.workers = try Connection.Workers.start(
+        self.workers = Connection.Workers.start(
             self.io,
             self.gpa,
             &self.connection,
             .{ .ptr = self, .push = pushFrame, .malformed = noteMalformed },
             .{ .ptr = self, .callback = workerExited },
             .{ .ptr = self, .callback = frameSent },
-        );
+        ) catch |err| {
+            self.connection.close();
+            return err;
+        };
         try self.register();
     }
 
@@ -295,6 +317,14 @@ pub const RemoteAgent = struct {
         }
     }
 
+    /// Stop and close the connection once a connection worker exited.
+    fn reapDeadWorkers(self: *RemoteAgent) void {
+        const workers = self.workers orelse return;
+        if (!workers.isDead()) return;
+        self.stopWorkers();
+        self.connection.close();
+    }
+
     /// Handle the parsed message.
     fn handleMessage(self: *RemoteAgent, msg: protocol.Msg) !void {
         switch (msg) {
@@ -327,8 +357,9 @@ pub const RemoteAgent = struct {
                     .VersionMismatch => self.exit_error = ExitError.VersionMismatch,
                 }
                 if (self.exit_error != null) {
-                    self.connection.close();
                     self.stop();
+                    self.stopWorkers();
+                    self.connection.close();
                 }
             },
             .sync_begin => |m| self.beginSync(m),
@@ -899,15 +930,11 @@ fn noteMalformed(
     log.warn("Discarding malformed remote message: {s}", .{@errorName(err)});
 }
 
-/// React to a connection worker exit. A dead reader closes the
-/// connection so the main loop reconnects, a dead writer interrupts
-/// the reader which may outlive it.
+/// React to a connection worker exit by interrupting the surviving worker.
 fn workerExited(opq: *anyopaque, kind: Connection.WorkerKind) void {
+    _ = kind;
     const self: *RemoteAgent = @ptrCast(@alignCast(opq));
-    switch (kind) {
-        .reader => self.connection.close(),
-        .writer => self.connection.shutdown(),
-    }
+    self.connection.shutdown();
 }
 
 /// Record activity after each sent frame.

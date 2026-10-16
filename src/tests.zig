@@ -1804,3 +1804,58 @@ test "apply_edited_task" {
     try task_manager.waitUntilIdle();
     try expect(task_manager.datastore.tasks.get("503") != null);
 }
+
+test "remote_agent_disconnect_stress" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const bind = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try bind.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(
+        io,
+        gpa,
+        "runner1",
+        1,
+        &output.writer,
+        env.data_dir,
+    );
+    defer agent.deinit();
+    try agent.connect(server.socket.address);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+    defer {
+        agent.stop();
+        agent_thread.join();
+    }
+
+    for (0..10) |cycle| {
+        const stream = try server.accept(io);
+        var reader = try Connection.Reader.init(io, gpa, stream);
+        defer reader.deinit();
+        var writer = Connection.Writer.init(io, gpa, stream);
+        defer writer.deinit();
+
+        // Wait for register
+        while (true) {
+            const frame = try reader.readNextFrame();
+            const owned = try gpa.dupe(u8, frame);
+            const msg = try protocol.parseOwned(gpa, owned);
+            defer msg.deinit();
+            if (std.meta.activeTag(msg.msg) == .register) break;
+        }
+
+        const base: u64 = @intCast(cycle * 1_000_000);
+        // Flood with frames
+        for (0..3000) |n| {
+            try sendProtocolMsg(&writer, gpa, .{ .sync_end = .{
+                .job_id = base + @as(u64, n),
+            } });
+        }
+        // Close the connection while agent is reading and writing
+        stream.close(io);
+    }
+}
