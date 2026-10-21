@@ -1493,8 +1493,13 @@ pub const RemoteManager = struct {
             log.warn("Failed to emit agent_changed: {s}", .{@errorName(err)});
     }
 
+    /// Fail a dispatched job whose runner disconnected while executing the job.
     fn failDisconnectedJob(self: *RemoteManager, req: DispatchRequest) void {
         defer req.deinit(self.gpa);
+        log.warn("Remote runner disconnected. Failing job '{s}' ({x})", .{
+            req.job_name,
+            req.dispatch_id,
+        });
         const event = self.makeJobFinishedEvent(
             req.task_id,
             req.dispatch_id,
@@ -1507,10 +1512,28 @@ pub const RemoteManager = struct {
             return;
         };
         self.emitEvent(event) catch {};
-        log.warn("Remote runner disconnected; failing job '{s}' ({x})", .{
-            req.job_name,
+    }
+
+    /// Fail a dispatched job whose workspace transfer was interrupted
+    /// by the agent disconnecting.
+    fn failInterruptedSync(self: *RemoteManager, req: DispatchRequest) void {
+        defer req.deinit(self.gpa);
+        log.warn(
+            "Remote runner disconnected during the workspace sync of job '{s}' ({x})",
+            .{ req.job_name, req.dispatch_id },
+        );
+        const event = self.makeJobFinishedEvent(
+            req.task_id,
             req.dispatch_id,
-        });
+            false,
+            ResultError.SyncFailed,
+            "Remote runner disconnected during the workspace transfer",
+            std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
+        ) catch {
+            log.warn("Failed to report remote job {x} as failed", .{req.dispatch_id});
+            return;
+        };
+        self.emitEvent(event) catch {};
     }
 
     fn failJobsForAgent(self: *RemoteManager, fd: std.Io.net.Socket.Handle) void {
@@ -1536,7 +1559,11 @@ pub const RemoteManager = struct {
                 break :blk entry.key_ptr.*;
             } else break;
             const req = self.dispatched_jobs.fetchRemove(job_id) orelse continue;
-            self.failDisconnectedJob(req.value);
+            if (req.value.sync != null and req.value.run_job_payload != null) {
+                self.failInterruptedSync(req.value);
+            } else {
+                self.failDisconnectedJob(req.value);
+            }
         }
     }
 
