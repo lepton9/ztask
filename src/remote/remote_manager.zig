@@ -1736,15 +1736,8 @@ test "sync_transfer_persistent_serves_requests" {
     for (content, 0..) |*byte, i| byte.* = @truncate(i);
     const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "big.bin", content);
     defer gpa.free(source_root);
-    {
-        // A second, small file served first.
-        const small = try tmp.dir.createFile(io, "small.txt", .{});
-        defer small.close(io);
-        var wbuf: [64]u8 = undefined;
-        var w = small.writer(io, &wbuf);
-        try w.interface.writeAll("tiny");
-        try w.interface.flush();
-    }
+    // A second, small file served first.
+    try testutil.writeFileInDir(io, tmp.dir, "small.txt", "tiny");
 
     const manager = try RemoteManager.init(io, gpa);
     defer manager.deinit();
@@ -1836,6 +1829,131 @@ test "sync_transfer_persistent_serves_requests" {
     try expect(seen_small and seen_big);
     try expect(st.session.sender.?.files_total.? == 2);
     try expect(st.session.sender.?.bytes_total.? == 4 + content.len);
+}
+
+test "sync_transfer_persistent_multi_page_manifest" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // A source root of long-named files whose manifest cannot fit one
+    // page: `queueManifest` must split it at MANIFEST_PAGE_BUDGET.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const count: usize = 1000;
+    for (0..count) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(
+            &name_buf,
+            "padded-entry-{d:0>6}-with-a-long-name.bin",
+            .{i},
+        );
+        try testutil.writeFileInDir(io, tmp.dir, name, "x");
+    }
+    const source_root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(source_root);
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+
+    var agent = try FakeAgent.init(io, gpa, 4 * 1024 * 1024);
+    defer agent.deinit(gpa);
+
+    const st = try SyncTransfer.start(
+        io,
+        gpa,
+        agent.writer,
+        fdHandle(4),
+        9,
+        "pages-task",
+        .{ .root = source_root, .mode = .persistent, .direction = .push },
+    );
+    try manager.syncs.put(manager.gpa, 9, st);
+    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+
+    // Drain frames until every manifest page arrived
+    var frames: std.ArrayList([]u8) = .empty;
+    defer {
+        for (frames.items) |frame| gpa.free(frame);
+        frames.deinit(gpa);
+    }
+    var manifest_frames: usize = 0;
+    var waited: usize = 0;
+    while (manifest_frames < 2) {
+        try expect(waited < 5000);
+        waited += 1;
+        while (agent.writer.send_queue.tryPop()) |frame| {
+            const msg = try protocol.Msg.parse(frame);
+            if (msg == .manifest) manifest_frames += 1;
+            try frames.append(gpa, frame);
+        }
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    while (agent.writer.send_queue.tryPop()) |frame|
+        try frames.append(gpa, frame);
+
+    // Every page promises the full entry count and the pages tile all
+    // entries without duplicates; persistent mode queues no file data
+    // and no sync_end before the first request.
+    var declared_paths: std.ArrayList([]const u8) = .empty;
+    defer declared_paths.deinit(gpa);
+    var seen = std.StringHashMap(void).init(gpa);
+    defer seen.deinit();
+    var total_declared: u32 = 0;
+    for (frames.items) |frame| {
+        const msg = try protocol.Msg.parse(frame);
+        switch (msg) {
+            .manifest => |m| {
+                try expect(m.total_entries == count);
+                total_declared += @as(u32, @intCast(m.entries.len()));
+                var it = m.entries.iterator();
+                while (it.next()) |entry| {
+                    const gop = try seen.getOrPut(entry.path);
+                    try expect(!gop.found_existing);
+                    try declared_paths.append(gpa, entry.path);
+                }
+            },
+            .file_done => return error.Unexpected,
+            .sync_end => return error.Unexpected,
+            else => {},
+        }
+    }
+    try expect(total_declared == count);
+
+    // Serve every declared path through the request inbox
+    for (declared_paths.items) |path|
+        try st.inbox.append(gpa, try gpa.dupe(u8, path));
+
+    waited = 0;
+    while (st.session.sender.?.files < count) {
+        try expect(waited < 5000);
+        waited += 1;
+        while (agent.writer.send_queue.tryPop()) |frame|
+            try frames.append(gpa, frame);
+        try std.Io.sleep(io, .fromMilliseconds(1), .awake);
+    }
+    while (agent.writer.send_queue.tryPop()) |frame|
+        try frames.append(gpa, frame);
+
+    st.requestStop();
+    st.join();
+    try expect(st.status.load(.acquire) == .running);
+
+    // Every requested file was served exactly once and the transfer
+    // still never sends sync_end.
+    var done_count: usize = 0;
+    var sync_end_count: usize = 0;
+    for (frames.items) |frame| {
+        const msg = try protocol.Msg.parse(frame);
+        switch (msg) {
+            .file_done => done_count += 1,
+            .sync_end => sync_end_count += 1,
+            else => {},
+        }
+    }
+    try expect(done_count == count);
+    try expect(sync_end_count == 0);
+    try expect(st.session.sender.?.files_total.? == count);
+    try expect(st.session.sender.?.bytes_total.? == count);
 }
 
 test "sync_transfer_fails_on_closed_queue" {
