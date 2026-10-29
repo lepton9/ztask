@@ -293,6 +293,8 @@ pub const RunJobMsg = struct {
     job_name: []const u8,
     /// The job's workspace plan.
     workspace: WorkspaceMode,
+    /// Whether the job has a workspace transfer before running.
+    sync: bool = false,
     /// The executed steps of this job.
     steps: ListView(task.Step),
 
@@ -980,6 +982,7 @@ test "run_job" {
         .task_id = "task-111",
         .job_name = "build",
         .workspace = .persistent,
+        .sync = true,
         .steps = .fromSlice(&steps),
     };
 
@@ -997,6 +1000,7 @@ test "run_job" {
     try std.testing.expectEqualStrings(msg.task_id, parsed.task_id);
     try std.testing.expectEqualStrings(msg.job_name, parsed.job_name);
     try std.testing.expectEqual(msg.workspace, parsed.workspace);
+    try expectEqual(msg.sync, parsed.sync);
     try expectEqual(steps.len, parsed.steps.len());
     for (0..steps.len) |i| {
         try std.testing.expect(std.meta.activeTag(steps[i]) == std.meta.activeTag(parsed_steps[i]));

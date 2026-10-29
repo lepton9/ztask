@@ -360,6 +360,30 @@ fn atomicTempPath(gpa: std.mem.Allocator, full: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ dirname, name });
 }
 
+/// Own a copy of a `ListView([]const u8)`.
+pub fn dupeListViewStr(
+    gpa: std.mem.Allocator,
+    view: protocol.ListView([]const u8),
+) error{OutOfMemory}![][]u8 {
+    var out: std.ArrayList([]u8) = try .initCapacity(gpa, view.len());
+    errdefer {
+        for (out.items) |item| gpa.free(item);
+        out.deinit(gpa);
+    }
+    var it = view.iterator();
+    while (it.next()) |item| {
+        const copy = try gpa.dupe(u8, item);
+        out.appendAssumeCapacity(copy);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Free a slice produced by `dupeListViewStr`.
+pub fn freeListViewStr(gpa: std.mem.Allocator, list: [][]u8) void {
+    for (list) |pattern| gpa.free(pattern);
+    if (list.len > 0) gpa.free(list);
+}
+
 const testutil = @import("../../testing/utils.zig");
 const TestEnv = testutil.TestEnv;
 

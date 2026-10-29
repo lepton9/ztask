@@ -1,7 +1,8 @@
-//! Receives one push workspace transfer into a destination root.
+//! Receives one workspace transfer into a destination root.
 
 const std = @import("std");
 const protocol = @import("../protocol.zig");
+const frames = @import("frame.zig");
 const wpaths = @import("../workspace.zig");
 const glob = @import("../glob.zig");
 const fs = @import("fs.zig");
@@ -21,6 +22,8 @@ pub const Params = struct {
     job_name: []const u8,
     /// Glob patterns of workspace-relative paths the delete pass keeps.
     exclude: protocol.ListView([]const u8) = .{},
+    /// Whether commit deletes files the manifest does not declare.
+    deletes: bool = true,
 };
 
 io: std.Io,
@@ -34,6 +37,8 @@ workspace: fs.Workspace,
 
 /// Whether the transfer reuses a persistent workspace.
 persistent: bool,
+/// Whether commit deletes files the manifest does not declare.
+deletes: bool,
 /// Owned copies of the exclude globs, applied by the delete pass.
 exclude: [][]u8 = &.{},
 
@@ -57,6 +62,8 @@ manifest_total: ?u32 = null,
 requests: std.ArrayList([]u8) = .empty,
 /// Number of requested files not received yet.
 outstanding: usize = 0,
+/// Payload bytes the diff marked as wanted so far.
+bytes_wanted: u64 = 0,
 
 /// Number of files completed with an explicit `file_done`.
 files: usize = 0,
@@ -97,8 +104,8 @@ pub fn init(
     errdefer gpa.free(task_id);
     const job_name = try gpa.dupe(u8, params.job_name);
     errdefer gpa.free(job_name);
-    const exclude = try dupeExclude(gpa, params.exclude);
-    errdefer freeExclude(gpa, exclude);
+    const exclude = try fs.dupeListViewStr(gpa, params.exclude);
+    errdefer fs.freeListViewStr(gpa, exclude);
 
     log.debug(
         "Workspace sync begin: task='{s}' job='{s}' dest='{s}'",
@@ -110,6 +117,7 @@ pub fn init(
         .task_id = task_id,
         .job_name = job_name,
         .persistent = ws.lifetime == .persistent,
+        .deletes = params.deletes,
         .exclude = exclude,
         .workspace = ws,
     };
@@ -129,7 +137,7 @@ pub fn deinit(self: *Receiver) void {
     self.tracked.deinit(self.gpa);
     for (self.requests.items) |path| self.gpa.free(path);
     self.requests.deinit(self.gpa);
-    freeExclude(self.gpa, self.exclude);
+    fs.freeListViewStr(self.gpa, self.exclude);
     self.workspace.deinit();
     self.gpa.free(self.task_id);
     self.gpa.free(self.job_name);
@@ -245,16 +253,16 @@ pub fn finishFile(self: *Receiver, path: []const u8, permissions: u32, hash: ?[]
 
 /// Accept one page of the workspace manifest. Records a failure
 /// instead of erroring.
-pub fn receiveManifest(self: *Receiver, msg: protocol.ManifestMsg) void {
+pub fn receiveManifest(self: *Receiver, page: frames.Page) void {
     if (self.failed) return;
     if (self.manifest_total) |total| {
-        if (total != msg.total_entries) return self.markFailed(
+        if (total != page.total_entries) return self.markFailed(
             "manifest pages disagree about the entry count ({d} vs {d})",
-            .{ total, msg.total_entries },
+            .{ total, page.total_entries },
         );
-    } else self.manifest_total = msg.total_entries;
+    } else self.manifest_total = page.total_entries;
 
-    var it = msg.entries.iterator();
+    var it = page.entries.iterator();
     while (it.next()) |entry| {
         wpaths.validateRelPath(entry.path) catch {
             return self.markFailed(
@@ -288,12 +296,13 @@ pub fn receiveManifest(self: *Receiver, msg: protocol.ManifestMsg) void {
                 };
                 gop.value_ptr.requested = true;
                 self.outstanding += 1;
+                self.bytes_wanted += entry.size;
             } else {
                 gop.value_ptr.matched = true;
             }
         }
     }
-    self.manifest_len += msg.entries.len();
+    self.manifest_len += page.entries.len();
     if (self.manifest_len > self.manifest_total.?) {
         return self.markFailed("manifest carries more entries than declared", .{});
     }
@@ -366,7 +375,7 @@ pub fn commit(self: *Receiver) bool {
         }
     }
     // Delete all not declared files, protecting the excluded globs
-    if (self.persistent) self.deleteUndeclared();
+    if (self.persistent and self.deletes) self.deleteUndeclared();
     // Apply the declared source mtimes to the received files
     var mtime_it = self.tracked.iterator();
     while (mtime_it.next()) |kv| {
@@ -449,30 +458,6 @@ pub fn markFailed(self: *Receiver, comptime fmt: []const u8, args: anytype) void
     self.closeOpen();
 }
 
-/// Own copies of the exclude globs.
-fn dupeExclude(
-    gpa: std.mem.Allocator,
-    view: protocol.ListView([]const u8),
-) error{OutOfMemory}![][]u8 {
-    var out: std.ArrayList([]u8) = try .initCapacity(gpa, view.len());
-    errdefer {
-        for (out.items) |pattern| gpa.free(pattern);
-        out.deinit(gpa);
-    }
-    var it = view.iterator();
-    while (it.next()) |pattern| {
-        const copy = try gpa.dupe(u8, pattern);
-        out.appendAssumeCapacity(copy);
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-/// Free a slice produced by `dupeExclude`.
-fn freeExclude(gpa: std.mem.Allocator, exclude: [][]u8) void {
-    for (exclude) |pattern| gpa.free(pattern);
-    if (exclude.len > 0) gpa.free(exclude);
-}
-
 const testutil = @import("../../testing/utils.zig");
 const TestEnv = testutil.TestEnv;
 
@@ -530,7 +515,6 @@ test "receiver_writes_and_commits" {
     recv.receiveChunk(file_path, cut, file_content[cut..]);
     recv.finishFile(file_path, 0o644, &hex);
     recv.receiveManifest(.{
-        .job_id = 7,
         .total_entries = 1,
         .entries = .fromSlice(&.{
             .{ .path = file_path, .size = 11, .mtime_ms = 0 },
@@ -573,7 +557,6 @@ test "receiver_empty_file" {
     const empty_hex = protocol.hexDigest(empty_digest);
     recv.finishFile("empty.txt", 0o600, &empty_hex);
     recv.receiveManifest(.{
-        .job_id = 8,
         .total_entries = 1,
         .entries = .fromSlice(&.{
             .{ .path = "empty.txt", .size = 0, .mtime_ms = 0 },
@@ -801,7 +784,6 @@ test "receiver_rejects_undeclared_file" {
     recv.receiveChunk("a.txt", 0, "a");
     recv.finishFile("a.txt", 0o644, null);
     recv.receiveManifest(.{
-        .job_id = 23,
         .total_entries = 1,
         .entries = .fromSlice(&.{
             .{ .path = "b.txt", .size = 1, .mtime_ms = 0 },
@@ -830,7 +812,6 @@ test "receiver_rejects_incomplete_manifest" {
     recv.finishFile("a.txt", 0o644, null);
     // Promises two entries but only one page arrives before sync_end
     recv.receiveManifest(.{
-        .job_id = 24,
         .total_entries = 2,
         .entries = .fromSlice(&.{
             .{ .path = "a.txt", .size = 1, .mtime_ms = 0 },
@@ -855,12 +836,10 @@ test "receiver_rejects_manifest_page_disagreement" {
     defer recv.deinit();
 
     recv.receiveManifest(.{
-        .job_id = 25,
         .total_entries = 1,
         .entries = .fromSlice(&.{}),
     });
     recv.receiveManifest(.{
-        .job_id = 25,
         .total_entries = 2,
         .entries = .fromSlice(&.{}),
     });
@@ -881,8 +860,7 @@ test "receiver_rejects_duplicate_manifest_entries" {
     );
     defer recv.deinit();
 
-    const page: protocol.ManifestMsg = .{
-        .job_id = 26,
+    const page: frames.Page = .{
         .total_entries = 2,
         .entries = .fromSlice(&.{
             .{ .path = "a.txt", .size = 1, .mtime_ms = 0 },
@@ -909,7 +887,6 @@ test "receiver_commits_empty_workspace" {
     defer recv.deinit();
 
     recv.receiveManifest(.{
-        .job_id = 27,
         .total_entries = 0,
         .entries = .fromSlice(&.{}),
     });
@@ -941,7 +918,6 @@ test "receiver_persistent_diffs_and_requests" {
     try createTestFile(dir, "changed.txt", "changed");
 
     recv.receiveManifest(.{
-        .job_id = 34,
         .total_entries = 3,
         .entries = .fromSlice(&.{
             .{ .path = "same.txt", .size = 4, .mtime_ms = mtime_ms, .permissions = 0o644 },
@@ -963,7 +939,6 @@ test "receiver_persistent_diffs_and_requests" {
 
     // A file missing on disk is requested like any changed one.
     recv.receiveManifest(.{
-        .job_id = 34,
         .total_entries = 3,
         .entries = .fromSlice(&.{
             .{ .path = "missing.txt", .size = 0, .mtime_ms = 0, .permissions = 0o644 },
@@ -1006,7 +981,6 @@ test "receiver_persistent_delete_pass" {
     try dir.setMtime("keep.txt", mtime_ms);
 
     recv.receiveManifest(.{
-        .job_id = 35,
         .total_entries = 1,
         .entries = .fromSlice(&.{
             .{ .path = "keep.txt", .size = 4, .mtime_ms = mtime_ms, .permissions = 0o644 },
@@ -1041,4 +1015,65 @@ test "receiver_persistent_delete_pass" {
     try expect(!exists(io, extra));
     try expect(!exists(io, sub_extra));
     try expect(exists(io, dep));
+}
+
+test "receiver_pull_collects_and_keeps_unrelated_files" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // A destination holding an unrelated local file
+    var ws = try testWorkspace(&env, .persistent, "dest");
+    const dir = &ws.directory;
+    try createTestFile(dir, "local.txt", "mine");
+    const mtime_ms: i64 = 1_700_000_000_000;
+    try dir.setMtime("local.txt", mtime_ms);
+
+    var params = testParams(&.{});
+    params.deletes = false;
+    var recv = try Receiver.init(io, gpa, ws, params);
+    defer recv.deinit();
+
+    // The agent declares the unchanged local file plus one output
+    const content = "output";
+    var digest: protocol.Digest = undefined;
+    Hash.hash(content, &digest, .{});
+    const hex = protocol.hexDigest(digest);
+    recv.receiveManifest(.{
+        .total_entries = 2,
+        .entries = .fromSlice(&.{
+            .{ .path = "local.txt", .size = 4, .mtime_ms = mtime_ms, .permissions = 0o644 },
+            .{ .path = "out.txt", .size = content.len, .mtime_ms = mtime_ms, .permissions = 0o644 },
+        }),
+    });
+    try expect(!recv.failed);
+
+    // Only the stat-mismatching output was requested
+    const reqs = recv.takeRequests() orelse return error.TestUnexpectedResult;
+    defer {
+        for (reqs) |path| gpa.free(path);
+        gpa.free(reqs);
+    }
+    try expect(reqs.len == 1);
+    try expectEqualStrings("out.txt", reqs[0]);
+    try expect(recv.outstanding == 1);
+    try expect(recv.bytes_wanted == content.len);
+
+    recv.receiveChunk("out.txt", 0, content);
+    recv.finishFile("out.txt", 0o644, &hex);
+    try expect(recv.commit());
+
+    // The unrelated file survived the commit and the output landed
+    const local_path = try wpaths.nativeRelPath(gpa, recv.rootDir(), "local.txt");
+    defer gpa.free(local_path);
+    const local = try std.Io.Dir.cwd().readFileAlloc(io, local_path, gpa, .unlimited);
+    defer gpa.free(local);
+    try expectEqualStrings("mine", local);
+
+    const out_path = try wpaths.nativeRelPath(gpa, recv.rootDir(), "out.txt");
+    defer gpa.free(out_path);
+    const out = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
+    defer gpa.free(out);
+    try expectEqualStrings(content, out);
 }
