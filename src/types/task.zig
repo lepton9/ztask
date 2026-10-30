@@ -412,7 +412,8 @@ pub const SyncDirection = enum(u8) {
 
 /// Workspace sync specification of remote jobs.
 pub const SyncSpec = struct {
-    /// Source root to transfer, relative to the task cwd.
+    /// Manager-side root of the transfer, relative to the task cwd.
+    /// This is the source for push and the destination for pull.
     root: []const u8 = ".",
     /// Workspace lifetime on the agent.
     mode: SyncMode = .ephemeral,

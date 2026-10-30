@@ -30,62 +30,6 @@ const JobEntry = struct {
     queued: bool = false,
 };
 
-/// One workspace transfer tracked by the agent.
-const SyncTransfer = struct {
-    session: sync.Session = .{},
-    /// Set once the transfer was settled with an ack.
-    settled: bool = false,
-
-    /// Create the transfer requested by `msg`.
-    fn start(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        store: *const workspace.Store,
-        msg: protocol.SyncBeginMsg,
-    ) !*SyncTransfer {
-        // Capability gate before any layout is touched
-        try sync.validate(msg);
-        var session: sync.Session = switch (msg.direction) {
-            .push => blk: {
-                var ws = try sync.createWorkspace(
-                    io,
-                    gpa,
-                    store,
-                    msg.mode,
-                    msg.task_id,
-                    msg.job_name,
-                    msg.job_id,
-                );
-                errdefer ws.deinit();
-                break :blk .{
-                    .receiver = try sync.Receiver.init(io, gpa, ws, .{
-                        .task_id = msg.task_id,
-                        .job_name = msg.job_name,
-                        .exclude = msg.exclude,
-                    }),
-                };
-            },
-            .pull, .both => return error.UnsupportedDirection,
-        };
-        errdefer session.deinit();
-
-        const st = try gpa.create(SyncTransfer);
-        errdefer gpa.destroy(st);
-        st.* = .{ .session = session };
-        return st;
-    }
-
-    /// The receiving role of the transfer, if it has one.
-    fn receiver(self: *SyncTransfer) ?*sync.Receiver {
-        return if (self.session.receiver) |*r| r else null;
-    }
-
-    fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
-        self.session.deinit();
-        gpa.destroy(self);
-    }
-};
-
 pub const RemoteAgent = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -106,7 +50,7 @@ pub const RemoteAgent = struct {
     /// Jobs currently running.
     active_runners: std.AutoHashMapUnmanaged(*JobNode, *LocalRunner),
     /// Tracked workspace transfers, keyed by job dispatch id.
-    syncs: std.AutoHashMapUnmanaged(u64, *SyncTransfer),
+    syncs: std.AutoHashMapUnmanaged(u64, *sync.Transfer),
 
     connection: Connection,
     /// Incoming parsed messages from the server.
@@ -191,8 +135,7 @@ pub const RemoteAgent = struct {
         var it = self.jobs.iterator();
         while (it.next()) |e| self.destroyJobEntry(e.value_ptr.*);
         self.jobs.deinit(self.gpa);
-        var syncs_it = self.syncs.valueIterator();
-        while (syncs_it.next()) |st| st.*.deinit(self.gpa);
+        // Empty: stopWorkers freed every transfer and its producer
         self.syncs.deinit(self.gpa);
         self.result_queue.close(self.io);
         while (true) {
@@ -310,6 +253,7 @@ pub const RemoteAgent = struct {
 
     /// Stop and free the connection workers, if any.
     fn stopWorkers(self: *RemoteAgent) void {
+        self.stopSyncTransfers();
         if (self.workers) |workers| {
             workers.stop(&self.connection);
             workers.deinit(self.gpa);
@@ -338,7 +282,7 @@ pub const RemoteAgent = struct {
                         m.job_id,
                         @errorName(err),
                     });
-                    self.destroySync(m.job_id);
+                    self.shutdownSync(m.job_id);
                     self.failDispatch(m.job_id, @errorName(err));
                 },
             },
@@ -367,18 +311,19 @@ pub const RemoteAgent = struct {
             .file_chunk => |m| self.handleSyncChunk(m),
             .file_done => |m| self.handleSyncFileDone(m),
             .sync_end => |m| self.handleSyncEnd(m),
-            .sync_ack, .file_req => {},
+            .file_req => |m| self.handleFileReq(m),
+            .sync_ack => {},
             else => {}, // Not relevant for agent
         }
     }
 
-    /// Start receiving a workspace transfer.
+    /// Start a workspace transfer.
     fn beginSync(self: *RemoteAgent, msg: protocol.SyncBeginMsg) void {
         if (self.syncs.contains(msg.job_id)) {
             log.warn("Ignoring duplicate sync_begin for job {x}", .{msg.job_id});
             return;
         }
-        const st = SyncTransfer.start(self.io, self.gpa, &self.workspaces, msg) catch |err| {
+        const st = self.startTransfer(msg) catch |err| {
             log.warn("Rejected workspace sync for job {x}: {s}", .{
                 msg.job_id,
                 @errorName(err),
@@ -400,16 +345,84 @@ pub const RemoteAgent = struct {
             st.deinit(self.gpa);
             return;
         };
+
+        // The sending role of a pull transfer runs as its own producer
+        if (st.sender() != null) {
+            st.spawnProducer() catch |err| {
+                log.err("Failed to start the transfer worker of job {x}: {s}", .{
+                    msg.job_id,
+                    @errorName(err),
+                });
+                self.sendSyncAck(msg.job_id, false, "failed to start the transfer worker");
+                self.shutdownSync(msg.job_id);
+                return;
+            };
+        }
+    }
+
+    /// Create the transfer requested by `msg`.
+    fn startTransfer(self: *RemoteAgent, msg: protocol.SyncBeginMsg) !*sync.Transfer {
+        try sync.validate(msg);
+        const workers = self.workers orelse return error.Closed;
+        const wire_link = try sync.WireLink.init(self.gpa, &workers.outbox, msg.job_id);
+        errdefer wire_link.deinit();
+
+        const roles: sync.Transfer.Roles = switch (msg.direction) {
+            .push => blk: {
+                var ws = try sync.createWorkspace(
+                    self.io,
+                    self.gpa,
+                    &self.workspaces,
+                    msg.mode,
+                    msg.task_id,
+                    msg.job_name,
+                    msg.job_id,
+                );
+                errdefer ws.deinit();
+                break :blk .{
+                    .receiver = try .init(self.io, self.gpa, ws, .{
+                        .task_id = msg.task_id,
+                        .job_name = msg.job_name,
+                        .exclude = msg.exclude,
+                    }),
+                };
+            },
+            .pull => blk: {
+                const root = try self.workspaces.workspaceRoot(
+                    self.gpa,
+                    msg.task_id,
+                    msg.job_name,
+                );
+                defer self.gpa.free(root);
+                const exclude = try sync.fs.dupeListViewStr(self.gpa, msg.exclude);
+                defer sync.fs.freeListViewStr(self.gpa, exclude);
+                break :blk .{ .sender = try .init(self.io, self.gpa, root, exclude) };
+            },
+            .both => return error.UnsupportedDirection,
+        };
+
+        return try sync.Transfer.init(self.io, self.gpa, roles, .{
+            .id = msg.job_id,
+            .link = wire_link.link(),
+            .serve = if (msg.direction == .pull) .requests else .stream,
+            .hooks = .{
+                .ptr = self,
+                .settle = syncSettleHook,
+                .producer_done = syncProducerDoneHook,
+            },
+        });
     }
 
     /// Accept one page of the workspace manifest, then pump the transfer.
     fn handleManifest(self: *RemoteAgent, msg: protocol.ManifestMsg) void {
-        const recv = self.transferReceiver(msg.job_id) orelse {
+        const st = self.syncs.get(msg.job_id) orelse {
             log.debug("Ignoring manifest for unknown sync {x}", .{msg.job_id});
             return;
         };
-        recv.receiveManifest(msg);
-        self.pumpSync(msg.job_id);
+        st.receive(.{ .page = .{
+            .total_entries = msg.total_entries,
+            .entries = msg.entries,
+        } });
     }
 
     /// The receiving role of a tracked transfer, if it has one.
@@ -420,59 +433,46 @@ pub const RemoteAgent = struct {
 
     /// Write one file chunk of an in-flight transfer.
     fn handleSyncChunk(self: *RemoteAgent, msg: protocol.FileChunkMsg) void {
-        const recv = self.transferReceiver(msg.job_id) orelse {
+        const st = self.syncs.get(msg.job_id) orelse {
             log.debug("Ignoring file chunk for unknown sync {x}", .{msg.job_id});
             return;
         };
-        recv.receiveChunk(msg.path, msg.offset, msg.data);
+        st.receive(.{ .chunk = .{
+            .path = msg.path,
+            .offset = msg.offset,
+            .data = msg.data,
+        } });
     }
 
     /// Complete one file of an in-flight transfer, then pump the transfer.
     fn handleSyncFileDone(self: *RemoteAgent, msg: protocol.FileDoneMsg) void {
-        const recv = self.transferReceiver(msg.job_id) orelse {
+        const st = self.syncs.get(msg.job_id) orelse {
             log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
             return;
         };
-        recv.finishFile(msg.path, msg.permissions, msg.hash);
-        self.pumpSync(msg.job_id);
+        st.receive(.{ .done = .{
+            .path = msg.path,
+            .permissions = msg.permissions,
+            .hash = msg.hash,
+        } });
     }
 
-    /// Pump a persistent transfer. Ask the remote manager for the files the
-    /// last manifest page marked as wanted, and complete the transfer
-    /// once the manifest is complete and every requested file arrived.
-    fn pumpSync(self: *RemoteAgent, job_id: u64) void {
-        const recv = self.transferReceiver(job_id) orelse return;
-        if (!recv.persistent) return;
-        if (recv.failed) return self.settleSync(job_id);
-        const reqs = recv.takeRequests() orelse return self.settleSync(job_id);
-        defer self.gpa.free(reqs);
-        for (reqs) |path| {
-            defer self.gpa.free(path);
-            if (!self.sendFileReq(job_id, path)) {
-                recv.markFailed("failed to request '{s}' from the manager", .{path});
-                return self.settleSync(job_id);
-            }
-        }
-        if (recv.manifestComplete() and recv.outstanding == 0)
-            return self.settleSync(job_id);
-    }
-
-    /// Request the content of one workspace file from the manager.
-    /// Returns whether the request was queued.
-    fn sendFileReq(self: *RemoteAgent, job_id: u64, path: []const u8) bool {
-        const msg: protocol.FileReqMsg = .{
-            .job_id = job_id,
-            .path = path,
-            .offset = 0,
+    /// Queue a manager file request for a pull transfer's producer.
+    fn handleFileReq(self: *RemoteAgent, msg: protocol.FileReqMsg) void {
+        const st = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring file request for unknown sync {x}", .{msg.job_id});
+            return;
         };
-        const payload = protocol.serialize(self.gpa, .{ .file_req = msg }) catch |err| {
-            log.err("Failed to serialize file request for job {x}: {s}", .{
-                job_id, @errorName(err),
-            });
-            return false;
+        st.pushRequest(msg.path) catch |err| switch (err) {
+            error.Closed => {},
+            error.OutOfMemory => {
+                log.warn("Failed to queue a file request for sync {x}: {s}", .{
+                    msg.job_id, @errorName(err),
+                });
+                self.sendSyncAck(msg.job_id, false, "out of memory");
+                self.shutdownSync(msg.job_id);
+            },
         };
-        self.sendMessageOwned(payload);
-        return true;
     }
 
     /// Validate and commit a finished transfer, then run any job waiting on it.
@@ -481,20 +481,14 @@ pub const RemoteAgent = struct {
             self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
             return;
         };
-        if (st.receiver() == null) {
-            log.debug("Ignoring sync_end for transfer {x} without a receiver", .{msg.job_id});
-            self.sendSyncAck(msg.job_id, false, "unknown workspace transfer");
-            return;
-        }
-        self.settleSync(msg.job_id);
+        if (st.receiver() != null) return st.receive(.end);
+        // Sender role (pull)
+        self.shutdownSync(msg.job_id);
     }
 
-    /// Settle a transfer. Commit the receiver, release a waiting job
-    /// on success and ack the manager with the outcome.
-    fn settleSync(self: *RemoteAgent, job_id: u64) void {
-        const st = self.syncs.get(job_id) orelse return;
-        if (st.settled) return;
-        st.settled = true;
+    /// Settle a tracked transfer. Commit the receiver, release a
+    /// waiting job on success and ack the manager with the outcome.
+    fn settleSync(self: *RemoteAgent, job_id: u64, st: *sync.Transfer) void {
         const recv = st.receiver() orelse return;
 
         if (!recv.failed and recv.commit()) {
@@ -512,7 +506,7 @@ pub const RemoteAgent = struct {
         const message = recv.failureMessage();
         self.sendSyncAck(job_id, false, message);
         self.abortPendingJob(job_id);
-        self.destroySync(job_id);
+        self.shutdownSync(job_id);
     }
 
     /// Report a dispatch that could not be queued to the manager.
@@ -543,6 +537,23 @@ pub const RemoteAgent = struct {
             return;
         };
         self.sendMessageOwned(payload);
+    }
+
+    /// Queue a sync ack from a producer thread.
+    fn ackFromProducer(self: *RemoteAgent, job_id: u64, ok: bool, message: ?[]const u8) void {
+        const workers = self.workers orelse return;
+        const msg: protocol.SyncAckMsg = .{
+            .job_id = job_id,
+            .ok = ok,
+            .message = message,
+        };
+        const payload = protocol.serialize(self.gpa, .{ .sync_ack = msg }) catch return;
+        workers.outbox.enqueueOwned(payload) catch |err| {
+            self.gpa.free(payload);
+            log.warn("Failed to queue sync ack for job {x}: {s}", .{
+                job_id, @errorName(err),
+            });
+        };
     }
 
     /// Load a dispatched job, create its workspace, and either queue it or
@@ -591,7 +602,7 @@ pub const RemoteAgent = struct {
             }
             return;
         }
-        if (msg.workspace != .none) {
+        if (msg.sync and msg.workspace != .none) {
             // Transfer promised but not started: wait for its receiver.
             entry.awaiting_sync = true;
             return;
@@ -652,13 +663,28 @@ pub const RemoteAgent = struct {
         self.removeJob(job_id);
     }
 
-    /// Delete a transfer's staging dir and free its tracked state.
-    fn destroySync(self: *RemoteAgent, job_id: u64) void {
+    /// Stop and free a tracked transfer.
+    fn shutdownSync(self: *RemoteAgent, job_id: u64) void {
         const kv = self.syncs.fetchRemove(job_id) orelse return;
-        kv.value.deinit(self.gpa);
+        kv.value.shutdown(self.gpa);
     }
 
-    /// Drop every job and transfer tracked for the previous connection.
+    /// Stop, join and free every tracked transfer, leaving `syncs` empty.
+    fn stopSyncTransfers(self: *RemoteAgent) void {
+        var it = self.syncs.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.requestStop();
+        it = self.syncs.iterator();
+        while (it.next()) |entry| entry.value_ptr.*.join();
+        it = self.syncs.iterator();
+        while (it.next()) |entry| {
+            log.info("Aborted workspace transfer {x}", .{entry.key_ptr.*});
+            entry.value_ptr.*.deinit(self.gpa);
+        }
+        self.syncs.clearAndFree(self.gpa);
+    }
+
+    /// Drop every job tracked for the previous connection. The
+    /// connection's transfers were already torn down by `stopWorkers`.
     fn resetJobState(self: *RemoteAgent) void {
         self.pool.cancelWaiter(self);
         self.queue.clear();
@@ -678,16 +704,6 @@ pub const RemoteAgent = struct {
         var jobs_it = self.jobs.iterator();
         while (jobs_it.next()) |e| self.destroyJobEntry(e.value_ptr.*);
         self.jobs.clearAndFree(self.gpa);
-
-        var syncs_it = self.syncs.iterator();
-        while (syncs_it.next()) |entry| {
-            log.info(
-                "Aborted workspace transfer {x} of the dropped connection",
-                .{entry.key_ptr.*},
-            );
-            entry.value_ptr.*.deinit(self.gpa);
-        }
-        self.syncs.clearAndFree(self.gpa);
 
         // Drop queued events, results and frames
         while (self.log_queue.pop()) |event| event.deinit(self.gpa);
@@ -748,7 +764,7 @@ pub const RemoteAgent = struct {
             }
             self.removeJob(msg.job_id);
         }
-        self.destroySync(msg.job_id);
+        self.shutdownSync(msg.job_id);
     }
 
     /// Send a register packet
@@ -797,7 +813,7 @@ pub const RemoteAgent = struct {
                 if (self.jobs.fetchRemove(job_id)) |kv| {
                     self.destroyJobEntry(kv.value);
                 }
-                self.destroySync(job_id);
+                self.shutdownSync(job_id);
             }
         }
     }
@@ -941,4 +957,15 @@ fn workerExited(opq: *anyopaque, kind: Connection.WorkerKind) void {
 fn frameSent(opq: *anyopaque) void {
     const self: *RemoteAgent = @ptrCast(@alignCast(opq));
     self.connection.setLastAccessed();
+}
+
+fn syncSettleHook(ptr: *anyopaque, t: *sync.Transfer) void {
+    const self: *RemoteAgent = @ptrCast(@alignCast(ptr));
+    self.settleSync(t.id, t);
+}
+
+fn syncProducerDoneHook(ptr: *anyopaque, t: *sync.Transfer) void {
+    const self: *RemoteAgent = @ptrCast(@alignCast(ptr));
+    if (t.producer.reportedFailure()) |f|
+        self.ackFromProducer(t.id, false, f.message);
 }

@@ -318,9 +318,7 @@ pub const AgentServer = struct {
     }
 };
 
-/// The test-side endpoint of an accepted agent connection: frames are
-/// sent through the `send*` helpers and the agent's frames are read
-/// from `reader`. `deinit` releases the connection.
+/// The test-side endpoint of an accepted agent connection.
 pub const AgentConn = struct {
     io: std.Io,
     gpa: std.mem.Allocator,
