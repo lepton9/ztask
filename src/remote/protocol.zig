@@ -293,8 +293,8 @@ pub const RunJobMsg = struct {
     job_name: []const u8,
     /// The job's workspace plan.
     workspace: WorkspaceMode,
-    /// Whether the job has a workspace transfer before running.
-    sync: bool = false,
+    /// The dispatch's sync plan.
+    sync: ?SyncDirection = null,
     /// The executed steps of this job.
     steps: ListView(task.Step),
 
@@ -982,7 +982,7 @@ test "run_job" {
         .task_id = "task-111",
         .job_name = "build",
         .workspace = .persistent,
-        .sync = true,
+        .sync = .push,
         .steps = .fromSlice(&steps),
     };
 
@@ -1006,6 +1006,22 @@ test "run_job" {
         try std.testing.expect(std.meta.activeTag(steps[i]) == std.meta.activeTag(parsed_steps[i]));
         try std.testing.expectEqualStrings(steps[i].command.value, parsed_steps[i].command.value);
         try std.testing.expect(steps[i].command.exit_code == parsed_steps[i].command.exit_code);
+    }
+
+    // The sync plan round-trips in every state, including absent
+    inline for (.{ @as(?SyncDirection, null), .push, .pull, .both }) |plan| {
+        const planned: RunJobMsg = .{
+            .job_id = 112,
+            .task_id = "task-111",
+            .job_name = "build",
+            .workspace = .ephemeral,
+            .sync = plan,
+            .steps = .fromSlice(&steps),
+        };
+        const planned_serialized = try serialize(gpa, .{ .run_job = planned });
+        defer gpa.free(planned_serialized);
+        const planned_parsed = try Msg.parse(planned_serialized);
+        try expectEqual(planned.sync, planned_parsed.run_job.sync);
     }
 }
 

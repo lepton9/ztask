@@ -565,19 +565,13 @@ pub const RemoteManager = struct {
         spec: ?SyncSpec,
     ) error{ OutOfMemory, FrameTooLarge, Closed }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
-        const workspace: protocol.WorkspaceMode = if (spec) |s| s.mode else .none;
-        // A push transfer precedes the job
-        const sync_precedes = if (spec) |s|
-            s.direction == .push or s.direction == .both
-        else
-            false;
 
         const run_job_payload = try protocol.serialize(self.gpa, .{ .run_job = .{
             .job_id = dispatch_id,
             .task_id = task_id,
             .job_name = job_name,
-            .workspace = workspace,
-            .sync = sync_precedes,
+            .workspace = if (spec) |s| s.mode else .none,
+            .sync = if (spec) |s| s.direction else null,
             .steps = .fromSlice(steps),
         } });
         errdefer self.gpa.free(run_job_payload);
@@ -787,11 +781,9 @@ pub const RemoteManager = struct {
         const spec = req.sync;
 
         // TODO: pull on failure? a flag for deciding?
-        const wants_pull = msg.success and spec != null and
+        const pull = msg.success and spec != null and spec.?.mode != .none and
             (spec.?.direction == .pull or spec.?.direction == .both);
 
-        // TODO: pull in ephemeral mode?
-        const pull = wants_pull and spec.?.mode == .persistent;
         errdefer req.deinit(self.gpa);
 
         const event = try self.makeJobFinishedEvent(
@@ -1275,6 +1267,8 @@ pub const RemoteManager = struct {
             );
             if (self.dispatched_jobs.fetchRemove(job_id)) |kv|
                 kv.value.deinit(self.gpa);
+            // Tell the agent to not expect a pull
+            self.sendCancelJob(agent, job_id);
             return;
         };
         self.announceSyncTransfer(agent, entry) catch |err|

@@ -20,8 +20,7 @@ pub const WireLink = @import("sync/WireLink.zig");
 pub fn validate(msg: protocol.SyncBeginMsg) error{ UnsupportedMode, UnsupportedDirection }!void {
     switch (msg.direction) {
         .push => if (msg.mode == .none) return error.UnsupportedMode,
-        // TODO: support in ephemeral mode? Delete after the pull?
-        .pull => if (msg.mode != .persistent) return error.UnsupportedMode,
+        .pull => if (msg.mode == .none) return error.UnsupportedMode,
         .both => return error.UnsupportedDirection,
     }
 }
@@ -30,6 +29,21 @@ pub fn validate(msg: protocol.SyncBeginMsg) error{ UnsupportedMode, UnsupportedD
 pub fn openDestination(io: std.Io, gpa: std.mem.Allocator, root: []const u8) !fs.Workspace {
     try std.Io.Dir.cwd().createDirPath(io, root);
     return fs.Workspace.init(io, gpa, root, .persistent);
+}
+
+/// The root a pull transfer serves.
+pub fn pullSource(
+    gpa: std.mem.Allocator,
+    store: *const workspace.Store,
+    mode: protocol.WorkspaceMode,
+    task_id: []const u8,
+    job_name: []const u8,
+    job_id: u64,
+) ![]u8 {
+    return switch (mode) {
+        .persistent => store.workspaceRoot(gpa, task_id, job_name),
+        .none, .ephemeral => store.stagingDir(gpa, task_id, job_name, job_id),
+    };
 }
 
 /// Create a workspace for `mode`: a persistent root or an ephemeral
@@ -90,12 +104,11 @@ test "validate_gates_modes_per_direction" {
     msg.mode = .persistent;
     try validate(msg);
 
-    // Pull collects the outputs of a finished job and is
-    // persistent-only
+    // Pull collects the outputs of a finished job
     msg.direction = .pull;
     try validate(msg);
     msg.mode = .ephemeral;
-    try expectError(error.UnsupportedMode, validate(msg));
+    try validate(msg);
     msg.mode = .none;
     try expectError(error.UnsupportedMode, validate(msg));
 
