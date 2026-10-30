@@ -28,6 +28,9 @@ const JobEntry = struct {
     awaiting_sync: bool = false,
     /// Set once the job was appended to the run queue.
     queued: bool = false,
+    /// Whether the dispatch plans a post-job pull. A finished job then
+    /// keeps its workspace until the pull settles.
+    post_pull: bool = false,
 };
 
 pub const RemoteAgent = struct {
@@ -388,10 +391,20 @@ pub const RemoteAgent = struct {
                 };
             },
             .pull => blk: {
-                const root = try self.workspaces.workspaceRoot(
+                // A pull collects a finished run. Reject it while its
+                // job is still queued, running or waiting for its push.
+                if (self.jobs.getPtr(msg.job_id)) |slot| {
+                    const entry = slot.*;
+                    if (entry.awaiting_sync or entry.queued or
+                        self.active_runners.contains(&entry.node)) return error.JobRunning;
+                }
+                const root = try sync.pullSource(
                     self.gpa,
+                    &self.workspaces,
+                    msg.mode,
                     msg.task_id,
                     msg.job_name,
+                    msg.job_id,
                 );
                 defer self.gpa.free(root);
                 const exclude = try sync.fs.dupeListViewStr(self.gpa, msg.exclude);
@@ -484,6 +497,7 @@ pub const RemoteAgent = struct {
         if (st.receiver() != null) return st.receive(.end);
         // Sender role (pull)
         self.shutdownSync(msg.job_id);
+        self.removeJob(msg.job_id);
     }
 
     /// Settle a tracked transfer. Commit the receiver, release a
@@ -586,6 +600,10 @@ pub const RemoteAgent = struct {
             .job = .{ .name = job_name, .steps = steps },
             .node = .{ .ptr = undefined, .id = msg.job_id },
             .workspace = ws,
+            .post_pull = if (msg.sync) |plan|
+                (plan == .pull or plan == .both) and msg.workspace != .none
+            else
+                false,
         };
         entry.node.ptr = &entry.job;
         try self.jobs.put(self.gpa, msg.job_id, entry);
@@ -602,11 +620,14 @@ pub const RemoteAgent = struct {
             }
             return;
         }
-        if (msg.sync and msg.workspace != .none) {
-            // Transfer promised but not started: wait for its receiver.
-            entry.awaiting_sync = true;
-            return;
-        }
+        if (msg.sync) |plan| switch (plan) {
+            .pull => {}, // Pull runs the job right away and collects afterwards
+            .push, .both => if (msg.workspace != .none) {
+                // Transfer promised but not started: wait for its receiver
+                entry.awaiting_sync = true;
+                return;
+            },
+        };
         self.enqueueJob(entry);
     }
 
@@ -748,8 +769,10 @@ pub const RemoteAgent = struct {
     /// Force stops the runner if active, otherwise removes the job from the
     /// queue or its pending transfer. Always tears down a matching transfer.
     fn cancelJob(self: *RemoteAgent, msg: protocol.CancelJobMsg) void {
+        self.shutdownSync(msg.job_id);
         if (self.jobs.get(msg.job_id)) |entry| {
             if (self.active_runners.fetchRemove(&entry.node)) |kv| {
+                entry.post_pull = false; // Never collect cancelled run
                 kv.value.forceStop();
                 self.pool.release(kv.value);
                 log.info("Cancelled remote job {x} while running", .{msg.job_id});
@@ -764,7 +787,6 @@ pub const RemoteAgent = struct {
             }
             self.removeJob(msg.job_id);
         }
-        self.shutdownSync(msg.job_id);
     }
 
     /// Send a register packet
@@ -809,11 +831,19 @@ pub const RemoteAgent = struct {
                     self.pool.release(runner);
                 }
 
-                // Free the job
-                if (self.jobs.fetchRemove(job_id)) |kv| {
-                    self.destroyJobEntry(kv.value);
+                // Free the job, keeping the workspace of a successful
+                // run whose dispatch plans a post-job pull
+                if (self.jobs.getPtr(job_id)) |e| blk: {
+                    const entry = e.*;
+                    if (entry.post_pull and res.result.success) {
+                        entry.queued = false;
+                        break :blk;
+                    }
+                    // Remove if no post-run pull
+                    _ = self.jobs.remove(job_id);
+                    self.destroyJobEntry(entry);
+                    self.shutdownSync(job_id);
                 }
-                self.shutdownSync(job_id);
             }
         }
     }
