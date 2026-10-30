@@ -474,7 +474,7 @@ fn testParams(exclude: []const []const u8) Params {
 }
 
 /// Create an empty workspace root in the test environment.
-fn testWorkspace(env: *TestEnv, lifetime: fs.Lifetime, name: []const u8) !fs.Workspace {
+fn testWorkspace(env: *TestEnv, lifetime: wpaths.Lifetime, name: []const u8) !fs.Workspace {
     const root = try std.fs.path.join(env.gpa, &.{ env.path, name });
     defer env.gpa.free(root);
     try std.Io.Dir.cwd().createDirPath(env.io, root);

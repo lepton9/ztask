@@ -537,9 +537,7 @@ test "remote_sync_agent_transfer" {
     try conn.expectJobFinish(job_id, true);
 
     // The ephemeral staging workspace is removed once the job has finished.
-    const staging = try std.fs.path.join(gpa, &.{
-        env.data_dir, "workspaces", "sync-agent", "build", "runs", "1",
-    });
+    const staging = try env.stagingPath("sync-agent", "build", 1);
     defer gpa.free(staging);
     try waitRemoved(io, staging);
 
@@ -563,13 +561,11 @@ test "remote_sync_agent_transfer" {
 
     try conn.expectSyncAck(bad_id, false);
 
-    const bad_staging = try std.fs.path.join(gpa, &.{
-        env.data_dir, "workspaces", "sync-agent", "build", "runs", "2",
-    });
+    const bad_staging = try env.stagingPath("sync-agent", "build", 2);
     defer gpa.free(bad_staging);
     try waitRemoved(io, bad_staging);
-    const runs_dir = std.fs.path.dirname(bad_staging) orelse unreachable;
-    const escaped = try std.fs.path.join(gpa, &.{ runs_dir, "evil.txt" });
+    const job_dir = std.fs.path.dirname(bad_staging) orelse unreachable;
+    const escaped = try std.fs.path.join(gpa, &.{ job_dir, "evil.txt" });
     defer gpa.free(escaped);
     try testutil.expectPathMissing(io, escaped);
 
@@ -655,9 +651,6 @@ test "remote_sync_persistent_agent_transfer" {
 
     // The workspace root is reused
     try expectWorkspaceFile(io, gpa, ws_root, "a.txt", "hi", declared_mtime);
-    const runs_dir = try std.fs.path.join(gpa, &.{ ws_root, "runs" });
-    defer gpa.free(runs_dir);
-    try testutil.expectPathMissing(io, runs_dir);
 
     // Job-created files that the manager does not declare. `stale.txt`
     // must be deleted by the second transfer's commit.
@@ -893,17 +886,6 @@ test "remote_sync_ephemeral_pull_lifecycle" {
 
     const task_id = "pull-agent";
     const job_name = "build";
-    const ws_root = try env.workspacePath(task_id, job_name);
-    defer gpa.free(ws_root);
-    const staging = struct {
-        fn get(g: std.mem.Allocator, root: []const u8, job: u64) ![]u8 {
-            const runs = try std.fs.path.join(g, &.{ root, "runs" });
-            defer g.free(runs);
-            const id = try std.fmt.allocPrint(g, "{d}", .{job});
-            defer g.free(id);
-            return std.fs.path.join(g, &.{ runs, id });
-        }
-    }.get;
 
     const write_steps = [_]task_types.Step{.{ .command = .{
         .value = "dd if=/dev/zero of=out.txt bs=8 count=1",
@@ -939,7 +921,7 @@ test "remote_sync_ephemeral_pull_lifecycle" {
 
     // The finished run keeps its staging for the collection
     try conn.expectJobFinish(600, true);
-    const staging0 = try staging(gpa, ws_root, 600);
+    const staging0 = try env.stagingPath(task_id, job_name, 600);
     defer gpa.free(staging0);
     try std.Io.sleep(io, .fromNanoseconds(50 * std.time.ns_per_ms), .awake);
     _ = try std.Io.Dir.cwd().statFile(io, staging0, .{});
@@ -985,7 +967,7 @@ test "remote_sync_ephemeral_pull_lifecycle" {
     } });
     try conn.expectJobFinish(601, true);
 
-    const staging1 = try staging(gpa, ws_root, 601);
+    const staging1 = try env.stagingPath(task_id, job_name, 601);
     defer gpa.free(staging1);
     try conn.send(.{ .cancel_job = .{ .job_id = 601 } });
     try testutil.waitRemoved(io, staging1);
@@ -1002,7 +984,7 @@ test "remote_sync_ephemeral_pull_lifecycle" {
     } });
     try conn.expectJobFinish(602, false);
 
-    const staging2 = try staging(gpa, ws_root, 602);
+    const staging2 = try env.stagingPath(task_id, job_name, 602);
     defer gpa.free(staging2);
     try testutil.waitRemoved(io, staging2);
 
@@ -1130,9 +1112,7 @@ test "remote_job_uses_empty_workspace" {
         .steps = .fromSlice(&steps),
     } });
 
-    const workspace = try std.fs.path.join(gpa, &.{
-        env.data_dir, "workspaces", "empty-ws", "jobA", "runs", "5",
-    });
+    const workspace = try env.stagingPath("empty-ws", "jobA", 5);
     defer gpa.free(workspace);
 
     var got_output: std.ArrayListUnmanaged(u8) = .empty;
@@ -1574,11 +1554,7 @@ test "remote_sync_ephemeral_pull_collects_and_deletes_staging" {
     try expectEqualStrings("mine", local);
 
     // The run's staging workspace died with the settled collection
-    const ws_root = try env.workspacePath("collect-task", "build");
-    defer gpa.free(ws_root);
-    const run1 = try std.fmt.allocPrint(gpa, "{d}", .{dispatch1});
-    defer gpa.free(run1);
-    const staging1 = try std.fs.path.join(gpa, &.{ ws_root, "runs", run1 });
+    const staging1 = try env.stagingPath("collect-task", "build", dispatch1);
     defer gpa.free(staging1);
     try testutil.waitRemoved(io, staging1);
 

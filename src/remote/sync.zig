@@ -40,10 +40,8 @@ pub fn pullSource(
     job_name: []const u8,
     job_id: u64,
 ) ![]u8 {
-    return switch (mode) {
-        .persistent => store.workspaceRoot(gpa, task_id, job_name),
-        .none, .ephemeral => store.stagingDir(gpa, task_id, job_name, job_id),
-    };
+    const lifetime = workspace.Lifetime.fromWorkspaceMode(mode);
+    return store.workspaceDir(gpa, lifetime, task_id, job_name, job_id);
 }
 
 /// Create a workspace for `mode`: a persistent root or an ephemeral
@@ -57,19 +55,13 @@ pub fn createWorkspace(
     job_name: []const u8,
     job_id: u64,
 ) !Workspace {
-    switch (mode) {
-        .persistent => {
-            const path = try store.createWorkspaceRoot(io, gpa, task_id, job_name);
-            defer gpa.free(path);
-            return Workspace.init(io, gpa, path, .persistent);
-        },
-        .none, .ephemeral => {
-            const path = try store.createStagingDir(io, gpa, task_id, job_name, job_id);
-            defer gpa.free(path);
-            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
-            return Workspace.init(io, gpa, path, .ephemeral);
-        },
-    }
+    const lifetime = workspace.Lifetime.fromWorkspaceMode(mode);
+    const path = try store.createWorkspaceDir(io, gpa, lifetime, task_id, job_name, job_id);
+    defer gpa.free(path);
+    errdefer if (lifetime == .ephemeral) {
+        std.Io.Dir.cwd().deleteTree(io, path) catch {};
+    };
+    return Workspace.init(io, gpa, path, lifetime);
 }
 
 const expectError = std.testing.expectError;

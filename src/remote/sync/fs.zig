@@ -3,6 +3,7 @@
 const std = @import("std");
 const protocol = @import("../protocol.zig");
 const workspace = @import("../workspace.zig");
+const Lifetime = workspace.Lifetime;
 
 const log = std.log.scoped(.sync);
 
@@ -220,17 +221,6 @@ pub const Directory = struct {
                 self.root,
                 @errorName(err),
             });
-    }
-};
-
-pub const Lifetime = enum {
-    /// Removed after use.
-    ephemeral,
-    /// No deletion after use.
-    persistent,
-
-    pub inline fn fromWorkspaceMode(mode: protocol.WorkspaceMode) Lifetime {
-        return if (mode == .persistent) .persistent else .ephemeral;
     }
 };
 
