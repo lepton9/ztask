@@ -579,7 +579,7 @@ pub const RemoteAgent = struct {
         if (recv) |r| {
             // An in-flight transfer must match the dispatch plan
             if (msg.workspace == .none) return error.WorkspaceMismatch;
-            const planned: sync.fs.Lifetime = .fromWorkspaceMode(msg.workspace);
+            const planned: workspace.Lifetime = .fromWorkspaceMode(msg.workspace);
             if (r.workspace.lifetime != planned) return error.WorkspaceMismatch;
         }
 

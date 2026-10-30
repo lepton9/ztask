@@ -88,7 +88,21 @@ pub const TestEnv = struct {
         job_name: []const u8,
     ) ![]u8 {
         return std.fs.path.join(self.gpa, &.{
-            self.data_dir, "workspaces", task_id, job_name,
+            self.data_dir, "workspaces", "persistent", task_id, job_name,
+        });
+    }
+
+    /// Path of the ephemeral staging dir of a run.
+    pub fn stagingPath(
+        self: *const TestEnv,
+        task_id: []const u8,
+        job_name: []const u8,
+        run_id: u64,
+    ) ![]u8 {
+        const id = try std.fmt.allocPrint(self.gpa, "{d}", .{run_id});
+        defer self.gpa.free(id);
+        return std.fs.path.join(self.gpa, &.{
+            self.data_dir, "workspaces", "ephemeral", task_id, job_name, id,
         });
     }
 };

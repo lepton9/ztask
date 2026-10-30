@@ -1,25 +1,50 @@
 const std = @import("std");
 const data = @import("../data.zig");
+const protocol = @import("protocol.zig");
 
 const log = std.log.scoped(.workspace);
 
 pub const WORKSPACES_DIR: []const u8 = "workspaces";
-pub const RUNS_DIR: []const u8 = "runs";
+pub const PERSISTENT_DIR: []const u8 = "persistent";
+pub const EPHEMERAL_DIR: []const u8 = "ephemeral";
 pub const MANIFEST_SUFFIX: []const u8 = ".manifest.json";
 
 pub const PathError = error{InvalidPath};
+
+/// Deletion policy of a workspace tree.
+pub const Lifetime = enum {
+    /// Removed after use.
+    ephemeral,
+    /// No deletion after use.
+    persistent,
+
+    /// Map a wire workspace mode.
+    pub inline fn fromWorkspaceMode(mode: protocol.WorkspaceMode) Lifetime {
+        return if (mode == .persistent) .persistent else .ephemeral;
+    }
+
+    /// Fixed top-level directory of the lifetime under `workspaces/`.
+    pub inline fn dirName(self: Lifetime) []const u8 {
+        return switch (self) {
+            .persistent => PERSISTENT_DIR,
+            .ephemeral => EPHEMERAL_DIR,
+        };
+    }
+};
 
 /// Agent workspace storage rooted at the agent data directory.
 pub const Store = struct {
     /// Owned root data directory.
     root_dir: []const u8,
 
-    /// Initialize the store and create the workspace root on disk.
+    /// Initialize the store and create the lifetime roots on disk.
     pub fn init(io: std.Io, gpa: std.mem.Allocator, root_dir: []const u8) !Store {
-        const workspaces = try workspacesPath(gpa, root_dir);
-        defer gpa.free(workspaces);
-        var dir = try data.openDir(io, workspaces, .{ .create = true });
-        dir.close(io);
+        for ([_]Lifetime{ .persistent, .ephemeral }) |lifetime| {
+            const path = try lifetimeRootPath(gpa, root_dir, lifetime);
+            defer gpa.free(path);
+            var dir = try data.openDir(io, path, .{ .create = true });
+            dir.close(io);
+        }
         return .{ .root_dir = try gpa.dupe(u8, root_dir) };
     }
 
@@ -27,76 +52,46 @@ pub const Store = struct {
         gpa.free(self.root_dir);
     }
 
-    /// Workspace root of a task job: `workspaces/<task_id>/<job_name>`.
-    pub fn workspaceRoot(
+    /// Return the workspace directory based on the lifetime.
+    ///
+    /// - persistent: `workspaces/persistent/<task_id>/<job_name>`
+    /// - ephemeral:  `workspaces/ephemeral/<task_id>/<job_name>/<run_id>`
+    ///
+    /// Both name components are validated before joining.
+    pub fn workspaceDir(
         self: *const Store,
         gpa: std.mem.Allocator,
+        lifetime: Lifetime,
         task_id: []const u8,
         job_name: []const u8,
-    ) ![]u8 {
-        try validateComponent(task_id);
-        try validateComponent(job_name);
-        return std.fs.path.join(gpa, &.{
-            self.root_dir, WORKSPACES_DIR, task_id, job_name,
-        });
-    }
-
-    /// Parent directory of all per-run staging dirs: `<root>/runs`.
-    pub fn runsRoot(
-        self: *const Store,
-        gpa: std.mem.Allocator,
-        task_id: []const u8,
-        job_name: []const u8,
-    ) ![]u8 {
-        try validateComponent(task_id);
-        try validateComponent(job_name);
-        return std.fs.path.join(gpa, &.{
-            self.root_dir, WORKSPACES_DIR, task_id, job_name, RUNS_DIR,
-        });
-    }
-
-    /// Ephemeral staging dir of a run: `<root>/runs/<run_id>`.
-    pub fn stagingDir(
-        self: *const Store,
-        gpa: std.mem.Allocator,
-        task_id: []const u8,
-        job_name: []const u8,
-        run_id: u64,
+        run_id: ?u64,
     ) ![]u8 {
         try validateComponent(task_id);
         try validateComponent(job_name);
         var buf: [20]u8 = undefined;
-        const run_str = std.fmt.bufPrint(&buf, "{d}", .{run_id}) catch unreachable;
+        var run_str: []const u8 = "";
+
+        std.debug.assert(lifetime == .persistent or run_id != null);
+
+        if (lifetime == .ephemeral) if (run_id) |id| {
+            run_str = std.fmt.bufPrint(&buf, "{d}", .{id}) catch unreachable;
+        };
         return std.fs.path.join(gpa, &.{
-            self.root_dir, WORKSPACES_DIR, task_id, job_name, RUNS_DIR, run_str,
+            self.root_dir, WORKSPACES_DIR, lifetime.dirName(), task_id, job_name, run_str,
         });
     }
 
-    /// Create the staging dir of a run and return its path.
-    pub fn createStagingDir(
+    /// Create the workspace dir of a task job and return its path.
+    pub fn createWorkspaceDir(
         self: *const Store,
         io: std.Io,
         gpa: std.mem.Allocator,
+        lifetime: Lifetime,
         task_id: []const u8,
         job_name: []const u8,
-        run_id: u64,
+        run_id: ?u64,
     ) ![]u8 {
-        const path = try self.stagingDir(gpa, task_id, job_name, run_id);
-        errdefer gpa.free(path);
-        var dir = try data.openDir(io, path, .{ .create = true });
-        dir.close(io);
-        return path;
-    }
-
-    /// Create the reusable workspace root of a task job and return its path.
-    pub fn createWorkspaceRoot(
-        self: *const Store,
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        task_id: []const u8,
-        job_name: []const u8,
-    ) ![]u8 {
-        const path = try self.workspaceRoot(gpa, task_id, job_name);
+        const path = try self.workspaceDir(gpa, lifetime, task_id, job_name, run_id);
         errdefer gpa.free(path);
         var dir = try data.openDir(io, path, .{ .create = true });
         dir.close(io);
@@ -104,6 +99,8 @@ pub const Store = struct {
     }
 
     /// Return an allocated manifest file path.
+    ///
+    /// `workspaces/persistent/<task_id>/<job_name>.manifest.json`.
     pub fn manifestPath(
         self: *const Store,
         gpa: std.mem.Allocator,
@@ -112,62 +109,72 @@ pub const Store = struct {
     ) ![]u8 {
         try validateComponent(task_id);
         try validateComponent(job_name);
-        const file = try std.fmt.allocPrint(gpa, "{s}{s}", .{ job_name, MANIFEST_SUFFIX });
+        const file = try std.fmt.allocPrint(gpa, "{s}{s}", .{
+            job_name, MANIFEST_SUFFIX,
+        });
         defer gpa.free(file);
-        return std.fs.path.join(gpa, &.{ self.root_dir, WORKSPACES_DIR, task_id, file });
+        const persistent_root = try lifetimeRootPath(gpa, self.root_dir, .persistent);
+        defer gpa.free(persistent_root);
+        return std.fs.path.join(gpa, &.{ persistent_root, task_id, file });
     }
 
-    /// Reclaim leftover per-run staging dirs of every workspace.
+    /// Reclaim every non-persistent workspace.
     pub fn gc(self: *const Store, io: std.Io, gpa: std.mem.Allocator) void {
+        // TODO: handle multiple remote agents modifying the same workspace dir
+
+        // Ephemeral staging never survives a restart
+        const ephemeral = lifetimeRootPath(gpa, self.root_dir, .ephemeral) catch return;
+        defer gpa.free(ephemeral);
+        deleteTreeReclaim(io, ephemeral);
+
         const workspaces = workspacesPath(gpa, self.root_dir) catch return;
         defer gpa.free(workspaces);
         var dir = std.Io.Dir.openDirAbsolute(io, workspaces, .{
             .iterate = true,
         }) catch return;
         defer dir.close(io);
-        var walker = dir.walk(gpa) catch return;
-        defer walker.deinit();
 
-        // Collect the stale trees first
         var stale: std.ArrayList([]u8) = .empty;
         defer {
             for (stale.items) |path| gpa.free(path);
             stale.deinit(gpa);
         }
+        var it = dir.iterate();
         while (true) {
-            const maybe = walker.next(io) catch return;
-            const entry = maybe orelse break;
-            if (entry.kind != .directory) continue;
-            // Only `<task_id>/<job_name>/runs` is reclaimable.
-            var it = std.mem.splitScalar(u8, entry.path, std.fs.path.sep);
-            _ = it.next() orelse continue;
-            _ = it.next() orelse continue;
-            const runs = it.next() orelse continue;
-            if (it.next() != null) continue;
-            if (!std.mem.eql(u8, runs, RUNS_DIR)) continue;
-            const path = std.fs.path.join(gpa, &.{ workspaces, entry.path }) catch continue;
+            const entry = it.next(io) catch null orelse break;
+            // Only the fixed lifetime roots are known
+            if (std.mem.eql(u8, entry.name, PERSISTENT_DIR)) continue;
+            if (std.mem.eql(u8, entry.name, EPHEMERAL_DIR)) continue;
+            const path = std.fs.path.join(gpa, &.{ workspaces, entry.name }) catch continue;
             stale.append(gpa, path) catch {
                 gpa.free(path);
                 continue;
             };
         }
 
-        for (stale.items) |path| {
-            std.Io.Dir.cwd().deleteTree(io, path) catch |err| {
-                log.warn("Failed to reclaim stale staging dir '{s}': {s}", .{
-                    path,
-                    @errorName(err),
-                });
-                continue;
-            };
-            log.debug("Reclaimed stale staging dir '{s}'", .{path});
-        }
+        for (stale.items) |path| deleteTreeReclaim(io, path);
     }
 };
 
 /// Path of the workspace root directory under a data dir.
 fn workspacesPath(gpa: std.mem.Allocator, data_dir: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ data_dir, WORKSPACES_DIR });
+}
+
+/// Root directory of a lifetime: `<data_dir>/workspaces/<dirName>`.
+fn lifetimeRootPath(gpa: std.mem.Allocator, data_dir: []const u8, lifetime: Lifetime) ![]u8 {
+    return std.fs.path.join(gpa, &.{ data_dir, WORKSPACES_DIR, lifetime.dirName() });
+}
+
+/// Delete a tree at `path`. Missing paths are ignored.
+fn deleteTreeReclaim(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch |err| {
+        log.warn("Failed to reclaim stale workspace dir '{s}': {s}", .{
+            path, @errorName(err),
+        });
+        return;
+    };
+    log.debug("Reclaimed stale workspace dir '{s}'", .{path});
 }
 
 /// Validate a single path component usable as a directory or file name.
@@ -277,12 +284,14 @@ pub fn ensureNoSymlinkEscapeReal(
 ) !void {
     try validateRelPath(rel_path);
 
+    const cwd = std.Io.Dir.cwd();
     var prefix: std.ArrayListUnmanaged(u8) = .empty;
     defer prefix.deinit(gpa);
     var full: std.ArrayListUnmanaged(u8) = .empty;
     defer full.deinit(gpa);
     const sep = std.fs.path.sep;
     var it = std.mem.splitScalar(u8, rel_path, '/');
+
     while (it.next()) |comp| {
         if (prefix.items.len != 0) try prefix.append(gpa, '/');
         try prefix.appendSlice(gpa, comp);
@@ -292,7 +301,7 @@ pub fn ensureNoSymlinkEscapeReal(
         try full.append(gpa, sep);
         try full.appendSlice(gpa, prefix.items);
 
-        if (std.Io.Dir.cwd().realPathFileAlloc(io, full.items, gpa)) |real| {
+        if (cwd.realPathFileAlloc(io, full.items, gpa)) |real| {
             defer gpa.free(real);
             if (!containsPath(root_real, real)) return error.SymlinkEscape;
             continue;
@@ -304,7 +313,7 @@ pub fn ensureNoSymlinkEscapeReal(
         // TODO: handle dangling symlinks that end up inside the root
         // The component does not resolve
         var link_buf: [std.fs.max_path_bytes]u8 = undefined;
-        _ = std.Io.Dir.cwd().readLink(io, full.items, &link_buf) catch |err| switch (err) {
+        _ = cwd.readLink(io, full.items, &link_buf) catch |err| switch (err) {
             error.FileNotFound, error.NotLink => break,
             else => return err,
         };
@@ -387,6 +396,12 @@ test "contains_path" {
     try expect(!containsPath("C:\\ws", "C:\\ws\\..\\x"));
 }
 
+test "lifetime_from_workspace_mode" {
+    try expect(Lifetime.fromWorkspaceMode(.persistent) == .persistent);
+    try expect(Lifetime.fromWorkspaceMode(.ephemeral) == .ephemeral);
+    try expect(Lifetime.fromWorkspaceMode(.none) == .ephemeral);
+}
+
 test "store_layout" {
     var env: TestEnv = try .init();
     defer env.deinit();
@@ -396,43 +411,39 @@ test "store_layout" {
     var store = try Store.init(io, gpa, env.data_dir);
     defer store.deinit(gpa);
 
-    // Workspace root was created on disk
-    const workspaces = try workspacesPath(gpa, env.data_dir);
-    defer gpa.free(workspaces);
-    const stat = try env.dir.statFile(io, "ztask-data/workspaces", .{});
-    try expect(stat.kind == .directory);
+    // Both lifetime roots were created on disk
+    const persistent_stat = try env.dir.statFile(io, "ztask-data/workspaces/persistent", .{});
+    try expect(persistent_stat.kind == .directory);
+    const ephemeral_stat = try env.dir.statFile(io, "ztask-data/workspaces/ephemeral", .{});
+    try expect(ephemeral_stat.kind == .directory);
 
-    const root = try store.workspaceRoot(gpa, "task1", "build");
+    const root = try store.workspaceDir(gpa, .persistent, "task1", "build", null);
     defer gpa.free(root);
-    try expect(std.mem.endsWith(u8, root, "workspaces/task1/build"));
+    try expect(std.mem.endsWith(u8, root, "workspaces/persistent/task1/build"));
 
-    const runs = try store.runsRoot(gpa, "task1", "build");
-    defer gpa.free(runs);
-    try expect(std.mem.endsWith(u8, runs, "workspaces/task1/build/runs"));
-
-    const staging = try store.stagingDir(gpa, "task1", "build", 42);
+    const staging = try store.workspaceDir(gpa, .ephemeral, "task1", "build", 42);
     defer gpa.free(staging);
-    try expect(std.mem.endsWith(u8, staging, "workspaces/task1/build/runs/42"));
+    try expect(std.mem.endsWith(u8, staging, "workspaces/ephemeral/task1/build/42"));
 
     const manifest = try store.manifestPath(gpa, "task1", "build");
     defer gpa.free(manifest);
-    try expect(std.mem.endsWith(u8, manifest, "workspaces/task1/build.manifest.json"));
-
-    // Staging dirs are created on demand
-    const created = try store.createStagingDir(io, gpa, "task1", "build", 7);
-    defer gpa.free(created);
-    const staging_stat = try env.dir.statFile(io, "ztask-data/workspaces/task1/build/runs/7", .{});
-    try expect(staging_stat.kind == .directory);
+    try expect(std.mem.endsWith(u8, manifest, "workspaces/persistent/task1/build.manifest.json"));
 
     // Workspace roots are created on demand
-    const created_root = try store.createWorkspaceRoot(io, gpa, "task1", "build2");
+    const created_root = try store.createWorkspaceDir(io, gpa, .persistent, "task1", "build2", null);
     defer gpa.free(created_root);
-    const root_stat = try env.dir.statFile(io, "ztask-data/workspaces/task1/build2", .{});
+    const root_stat = try env.dir.statFile(io, "ztask-data/workspaces/persistent/task1/build2", .{});
     try expect(root_stat.kind == .directory);
 
+    // Staging dirs are created on demand
+    const created = try store.createWorkspaceDir(io, gpa, .ephemeral, "task1", "build", 7);
+    defer gpa.free(created);
+    const staging_stat = try env.dir.statFile(io, "ztask-data/workspaces/ephemeral/task1/build/7", .{});
+    try expect(staging_stat.kind == .directory);
+
     // Invalid components are rejected before any path is built
-    try expectError(error.InvalidPath, store.workspaceRoot(gpa, "../x", "build"));
-    try expectError(error.InvalidPath, store.workspaceRoot(gpa, "task1", "a/b"));
+    try expectError(error.InvalidPath, store.workspaceDir(gpa, .persistent, "../x", "build", null));
+    try expectError(error.InvalidPath, store.workspaceDir(gpa, .ephemeral, "task1", "a/b", 1));
     try expectError(error.InvalidPath, store.manifestPath(gpa, "task1", ".."));
 }
 
