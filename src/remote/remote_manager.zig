@@ -157,10 +157,13 @@ pub const DispatchRequest = struct {
     run_job_payload: ?[]u8 = null,
     /// Owned copy of the sync inputs.
     sync: ?SyncSpec = null,
-    /// Socket handle of the connected remote agent.
+    /// Socket handle of the connected remote agent the job was
+    /// dispatched over. Set once the entry enters `dispatched_jobs`.
     agent_fd: ?std.Io.net.Socket.Handle = null,
     /// Absolute time after which a dispatch with no matching runner fails.
     deadline_ms: ?i64 = null,
+    /// Set once the post-job pull transfer of this dispatch started.
+    pulling: bool = false,
 
     const RETRY_TIMEOUT_MS = 5 * std.time.ms_per_s;
 
@@ -172,205 +175,62 @@ pub const DispatchRequest = struct {
         if (self.run_job_payload) |payload| gpa.free(payload);
         if (self.sync) |s| s.deinit(gpa);
     }
+
+    /// Whether the job was dispatched over the agent socket `fd`.
+    fn sentOver(self: *const DispatchRequest, fd: std.Io.net.Socket.Handle) bool {
+        const agent_fd = self.agent_fd orelse return false;
+        return agent_fd == fd;
+    }
 };
 
 /// Fail a workspace transfer once no frame was queued for this long.
 const SYNC_STALL_TIMEOUT_MS: i64 = 60 * std.time.ms_per_s;
 /// Min interval between throttled sync progress.
 const SYNC_PROGRESS_INTERVAL_MS: i64 = 500;
-/// Chunk payload quota of one sync pump pass.
-const SYNC_PUMP_QUOTA_BYTES: usize = 32 * protocol.SYNC_CHUNK_SIZE;
 
-/// Terminal state reported by a transfer's producer.
-const SyncProducerStatus = enum(u8) { running, ended, failed };
+fn syncSettleHook(ptr: *anyopaque, t: *sync.Transfer) void {
+    const self: *RemoteManager = @ptrCast(@alignCast(ptr));
+    self.settlePull(t.id, t);
+}
 
-/// State of one in-flight workspace transfer.
-const SyncTransfer = struct {
-    io: std.Io,
-    /// Socket handle of the agent receiving the transfer.
-    agent_fd: std.Io.net.Socket.Handle,
-    /// Globally unique dispatch id of the transfer's job.
-    job_id: u64,
-    /// Owned copy of the task id, read by progress events.
-    task_id: []u8,
-    /// Workspace mode of the transfer.
-    mode: SyncMode,
-    /// Direction of the transfer.
-    direction: SyncDirection,
-    /// The connection's queueing writer. Stable while the agent
-    /// connection lives.
-    writer: *Connection.Writer,
-    /// Transfer session roles.
-    session: sync.Session,
-    /// Requested file paths queued for the transfer's producer.
-    inbox: MutexQueue([]u8),
-    /// Producer thread, spawned once the transfer is tracked.
-    thread: ?std.Thread = null,
-    /// Set by the manager to stop the producer.
-    stop: std.atomic.Value(bool) = .init(false),
-    /// Terminal status reported by the producer.
-    status: std.atomic.Value(SyncProducerStatus) = .init(.running),
-    /// Producer failure description, valid once status is `.failed`.
-    failure_msg: []const u8 = "",
-    /// Producer failure error, valid once status is `.failed`.
-    failure_err: anyerror = error.Unknown,
-    /// Last time a frame was successfully queued.
-    last_progress_ms: std.atomic.Value(i64),
-    /// Time the transfer started at.
-    start_ms: i64,
+/// Wake the manager loop when a producer thread finished.
+fn syncProducerDoneHook(ptr: *anyopaque, t: *sync.Transfer) void {
+    _ = t;
+    const self: *RemoteManager = @ptrCast(@alignCast(ptr));
+    self.wake();
+}
 
-    /// Create the transfer of `spec` to the agent at `agent_fd`.
-    fn start(
-        io: std.Io,
-        gpa: std.mem.Allocator,
-        writer: *Connection.Writer,
-        agent_fd: std.Io.net.Socket.Handle,
-        job_id: u64,
-        task_id: []const u8,
-        spec: SyncSpec,
-    ) !*SyncTransfer {
-        var session: sync.Session = switch (spec.direction) {
-            .push => .{
-                .sender = try .init(
-                    io,
-                    gpa,
-                    spec.root,
-                    spec.exclude,
-                    job_id,
-                ),
-            },
-            .pull, .both => return error.UnsupportedDirection,
-        };
-        errdefer session.deinit();
-        // Persistent transfers complete agent-side
-        if (session.sender) |*sender| sender.send_end = spec.mode != .persistent;
-
-        const task_id_copy = try gpa.dupe(u8, task_id);
-        errdefer gpa.free(task_id_copy);
-
-        const st = try gpa.create(SyncTransfer);
-        errdefer gpa.destroy(st);
-        const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-        st.* = .{
-            .io = io,
-            .agent_fd = agent_fd,
-            .job_id = job_id,
-            .task_id = task_id_copy,
-            .mode = spec.mode,
-            .direction = spec.direction,
-            .writer = writer,
-            .session = session,
-            .inbox = MutexQueue([]u8).init(io),
-            .start_ms = now_ms,
-            .last_progress_ms = .init(now_ms),
-        };
-        return st;
-    }
-
-    /// Free the transfer. The producer thread must be joined first.
-    fn deinit(self: *SyncTransfer, gpa: std.mem.Allocator) void {
-        std.debug.assert(self.thread == null);
-        gpa.free(self.task_id);
-        while (self.inbox.pop()) |path| gpa.free(path);
-        self.inbox.deinit(gpa);
-        self.session.deinit();
-        gpa.destroy(self);
-    }
-
-    /// Ask the producer to stop and unblock it.
-    fn requestStop(self: *SyncTransfer) void {
-        self.stop.store(true, .release);
-        self.inbox.close();
-        self.writer.send_queue.wake();
-    }
-
-    /// Join the producer thread, if one was spawned.
-    fn join(self: *SyncTransfer) void {
-        if (self.thread) |thread| {
-            thread.join();
-            self.thread = null;
-        }
-    }
-
-    /// Record forward progress of the transfer.
-    fn touch(self: *SyncTransfer) void {
-        self.last_progress_ms.store(
-            std.Io.Timestamp.now(self.io, .awake).toMilliseconds(),
-            .release,
-        );
-    }
-
-    /// Producer thread body. Dispatches to the transfer model the mode
-    /// selected (`streamAll` for ephemeral, `serveRequests` for persistent).
-    fn produce(self: *SyncTransfer, manager: *RemoteManager) void {
-        const sender = &(self.session.sender orelse return);
-        var ctx: SyncRunContext = .{ .st = self, .manager = manager };
-        const hooks: sync.Sender.RunHooks = .{
-            .ptr = &ctx,
-            .activity = SyncRunContext.activity,
-            .progress = SyncRunContext.progress,
-        };
-        const options: sync.Sender.RunOptions = .{
-            .outbox = self.writer,
-            .quota_bytes = SYNC_PUMP_QUOTA_BYTES,
-            .stop = &self.stop,
-            .start_ms = self.start_ms,
-            .progress_interval_ms = SYNC_PROGRESS_INTERVAL_MS,
-            .hooks = hooks,
-        };
-        const outcome = if (self.mode == .persistent)
-            sender.serveRequests(&self.inbox, options)
-        else
-            sender.streamAll(options);
-        switch (outcome) {
-            .ended => {
-                self.status.store(.ended, .release);
-                manager.wake();
-            },
-            .stopped => {},
-            .failed => |f| {
-                self.failure_msg = f.message;
-                self.failure_err = f.err;
-                self.status.store(.failed, .release);
-                manager.wake();
-            },
-        }
-    }
-};
-
-/// Producer-thread context.
-const SyncRunContext = struct {
-    st: *SyncTransfer,
+/// Immutable fields of a transfer's sync events.
+const SyncLabel = struct {
+    gpa: std.mem.Allocator,
     manager: *RemoteManager,
+    task_id: []u8,
+    mode: SyncMode,
+    direction: SyncDirection,
 
-    fn activity(opq: *anyopaque) void {
-        const self: *SyncRunContext = @ptrCast(@alignCast(opq));
-        self.st.touch();
-    }
-
-    fn progress(
-        opq: *anyopaque,
-        files: usize,
-        bytes: u64,
-        files_total: ?usize,
-        bytes_total: ?u64,
-        elapsed_ms: i64,
-    ) void {
-        const self: *SyncRunContext = @ptrCast(@alignCast(opq));
-        self.manager.emitSyncEvent(
-            self.st.task_id,
-            self.st.job_id,
-            self.st.mode,
-            self.st.direction,
-            .progress,
-            files,
-            bytes,
-            files_total,
-            bytes_total,
-            elapsed_ms,
-        );
+    fn free(ptr: *anyopaque) void {
+        const self: *SyncLabel = @ptrCast(@alignCast(ptr));
+        self.gpa.free(self.task_id);
+        self.gpa.destroy(self);
     }
 };
+
+/// Emit the throttled progress of a transfer.
+fn syncProgressHook(ptr: *anyopaque, t: *sync.Transfer, p: sync.Transfer.Progress) void {
+    const label: *SyncLabel = @ptrCast(@alignCast(ptr));
+    label.manager.emitSyncEvent(
+        label.task_id,
+        t.id,
+        label.mode,
+        label.direction,
+        .progress,
+        p.files,
+        p.bytes,
+        p.files_total,
+        p.bytes_total,
+        p.elapsed_ms,
+    );
+}
 
 pub const RemoteCommand = union(enum) {
     dispatch: DispatchRequest,
@@ -463,7 +323,7 @@ pub const AgentHandle = struct {
     }
 
     /// The socket handle of the agent connection.
-    fn fd(self: *AgentHandle) std.Io.net.Socket.Handle {
+    fn fd(self: *const AgentHandle) std.Io.net.Socket.Handle {
         return self.connection.conn.stream.socket.handle;
     }
 
@@ -503,9 +363,10 @@ pub const RemoteManager = struct {
     /// Queue of requests ready to be dispatched.
     dispatch_queue: Queue(DispatchRequest) = .{},
     /// Currently dispatched job requests waiting to be finished.
+    /// Keyed by job dispatch id.
     dispatched_jobs: std.AutoHashMapUnmanaged(u64, DispatchRequest) = .empty,
     /// In-flight workspace transfers, keyed by job dispatch id.
-    syncs: std.AutoHashMapUnmanaged(u64, *SyncTransfer) = .empty,
+    syncs: std.AutoHashMapUnmanaged(u64, *sync.Transfer) = .empty,
 
     pub fn init(io: std.Io, gpa: std.mem.Allocator) !*RemoteManager {
         const manager = try gpa.create(RemoteManager);
@@ -705,12 +566,18 @@ pub const RemoteManager = struct {
     ) error{ OutOfMemory, FrameTooLarge, Closed }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
         const workspace: protocol.WorkspaceMode = if (spec) |s| s.mode else .none;
+        // A push transfer precedes the job
+        const sync_precedes = if (spec) |s|
+            s.direction == .push or s.direction == .both
+        else
+            false;
 
         const run_job_payload = try protocol.serialize(self.gpa, .{ .run_job = .{
             .job_id = dispatch_id,
             .task_id = task_id,
             .job_name = job_name,
             .workspace = workspace,
+            .sync = sync_precedes,
             .steps = .fromSlice(steps),
         } });
         errdefer self.gpa.free(run_job_payload);
@@ -895,23 +762,13 @@ pub const RemoteManager = struct {
                     .data = data,
                 } });
             },
-            .job_finish => |m| {
-                const kv = self.dispatched_jobs.fetchRemove(m.job_id) orelse return;
-                var req = kv.value;
-                defer req.deinit(self.gpa);
-                const event = try self.makeJobFinishedEvent(
-                    req.task_id,
-                    req.dispatch_id,
-                    m.success,
-                    null,
-                    m.message,
-                    m.timestamp,
-                );
-                try self.emitEvent(event);
-            },
+            .job_finish => |m| try self.handleJobFinish(agent, m),
             .sync_ack => |m| self.handleSyncAck(agent, m),
             .file_req => |m| self.handleFileReq(agent, m),
-            .sync_begin, .manifest, .file_chunk, .file_done, .sync_end => {
+            .manifest => |m| self.handleSyncManifest(agent, m),
+            .file_chunk => |m| self.handleSyncChunk(agent, m),
+            .file_done => |m| self.handleSyncFileDone(agent, m),
+            .sync_begin, .sync_end => {
                 log.debug("Ignoring sync message '{s}'", .{
                     @tagName(std.meta.activeTag(msg)),
                 });
@@ -920,25 +777,62 @@ pub const RemoteManager = struct {
         }
     }
 
-    /// Complete a workspace transfer. Send `run_job` after an
+    fn handleJobFinish(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.JobEndMsg,
+    ) !void {
+        const kv = self.dispatched_jobs.fetchRemove(msg.job_id) orelse return;
+        var req = kv.value;
+        const spec = req.sync;
+
+        // TODO: pull on failure? a flag for deciding?
+        const wants_pull = msg.success and spec != null and
+            (spec.?.direction == .pull or spec.?.direction == .both);
+
+        // TODO: pull in ephemeral mode?
+        const pull = wants_pull and spec.?.mode == .persistent;
+        errdefer req.deinit(self.gpa);
+
+        const event = try self.makeJobFinishedEvent(
+            req.task_id,
+            req.dispatch_id,
+            msg.success,
+            null,
+            msg.message,
+            msg.timestamp,
+        );
+        try self.emitEvent(event);
+
+        if (!pull) {
+            req.deinit(self.gpa);
+            return;
+        }
+        // The dispatch entry stays tracked until the pull settles
+        self.dispatched_jobs.put(self.gpa, msg.job_id, req) catch {
+            req.deinit(self.gpa);
+            return;
+        };
+        self.startPull(agent, msg.job_id);
+    }
+
+    /// Complete a push workspace transfer. Send `run_job` after an
     /// affirmative ack or fail the dispatch.
     fn handleSyncAck(
         self: *RemoteManager,
         agent: *AgentHandle,
         msg: protocol.SyncAckMsg,
     ) void {
-        const st = self.syncs.get(msg.job_id) orelse return;
-        const fd = agent.connection.conn.stream.socket.handle;
-        if (st.agent_fd != fd) {
+        if (!self.syncs.contains(msg.job_id)) return;
+        const entry = self.dispatched_jobs.getPtr(msg.job_id) orelse return;
+        if (!entry.sentOver(agent.fd())) {
             log.warn("Ignoring sync ack for job {x} from a different agent", .{msg.job_id});
             return;
         }
-        if (!msg.ok) {
-            return self.failSyncedDispatch(
-                msg.job_id,
-                msg.message orelse "workspace transfer rejected",
-            );
-        }
+        if (!msg.ok) return self.failSyncedDispatch(
+            msg.job_id,
+            msg.message orelse "workspace transfer rejected",
+        );
         const taken = self.takeSync(msg.job_id) orelse return;
         defer taken.deinit(self.gpa);
         self.emitSyncTerminal(msg.job_id, taken, .finished);
@@ -952,30 +846,120 @@ pub const RemoteManager = struct {
         msg: protocol.FileReqMsg,
     ) void {
         const st = self.syncs.get(msg.job_id) orelse return;
-        const fd = agent.connection.conn.stream.socket.handle;
-        if (st.agent_fd != fd) return;
-        // An agent-driven transfer only moves when requests arrive, so
-        // each one keeps the stall reaper off an idle-waiting producer.
-        st.touch();
-        // The producer owns the queued path once it pops it.
-        const copy = self.gpa.dupe(u8, msg.path) catch {
-            return self.failSyncedDispatchErr(
+        const entry = self.dispatched_jobs.getPtr(msg.job_id) orelse return;
+        if (!entry.sentOver(agent.fd())) return;
+        st.pushRequest(msg.path) catch |err| switch (err) {
+            error.Closed => {}, // the transfer is being torn down
+            error.OutOfMemory => self.failSyncedDispatchErr(
                 msg.job_id,
                 "failed to queue the file request",
                 error.OutOfMemory,
-            );
+            ),
         };
-        st.inbox.append(self.gpa, copy) catch |err| switch (err) {
-            error.Closed => self.gpa.free(copy), // the transfer is being torn down
-            error.OutOfMemory => {
-                self.gpa.free(copy);
-                self.failSyncedDispatchErr(
-                    msg.job_id,
-                    "failed to queue the file request",
-                    error.OutOfMemory,
-                );
-            },
+    }
+
+    /// Accept one page of a pull transfer's manifest, then pump it.
+    fn handleSyncManifest(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.ManifestMsg,
+    ) void {
+        const st = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring manifest for unknown sync {x}", .{msg.job_id});
+            return;
         };
+        if (st.receiver() == null) {
+            log.debug("Ignoring manifest for transfer {x} without a receiver", .{msg.job_id});
+            return;
+        }
+        const entry = self.dispatched_jobs.getPtr(msg.job_id) orelse return;
+        if (!entry.sentOver(agent.fd())) return;
+        st.receive(.{ .page = .{
+            .total_entries = msg.total_entries,
+            .entries = msg.entries,
+        } });
+    }
+
+    /// Write one file chunk of a pull transfer into its destination.
+    fn handleSyncChunk(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.FileChunkMsg,
+    ) void {
+        const st = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring file chunk for unknown sync {x}", .{msg.job_id});
+            return;
+        };
+        if (st.receiver() == null) {
+            log.debug("Ignoring file chunk for transfer {x} without a receiver", .{msg.job_id});
+            return;
+        }
+        const entry = self.dispatched_jobs.getPtr(msg.job_id) orelse return;
+        if (!entry.sentOver(agent.fd())) return;
+        st.receive(.{ .chunk = .{
+            .path = msg.path,
+            .offset = msg.offset,
+            .data = msg.data,
+        } });
+    }
+
+    /// Complete one file of a pull transfer, then pump it.
+    fn handleSyncFileDone(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        msg: protocol.FileDoneMsg,
+    ) void {
+        const st = self.syncs.get(msg.job_id) orelse {
+            log.debug("Ignoring file_done for unknown sync {x}", .{msg.job_id});
+            return;
+        };
+        if (st.receiver() == null) {
+            log.debug("Ignoring file_done for transfer {x} without a receiver", .{msg.job_id});
+            return;
+        }
+        const entry = self.dispatched_jobs.getPtr(msg.job_id) orelse return;
+        if (!entry.sentOver(agent.fd())) return;
+        st.receive(.{ .done = .{
+            .path = msg.path,
+            .permissions = msg.permissions,
+            .hash = msg.hash,
+        } });
+    }
+
+    /// Settle a pull transfer. Commit the receiver, report the
+    /// outcome and tell the agent's sender to stop.
+    fn settlePull(self: *RemoteManager, job_id: u64, st: *sync.Transfer) void {
+        const kv = self.syncs.fetchRemove(job_id) orelse return;
+        std.debug.assert(kv.value == st);
+        defer st.deinit(self.gpa);
+        const recv = st.receiver() orelse return;
+        const ok = recv.commit();
+
+        self.emitSyncTerminal(job_id, st, if (ok) .finished else .failed);
+
+        const entry = self.dispatched_jobs.fetchRemove(job_id) orelse return;
+        defer entry.value.deinit(self.gpa);
+        const fd = entry.value.agent_fd orelse return;
+        if (self.agents.getPtr(fd)) |agent| if (ok)
+            self.sendSyncEnd(agent, job_id)
+        else
+            self.sendCancelJob(agent, job_id);
+    }
+
+    /// Tell the agent a pull transfer is done and its sender can stop.
+    fn sendSyncEnd(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const payload = protocol.serialize(self.gpa, .{
+            .sync_end = .{ .job_id = job_id },
+        }) catch return;
+        self.sendMessageOwned(agent, payload) catch self.gpa.free(payload);
+    }
+
+    /// Tell the agent to cancel a job, tearing down its transfer.
+    fn sendCancelJob(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const payload = protocol.serialize(self.gpa, .{
+            .cancel_job = .{ .job_id = job_id },
+        }) catch return;
+        self.sendMessageOwned(agent, payload) catch self.gpa.free(payload);
     }
 
     /// Find if a connected and registered agent exists with the name
@@ -1064,7 +1048,7 @@ pub const RemoteManager = struct {
         var sync_it = self.syncs.iterator();
         while (sync_it.next()) |entry| {
             const st = entry.value_ptr.*;
-            const stall_at = st.last_progress_ms.load(.acquire) + SYNC_STALL_TIMEOUT_MS;
+            const stall_at = st.lastActivityMs() + SYNC_STALL_TIMEOUT_MS;
             min.set(stall_at);
         }
         const deadline = min.time orelse {
@@ -1084,13 +1068,14 @@ pub const RemoteManager = struct {
         req: DispatchRequest,
     ) !void {
         var dispatched = req;
-        dispatched.agent_fd = agent.connection.conn.stream.socket.handle;
+        dispatched.agent_fd = agent.fd();
         self.dispatched_jobs.put(self.gpa, dispatched.dispatch_id, dispatched) catch |err| {
             dispatched.deinit(self.gpa);
             return err;
         };
-        // Sync the workspace before dispatching
-        if (dispatched.sync != null) {
+        // Sync the workspace before dispatching. A pull-only spec runs
+        // the job right away.
+        if (dispatched.sync != null and dispatched.sync.?.direction != .pull) {
             self.startSync(agent, dispatched.dispatch_id);
             return;
         }
@@ -1128,28 +1113,93 @@ pub const RemoteManager = struct {
         self.emitEvent(event) catch {};
     }
 
-    /// Start the workspace transfer of a dispatched job.
-    fn startSync(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
-        const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
-        const spec = entry.sync orelse return;
+    /// Create and track the workspace transfer of a dispatched job.
+    fn trackSyncTransfer(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        entry: *const DispatchRequest,
+    ) !*sync.Transfer {
+        const job_id = entry.dispatch_id;
+        const spec = entry.sync orelse return error.NoSyncSpec;
 
-        const st = SyncTransfer.start(
-            self.io,
-            self.gpa,
-            &agent.workers.outbox,
-            agent.connection.conn.stream.socket.handle,
-            job_id,
-            entry.task_id,
-            spec,
-        ) catch |err| return self.failSyncedDispatchErr(
-            job_id,
-            "failed to start the workspace transfer",
-            err,
-        );
-        self.syncs.put(self.gpa, job_id, st) catch {
-            st.deinit(self.gpa);
-            return self.failSyncedDispatch(job_id, "out of memory");
+        const st = blk: {
+            const wire_link = try sync.WireLink.init(
+                self.gpa,
+                &agent.workers.outbox,
+                job_id,
+            );
+            errdefer wire_link.deinit();
+
+            const label = try self.gpa.create(SyncLabel);
+            errdefer self.gpa.destroy(label);
+            label.* = .{
+                .gpa = self.gpa,
+                .manager = self,
+                .task_id = try self.gpa.dupe(u8, entry.task_id),
+                .mode = spec.mode,
+                .direction = spec.direction,
+            };
+            errdefer self.gpa.free(label.task_id);
+
+            break :blk try sync.Transfer.init(
+                self.io,
+                self.gpa,
+                try self.transferRoles(entry),
+                .{
+                    .id = job_id,
+                    .link = wire_link.link(),
+                    .serve = if (spec.mode == .persistent) .requests else .stream,
+                    .progress_interval_ms = SYNC_PROGRESS_INTERVAL_MS,
+                    .state = label,
+                    .state_deinit = SyncLabel.free,
+                    .hooks = .{
+                        .ptr = self,
+                        .progress_ptr = label,
+                        .settle = syncSettleHook,
+                        .producer_done = syncProducerDoneHook,
+                        .progress = syncProgressHook,
+                    },
+                },
+            );
         };
+        errdefer st.deinit(self.gpa);
+        try self.syncs.put(self.gpa, job_id, st);
+        return st;
+    }
+
+    /// Build the roles of a transfer from the dispatch's sync spec.
+    fn transferRoles(
+        self: *RemoteManager,
+        entry: *const DispatchRequest,
+    ) !sync.Transfer.Roles {
+        const spec = entry.sync orelse return error.NoSyncSpec;
+        switch (spec.direction) {
+            .push => return .{
+                .sender = try .init(self.io, self.gpa, spec.root, spec.exclude),
+            },
+            .pull => {
+                var ws = try sync.openDestination(self.io, self.gpa, spec.root);
+                errdefer ws.deinit();
+                return .{ .receiver = try .init(self.io, self.gpa, ws, .{
+                    .task_id = entry.task_id,
+                    .job_name = entry.job_name,
+                    .exclude = .fromSlice(spec.exclude),
+                    .deletes = false,
+                }) };
+            },
+            .both => return error.UnsupportedDirection,
+        }
+    }
+
+    /// Announce the tracked transfer of a dispatched job. Emit the
+    /// `started` event and send `sync_begin`.
+    fn announceSyncTransfer(
+        self: *RemoteManager,
+        agent: *AgentHandle,
+        entry: *const DispatchRequest,
+    ) !void {
+        const job_id = entry.dispatch_id;
+        const spec = entry.sync orelse return error.NoSyncSpec;
 
         self.emitSyncEvent(
             entry.task_id,
@@ -1169,35 +1219,66 @@ pub const RemoteManager = struct {
             .{ job_id, entry.task_id, entry.job_name, spec.root, @tagName(spec.mode), @tagName(spec.direction) },
         );
 
-        const begin = protocol.serialize(self.gpa, .{ .sync_begin = .{
+        const begin = try protocol.serialize(self.gpa, .{ .sync_begin = .{
             .job_id = job_id,
             .task_id = entry.task_id,
             .job_name = entry.job_name,
             .mode = spec.mode,
             .direction = spec.direction,
             .exclude = .fromSlice(spec.exclude),
-        } }) catch return self.failSyncedDispatch(job_id, "out of memory");
-        self.sendMessageOwned(agent, begin) catch |err| {
-            self.gpa.free(begin);
-            return self.failSyncedDispatchErr(
+        } });
+        errdefer self.gpa.free(begin);
+        try self.sendMessageOwned(agent, begin);
+    }
+
+    /// Start the pre-job workspace transfer of a dispatched job.
+    fn startSync(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
+        if (entry.sync == null) return;
+
+        const st = self.trackSyncTransfer(agent, entry) catch |err|
+            return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
+        self.announceSyncTransfer(agent, entry) catch |err|
+            return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
+
+        if (st.sender() != null) {
+            st.spawnProducer() catch |err| return self.failSyncedDispatchErr(
                 job_id,
-                "failed to send sync_begin",
+                "failed to start the workspace transfer worker",
                 err,
             );
-        };
-
-        // The producer thread owns the transfer's sending role;
-        // receiver-only transfers (pull) are driven by the manager loop
-        // instead and spawn no thread.
-        if (st.session.sender != null) {
-            st.thread = std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, self }) catch |err| {
-                return self.failSyncedDispatchErr(
-                    job_id,
-                    "failed to start the workspace transfer worker",
-                    err,
-                );
-            };
         }
+    }
+
+    /// Start the post-job pull transfer of a finished job.
+    fn startPull(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+        const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
+        const spec = entry.sync orelse return;
+
+        entry.pulling = true;
+        _ = self.trackSyncTransfer(agent, entry) catch |err| {
+            log.warn(
+                "Workspace pull for job '{s}' ({x}) failed to start: {s}",
+                .{ entry.job_name, job_id, @errorName(err) },
+            );
+            self.emitSyncEvent(
+                entry.task_id,
+                job_id,
+                spec.mode,
+                spec.direction,
+                .failed,
+                0,
+                0,
+                null,
+                null,
+                0,
+            );
+            if (self.dispatched_jobs.fetchRemove(job_id)) |kv|
+                kv.value.deinit(self.gpa);
+            return;
+        };
+        self.announceSyncTransfer(agent, entry) catch |err|
+            return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
     }
 
     /// Emit one sync progress event.
@@ -1233,52 +1314,53 @@ pub const RemoteManager = struct {
     fn emitSyncTerminal(
         self: *RemoteManager,
         job_id: u64,
-        st: *const SyncTransfer,
+        st: *const sync.Transfer,
         phase: SyncPhase,
     ) void {
-        const sender = st.session.sender orelse return;
         const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
         const spec = entry.sync orelse return;
+        const p = st.progress();
         self.emitSyncEvent(
             entry.task_id,
             job_id,
             spec.mode,
             spec.direction,
             phase,
-            sender.files,
-            sender.bytes,
-            sender.files_total,
-            sender.bytes_total,
-            std.Io.Timestamp.now(self.io, .awake).toMilliseconds() - st.start_ms,
+            p.files,
+            p.bytes,
+            p.files_total,
+            p.bytes_total,
+            p.elapsed_ms,
         );
     }
 
     /// Fail transfers whose producer thread reported a failure.
     fn sweepSyncs(self: *RemoteManager) void {
         while (true) {
-            const Target: type = struct { job_id: u64, st: *SyncTransfer };
+            const Target: type = struct { job_id: u64, st: *sync.Transfer };
             var it = self.syncs.iterator();
             const next: ?Target = blk: while (it.next()) |entry| {
                 const st = entry.value_ptr.*;
-                if (st.status.load(.acquire) == .failed) {
+                if (st.producer.status.load(.acquire) == .failed) {
                     break :blk .{ .job_id = entry.key_ptr.*, .st = st };
                 }
             } else null;
             const target = next orelse return;
+            const failure = target.st.producer.reportedFailure() orelse continue;
             self.failSyncedDispatchErr(
                 target.job_id,
-                target.st.failure_msg,
-                target.st.failure_err,
+                failure.message,
+                failure.err,
             );
         }
     }
 
     /// Whether the agent has an in-flight workspace transfer.
     fn agentBusySync(self: *RemoteManager, agent: *const AgentHandle) bool {
-        const fd = agent.connection.conn.stream.socket.handle;
         var it = self.syncs.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.*.agent_fd == fd) return true;
+            const owner = self.dispatched_jobs.getPtr(entry.key_ptr.*) orelse continue;
+            if (owner.sentOver(agent.fd())) return true;
         }
         return false;
     }
@@ -1286,7 +1368,7 @@ pub const RemoteManager = struct {
     /// Remove the transfer of a job and stop its producer thread.
     ///
     /// Returns the stopped transfer for the caller to emit and free.
-    fn takeSync(self: *RemoteManager, job_id: u64) ?*SyncTransfer {
+    fn takeSync(self: *RemoteManager, job_id: u64) ?*sync.Transfer {
         const kv = self.syncs.fetchRemove(job_id) orelse return null;
         const st = kv.value;
         st.requestStop();
@@ -1302,8 +1384,9 @@ pub const RemoteManager = struct {
             var it = self.syncs.iterator();
             const stalled: ?Stalled = blk: while (it.next()) |entry| {
                 const st = entry.value_ptr.*;
-                if (now_ms >= st.last_progress_ms.load(.acquire) + SYNC_STALL_TIMEOUT_MS) {
-                    break :blk .{ .job_id = entry.key_ptr.*, .agent_fd = st.agent_fd };
+                if (now_ms >= st.lastActivityMs() + SYNC_STALL_TIMEOUT_MS) {
+                    const owner = self.dispatched_jobs.getPtr(entry.key_ptr.*) orelse continue;
+                    break :blk .{ .job_id = entry.key_ptr.*, .agent_fd = owner.agent_fd orelse continue };
                 }
             } else null;
             const target = stalled orelse return;
@@ -1347,14 +1430,11 @@ pub const RemoteManager = struct {
             });
         }
         // Tell the agent to tear the job as well
-        if (self.findAgent(req.agent)) |agent| {
-            const payload = protocol.serialize(self.gpa, .{
-                .cancel_job = .{ .job_id = job_id },
-            }) catch null;
-            if (payload) |frame| self.sendMessageOwned(agent, frame) catch {
-                self.gpa.free(frame);
-            };
-        }
+        if (self.findAgent(req.agent)) |agent| self.sendCancelJob(agent, job_id);
+
+        // A pull runs post-job
+        if (req.pulling) return;
+
         const event = self.makeJobFinishedEvent(
             req.task_id,
             req.dispatch_id,
@@ -1541,7 +1621,8 @@ pub const RemoteManager = struct {
         while (true) {
             var sync_it = self.syncs.iterator();
             const sync_id: ?u64 = blk: while (sync_it.next()) |entry| {
-                if (entry.value_ptr.*.agent_fd != fd) continue;
+                const owner = self.dispatched_jobs.getPtr(entry.key_ptr.*) orelse continue;
+                if (!owner.sentOver(fd)) continue;
                 break :blk entry.key_ptr.*;
             } else null;
             const job_id = sync_id orelse break;
@@ -1559,6 +1640,10 @@ pub const RemoteManager = struct {
                 break :blk entry.key_ptr.*;
             } else break;
             const req = self.dispatched_jobs.fetchRemove(job_id) orelse continue;
+            if (req.value.pulling) {
+                req.value.deinit(self.gpa);
+                continue;
+            }
             if (req.value.sync != null and req.value.run_job_payload != null) {
                 self.failInterruptedSync(req.value);
             } else {
@@ -1663,9 +1748,9 @@ test "sync_transfer_thread_queues_frames_in_order" {
     var agent = try FakeAgent.init(io, gpa, protocol.SYNC_CHUNK_SIZE + 512);
     defer agent.deinit(gpa);
 
-    const st = try testTransfer(io, gpa, agent.writer, source_root, 7, fdHandle(1));
+    const st = try testTransfer(io, gpa, agent.writer, source_root, 7);
     try manager.syncs.put(manager.gpa, 7, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+    try st.spawnProducer();
 
     // Drain frames while the producer runs
     var frames: std.ArrayList([]u8) = .empty;
@@ -1674,7 +1759,7 @@ test "sync_transfer_thread_queues_frames_in_order" {
         frames.deinit(gpa);
     }
     var waited: usize = 0;
-    while (st.status.load(.acquire) == .running) {
+    while (st.producer.status.load(.acquire) == .running) {
         try expect(waited < 5000);
         waited += 1;
         while (agent.writer.send_queue.tryPop()) |frame|
@@ -1684,8 +1769,8 @@ test "sync_transfer_thread_queues_frames_in_order" {
     while (agent.writer.send_queue.tryPop()) |frame|
         try frames.append(gpa, frame);
 
-    try expect(st.status.load(.acquire) == .ended);
-    try expect(st.session.sender.?.pending == null);
+    try expect(st.producer.status.load(.acquire) == .ended);
+    try expect(st.sender().?.pending == null);
     // 3 chunk frames + file_done + manifest page + sync_end
     try expect(frames.items.len == 6);
 
@@ -1745,17 +1830,16 @@ test "sync_transfer_persistent_serves_requests" {
     var agent = try FakeAgent.init(io, gpa, 4 * 1024 * 1024);
     defer agent.deinit(gpa);
 
-    const st = try SyncTransfer.start(
+    const st = try testTransferServe(
         io,
         gpa,
         agent.writer,
-        fdHandle(2),
+        source_root,
         8,
-        "persist-task",
-        .{ .root = source_root, .mode = .persistent, .direction = .push },
+        .requests,
     );
     try manager.syncs.put(manager.gpa, 8, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+    try st.spawnProducer();
 
     // Drain frames until the manifest page arrived
     var frames: std.ArrayList([]u8) = .empty;
@@ -1777,11 +1861,13 @@ test "sync_transfer_persistent_serves_requests" {
     }
 
     // Ask for both files
-    try st.inbox.append(gpa, try gpa.dupe(u8, "small.txt"));
-    try st.inbox.append(gpa, try gpa.dupe(u8, "big.bin"));
+    if (st.inbox) |*inbox| {
+        try inbox.append(gpa, try gpa.dupe(u8, "small.txt"));
+        try inbox.append(gpa, try gpa.dupe(u8, "big.bin"));
+    }
 
     waited = 0;
-    while (st.session.sender.?.files < 2) {
+    while (st.sender().?.files < 2) {
         try expect(waited < 5000);
         waited += 1;
         while (agent.writer.send_queue.tryPop()) |frame|
@@ -1793,7 +1879,7 @@ test "sync_transfer_persistent_serves_requests" {
 
     st.requestStop();
     st.join();
-    try expect(st.status.load(.acquire) == .running);
+    try expect(st.producer.status.load(.acquire) == .running);
     try expect(manager.syncs.count() == 1);
 
     // Persistent mode queues the manifest pages first, then only the
@@ -1827,8 +1913,72 @@ test "sync_transfer_persistent_serves_requests" {
         }
     }
     try expect(seen_small and seen_big);
-    try expect(st.session.sender.?.files_total.? == 2);
-    try expect(st.session.sender.?.bytes_total.? == 4 + content.len);
+    try expect(st.sender().?.files_total.? == 2);
+    try expect(st.sender().?.bytes_total.? == 4 + content.len);
+}
+
+test "pull_disconnect_reports_only_the_sync_terminal" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    // A destination root with one file
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dest_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "out.txt", "output");
+    defer gpa.free(dest_root);
+
+    var sink = testutil.RemoteEventSink.init(io, gpa);
+    defer sink.deinit();
+
+    const manager = try RemoteManager.init(io, gpa);
+    defer manager.deinit();
+    manager.setEventSink(.{ .ptr = &sink, .emit = testutil.RemoteEventSink.emit });
+
+    // Standalone writer for a transfer without a live connection
+    const writer = try gpa.create(Connection.Writer);
+    writer.* = .init(io, gpa, undefined);
+    defer {
+        writer.deinit();
+        gpa.destroy(writer);
+    }
+
+    const st = try testPullTransfer(io, gpa, writer, dest_root, 7);
+    try manager.syncs.put(manager.gpa, 7, st);
+    try manager.dispatched_jobs.put(manager.gpa, 7, .{
+        .dispatch_id = 7,
+        .task_id = try manager.gpa.dupe(u8, "pull-task"),
+        .job_name = try manager.gpa.dupe(u8, "build"),
+        .agent = .{ .name = try manager.gpa.dupe(u8, "runner1") },
+        .sync = .{
+            .root = try manager.gpa.dupe(u8, dest_root),
+            .mode = .persistent,
+            .direction = .pull,
+        },
+        .agent_fd = fdHandle(1),
+        // The job finished and its result was emitted before the pull
+        .pulling = true,
+    });
+
+    manager.failJobsForAgent(fdHandle(1));
+    try expect(manager.syncs.count() == 0);
+    try expect(manager.dispatched_jobs.count() == 0);
+
+    // The pull reports its own terminal event; no job result is
+    // emitted a second time.
+    var saw_failed = false;
+    while (sink.queue.pop()) |event| {
+        defer event.deinit(gpa);
+        switch (event) {
+            .sync_progress => |p| {
+                try expect(p.phase == .failed);
+                try expect(p.direction == .pull);
+                saw_failed = true;
+            },
+            .job_finished => return error.Unexpected,
+            else => {},
+        }
+    }
+    try expect(saw_failed);
 }
 
 test "sync_transfer_persistent_multi_page_manifest" {
@@ -1858,17 +2008,16 @@ test "sync_transfer_persistent_multi_page_manifest" {
     var agent = try FakeAgent.init(io, gpa, 4 * 1024 * 1024);
     defer agent.deinit(gpa);
 
-    const st = try SyncTransfer.start(
+    const st = try testTransferServe(
         io,
         gpa,
         agent.writer,
-        fdHandle(4),
+        source_root,
         9,
-        "pages-task",
-        .{ .root = source_root, .mode = .persistent, .direction = .push },
+        .requests,
     );
     try manager.syncs.put(manager.gpa, 9, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+    try st.spawnProducer();
 
     // Drain frames until every manifest page arrived
     var frames: std.ArrayList([]u8) = .empty;
@@ -1921,10 +2070,10 @@ test "sync_transfer_persistent_multi_page_manifest" {
 
     // Serve every declared path through the request inbox
     for (declared_paths.items) |path|
-        try st.inbox.append(gpa, try gpa.dupe(u8, path));
+        if (st.inbox) |*inbox| try inbox.append(gpa, try gpa.dupe(u8, path));
 
     waited = 0;
-    while (st.session.sender.?.files < count) {
+    while (st.sender().?.files < count) {
         try expect(waited < 5000);
         waited += 1;
         while (agent.writer.send_queue.tryPop()) |frame|
@@ -1936,7 +2085,7 @@ test "sync_transfer_persistent_multi_page_manifest" {
 
     st.requestStop();
     st.join();
-    try expect(st.status.load(.acquire) == .running);
+    try expect(st.producer.status.load(.acquire) == .running);
 
     // Every requested file was served exactly once and the transfer
     // still never sends sync_end.
@@ -1952,8 +2101,8 @@ test "sync_transfer_persistent_multi_page_manifest" {
     }
     try expect(done_count == count);
     try expect(sync_end_count == 0);
-    try expect(st.session.sender.?.files_total.? == count);
-    try expect(st.session.sender.?.bytes_total.? == count);
+    try expect(st.sender().?.files_total.? == count);
+    try expect(st.sender().?.bytes_total.? == count);
 }
 
 test "sync_transfer_fails_on_closed_queue" {
@@ -1982,12 +2131,12 @@ test "sync_transfer_fails_on_closed_queue" {
 
     try putTestDispatch(manager, 7, source_root, fdHandle(1));
 
-    const st = try testTransfer(io, gpa, agent.writer, source_root, 7, fdHandle(1));
+    const st = try testTransfer(io, gpa, agent.writer, source_root, 7);
     try manager.syncs.put(manager.gpa, 7, st);
-    st.thread = try std.Thread.spawn(.{}, SyncTransfer.produce, .{ st, manager });
+    try st.spawnProducer();
 
     var waited: usize = 0;
-    while (st.session.sender.?.pending == null) {
+    while (st.sender().?.pending == null) {
         try expect(waited < 5000);
         waited += 1;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
@@ -1997,12 +2146,12 @@ test "sync_transfer_fails_on_closed_queue" {
     // the sweep removes the transfer and fails the dispatch.
     agent.writer.closeQueue();
     waited = 0;
-    while (st.status.load(.acquire) == .running) {
+    while (st.producer.status.load(.acquire) == .running) {
         try expect(waited < 5000);
         waited += 1;
         try std.Io.sleep(io, .fromMilliseconds(1), .awake);
     }
-    try expect(st.status.load(.acquire) == .failed);
+    try expect(st.producer.status.load(.acquire) == .failed);
 
     manager.sweepSyncs();
     try expect(manager.syncs.count() == 0);
@@ -2022,17 +2171,52 @@ fn testTransfer(
     writer: *Connection.Writer,
     source_root: []const u8,
     job_id: u64,
-    agent_fd: std.Io.net.Socket.Handle,
-) !*SyncTransfer {
-    return SyncTransfer.start(
-        io,
-        gpa,
-        writer,
-        agent_fd,
-        job_id,
-        "stall-task",
-        .{ .root = source_root, .mode = .ephemeral, .direction = .push },
-    );
+) !*sync.Transfer {
+    return testTransferServe(io, gpa, writer, source_root, job_id, .stream);
+}
+
+/// Create one push transfer with an explicit serving model.
+fn testTransferServe(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    writer: *Connection.Writer,
+    source_root: []const u8,
+    job_id: u64,
+    serve: sync.Transfer.Serve,
+) !*sync.Transfer {
+    const wire_link = try sync.WireLink.init(gpa, writer, job_id);
+    const st = try sync.Transfer.init(io, gpa, .{
+        .sender = try sync.Sender.init(io, gpa, source_root, &.{}),
+    }, .{
+        .id = job_id,
+        .link = wire_link.link(),
+        .serve = serve,
+    });
+    return st;
+}
+
+/// Create one pull transfer collecting into `dest_root`.
+fn testPullTransfer(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    writer: *Connection.Writer,
+    dest_root: []const u8,
+    job_id: u64,
+) !*sync.Transfer {
+    const wire_link = try sync.WireLink.init(gpa, writer, job_id);
+    var ws = try sync.openDestination(io, gpa, dest_root);
+    errdefer ws.deinit();
+    const st = try sync.Transfer.init(io, gpa, .{
+        .receiver = try sync.Receiver.init(io, gpa, ws, .{
+            .task_id = "pull-task",
+            .job_name = "build",
+            .deletes = false,
+        }),
+    }, .{
+        .id = job_id,
+        .link = wire_link.link(),
+    });
+    return st;
 }
 
 /// A fake agent with a bounded writer queue and no worker threads.
@@ -2140,19 +2324,19 @@ test "sync_stall_reaper_fails_and_disconnects" {
 
     try putTestDispatch(manager, 7, source_root, agent_fd);
 
-    const stalled = try testTransfer(io, gpa, &workers.outbox, source_root, 7, agent_fd);
+    const stalled = try testTransfer(io, gpa, &workers.outbox, source_root, 7);
     try manager.syncs.put(manager.gpa, 7, stalled);
 
-    const unacked = try testTransfer(io, gpa, writer2, source_root, 8, fdHandle(2));
+    const unacked = try testTransfer(io, gpa, writer2, source_root, 8);
     try manager.syncs.put(manager.gpa, 8, unacked);
     try putTestDispatch(manager, 8, source_root, fdHandle(2));
 
-    const fresh = try testTransfer(io, gpa, writer3, source_root, 9, fdHandle(3));
+    const fresh = try testTransfer(io, gpa, writer3, source_root, 9);
     try manager.syncs.put(manager.gpa, 9, fresh);
 
     const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
-    stalled.last_progress_ms.store(now_ms - SYNC_STALL_TIMEOUT_MS - 1, .release);
-    unacked.last_progress_ms.store(now_ms - SYNC_STALL_TIMEOUT_MS - 1, .release);
+    stalled.last_activity_ms.store(now_ms - SYNC_STALL_TIMEOUT_MS - 1, .release);
+    unacked.last_activity_ms.store(now_ms - SYNC_STALL_TIMEOUT_MS - 1, .release);
 
     manager.reapStalledSyncs();
 

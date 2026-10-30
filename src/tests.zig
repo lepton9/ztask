@@ -36,6 +36,26 @@ fn findTask(tasks: []snap.UiTaskSnap, task_id: []const u8) ?*snap.UiTaskSnap {
     return null;
 }
 
+/// Wait for a sync progress event in the given phase, skipping the
+/// other events and phases.
+fn waitSyncPhase(
+    events: *testutil.RemoteEventSink,
+    io: std.Io,
+    phase: remote_manager.SyncPhase,
+) !remote_manager.RemoteEvent {
+    var waited: usize = 0;
+    while (true) {
+        while (events.queue.pop()) |event| {
+            const matched = event == .sync_progress and event.sync_progress.phase == phase;
+            if (matched) return event;
+            event.deinit(events.gpa);
+        }
+        try expect(waited < 300);
+        waited += 1;
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+}
+
 test "task_to_yaml_parsed" {
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -753,6 +773,113 @@ test "remote_sync_persistent_abort_recovers_on_next_run" {
     try expectWorkspaceFile(io, gpa, ws_root, "b.txt", "abc", declared_mtime);
 }
 
+test "remote_sync_pull_disconnect_tears_down_and_reconnects" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    const fx = try testutil.AgentServer.start(&env, .{});
+    defer fx.deinit();
+
+    const task_id = "pull-agent";
+    const job_name = "build";
+    const declared_mtime: i64 = 1_700_000_000_000;
+    const ws_root = try env.workspacePath(task_id, job_name);
+    defer gpa.free(ws_root);
+
+    // The persistent workspace the pull serves from
+    try std.Io.Dir.cwd().createDirPath(io, ws_root);
+    var ws_dir = try sync.fs.Directory.init(io, gpa, ws_root);
+    defer ws_dir.deinit();
+    var file = try ws_dir.openWrite("out.txt");
+    defer file.deinit();
+    try file.writeAt(0, "output");
+    try file.finish(0o644);
+    try ws_dir.setMtime("out.txt", declared_mtime);
+
+    const conn = try fx.acceptConn();
+    defer conn.deinit();
+
+    // The pull's producer queues the manifest, then serves the file
+    // requested by the manager.
+    const job_id: u64 = 500;
+    try conn.send(.{ .sync_begin = .{
+        .job_id = job_id,
+        .task_id = task_id,
+        .job_name = job_name,
+        .mode = .persistent,
+        .direction = .pull,
+        .exclude = .{},
+    } });
+    const manifest = try conn.expectNextMsg(.manifest);
+    defer manifest.deinit();
+    try expect(manifest.msg.manifest.job_id == job_id);
+    try expect(manifest.msg.manifest.total_entries == 1);
+
+    try conn.send(.{ .file_req = .{
+        .job_id = job_id,
+        .path = "out.txt",
+        .offset = 0,
+    } });
+    const chunk = try conn.expectNextMsg(.file_chunk);
+    defer chunk.deinit();
+    try expectEqualStrings("out.txt", chunk.msg.file_chunk.path);
+    const done = try conn.expectNextMsg(.file_done);
+    defer done.deinit();
+    try expectEqualStrings("out.txt", done.msg.file_done.path);
+
+    // Drop the connection mid-transfer. The agent must stop the pull's
+    // producer and free the transfer with the dying connection,
+    // leaving the persistent workspace untouched.
+    conn.close();
+
+    var waited: usize = 0;
+    while (fx.agent.syncs.count() != 0) {
+        try expect(waited < 500);
+        waited += 1;
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+    try testutil.expectWorkspaceFile(io, gpa, ws_root, "out.txt", "output", declared_mtime);
+
+    // The reconnect is clean: a fresh pull over the new connection
+    // serves the file again and the manager settles it with sync_end.
+    const conn2 = try fx.acceptConn();
+    defer conn2.deinit();
+
+    const job_id2: u64 = 501;
+    try conn2.send(.{ .sync_begin = .{
+        .job_id = job_id2,
+        .task_id = task_id,
+        .job_name = job_name,
+        .mode = .persistent,
+        .direction = .pull,
+        .exclude = .{},
+    } });
+    const manifest2 = try conn2.expectNextMsg(.manifest);
+    defer manifest2.deinit();
+
+    try conn2.send(.{ .file_req = .{
+        .job_id = job_id2,
+        .path = "out.txt",
+        .offset = 0,
+    } });
+    const chunk2 = try conn2.expectNextMsg(.file_chunk);
+    defer chunk2.deinit();
+    const done2 = try conn2.expectNextMsg(.file_done);
+    defer done2.deinit();
+
+    try conn2.send(.{ .sync_end = .{ .job_id = job_id2 } });
+
+    waited = 0;
+    while (fx.agent.syncs.count() != 0) {
+        try expect(waited < 500);
+        waited += 1;
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+    try expect(fx.agent.isIdle());
+}
+
 test "remote_sync_persistent_multi_page_diff" {
     var env: TestEnv = try .init();
     defer env.deinit();
@@ -1121,6 +1248,194 @@ test "remote_sync_persistent_interrupted_by_disconnect" {
     agent2.stop();
     agent2_thread.join();
     try expect(agent2.isIdle());
+}
+
+test "remote_sync_pull_collects_job_outputs" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // The push-seeded agent workspace content
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "hello.txt", "world");
+    defer gpa.free(source_root);
+
+    // The pull destination holds an unrelated local file
+    const dest_root = try std.fs.path.join(gpa, &.{ env.path, "pulled" });
+    defer gpa.free(dest_root);
+    try std.Io.Dir.cwd().createDirPath(io, dest_root);
+    const local_path = try std.fs.path.join(gpa, &.{ dest_root, "local.txt" });
+    defer gpa.free(local_path);
+    try data.writeFile(io, local_path, "mine", .{ .truncate = true });
+
+    var events = testutil.RemoteEventSink.init(io, gpa);
+    defer events.deinit();
+
+    var remote = try remote_manager.RemoteManager.init(io, gpa);
+    defer remote.deinit();
+    remote.setEventSink(.{ .ptr = &events, .emit = testutil.RemoteEventSink.emit });
+    try remote.start(try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
+    defer agent.deinit();
+    try agent.connect(remote.getAddress().?);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    try testutil.waitAgentRegistered(io, remote);
+
+    const agent_spec = task_types.RemoteRunSpec{ .name = "runner1" };
+
+    // Seed the persistent agent workspace with a push
+    const seed_steps = [_]task_types.Step{.{ .command = .{ .value = "test -f hello.txt" } }};
+    _ = try remote.pushDispatch(
+        "collect-task",
+        "build",
+        agent_spec,
+        &seed_steps,
+        .{ .root = source_root, .mode = .persistent, .direction = .push },
+    );
+    var seeded = try events.waitJobFinished(io);
+    defer seeded.deinit(gpa);
+    try expect(seeded.job_finished.success);
+    // Drop the seed run's sync events so the pull's are read fresh
+    while (events.queue.pop()) |event| event.deinit(gpa);
+
+    // The pull runs the job right away and collects its outputs
+    const pull_steps = [_]task_types.Step{.{ .command = .{ .value = "cp hello.txt out.txt" } }};
+    const dispatch1 = try remote.pushDispatch(
+        "collect-task",
+        "build",
+        agent_spec,
+        &pull_steps,
+        .{ .root = dest_root, .mode = .persistent, .direction = .pull },
+    );
+    var ran1 = try events.waitJobFinished(io);
+    defer ran1.deinit(gpa);
+    try expect(ran1.job_finished.success);
+    try expect(ran1.job_finished.dispatch_id == dispatch1);
+
+    var pulled1 = try waitSyncPhase(&events, io, .finished);
+    defer pulled1.deinit(gpa);
+    try expect(pulled1.sync_progress.direction == .pull);
+    try expect(pulled1.sync_progress.mode == .persistent);
+    // Both the seeded file and the new output are missing locally
+    try expect(pulled1.sync_progress.files_done == 2);
+    try expect(pulled1.sync_progress.files_total == 2);
+
+    // The output was collected and the unrelated file survived
+    const out_path = try std.fs.path.join(gpa, &.{ dest_root, "out.txt" });
+    defer gpa.free(out_path);
+    const out = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
+    defer gpa.free(out);
+    try expectEqualStrings("world", out);
+    const local = try std.Io.Dir.cwd().readFileAlloc(io, local_path, gpa, .unlimited);
+    defer gpa.free(local);
+    try expectEqualStrings("mine", local);
+
+    // The second run only transfers what changed: the untouched
+    // output stat-matches and is skipped
+    const pull_steps2 = [_]task_types.Step{.{ .command = .{ .value = "cp hello.txt out2.txt" } }};
+    const dispatch2 = try remote.pushDispatch(
+        "collect-task",
+        "build",
+        agent_spec,
+        &pull_steps2,
+        .{ .root = dest_root, .mode = .persistent, .direction = .pull },
+    );
+    var ran2 = try events.waitJobFinished(io);
+    defer ran2.deinit(gpa);
+    try expect(ran2.job_finished.success);
+    try expect(ran2.job_finished.dispatch_id == dispatch2);
+
+    var pulled2 = try waitSyncPhase(&events, io, .finished);
+    defer pulled2.deinit(gpa);
+    try expect(pulled2.sync_progress.direction == .pull);
+    // Three files declared, one received: the unchanged seeded and
+    // previously collected files stat-matched and were skipped
+    try expect(pulled2.sync_progress.files_done == 1);
+    try expect(pulled2.sync_progress.files_total == 3);
+
+    const out2_path = try std.fs.path.join(gpa, &.{ dest_root, "out2.txt" });
+    defer gpa.free(out2_path);
+    const out2 = try std.Io.Dir.cwd().readFileAlloc(io, out2_path, gpa, .unlimited);
+    defer gpa.free(out2);
+    try expectEqualStrings("world", out2);
+    const out_again = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
+    defer gpa.free(out_again);
+    try expectEqualStrings("world", out_again);
+
+    agent.stop();
+    agent_thread.join();
+    try expect(agent.isIdle());
+    try expect(remote.syncs.count() == 0);
+    try expect(remote.dispatched_jobs.count() == 0);
+}
+
+test "remote_sync_pull_start_failure_reports_failed_sync" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // A destination below an existing file cannot be created
+    try testutil.writeFileInDir(io, env.dir, "blocker", "x");
+    const blocked_root = try std.fs.path.join(gpa, &.{ env.path, "blocker", "pulled" });
+    defer gpa.free(blocked_root);
+
+    var events = testutil.RemoteEventSink.init(io, gpa);
+    defer events.deinit();
+
+    var remote = try remote_manager.RemoteManager.init(io, gpa);
+    defer remote.deinit();
+    remote.setEventSink(.{ .ptr = &events, .emit = testutil.RemoteEventSink.emit });
+    try remote.start(try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
+    defer agent.deinit();
+    try agent.connect(remote.getAddress().?);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    try testutil.waitAgentRegistered(io, remote);
+
+    const agent_spec = task_types.RemoteRunSpec{ .name = "runner1" };
+    const steps = [_]task_types.Step{.{ .command = .{ .value = "test -d ." } }};
+    _ = try remote.pushDispatch(
+        "collect-task",
+        "build",
+        agent_spec,
+        &steps,
+        .{ .root = blocked_root, .mode = .persistent, .direction = .pull },
+    );
+
+    // The job result is not held hostage by the failed collection
+    var ran = try events.waitJobFinished(io);
+    defer ran.deinit(gpa);
+    try expect(ran.job_finished.success);
+
+    var failed = try waitSyncPhase(&events, io, .failed);
+    defer failed.deinit(gpa);
+    try expect(failed.sync_progress.direction == .pull);
+    try expect(failed.sync_progress.mode == .persistent);
+
+    // The failed pull emits no second job result
+    var quiet: usize = 0;
+    while (quiet < 30) : (quiet += 1) {
+        while (events.queue.pop()) |event| {
+            defer event.deinit(gpa);
+            try expect(event != .job_finished);
+        }
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+    try expect(remote.syncs.count() == 0);
+    try expect(remote.dispatched_jobs.count() == 0);
+
+    agent.stop();
+    agent_thread.join();
+    try expect(agent.isIdle());
 }
 
 test "manager_run_history_prefetch" {
