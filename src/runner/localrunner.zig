@@ -54,6 +54,8 @@ pub const ExecResult = struct {
     err: ?ResultError = null,
     /// Owned failure message. Call `deinit` once the result is consumed.
     msg: ?[]u8 = null,
+    /// Wall-clock time in milliseconds when the run ended.
+    timestamp_ms: i64 = 0,
 
     pub fn deinit(self: *ExecResult, gpa: std.mem.Allocator) void {
         if (self.msg) |msg| gpa.free(msg);
@@ -129,6 +131,7 @@ pub const LocalRunner = struct {
                 .result = .{
                     .success = false,
                     .msg = message,
+                    .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
                 },
             }) catch if (message) |msg| gpa.free(msg);
             if (notify) |work_notify| work_notify.callback(work_notify.ptr);
@@ -225,18 +228,21 @@ pub const LocalRunner = struct {
         const result_msg = err_msg;
         err_msg = null;
 
+        const finished_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+
         logs.append(gpa, .{ .job_finished = .{
             .job_id = job.id,
             .name = gpa.dupe(u8, job.ptr.name) catch null,
             .success = success,
             .message = if (result_msg) |msg| gpa.dupe(u8, msg) catch null else null,
-            .timestamp_ms = std.Io.Clock.real.now(self.io).toMilliseconds(),
+            .timestamp_ms = finished_ms,
         } }) catch {};
         results.putOneUncancelable(self.io, .{
             .node = job,
             .result = .{
                 .success = success,
                 .msg = result_msg,
+                .timestamp_ms = finished_ms,
             },
         }) catch if (result_msg) |msg| gpa.free(msg);
         if (notify) |work_notify| work_notify.callback(work_notify.ptr);

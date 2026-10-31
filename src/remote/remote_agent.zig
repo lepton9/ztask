@@ -12,6 +12,7 @@ const MutexQueue = @import("../types/queue.zig").MutexQueue;
 const LocalRunner = localrunner.LocalRunner;
 const JobNode = localrunner.JobNode;
 const Result = localrunner.Result;
+const ExecResult = localrunner.ExecResult;
 const LogQueue = localrunner.LogQueue;
 
 const log = std.log.scoped(.agent);
@@ -28,7 +29,7 @@ const JobEntry = struct {
     awaiting_sync: bool = false,
     /// Set once the job was appended to the run queue.
     queued: bool = false,
-    /// Set once the job finished, per its `job_finished` event.
+    /// Set once the job's result was processed.
     finished: bool = false,
     /// Whether the dispatch plans a post-job pull. A finished job then
     /// keeps its workspace until the pull settles.
@@ -820,6 +821,49 @@ pub const RemoteAgent = struct {
         return (now - self.connection.last_msg.load(.monotonic) > HEARTBEAT_FREQ_S);
     }
 
+    /// Send a job_start message for a job handed to a runner.
+    fn reportJobStart(self: *RemoteAgent, job_id: u64, name: []const u8) void {
+        const msg: protocol.JobStartMsg = .{
+            .job_id = job_id,
+            .timestamp = std.Io.Clock.real.now(self.io).toMilliseconds(),
+        };
+        const payload = protocol.serialize(self.gpa, .{ .job_start = msg }) catch |err| {
+            log.err("Failed to serialize job start for job {x}: {s}", .{
+                job_id, @errorName(err),
+            });
+            return;
+        };
+        self.sendMessageOwned(payload);
+        self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name });
+    }
+
+    /// Send a job_finish message for a completed job.
+    fn reportJobEnd(self: *RemoteAgent, job_id: u64, result: ExecResult) void {
+        const msg: protocol.JobEndMsg = .{
+            .job_id = job_id,
+            .timestamp = result.timestamp_ms,
+            .success = result.success,
+            .message = result.msg,
+        };
+        const payload = protocol.serialize(self.gpa, .{ .job_finish = msg }) catch |err| {
+            log.err("Failed to serialize job end for job {x}: {s}", .{
+                job_id, @errorName(err),
+            });
+            return;
+        };
+        self.sendMessageOwned(payload);
+        if (self.jobs.get(job_id)) |entry|
+            self.writeStatus(
+                "{s:<12} job='{s}' success={} message={?s}\n",
+                .{ "job_finished", entry.job.name, result.success, result.msg },
+            )
+        else
+            self.writeStatus(
+                "{s:<12} job='{x}' success={} message={?s}\n",
+                .{ "job_finished", job_id, result.success, result.msg },
+            );
+    }
+
     /// Handle the completed job results
     fn handleResults(self: *RemoteAgent) void {
         var results: [4]Result = undefined;
@@ -837,14 +881,16 @@ pub const RemoteAgent = struct {
                     self.pool.release(runner);
                 }
 
+                // Notify the manager that the job is done
+                self.reportJobEnd(job_id, res.result);
+
                 // Free the job, keeping the workspace of a successful
                 // run whose dispatch plans a post-job pull
                 if (self.jobs.getPtr(job_id)) |e| blk: {
                     const entry = e.*;
-                    if (entry.post_pull and res.result.success) {
-                        entry.queued = false;
-                        break :blk;
-                    }
+                    entry.finished = true;
+                    entry.queued = false;
+                    if (entry.post_pull and res.result.success) break :blk;
                     // Remove if no post-run pull
                     _ = self.jobs.remove(job_id);
                     self.destroyJobEntry(entry);
@@ -859,20 +905,6 @@ pub const RemoteAgent = struct {
         while (self.log_queue.pop()) |event| {
             defer event.deinit(self.gpa);
             switch (event) {
-                .job_started => |e| {
-                    const msg: protocol.JobStartMsg = .{
-                        .job_id = e.job_id,
-                        .timestamp = e.timestamp_ms,
-                    };
-                    const payload = try protocol.serialize(self.gpa, .{
-                        .job_start = msg,
-                    });
-                    self.sendMessageOwned(payload);
-                    if (e.name) |name|
-                        self.writeStatus("{s:<12} job='{s}'\n", .{ "job_started", name })
-                    else
-                        self.writeStatus("{s:<12} job={x}\n", .{ "job_started", e.job_id });
-                },
                 .job_output => |e| {
                     const msg: protocol.JobLogMsg = .{
                         .job_id = e.job_id,
@@ -884,29 +916,8 @@ pub const RemoteAgent = struct {
                     });
                     self.sendMessageOwned(payload);
                 },
-                .job_finished => |e| {
-                    if (self.jobs.getPtr(e.job_id)) |slot| slot.*.finished = true;
-                    const msg: protocol.JobEndMsg = .{
-                        .job_id = e.job_id,
-                        .timestamp = e.timestamp_ms,
-                        .success = e.success,
-                        .message = e.message,
-                    };
-                    const payload = try protocol.serialize(self.gpa, .{
-                        .job_finish = msg,
-                    });
-                    self.sendMessageOwned(payload);
-                    if (e.name) |name|
-                        self.writeStatus(
-                            "{s:<12} job='{s}' success={} message={?s}\n",
-                            .{ "job_finished", name, e.success, e.message },
-                        )
-                    else
-                        self.writeStatus(
-                            "{s:<12} job='{x}' success={} message={?s}\n",
-                            .{ "job_finished", e.job_id, e.success, e.message },
-                        );
-                },
+                // Lifecycle events are sent elsewhere so here we ignore
+                .job_started, .job_finished => {},
             }
         }
     }
@@ -928,6 +939,7 @@ pub const RemoteAgent = struct {
             self.pool.release(runner);
             return;
         };
+        self.reportJobStart(node.id, entry.job.name);
         self.active_runners.putAssumeCapacity(node, runner);
         runner.runJobWithMode(
             self.gpa,
