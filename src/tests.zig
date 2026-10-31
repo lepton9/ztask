@@ -1488,6 +1488,188 @@ test "remote_sync_pull_collects_job_outputs" {
     try expect(remote.dispatched_jobs.count() == 0);
 }
 
+test "remote_sync_both_pushes_runs_and_pulls" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // The local root is the push source and the pull destination
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "hello.txt", "world");
+    defer gpa.free(root);
+
+    var events = testutil.RemoteEventSink.init(io, gpa);
+    defer events.deinit();
+
+    var remote = try remote_manager.RemoteManager.init(io, gpa);
+    defer remote.deinit();
+    remote.setEventSink(.{ .ptr = &events, .emit = testutil.RemoteEventSink.emit });
+    try remote.start(try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
+    defer agent.deinit();
+    try agent.connect(remote.getAddress().?);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    try testutil.waitAgentRegistered(io, remote);
+
+    const steps = [_]task_types.Step{
+        .{ .command = .{ .value = "test -f hello.txt" } },
+        .{ .command = .{ .value = "cp hello.txt out.txt" } },
+    };
+    const agent_spec = task_types.RemoteRunSpec{ .name = "runner1" };
+
+    const dispatch_id = try remote.pushDispatch(
+        "both-task",
+        "build",
+        agent_spec,
+        &steps,
+        .{ .root = root, .mode = .ephemeral, .direction = .both },
+    );
+
+    // The push leg runs first
+    var pushed = try waitSyncPhase(&events, io, .started);
+    defer pushed.deinit(gpa);
+    try expect(pushed.sync_progress.direction == .push);
+    try expect(pushed.sync_progress.dispatch_id == dispatch_id);
+
+    var push_done = try waitSyncPhase(&events, io, .finished);
+    defer push_done.deinit(gpa);
+    try expect(push_done.sync_progress.direction == .push);
+    try expect(push_done.sync_progress.files_done == 1);
+
+    // The job runs in the pushed workspace
+    var finished = try events.waitJobFinished(io);
+    defer finished.deinit(gpa);
+    try expect(finished.job_finished.success);
+    try expect(finished.job_finished.dispatch_id == dispatch_id);
+
+    // The pull leg collects the results afterwards
+    var pulled = try waitSyncPhase(&events, io, .started);
+    defer pulled.deinit(gpa);
+    try expect(pulled.sync_progress.direction == .pull);
+    try expect(pulled.sync_progress.dispatch_id == dispatch_id);
+
+    var pull_done = try waitSyncPhase(&events, io, .finished);
+    defer pull_done.deinit(gpa);
+    try expect(pull_done.sync_progress.direction == .pull);
+    // Two files declared, one received: the pushed input stat-matches
+    // the local copy and is skipped, only the output is collected
+    try expect(pull_done.sync_progress.files_done == 1);
+    try expect(pull_done.sync_progress.files_total == 2);
+
+    // Both the pushed input and the produced output landed locally
+    const out_path = try std.fs.path.join(gpa, &.{ root, "out.txt" });
+    defer gpa.free(out_path);
+    const out = try std.Io.Dir.cwd().readFileAlloc(io, out_path, gpa, .unlimited);
+    defer gpa.free(out);
+    try expectEqualStrings("world", out);
+    const hello_path = try std.fs.path.join(gpa, &.{ root, "hello.txt" });
+    defer gpa.free(hello_path);
+    const hello = try std.Io.Dir.cwd().readFileAlloc(io, hello_path, gpa, .unlimited);
+    defer gpa.free(hello);
+    try expectEqualStrings("world", hello);
+
+    // The run's staging workspace died with the settled collection
+    const staging = try env.stagingPath("both-task", "build", dispatch_id);
+    defer gpa.free(staging);
+    try testutil.waitRemoved(io, staging);
+
+    var waited: usize = 0;
+    while (!agent.isIdle()) {
+        try expect(waited < 500);
+        waited += 1;
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+    agent.stop();
+    agent_thread.join();
+    try expect(agent.isIdle());
+    try expect(remote.syncs.count() == 0);
+    try expect(remote.dispatched_jobs.count() == 0);
+}
+
+test "remote_sync_both_skips_pull_on_failure" {
+    var env: TestEnv = try .init();
+    defer env.deinit();
+    const io = env.io;
+    const gpa = env.gpa;
+
+    // The local root is the push source and the pull destination
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testutil.tmpSourceRoot(io, gpa, tmp.dir, "hello.txt", "world");
+    defer gpa.free(root);
+
+    var events = testutil.RemoteEventSink.init(io, gpa);
+    defer events.deinit();
+
+    var remote = try remote_manager.RemoteManager.init(io, gpa);
+    defer remote.deinit();
+    remote.setEventSink(.{ .ptr = &events, .emit = testutil.RemoteEventSink.emit });
+    try remote.start(try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0));
+
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var agent = try remote_agent.RemoteAgent.init(io, gpa, "runner1", 5, &output.writer, env.data_dir);
+    defer agent.deinit();
+    try agent.connect(remote.getAddress().?);
+    var agent_thread = try std.Thread.spawn(.{}, remote_agent.RemoteAgent.run, .{agent});
+
+    try testutil.waitAgentRegistered(io, remote);
+
+    // The run produces an output and then fails
+    const steps = [_]task_types.Step{
+        .{ .command = .{ .value = "cp hello.txt out.txt" } },
+        .{ .command = .{ .value = "false" } },
+    };
+    const agent_spec = task_types.RemoteRunSpec{ .name = "runner1" };
+    _ = try remote.pushDispatch(
+        "both-fail-task",
+        "build",
+        agent_spec,
+        &steps,
+        .{ .root = root, .mode = .ephemeral, .direction = .both },
+    );
+
+    // The push leg runs and finishes before the job runs
+    var pushed = try waitSyncPhase(&events, io, .started);
+    defer pushed.deinit(gpa);
+    try expect(pushed.sync_progress.direction == .push);
+
+    var push_done = try waitSyncPhase(&events, io, .finished);
+    defer push_done.deinit(gpa);
+    try expect(push_done.sync_progress.direction == .push);
+
+    var finished = try events.waitJobFinished(io);
+    defer finished.deinit(gpa);
+    try expect(!finished.job_finished.success);
+
+    // No pull ever starts for a failed run: drain the queue for a
+    // while and assert no pull event shows up
+    var waited: usize = 0;
+    while (waited < 20) : (waited += 1) {
+        while (events.queue.pop()) |event| {
+            defer event.deinit(gpa);
+            if (event != .sync_progress) continue;
+            try expect(event.sync_progress.direction != .pull);
+        }
+        try std.Io.sleep(io, .fromNanoseconds(10 * std.time.ns_per_ms), .awake);
+    }
+
+    // The produced output was never collected
+    const out_path = try std.fs.path.join(gpa, &.{ root, "out.txt" });
+    defer gpa.free(out_path);
+    try expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, out_path, .{}));
+
+    agent.stop();
+    agent_thread.join();
+    try expect(agent.isIdle());
+    try expect(remote.syncs.count() == 0);
+    try expect(remote.dispatched_jobs.count() == 0);
+}
+
 test "remote_sync_ephemeral_pull_collects_and_deletes_staging" {
     var env: TestEnv = try .init();
     defer env.deinit();

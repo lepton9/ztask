@@ -28,6 +28,8 @@ const JobEntry = struct {
     awaiting_sync: bool = false,
     /// Set once the job was appended to the run queue.
     queued: bool = false,
+    /// Set once the job finished, per its `job_finished` event.
+    finished: bool = false,
     /// Whether the dispatch plans a post-job pull. A finished job then
     /// keeps its workspace until the pull settles.
     post_pull: bool = false,
@@ -322,9 +324,11 @@ pub const RemoteAgent = struct {
 
     /// Start a workspace transfer.
     fn beginSync(self: *RemoteAgent, msg: protocol.SyncBeginMsg) void {
-        if (self.syncs.contains(msg.job_id)) {
-            log.warn("Ignoring duplicate sync_begin for job {x}", .{msg.job_id});
-            return;
+        if (self.syncs.get(msg.job_id)) |old| {
+            // Drop a stale push transfer
+            const stale = old.settled and old.receiver() != null and old.sender() == null;
+            if (!stale) return log.warn("Ignoring duplicate sync_begin for job {x}", .{msg.job_id});
+            self.shutdownSync(msg.job_id);
         }
         const st = self.startTransfer(msg) catch |err| {
             log.warn("Rejected workspace sync for job {x}: {s}", .{
@@ -391,12 +395,12 @@ pub const RemoteAgent = struct {
                 };
             },
             .pull => blk: {
-                // A pull collects a finished run. Reject it while its
-                // job is still queued, running or waiting for its push.
-                if (self.jobs.getPtr(msg.job_id)) |slot| {
-                    const entry = slot.*;
-                    if (entry.awaiting_sync or entry.queued or
-                        self.active_runners.contains(&entry.node)) return error.JobRunning;
+                // A pull collects a finished run. Reject it while the
+                // job has not finished yet or still waits for its push.
+                if (self.jobs.getPtr(msg.job_id)) |e| {
+                    const entry = e.*;
+                    if (!entry.finished or entry.awaiting_sync)
+                        return error.JobRunning;
                 }
                 const root = try sync.pullSource(
                     self.gpa,
@@ -512,6 +516,7 @@ pub const RemoteAgent = struct {
                     entry.awaiting_sync = false;
                     self.enqueueJob(entry);
                 }
+                self.shutdownSync(job_id);
             }
             self.sendSyncAck(job_id, true, null);
             return;
@@ -615,6 +620,7 @@ pub const RemoteAgent = struct {
             }
             if (r.committed) {
                 self.enqueueJob(entry);
+                self.shutdownSync(msg.job_id);
             } else {
                 entry.awaiting_sync = true;
             }
@@ -879,6 +885,7 @@ pub const RemoteAgent = struct {
                     self.sendMessageOwned(payload);
                 },
                 .job_finished => |e| {
+                    if (self.jobs.getPtr(e.job_id)) |slot| slot.*.finished = true;
                     const msg: protocol.JobEndMsg = .{
                         .job_id = e.job_id,
                         .timestamp = e.timestamp_ms,

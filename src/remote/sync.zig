@@ -104,7 +104,7 @@ test "validate_gates_modes_per_direction" {
     msg.mode = .none;
     try expectError(error.UnsupportedMode, validate(msg));
 
-    // Bidirectional sync waits for conflict semantics
+    // The wire never carries `.both`
     msg.mode = .persistent;
     msg.direction = .both;
     try expectError(error.UnsupportedDirection, validate(msg));

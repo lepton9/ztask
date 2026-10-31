@@ -406,7 +406,8 @@ pub const SyncDirection = enum(u8) {
     push = 1,
     /// Agent sends workspace results back to the manager.
     pull = 2,
-    /// Bidirectional sync.
+    /// Push before the run and pull after it. Run as two one-way
+    /// transfers over the same root.
     both = 3,
 };
 

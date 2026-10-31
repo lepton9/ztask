@@ -566,12 +566,18 @@ pub const RemoteManager = struct {
     ) error{ OutOfMemory, FrameTooLarge, Closed }!u64 {
         const dispatch_id = self.next_dispatch_id.fetchAdd(1, .monotonic);
 
+        const sync_spec: ?SyncSpec = if (spec) |s| blk: {
+            if (s.mode == .none) break :blk null;
+            break :blk try s.dupe(self.gpa);
+        } else null;
+        errdefer if (sync_spec) |*s| s.deinit(self.gpa);
+
         const run_job_payload = try protocol.serialize(self.gpa, .{ .run_job = .{
             .job_id = dispatch_id,
             .task_id = task_id,
             .job_name = job_name,
-            .workspace = if (spec) |s| s.mode else .none,
-            .sync = if (spec) |s| s.direction else null,
+            .workspace = if (sync_spec) |s| s.mode else .none,
+            .sync = if (sync_spec) |s| s.direction else null,
             .steps = .fromSlice(steps),
         } });
         errdefer self.gpa.free(run_job_payload);
@@ -588,9 +594,6 @@ pub const RemoteManager = struct {
         else
             null;
         errdefer if (agent_addr) |addr| self.gpa.free(addr);
-
-        var sync_spec: ?SyncSpec = if (spec) |s| try s.dupe(self.gpa) else null;
-        errdefer if (sync_spec) |*s| s.deinit(self.gpa);
 
         // `error.Closed` means the manager is stopping; the scheduler's
         // dispatch handler fails the job on any error, so it propagates.
@@ -805,7 +808,7 @@ pub const RemoteManager = struct {
             req.deinit(self.gpa);
             return;
         };
-        self.startPull(agent, msg.job_id);
+        self.startSyncPull(agent, msg.job_id);
     }
 
     /// Complete a push workspace transfer. Send `run_job` after an
@@ -1067,10 +1070,9 @@ pub const RemoteManager = struct {
         };
         // Sync the workspace before dispatching. A pull-only spec runs
         // the job right away.
-        if (dispatched.sync != null and dispatched.sync.?.direction != .pull) {
-            self.startSync(agent, dispatched.dispatch_id);
-            return;
-        }
+        if (dispatched.sync) |s| if (s.direction == .push or s.direction == .both) {
+            return self.startSyncPush(agent, dispatched.dispatch_id);
+        };
         self.sendRunJob(agent, dispatched.dispatch_id);
     }
 
@@ -1110,7 +1112,11 @@ pub const RemoteManager = struct {
         self: *RemoteManager,
         agent: *AgentHandle,
         entry: *const DispatchRequest,
+        direction: SyncDirection,
     ) !*sync.Transfer {
+        // `.both` should run as a separate `.push` and `.pull` syncs
+        std.debug.assert(direction != .both);
+
         const job_id = entry.dispatch_id;
         const spec = entry.sync orelse return error.NoSyncSpec;
 
@@ -1129,14 +1135,14 @@ pub const RemoteManager = struct {
                 .manager = self,
                 .task_id = try self.gpa.dupe(u8, entry.task_id),
                 .mode = spec.mode,
-                .direction = spec.direction,
+                .direction = direction,
             };
             errdefer self.gpa.free(label.task_id);
 
             break :blk try sync.Transfer.init(
                 self.io,
                 self.gpa,
-                try self.transferRoles(entry),
+                try self.transferRoles(entry, direction),
                 .{
                     .id = job_id,
                     .link = wire_link.link(),
@@ -1159,13 +1165,14 @@ pub const RemoteManager = struct {
         return st;
     }
 
-    /// Build the roles of a transfer from the dispatch's sync spec.
+    /// Build the roles of one transfer from the dispatch's sync spec.
     fn transferRoles(
         self: *RemoteManager,
         entry: *const DispatchRequest,
+        direction: SyncDirection,
     ) !sync.Transfer.Roles {
         const spec = entry.sync orelse return error.NoSyncSpec;
-        switch (spec.direction) {
+        switch (direction) {
             .push => return .{
                 .sender = try .init(self.io, self.gpa, spec.root, spec.exclude),
             },
@@ -1179,6 +1186,8 @@ pub const RemoteManager = struct {
                     .deletes = false,
                 }) };
             },
+            // The wire should never carry `.both`. Should be divided
+            // to `.push` and `.pull`.
             .both => return error.UnsupportedDirection,
         }
     }
@@ -1189,6 +1198,7 @@ pub const RemoteManager = struct {
         self: *RemoteManager,
         agent: *AgentHandle,
         entry: *const DispatchRequest,
+        direction: SyncDirection,
     ) !void {
         const job_id = entry.dispatch_id;
         const spec = entry.sync orelse return error.NoSyncSpec;
@@ -1197,7 +1207,7 @@ pub const RemoteManager = struct {
             entry.task_id,
             job_id,
             spec.mode,
-            spec.direction,
+            direction,
             .started,
             0,
             0,
@@ -1208,7 +1218,7 @@ pub const RemoteManager = struct {
 
         log.debug(
             "Workspace sync {x} begin: task='{s}' job='{s}' root='{s}' mode={s} direction={s}",
-            .{ job_id, entry.task_id, entry.job_name, spec.root, @tagName(spec.mode), @tagName(spec.direction) },
+            .{ job_id, entry.task_id, entry.job_name, spec.root, @tagName(spec.mode), @tagName(direction) },
         );
 
         const begin = try protocol.serialize(self.gpa, .{ .sync_begin = .{
@@ -1216,7 +1226,7 @@ pub const RemoteManager = struct {
             .task_id = entry.task_id,
             .job_name = entry.job_name,
             .mode = spec.mode,
-            .direction = spec.direction,
+            .direction = direction,
             .exclude = .fromSlice(spec.exclude),
         } });
         errdefer self.gpa.free(begin);
@@ -1224,13 +1234,13 @@ pub const RemoteManager = struct {
     }
 
     /// Start the pre-job workspace transfer of a dispatched job.
-    fn startSync(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+    fn startSyncPush(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
         const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
         if (entry.sync == null) return;
 
-        const st = self.trackSyncTransfer(agent, entry) catch |err|
+        const st = self.trackSyncTransfer(agent, entry, .push) catch |err|
             return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
-        self.announceSyncTransfer(agent, entry) catch |err|
+        self.announceSyncTransfer(agent, entry, .push) catch |err|
             return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
 
         if (st.sender() != null) {
@@ -1243,12 +1253,12 @@ pub const RemoteManager = struct {
     }
 
     /// Start the post-job pull transfer of a finished job.
-    fn startPull(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
+    fn startSyncPull(self: *RemoteManager, agent: *AgentHandle, job_id: u64) void {
         const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
         const spec = entry.sync orelse return;
 
         entry.pulling = true;
-        _ = self.trackSyncTransfer(agent, entry) catch |err| {
+        _ = self.trackSyncTransfer(agent, entry, .pull) catch |err| {
             log.warn(
                 "Workspace pull for job '{s}' ({x}) failed to start: {s}",
                 .{ entry.job_name, job_id, @errorName(err) },
@@ -1257,7 +1267,7 @@ pub const RemoteManager = struct {
                 entry.task_id,
                 job_id,
                 spec.mode,
-                spec.direction,
+                .pull,
                 .failed,
                 0,
                 0,
@@ -1271,7 +1281,7 @@ pub const RemoteManager = struct {
             self.sendCancelJob(agent, job_id);
             return;
         };
-        self.announceSyncTransfer(agent, entry) catch |err|
+        self.announceSyncTransfer(agent, entry, .pull) catch |err|
             return self.failSyncedDispatchErr(job_id, "failed to start the workspace transfer", err);
     }
 
@@ -1313,12 +1323,15 @@ pub const RemoteManager = struct {
     ) void {
         const entry = self.dispatched_jobs.getPtr(job_id) orelse return;
         const spec = entry.sync orelse return;
+        const direction: SyncDirection = if (entry.pulling)
+            .pull
+        else if (spec.direction == .both) .push else spec.direction;
         const p = st.progress();
         self.emitSyncEvent(
             entry.task_id,
             job_id,
             spec.mode,
-            spec.direction,
+            direction,
             phase,
             p.files,
             p.bytes,
